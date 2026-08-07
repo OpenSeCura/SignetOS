@@ -17,7 +17,7 @@ But you probably don’t need the linux and can maybe replace with qemu only.
 
 ## 1\. Setup Environment Variables
 
-# First, define paths to your specific compiler and QEMU instance. Update these paths if your toolchain is installed in a different location.
+First, define paths to your specific compiler and QEMU instance. Update these paths if your toolchain is installed in a different location.
 
 ```
 export COMPILER="~/cheri/output/cheri-std093-sdk/bin/clang"
@@ -26,7 +26,7 @@ export QEMU="~/cheri/build/cheri-std093-qemu-build/qemu-system-riscv64xcheri"
 
 ## 2\. Compile and Link the Executable
 
-# Since you are building a bare-metal application, you cannot rely on the host operating system's standard libraries or default startup logic. You must provide your own linker script and pass specific flags to structure the executable for bare-metal execution.
+Since you are building a bare-metal application, you cannot rely on the host operating system's standard libraries or default startup logic. You must provide your own linker script and pass specific flags to structure the executable for bare-metal execution.
 
 ```
 $COMPILER -O2 -g \
@@ -40,17 +40,17 @@ $COMPILER -O2 -g \
 
 ### Important Compile & Link Flags:
 
-* # **Architecture Flags** (\--target, \-march, \-mabi): Configures the target to compile for RISC-V 64-bit with CHERI capability extensions.
+* **Architecture Flags** (\--target, \-march, \-mabi): Configures the target to compile for RISC-V 64-bit with CHERI capability extensions.
 
-* # **\-mcmodel=medany**: Generates code using the "medium-any" code model, which is the standard approach for RISC-V kernels allowing code execution at any address layout.
+* **\-mcmodel=medany**: Generates code using the "medium-any" code model, which is the standard approach for RISC-V kernels allowing code execution at any address layout.
 
-* # **\-ffreestanding \-nostdlib \-nostartfiles**: Tells the compiler **not** to bundle the standard C/C++ library or default OS entry-point code. Your codebase must provide its own entry point (e.g., typically \_start inside a custom boot.S).
+* **\-ffreestanding \-nostdlib \-nostartfiles**: Tells the compiler **not** to bundle the standard C/C++ library or default OS entry-point code. Your codebase must provide its own entry point (e.g., typically \_start inside a custom boot.S).
 
-* # **\-fno-exceptions \-fno-rtti**: Disables exceptions and runtime type information since these mechanisms rely on standard libraries and OS runtime support.
+* **\-fno-exceptions \-fno-rtti**: Disables exceptions and runtime type information since these mechanisms rely on standard libraries and OS runtime support.
 
-* # **\-fno-pic \-fno-pie**: Disables Position Independent Code/Executables, streamlining linking for flat, static address spaces.
+* **\-fno-pic \-fno-pie**: Disables Position Independent Code/Executables, streamlining linking for flat, static address spaces.
 
-* # **\-T your\_linker\_script.ld**: Relies on a customizable Linker Script that dictates exactly how the binary sections (.text, .data, .bss) should be loaded into physical memory.
+* **\-T your\_linker\_script.ld**: Relies on a customizable Linker Script that dictates exactly how the binary sections (.text, .data, .bss) should be loaded into physical memory.
 
 #### Example RISC-V Linker Script
 The linker flag flag requires a script to tell the compiler where to put everything in memory. Below is a minimal linker script.
@@ -100,7 +100,7 @@ SECTIONS
 
 ## 3\. Run with QEMU
 
-# Once your executable (.elf) is successfully built, use QEMU to act as the hardware and run it.
+Once your executable (.elf) is successfully built, use QEMU to act as the hardware and run it.
 
 ```
 $QEMU -machine virt -bios none -m 128M -nographic -kernel your_output_binary.elf
@@ -108,15 +108,14 @@ $QEMU -machine virt -bios none -m 128M -nographic -kernel your_output_binary.elf
 
 ### QEMU Execution Flags:
 
-* # **\-machine virt**: Uses QEMU's generic RISC-V virtual machine framework. This provides a baseline set of emulated peripherals (like a UART for console output) without tying it to a specific physical dev board.
+* **\-machine virt**: Uses QEMU's generic RISC-V virtual machine framework. This provides a baseline set of emulated peripherals (like a UART for console output) without tying it to a specific physical dev board.
 
-* # **\-bios none**: Disables default boot firmware (like OpenSBI or firmware that jumps to supervisor mode). This tells QEMU to load your binary and immediately hand off control to it in Machine Mode (M-Mode).
+* **\-bios none**: Disables default boot firmware (like OpenSBI or firmware that jumps to supervisor mode). This tells QEMU to load your binary and immediately hand off control to it in Machine Mode (M-Mode).
 
-* # **\-m 128M**: Determines how much physical RAM to provision to the virtual machine (adjust size as needed).
+* **\-m 128M**: Determines how much physical RAM to provision to the virtual machine (adjust size as needed).
 
-* # **\-nographic**: Disables all QEMU graphical windows. It redirects the emulated system's serial port (UART) directly into your current terminal output, which is ideal for bare-metal printf logging.
+* **\-nographic**: Disables all QEMU graphical windows. It redirects the emulated system's serial port (UART) directly into your current terminal output, which is ideal for bare-metal printf logging.
 
-* # **\-kernel ...**: Specifies the .elf binary image to inject into the virtual memory spacing and boot from.
+* **\-kernel ...**: Specifies the .elf binary image to inject into the virtual memory spacing and boot from.
 
-# 
 
