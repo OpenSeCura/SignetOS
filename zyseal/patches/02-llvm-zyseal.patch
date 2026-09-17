@@ -1,0 +1,135 @@
+--- a/clang/lib/Basic/Targets/RISCV.cpp
++++ b/clang/lib/Basic/Targets/RISCV.cpp
+@@ -272,6 +272,13 @@
+         Builder.defineMacro("__CHERI_CAP_PERMISSION_CAPABILITY_LEVEL__",
+                             Twine(1 << 4));
+       }
++      if(ISAInfo->hasExtension("zyseal")){
++        // Spec Figure 16: US is permission bit 25, SE is bit 24.  These come
++        // from the Reserved-ZERO region (bits XLEN-1:24); bits 10/11 are
++        // Reserved-ONE and would read as set on every capability.
++        Builder.defineMacro("__CHERI_CAP_PERMISSION_SEAL__", Twine(1 << 24));
++        Builder.defineMacro("__CHERI_CAP_PERMISSION_UNSEAL__", Twine(1 << 25));
++      }
+       // Software Defined Permissions
+       Builder.defineMacro("__CHERI_CAP_PERMISSION_USER_00__", Twine(1 << 6));
+       Builder.defineMacro("__CHERI_CAP_PERMISSION_USER_01__", Twine(1 << 7));
+@@ -450,7 +457,8 @@
+       ISAInfo->hasExtension("zcheripurecap") ||
+       ISAInfo->hasExtension("zcherihybrid") ||
+       ISAInfo->hasExtension("zcheripte") ||
+-      ISAInfo->hasExtension("zcherilevels")) {
++      ISAInfo->hasExtension("zcherilevels") ||
++      ISAInfo->hasExtension("zyseal")) {
+     HasCheri = true;
+     CapSize = XLen * 2;
+     CheriBoundVarArg = llvm::is_contained(Features, "+cheri-bounded-vararg");
+--- a/clang/lib/Sema/SemaChecking.cpp
++++ b/clang/lib/Sema/SemaChecking.cpp
+@@ -313,10 +313,15 @@
+         << TheCall->getSourceRange()
+         << StringRef("Requires zcherihybrid");
+     return true;
+-  case Builtin::BI__builtin_cheri_cap_type_copy:
+   case Builtin::BI__builtin_cheri_unseal:
+-  case Builtin::BI__builtin_cheri_conditional_seal:
+   case Builtin::BI__builtin_cheri_seal:
++    if (S.Context.getTargetInfo().hasFeature("zyseal"))
++      return false;
++    S.Diag(TheCall->getBeginLoc(), diag::err_bakewell_unsupported_builtin)
++        << TheCall->getSourceRange() << StringRef("Requires zyseal");
++    return true;
++  case Builtin::BI__builtin_cheri_cap_type_copy:
++  case Builtin::BI__builtin_cheri_conditional_seal:
+   case Builtin::BI__builtin_cheri_cap_load_tags:
+     S.Diag(TheCall->getBeginLoc(), diag::err_bakewell_unsupported_builtin)
+         << TheCall->getSourceRange() << StringRef("Unsupported Builtin");
+--- a/clang/test/Driver/print-supported-extensions-riscv.c
++++ b/clang/test/Driver/print-supported-extensions-riscv.c
+@@ -115,6 +115,7 @@
+ // CHECK-NEXT:     zvl8192b             1.0       'Zvl8192b' (Minimum Vector Length 8192)
+ // CHECK-NEXT:     zhinx                1.0       'Zhinx' (Half Float in Integer)
+ // CHECK-NEXT:     zhinxmin             1.0       'Zhinxmin' (Half Float in Integer Minimal)
++// CHECK-NEXT:     zyseal               0.9       'Zyseal' (Extension for Capability Sealing)
+ // CHECK-NEXT:     sha                  1.0       'Sha' (Augmented Hypervisor)
+ // CHECK-NEXT:     shcounterenw         1.0       'Shcounterenw' (Support writeable hcounteren enable bit for any hpmcounter that is not read-only zero)
+ // CHECK-NEXT:     shgatpa              1.0       'Shgatpa' (SvNNx4 mode supported for all modes supported by satp, as well as Bare)
+--- a/clang/test/Sema/cheri/bakewell/verify-builtins.c
++++ b/clang/test/Sema/cheri/bakewell/verify-builtins.c
+@@ -9,9 +9,9 @@
+ 
+     x = __builtin_cheri_cap_load_tags(cap); // expected-error{{builtin unsupported when using bakewell : Unsupported Builtin}}
+     void * __capability volatile z;
+-    z = __builtin_cheri_unseal(cap, cap); // expected-error{{builtin unsupported when using bakewell : Unsupported Builtin}}
++    z = __builtin_cheri_unseal(cap, cap); // expected-error{{builtin unsupported when using bakewell : Requires zyseal}}
+     z = __builtin_cheri_cap_type_copy(cap, cap); // expected-error{{builtin unsupported when using bakewell : Unsupported Builtin}}
+-    z = __builtin_cheri_seal(cap, cap); // expected-error{{builtin unsupported when using bakewell : Unsupported Builtin}}
++    z = __builtin_cheri_seal(cap, cap); // expected-error{{builtin unsupported when using bakewell : Requires zyseal}}
+     z = __builtin_cheri_conditional_seal(z, z); // expected-error{{builtin unsupported when using bakewell : Unsupported Builtin}}
+     
+     x = __builtin_cheri_flags_get(z); // purecap-error{{builtin unsupported when using bakewell : Requires zcherihybrid}}
+--- a/llvm/lib/Target/RISCV/RISCVFeatures.td
++++ b/llvm/lib/Target/RISCV/RISCVFeatures.td
+@@ -1421,6 +1421,17 @@
+                      [FeatureStdExtZCheriPureCap],
+                      "HasStdExtZCheriLevels">;
+ 
++def FeatureStdExtZyseal
++    : RISCVExtension<0, 9,
++                     "Extension for Capability Sealing",
++                     [FeatureStdExtZCheriPureCap],
++                     "HasStdExtZyseal">;
++
++def HasZyseal
++    : Predicate<"Subtarget->hasStdExtZyseal()">,
++                AssemblerPredicate<(all_of FeatureStdExtZyseal),
++                "'Zyseal' (Extension for Capability Sealing)">;
++
+ def FeatureStdExtZish4add
+     : RISCVExtension<0, 9,
+                      "Address Generation Instructions for wide-pointers.",
+--- a/llvm/unittests/TargetParser/RISCVISAInfoTest.cpp
++++ b/llvm/unittests/TargetParser/RISCVISAInfoTest.cpp
+@@ -1041,6 +1041,7 @@
+     zvl8192b             1.0
+     zhinx                1.0
+     zhinxmin             1.0
++    zyseal               0.9
+     sha                  1.0
+     shcounterenw         1.0
+     shgatpa              1.0
+--- a/llvm/lib/Target/RISCV/RISCVInstrInfoZCheriPurecap.td
++++ b/llvm/lib/Target/RISCV/RISCVInstrInfoZCheriPurecap.td
+@@ -129,6 +129,15 @@
+ def : InstAlias<"ybndswi $rd, $rs1, $imm", (SCBNDSI YGPR:$rd, YGPR:$rs1, csetbnd_imm:$imm), 0>;
+ } // HasZCheriPurecap
+ 
++let Predicates = [HasZyseal] in {
++let defsCanBeSealed = 1 in {
++def YSEAL   : ZCheri_rr<0x7, 0x2, "yseal", GPCR, GPCR, GPCR>,
++                  Sched<[WriteCHERIMod, ReadCHERIMod]>;
++def YUNSEAL : ZCheri_rr<0x7, 0x3, "yunseal", GPCR, GPCR, GPCR>,
++                  Sched<[WriteCHERIMod, ReadCHERIMod]>;
++} // defsCanBeSealed = 1
++} // HasZyseal
++
+ let Predicates = [HasZCheriHybrid] in {
+ def SCMODE        : ZCheri_rr<0x6, 0x7, "scmode">,
+                         Sched<[WriteCHERIMod, ReadCHERIMod]>;
+@@ -438,6 +447,16 @@
+ 
+ } // HasZCheriPurecap
+ 
++// Capability-Sealing Instructions
++// NB: The intrinsics take (capability_to_seal, authority) whereas the
++// instructions take (authority, capability_to_seal), so swap the operands.
++let Predicates = [HasZyseal] in {
++def : Pat<(int_cheri_cap_seal GPCR:$cap, GPCR:$auth),
++          (YSEAL GPCR:$auth, GPCR:$cap)>;
++def : Pat<(int_cheri_cap_unseal GPCR:$cap, GPCR:$auth),
++          (YUNSEAL GPCR:$auth, GPCR:$cap)>;
++} // HasZyseal
++
+ let Predicates = [HasZCheriHybrid] in
+ def : PatGpcrGpr<int_cheri_cap_flags_set, SCMODE>;
+ 

@@ -1,0 +1,398 @@
+--- a/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
++++ b/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
+@@ -75,15 +75,36 @@
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wpedantic"
+ enum {
+-    _CC_FIELD(RESERVED1, 127, 121),
+-    _CC_FIELD(SDP, 120, 117),
+-    _CC_FIELD(FLAGS, 116, 116), // TODO: remove this old alias
+-    _CC_FIELD(AP_M, 116, 108),  // Combined architectural permissions and mode
+-    _CC_FIELD(MODE, 116, 116),
+-    _CC_FIELD(AP, 115, 108),
++    /*
++     * Zyseal (SignetOS local dialect, NOT ratified) alters this layout in two
++     * ways relative to stock RV64LYA.
++     *
++     * 1. SE and US are AP bits 8 and 9, extending Table 26 (spec 3.1.2,
++     *    17.4).  AP[7:0] keep their stock meanings; AP grows upwards from
++     *    8 to 10 bits, so SDP and MODE move up into RESERVED1.
++     *
++     *    Storage position is unrelated to the position SE/US occupy in the
++     *    decoded YPERMC/YPERMR word (Figure 16: bits 24 and 25).  That
++     *    mapping is the lookup table in get_all_permissions() below, not a
++     *    formula -- e.g. decoded bit 0 comes from AP bit 1.
++     *
++     *    AP_M (the combined AP+MODE field) is gone: MODE is no longer
++     *    adjacent to AP.  Only the Sail test harness referenced it.
++     *
++     * 2. OTYPE/CT is 4 bits: 0 unsealed, 1 sentry, 2..15 Zyseal object types.
++     *    Deliberately narrow so software cannot depend on more types than the
++     *    64-bit capability format (RV32) could offer -- the spec's own
++     *    microcontroller encoding uses a 3-bit CT.  RESERVED0 (106:95) is
++     *    free, so widening means changing only the two field lines below.
++     */
++    _CC_FIELD(SDP, 127, 124),
++    _CC_FIELD(MODE, 123, 123),
++    _CC_FIELD(FLAGS, 123, 123), // TODO: remove this old alias (must track MODE)
++    _CC_FIELD(RESERVED1, 122, 118),
++    _CC_FIELD(AP, 117, 108), // AP[9]=US-permission, AP[8]=SE-permission
+     _CC_FIELD(LEVEL, 107, 107),
+-    _CC_FIELD(RESERVED0, 106, 92),
+-    _CC_FIELD(OTYPE, 91, 91),
++    _CC_FIELD(RESERVED0, 106, 95),
++    _CC_FIELD(OTYPE, 94, 91),
+     _CC_FIELD(EBT, 90, 64),
+ 
+     _CC_FIELD(EXPONENT_FORMAT, 90, 90),
+@@ -122,23 +143,65 @@
+ #define CC128R_PERM_ACCESS_SYS_REGS (1 << 16)
+ #define CC128R_PERM_EXECUTE (1 << 17)
+ #define CC128R_PERM_READ (1 << 18)
+-#define CC128R_PERMS_ALL (0x7003f)
++/*
++ * Zyseal SE/US.  Two independent bit positions; do not conflate them.
++ *
++ *   STORAGE  -- AP-field bits 8 and 9 (cap bits 116, 117).
++ *   DECODED  -- bits 24 and 25 of the word YPERMR (gcperm) produces and
++ *               YPERMC (acperm) masks.  Spec Figure 16.
++ *
++ * The decoded number does not imply the storage number; decoded bit 0 comes
++ * from AP bit 1.  get_all_permissions()/set_permissions() are the mapping.
++ *
++ * 24/25 are in Figure 6's Reserved-ZERO region.  They must be: YPERMR
++ * hardwires reserved bits in [23:0] to 1, so a permission sited there would
++ * make has_permissions() true for every capability.
++ */
++#define CC128R_AP_SE (1u << 8) /* storage: AP bit 8  */
++#define CC128R_AP_US (1u << 9) /* storage: AP bit 9  */
++#define CC128R_PERM_SEAL (1 << 24)   /* decoded word bit 24 */
++#define CC128R_PERM_UNSEAL (1 << 25) /* decoded word bit 25 */
++#define CC128R_PERMS_ALL (0x7003f | CC128R_PERM_SEAL | CC128R_PERM_UNSEAL)
++// This format has the spare metadata bits required for Zyseal.
++#define CC128R_HAS_ZYSEAL 1
+ 
+ _CC_STATIC_ASSERT_SAME(CC128R_UPERMS_ALL, CC128R_FIELD_SDP_MAX_VALUE);
+-// Encoded value is 0b100111111 since SL and EL are not supported in sail yet.
++/*
++ * The root capability must carry SE/US, otherwise (permissions being
++ * monotonically non-increasing) no capability could ever seal.  This is,
++ * however, the one change that makes the reset PESBT diverge from the
++ * pre-generated Sail model in test/contrib/, which predates Zyseal.
++ * Set to 0 to regression-test the field-layout change in isolation.
++ */
++#ifndef ZYSEAL_ROOT_HAS_SEAL_PERMS
++#define ZYSEAL_ROOT_HAS_SEAL_PERMS 1
++#endif
++#if ZYSEAL_ROOT_HAS_SEAL_PERMS
++#define CC128R_ROOT_SEAL_AP (CC128R_AP_SE | CC128R_AP_US) /* AP bits 8 and 9 */
++#else
++#define CC128R_ROOT_SEAL_AP 0
++#endif
++/*
++ * Root AP-field value.  AP[5:0] = C,W,R,X,ASR,LM; AP[7:6] = LG,SL, present
++ * only with Zylevels1.  Must stay 8 bits wide: bit 8 would be SE.
++ */
++#define CC128R_ROOT_AP(lvbits) (((lvbits) == 0 ? 0x03fu : 0x0ffu) | CC128R_ROOT_SEAL_AP)
+ #define CC128R_ENCODED_INFINITE_PERMS(lvbits)                                                                          \
+-    (_CC_ENCODE_FIELD(CC128R_UPERMS_ALL, SDP) | _CC_ENCODE_FIELD(lvbits == 0 ? 0x13f : 0x1ff, AP) |                    \
++    (_CC_ENCODE_FIELD(CC128R_UPERMS_ALL, SDP) | _CC_ENCODE_FIELD(CC128R_ROOT_AP(lvbits), AP) |                         \
+      _CC_ENCODE_FIELD(_CC_BITMASK64(lvbits), LEVEL) | _CC_ENCODE_FIELD(1, MODE))
+ #define CC128R_PERMS_MASK (CC128R_PERMS_ALL | CC128R_PERM_SW_ALL)
+ 
+-// Currently, only one type (sentry) is defined.
+-// However, other extensions (e.g. CHERIoT) define additional otypes beyond this.
++// CT values 0 (unsealed) and 1 (sentry) are architecturally reserved.
++// Zyseal object types occupy 2 .. MAX_REPRESENTABLE_OTYPE (15 for a 4-bit CT),
++// i.e. 14 usable types.  Everything below is derived from CC128R_OTYPE_BITS,
++// so the width is changed in exactly one place (the _CC_FIELD above).
+ enum _CC_N(OTypes) {
+     CC128R_MAX_REPRESENTABLE_OTYPE = ((1u << CC128R_OTYPE_BITS) - 1u),
+     _CC_SPECIAL_OTYPE(OTYPE_UNSEALED, 0),
+     _CC_SPECIAL_OTYPE(OTYPE_SENTRY, 1),
+     _CC_N(MIN_RESERVED_OTYPE) = _CC_N(OTYPE_UNSEALED),
+     _CC_N(MAX_RESERVED_OTYPE) = _CC_N(OTYPE_SENTRY),
++    _CC_N(MIN_ZYSEAL_OTYPE) = 2,
+ };
+ 
+ #define CC128R_LS_SPECIAL_OTYPES(ITEM, ...)                                                                            \
+@@ -191,6 +254,11 @@
+         // Levels extension not supported -> treat as reserved one-bits.
+         result |= CC128R_PERM_LEVEL | CC128R_PERM_STORE_LEVEL | CC128R_PERM_ELEVATE_LEVEL;
+     }
++    // Zyseal: SE/US are AP bits 8 and 9 (Table 26, augmented per spec 3.1.2).
++    if (arch_perms & CC128R_AP_SE)
++        result |= CC128R_PERM_SEAL;
++    if (arch_perms & CC128R_AP_US)
++        result |= CC128R_PERM_UNSEAL;
+     result |= _CC_N(PERMS_RESERVED_ONES); // Finally include the hardcoded one-bits
+     return result;
+ }
+@@ -223,6 +291,12 @@
+         unsigned new_level = permissions & CC128R_PERM_LEVEL ? 1 : 0;
+         cap->cr_pesbt = _CC_DEPOSIT_FIELD(cap->cr_pesbt, new_level, LEVEL);
+     }
++    // Zyseal: SE/US are AP bits 8 and 9.  Going through the decoded mask here
++    // is what lets acperm/YPERMC clear sealing authority.
++    if (permissions & CC128R_PERM_SEAL)
++        result |= CC128R_AP_SE;
++    if (permissions & CC128R_PERM_UNSEAL)
++        result |= CC128R_AP_US;
+     cap->cr_pesbt = _CC_DEPOSIT_FIELD(cap->cr_pesbt, result, AP);
+     cap->cr_pesbt = _CC_DEPOSIT_FIELD(cap->cr_pesbt, sw_perms, SDP);
+     if ((permissions & CC128R_PERM_EXECUTE) == 0 && mode == _CC_N(MODE_INT)) {
+--- a/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_64r.h
++++ b/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_64r.h
+@@ -125,6 +125,19 @@
+ #define CC64R_PERM_EXECUTE (1 << 17)
+ #define CC64R_PERM_READ (1 << 18)
+ #define CC64R_PERMS_ALL (0x7003f)
++/*
++ * Zyseal is unavailable in the 64-bit format: only 4 bits of metadata sit
++ * above EBT (SDP 2 | AP_M 5 | LEVEL 1 | RESERVED1 1 | RESERVED0 2 | OTYPE 1),
++ * so a widened CT plus SE/US will not fit.
++ */
++#define CC64R_HAS_ZYSEAL 0
++/*
++ * Must not be 0.  has_permissions() is (all_perms & mask) == mask, so a zero
++ * mask is true for every capability -- fail-open.  This format has no SE/US
++ * storage, so at these bit numbers the test always fails closed.
++ */
++#define CC64R_PERM_SEAL (1 << 24)
++#define CC64R_PERM_UNSEAL (1 << 25)
+ 
+ #define CC64R_AP_Q_MASK ((uint8_t)(3 << 3))
+ #define CC64R_AP_Q0 ((uint8_t)(0 << 3))
+--- a/target/cheri-common/cheri_defs.h
++++ b/target/cheri-common/cheri_defs.h
+@@ -120,6 +120,19 @@
+ #define CAP_OTYPE_UNSEALED_SIGNED CAP_CC(OTYPE_UNSEALED_SIGNED)
+ #define CAP_OTYPE_SENTRY CAP_CC(OTYPE_SENTRY)
+ 
++/*
++ * Zyseal is only available in capability formats with enough spare metadata
++ * bits for a widened CT field plus the SE/US permissions (128r yes, 64r no).
++ */
++#if defined(TARGET_CHERI_RISCV_STD_093)
++#define CAP_HAS_ZYSEAL CAP_CC(HAS_ZYSEAL)
++#if CAP_HAS_ZYSEAL
++#define CAP_MIN_ZYSEAL_OTYPE CAP_CC(MIN_ZYSEAL_OTYPE)
++#endif
++#else
++#define CAP_HAS_ZYSEAL 0
++#endif
++
+ #ifdef TARGET_AARCH64
+ #define CAP_OTYPE_LOAD_PAIR_BRANCH CAP_CC(OTYPE_LOAD_PAIR_BRANCH)
+ #define CAP_OTYPE_LOAD_BRANCH CAP_CC(OTYPE_LOAD_BRANCH)
+@@ -155,6 +168,14 @@
+     CAP_PERM_MUTABLE_LOAD = CAP_CC(PERM_LOAD_MUTABLE),
+ #ifdef TARGET_CHERI_RISCV_STD_093
+     CAP_PERM_ELEVATE_LEVEL = CAP_CC(PERM_ELEVATE_LEVEL),
++    /*
++     * Zyseal.  Zero (and unusable) in capability formats that lack the spare
++     * metadata bits -- see CAP_HAS_ZYSEAL below.  Note we deliberately do NOT
++     * set CHERI_HAS_OTYPE_SEALING, since that would enable the legacy v9
++     * cseal/cunseal/ccopytype/cinvoke helpers, which have different semantics.
++     */
++    CAP_PERM_SEAL = CAP_CC(PERM_SEAL),
++    CAP_PERM_UNSEAL = CAP_CC(PERM_UNSEAL),
+ #endif
+ #else
+     CAP_PERM_GLOBAL = CAP_CC(PERM_GLOBAL),
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -1474,6 +1474,7 @@
+     DEFINE_PROP_BOOL("y", RISCVCPU, cfg.ext_cheri, true),
+     DEFINE_PROP_BOOL("Zyhybrid", RISCVCPU, cfg.ext_zyhybrid, true),
+     DEFINE_PROP_BOOL("Zylevels1", RISCVCPU, cfg.ext_zylevels1, false),
++    DEFINE_PROP_BOOL("Zyseal", RISCVCPU, cfg.ext_zyseal, false),
+     DEFINE_PROP_UINT8("cheri_levels", RISCVCPU, cfg._compat_cheri_levels, 0),
+     DEFINE_PROP_BOOL("cheri_pte", RISCVCPU, cfg.cheri_pte, false),
+     DEFINE_PROP_BOOL("Svucrg", RISCVCPU, cfg.cheri_pte, false),
+@@ -1731,6 +1732,7 @@
+         ISA_EDATA_ENTRY(zihintpause, ext_zihintpause),
+         {"zcheripte", cpu->cfg.cheri_pte },
+         {"zcherilevels", cpu->cfg.lvbits > 0 },
++        {"zyseal", cpu->cfg.ext_zyseal },
+         ISA_EDATA_ENTRY(zish4add, ext_zish4add),
+ #endif
+     };
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -599,6 +599,7 @@
+ #elif defined(TARGET_CHERI_RISCV_STD)
+     bool ext_zyhybrid;
+     bool ext_zylevels1;
++    bool ext_zyseal;
+     /* number of levels (Zcherilevels): 0 invalid, 1 disabled (default)) */
+     uint8_t _compat_cheri_levels; /* To keep existing scripts working */
+     uint8_t lvbits; /* Only 0 and 1 (Zylevels1) are currently supported. */
+--- a/target/riscv/helper.h
++++ b/target/riscv/helper.h
+@@ -82,6 +82,10 @@
+ DEF_HELPER_2(gcmode, tl, env, i32)
+ DEF_HELPER_4(scmode, void, env, i32, i32, tl)
+ DEF_HELPER_3(scss, tl, env, i32, i32)
++#if defined(TARGET_CHERI_RISCV_STD_093) && CAP_HAS_ZYSEAL
++DEF_HELPER_4(yseal, void, env, i32, i32, i32)
++DEF_HELPER_4(yunseal, void, env, i32, i32, i32)
++#endif
+ #endif
+ 
+ #ifdef CONFIG_TCG_LOG_INSTR
+--- a/target/riscv/insn32-cheri-std.decode
++++ b/target/riscv/insn32-cheri-std.decode
+@@ -63,6 +63,9 @@
+ scss    0000110  ..... ..... 110 ..... 0110011 @rcc ?pred_cre
+ scbnds  0000111  ..... ..... 000 ..... 0110011 @ccr ?pred_cre
+ scbndsr 0000111  ..... ..... 001 ..... 0110011 @ccr ?pred_cre
++# Zyseal (local dialect, not ratified).  rs1 = sealing authority, rs2 = target.
++yseal   0000111  ..... ..... 010 ..... 0110011 @ccc ?pred_cre ?pred_zyseal
++yunseal 0000111  ..... ..... 011 ..... 0110011 @ccc ?pred_cre ?pred_zyseal
+ scmode  0000110  ..... ..... 111 ..... 0110011 @ccr ?pred_hybrid ?pred_cre
+ 
+ ### Two operand instructions
+--- a/target/riscv/insn_trans/trans_cheri.c.inc
++++ b/target/riscv/insn_trans/trans_cheri.c.inc
+@@ -698,6 +698,28 @@
+ TRANSLATE_CAP_CAP_INT_HELPER(schi, csethigh)
+ TRANSLATE_CAP_CAP_INT(scmode)
+ TRANSLATE_CAP_CAP_CAP_HELPER(cbld, cbuildcap)
++#if CAP_HAS_ZYSEAL
++/* Zyseal: instruction operand rs1 is the sealing authority, rs2 the target. */
++TRANSLATE_CAP_CAP_CAP_HELPER(yseal, yseal)
++TRANSLATE_CAP_CAP_CAP_HELPER(yunseal, yunseal)
++#else
++/*
++ * This capability format has no spare metadata bits for Zyseal.  decodetree
++ * still emits unconditional calls to these from the generated decoder (the
++ * ?pred_zyseal guard gates execution, not code generation), so we must supply
++ * definitions.  Returning false makes them decode as illegal instructions.
++ */
++static bool trans_yseal(DisasContext *ctx G_GNUC_UNUSED,
++                        arg_yseal *a G_GNUC_UNUSED)
++{
++    return false;
++}
++static bool trans_yunseal(DisasContext *ctx G_GNUC_UNUSED,
++                          arg_yunseal *a G_GNUC_UNUSED)
++{
++    return false;
++}
++#endif
+ 
+ TRANSLATE_INT_CAP_CAP_HELPER(sceq, cseqx)
+ TRANSLATE_INT_CAP_CAP(scss)
+--- a/target/riscv/op_helper_cheri.c
++++ b/target/riscv/op_helper_cheri.c
+@@ -599,3 +599,75 @@
+ 
+     return 1;
+ }
++
++#if defined(TARGET_CHERI_RISCV_STD_093) && CAP_HAS_ZYSEAL
++/*
++ * Zyseal (CHERI ISA spec chapter 17), SignetOS local dialect.
++ *
++ * Type capabilities are ordinary capabilities whose address/bounds are
++ * reinterpreted as a range of CT-field values.  Spec section 17.3 explicitly
++ * permits an encoding to conflate the memory and type address spaces, which
++ * is what we do here, so no new capability kind or root register is needed.
++ *
++ * Both instructions clear the result tag on failure rather than trapping,
++ * matching the rest of RVY.
++ */
++void HELPER(yseal)(CPUArchState *env, uint32_t cd, uint32_t cs1, uint32_t cs2)
++{
++    const cap_register_t *auth = get_readonly_capreg(env, cs1);
++    const cap_register_t *src = get_readonly_capreg(env, cs2);
++    cap_register_t result = *src;
++    target_ulong ct = cap_get_cursor(auth);
++
++    /* 17.6: rs1 is the sealing authority, rs2 is the capability to seal. */
++    bool ok = src->cr_tag && auth->cr_tag &&
++              cap_is_unsealed(src) &&
++              cap_has_perms(auth, CAP_PERM_SEAL) &&
++              cap_is_in_bounds(auth, ct, 1) &&
++              ct >= CAP_MIN_ZYSEAL_OTYPE && ct <= CAP_MAX_REPRESENTABLE_OTYPE;
++
++    if (ok) {
++        CAP_cc(update_otype)(&result, ct);
++    } else {
++        result.cr_tag = 0;
++    }
++    update_capreg(env, cd, &result);
++}
++
++void HELPER(yunseal)(CPUArchState *env, uint32_t cd, uint32_t cs1, uint32_t cs2)
++{
++    const cap_register_t *auth = get_readonly_capreg(env, cs1);
++    const cap_register_t *src = get_readonly_capreg(env, cs2);
++    cap_register_t result = *src;
++    target_ulong ct = cap_get_cursor(auth);
++
++    /*
++     * 17.6 requires exact equality between the authority's address and the
++     * sealed capability's CT field -- unlike YSUNSEAL, which uses a subset
++     * test.  Sentries (CT == 1) are not unsealable this way.
++     */
++    bool ok = src->cr_tag && auth->cr_tag &&
++              cap_has_perms(auth, CAP_PERM_UNSEAL) &&
++              cap_is_in_bounds(auth, ct, 1) &&
++              ct >= CAP_MIN_ZYSEAL_OTYPE &&
++              ct == cap_get_otype_unsigned(src);
++
++    if (ok) {
++        CAP_cc(update_otype)(&result, CAP_OTYPE_UNSEALED);
++        /*
++         * 17.6.2: if rs1 does not grant GL, clear GL on rd.  No such clause
++         * in 17.6.1, so YSEAL does not do this.
++         *
++         * Inert without Zylevels1: cr_lvbits is then 0 and GL reads as a
++         * hardwired one.
++         */
++        if (auth->cr_lvbits > 0 && !cap_has_perms(auth, CAP_PERM_GLOBAL)) {
++            cap_set_perms(env, &result,
++                          cap_get_all_perms(&result) & ~(target_ulong)CAP_PERM_GLOBAL);
++        }
++    } else {
++        result.cr_tag = 0;
++    }
++    update_capreg(env, cd, &result);
++}
++#endif /* TARGET_CHERI_RISCV_STD_093 && CAP_HAS_ZYSEAL */
+--- a/target/riscv/translate.c
++++ b/target/riscv/translate.c
+@@ -93,6 +93,9 @@
+     bool capmode;
+     bool hybrid;
+     bool cre;
++#ifdef TARGET_CHERI_RISCV_STD
++    bool zyseal;
++#endif
+ #ifdef TARGET_CHERI_RISCV_V9
+     bool cheri_v9_semantics;
+ #endif
+@@ -915,6 +918,11 @@
+ {
+     return ctx->cre;
+ }
++
++static bool pred_zyseal(DisasContext *ctx)
++{
++    return ctx->zyseal;
++}
+ #endif
+ 
+ /* Include the auto-generated decoder for 32 bit insn */
+@@ -1433,6 +1441,9 @@
+ #endif
+     ctx->hybrid = riscv_feature(env, RISCV_FEATURE_CHERI_HYBRID);
+     ctx->cre = riscv_cpu_mode_cre(env);
++#ifdef TARGET_CHERI_RISCV_STD
++    ctx->zyseal = cpu->cfg.ext_zyseal;
++#endif
+ #endif
+     ctx->priv_ver = env->priv_ver;
+ #if !defined(CONFIG_USER_ONLY)

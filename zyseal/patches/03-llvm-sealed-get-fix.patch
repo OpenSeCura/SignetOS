@@ -1,0 +1,31 @@
+--- a/llvm/lib/Target/RISCV/RISCVInstrInfoZCheriPurecap.td
++++ b/llvm/lib/Target/RISCV/RISCVInstrInfoZCheriPurecap.td
+@@ -404,7 +404,27 @@
+ def : PatCapInspect<int_cheri_cap_high_get,   GCHI  >;
+ def : PatCapInspect<int_cheri_cap_base_get,   GCBASE>;
+ def : PatCapInspect<int_cheri_cap_length_get, GCLEN >;
+-def : PatCapInspect<riscv_cap_sealed_get,     GCTYPE>;
++// NOTE(zyseal): riscv_cap_sealed_get must produce a 0/1 BOOLEAN, not the raw
++// object type.  RISCVISelLowering.cpp attaches an AssertZext(i1) to this node
++// and then folds the `!= 0` away, so whatever we select here is taken by the
++// optimiser to be already-normalised.
++//
++// The legacy XCheri path selects CGetSealed, which genuinely returns 0/1, so
++// the assertion holds there.  This path has no CGetSealed and used to select a
++// bare GCTYPE:
++//
++//     def : PatCapInspect<riscv_cap_sealed_get, GCTYPE>;   // WRONG
++//
++// That was harmless only while CT was one bit wide, where GCTYPE could return
++// nothing but 0 or 1.  With Zyseal widening CT to 4 bits, GCTYPE returns
++// 2..15 for sealed objects, the AssertZext becomes a lie, and
++// __builtin_cheri_sealed_get() yields garbage -- in particular any EVEN object
++// type can be reported as UNSEALED, because the optimiser is entitled to look
++// at bit 0 alone.
++//
++// Normalise explicitly with snez (SLTU x0, rs).
++def : Pat<(XLenVT (riscv_cap_sealed_get GPCR:$rs1)),
++          (SLTU (XLenVT X0), (GCTYPE GPCR:$rs1))>;
+ def : PatCapInspect<int_cheri_cap_type_get,   GCTYPE>;
+ let Predicates = [HasZCheriHybrid] in
+ def : PatCapInspect<int_cheri_cap_flags_get,  GCMODE>;
