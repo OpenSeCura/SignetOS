@@ -830,7 +830,7 @@ static void test_permission_bitfield(uart_t u, cap_t root)
  * through it. 17.6.1 has no matching clause, so YSEAL must not do it -- T29g
  * is that control.
  *
- * Without Zylevels1 there is no GL flag and the rule is vacuous, so T29a
+ * Without Zylevels1 there is no GL flag  so T29a
  * detects the mode and the rest is skipped.
  * ======================================================================== */
 static void test_gl_propagation(uart_t u, cap_t root, cap_t auth_gl)
@@ -855,7 +855,7 @@ static void test_gl_propagation(uart_t u, cap_t root, cap_t auth_gl)
            levels_on);   /* always passes; prints the mode */
 
     if (!levels_on) {
-        put_str(u, "       (Zylevels1 off -- 17.6.2 is vacuous, "
+        put_str(u, "       (Zylevels1 off --"
                    "T29b-h skipped)\n");
         return;
     }
