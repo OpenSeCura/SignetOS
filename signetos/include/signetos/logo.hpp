@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 Google LLC (Cherified Team)
+ * Copyright 2026 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,169 +27,256 @@
 
 namespace signetos::logo {
 
+#define ANSI_RESET  "\x1b[0m"
+#define ANSI_RED    "\x1b[91m"
+#define ANSI_GOLD   "\x1b[93m"
+#define ANSI_WHITE  "\x1b[97m"
+#define ANSI_GRAY   "\x1b[90m"
+
 struct Frame {
   const char* body;
   uint64_t hold_ms;
 };
 
 inline constexpr const char* kBorder =
+    ANSI_GRAY
     "================================================================================"
-    "\n";
+    ANSI_RESET "\n";
 
 inline constexpr Frame kFrames[] = {
     // Frame 0: Hot wax drop falling toward pool
-    {"        o\x1b[K\n"
+    {"        " ANSI_RED "o" ANSI_RESET "\x1b[K\n"
      "\x1b[K\n"
      "\x1b[K\n"
      "\x1b[K\n"
-     "\x1b[K\n"
-     "       .~.\x1b[K\n",
+     "       " ANSI_RED ".~." ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 1: Wax drop midway down, pool forming
     {"\x1b[K\n"
+     "        " ANSI_RED "o" ANSI_RESET "\x1b[K\n"
      "\x1b[K\n"
-     "        o\x1b[K\n"
-     "\x1b[K\n"
-     "      .~~~.\x1b[K\n"
-     "     (~~~~~)\x1b[K\n",
+     "      " ANSI_RED ".~~~." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "(~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 2: Drop splashes into pool; signet ring bezel enters at top
-    {"    [=======]\x1b[K\n"
+    {"    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
      "\x1b[K\n"
-     "\x1b[K\n"
-     "     .  o  .\x1b[K\n"
-     "      .~~~.\x1b[K\n"
-     "     (~~~~~)\x1b[K\n",
+     "     " ANSI_RED ".  o  ." ANSI_RESET "\x1b[K\n"
+     "      " ANSI_RED ".~~~." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "(~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 3: Signet ring descends 1 row
-    {"     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
+    {"     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
      "\x1b[K\n"
-     "\x1b[K\n"
-     "      .~~~.\x1b[K\n"
-     "     (~~~~~)\x1b[K\n",
+     "      " ANSI_RED ".~~~." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "(~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 4: Signet ring descends 1 row
-    {"     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "\x1b[K\n"
-     "      .~~~.\x1b[K\n"
-     "     (~~~~~)\x1b[K\n",
+    {"     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "      " ANSI_RED ".~~~." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "(~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 5: Full signet ring poised above molten wax
-    {"      .---.\x1b[K\n"
-     "     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "      .~~~.\x1b[K\n"
-     "     (~~~~~)\x1b[K\n",
+    {"      " ANSI_GOLD ".---." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "(~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      55},
     // Frame 6: Signet ring bezel contacts molten wax
-    {"\x1b[K\n"
-     "      .---.\x1b[K\n"
-     "     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "   .[=======].\x1b[K\n"
-     "    (~~~~~~~)\x1b[K\n",
+    {"      " ANSI_GOLD ".---." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "." ANSI_GOLD "[=======]" ANSI_RED "." ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "(~~~~~~~)" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      50},
     // Frame 7: Signet ring presses in; wax splashes outward
     {"\x1b[K\n"
-     "\x1b[K\n"
-     "      .---.\x1b[K\n"
-     "  *  //   \\\\  *\x1b[K\n"
-     " .   \\\\___//   .\x1b[K\n"
-     "   ([=======])\x1b[K\n",
+     "      " ANSI_GOLD ".---." ANSI_RESET "\x1b[K\n"
+     "  " ANSI_GOLD "*  //   \\\\  *" ANSI_RESET "\x1b[K\n"
+     " " ANSI_GOLD ".   \\\\___//   ." ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "(" ANSI_GOLD "[=======]" ANSI_RED ")" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      70},
     // Frame 8: Deep press; wax molds around the signet bezel
     {"\x1b[K\n"
-     "\x1b[K\n"
-     "      .---.\x1b[K\n"
-     "     //   \\\\\x1b[K\n"
-     "    /\\\\___//\\\x1b[K\n"
-     "   ([=======])\x1b[K\n",
+     "      " ANSI_GOLD ".---." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "/\\\\___//\\" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "(" ANSI_GOLD "[=======]" ANSI_RED ")" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      120},
     // Frame 9: Ring begins lifting (row 1); bottom rim of seal revealed
-    {"\x1b[K\n"
-     "      .---.\x1b[K\n"
-     "     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "     '-----'\x1b[K\n",
+    {"      " ANSI_GOLD ".---." ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      60},
     // Frame 10: Ring lifts (row 2); lower inner ring revealed
-    {"      .---.\x1b[K\n"
-     "     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "    \\ '---' /\x1b[K\n"
-     "     '-----'\x1b[K\n",
+    {"     " ANSI_GOLD "//   \\\\" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      60},
     // Frame 11: Ring lifts (row 3); [S] signet emblem revealed!
-    {"     //   \\\\\x1b[K\n"
-     "     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "   | | [S] | |\x1b[K\n"
-     "    \\ '---' /\x1b[K\n"
-     "     '-----'\x1b[K\n",
+    {"     " ANSI_GOLD "\\\\___//" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      60},
     // Frame 12: Ring lifts (row 4); upper inner ring revealed
-    {"     \\\\___//\x1b[K\n"
-     "    [=======]\x1b[K\n"
-     "    / .---. \\\x1b[K\n"
-     "   | | [S] | |\x1b[K\n"
-     "    \\ '---' /\x1b[K\n"
-     "     '-----'\x1b[K\n",
+    {"    " ANSI_GOLD "[=======]" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      60},
     // Frame 13: Ring bezel exits top; full wax seal revealed
-    {"    [=======]\x1b[K\n"
-     "     .-----.\x1b[K\n"
-     "    / .---. \\\x1b[K\n"
-     "   | | [S] | |\x1b[K\n"
-     "    \\ '---' /\x1b[K\n"
-     "     '-----'\x1b[K\n",
+    {"     " ANSI_RED ".-----." ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "\x1b[K\n"
+     "\x1b[K\n",
      65},
     // Frame 14: Seal settles into place; "Si" unfurls
-    {"     .-----.       ____  _\x1b[K\n"
-     "    / .---. \\     / ___|(_)\x1b[K\n"
-     "   | | [S] | |    \\___ \\| |\x1b[K\n"
-     "    \\ '---' /      ___) | |\x1b[K\n"
-     "     '-----'      |____/|_|\x1b[K\n"
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_)" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|" ANSI_RESET "\x1b[K\n"
      "\x1b[K\n",
-     55},
+     60},
     // Frame 15: "Sign" unfurls
-    {"     .-----.       ____  _\x1b[K\n"
-     "    / .---. \\     / ___|(_) __ _ _ __\x1b[K\n"
-     "   | | [S] | |    \\___ \\| |/ _` | '_ \\\x1b[K\n"
-     "    \\ '---' /      ___) | | (_| | | | |\x1b[K\n"
-     "     '-----'      |____/|_|\\__, |_| |_|\x1b[K\n"
-     "                           |___/\x1b[K\n",
-     55},
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "\x1b[K\n",
+     60},
     // Frame 16: "Signet" unfurls
-    {"     .-----.       ____  _                   _\x1b[K\n"
-     "    / .---. \\     / ___|(_) __ _ _ __   ___ | |_\x1b[K\n"
-     "   | | [S] | |    \\___ \\| |/ _` | '_ \\ / _ \\| __|\x1b[K\n"
-     "    \\ '---' /      ___) | | (_| | | | |  __/| |_|\x1b[K\n"
-     "     '-----'      |____/|_|\\__, |_| |_|\\___| \\__|\x1b[K\n"
-     "                           |___/\x1b[K\n",
-     55},
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __|" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_|" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "\x1b[K\n",
+     60},
     // Frame 17: "SignetOS" complete
-    {"     .-----.       ____  _                   _    ___  ____\x1b[K\n"
-     "    / .---. \\     / ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|\x1b[K\n"
-     "   | | [S] | |    \\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\\x1b[K\n"
-     "    \\ '---' /      ___) | | (_| | | | |  __/| |_| |_| |___) |\x1b[K\n"
-     "     '-----'      |____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/\x1b[K\n"
-     "                           |___/\x1b[K\n",
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "\x1b[K\n",
+     140},
+    // Frame 18: Cursor blinks on underneath text
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     200},
+    // Frame 19: Cursor blinks off
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  " ANSI_RESET "\x1b[K\n",
+     180},
+    // Frame 20: Typewriter starts: "(c) "
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
      70},
+    // Frame 21: "(c) Goo"
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Goo" ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     65},
+    // Frame 22: "(c) Google "
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     70},
+    // Frame 23: "(c) Google CH"
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CH" ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     65},
+    // Frame 24: "(c) Google CHERI "
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CHERI " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     70},
+    // Frame 25: Full metadata typed + cursor
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CHERI Team " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     150},
+    // Frame 26: Cursor blinks off
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CHERI Team" ANSI_RESET "\x1b[K\n",
+     150},
+    // Frame 27: Cursor blinks on
+    {"     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+     "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+     "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+     "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+     "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CHERI Team " ANSI_WHITE "▌" ANSI_RESET "\x1b[K\n",
+     150},
 };
 
 inline constexpr const char* kFinalBody =
-    "     .-----.       ____  _                   _    ___  ____\x1b[K\n"
-    "    / .---. \\     / ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|\x1b[K\n"
-    "   | | [S] | |    \\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\\x1b[K\n"
-    "    \\ '---' /      ___) | | (_| | | | |  __/| |_| |_| |___) |\x1b[K\n"
-    "     '-----'      |____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/\x1b[K\n"
-    "                           |___/   v0.1  |  (c) Google Cherified Team\x1b[K\n";
+    "     " ANSI_RED ".-----." ANSI_RESET "       " ANSI_WHITE "____  _                   _    ___  ____" ANSI_RESET "\x1b[K\n"
+    "    " ANSI_RED "/ .---. \\" ANSI_RESET "     " ANSI_WHITE "/ ___|(_) __ _ _ __   ___ | |_ / _ \\/ ___|" ANSI_RESET "\x1b[K\n"
+    "   " ANSI_RED "| | " ANSI_GOLD "[S]" ANSI_RED " | |" ANSI_RESET "    " ANSI_WHITE "\\___ \\| |/ _` | '_ \\ / _ \\| __| | | \\___ \\" ANSI_RESET "\x1b[K\n"
+    "    " ANSI_RED "\\ '---' /" ANSI_RESET "      " ANSI_WHITE "___) | | (_| | | | |  __/| |_| |_| |___) |" ANSI_RESET "\x1b[K\n"
+    "     " ANSI_RED "'-----'" ANSI_RESET "      " ANSI_WHITE "|____/|_|\\__, |_| |_|\\___| \\__|\\___/|____/" ANSI_RESET "\x1b[K\n"
+    "                           " ANSI_WHITE "|___/" ANSI_RESET "   " ANSI_GRAY "v0.1  |  (c) Google CHERI Team" ANSI_RESET "\x1b[K\n";
 
 template <typename PrintFn>
 inline void play(PrintFn&& out, uint64_t ticks_per_ms, bool animate = true) {
@@ -218,9 +305,16 @@ inline void play(PrintFn&& out, uint64_t ticks_per_ms, bool animate = true) {
   }
   out(kFinalBody);
   out(kBorder);
+  out(ANSI_RESET);
   if (animate) {
     out("\x1b[?25h");
   }
 }
+
+#undef ANSI_RESET
+#undef ANSI_RED
+#undef ANSI_GOLD
+#undef ANSI_WHITE
+#undef ANSI_GRAY
 
 }  // namespace signetos::logo
