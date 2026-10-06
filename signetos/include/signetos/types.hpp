@@ -22,6 +22,7 @@
 namespace signetos {
 
 using Capability = void* __capability;
+using Sentry = Capability;
 
 // CHERI hardware object types (the capability CT field, 4 bits wide).
 //

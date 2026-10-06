@@ -252,7 +252,7 @@ Capability create_kernel(Capability comp, Capability code_cap,
   return create_impl(comp, code_cap, perms_mask, false, out_status);
 }
 
-Capability handle_for(Capability record) {
+Sentry handle_for(Capability record) {
   if (!capability_is_valid(record) ||
       capability_get_length(record) != sizeof(EntryRecord)) {
     return nullptr;
@@ -262,18 +262,18 @@ Capability handle_for(Capability record) {
   return sealing::seal_as(OType::EntryPoint, handle);
 }
 
-Status resolve(Capability handle, Entry* out) {
+Status resolve(Sentry entry_point, Entry* out) {
   *out = Entry{};
-  if (!capability_is_valid(handle)) {
+  if (!capability_is_valid(entry_point)) {
     return Status::InvalidCapability;
   }
 
   // Operational authority (Permit_Load) is required to invoke an entry point.
-  if ((capability_get_perms(handle) & perms::Load) == 0) {
+  if ((capability_get_perms(entry_point) & perms::Load) == 0) {
     return Status::InsufficientPermission;
   }
 
-  Capability open = sealing::unseal_as(OType::EntryPoint, handle);
+  Capability open = sealing::unseal_as(OType::EntryPoint, entry_point);
   if (!capability_is_valid(open) ||
       capability_get_length(open) != sizeof(EntryRecord)) {
     return Status::InvalidCapability;
@@ -321,9 +321,9 @@ Status resolve(Capability handle, Entry* out) {
   return Status::Ok;
 }
 
-Capability unseal(Capability handle, Status* out_status) {
+Capability unseal(Sentry entry_point, Status* out_status) {
   Entry entry{};
-  const Status status = resolve(handle, &entry);
+  const Status status = resolve(entry_point, &entry);
   if (status != Status::Ok) {
     return fail_with(out_status, status);
   }
@@ -336,7 +336,7 @@ Capability unseal(Capability handle, Status* out_status) {
   return entry.sentry;
 }
 
-extern "C" Capability __signetos_switcher_prepare(Capability handle,
+extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame) {
   if (frame == nullptr) {
     return nullptr;
@@ -347,11 +347,11 @@ extern "C" Capability __signetos_switcher_prepare(Capability handle,
     return nullptr;
   };
 
-  // Unseal `handle` (`OType::EntryPoint`, CT = 12), verify its owning
+  // Unseal `entry_point` (`OType::EntryPoint`, CT = 12), verify its owning
   // compartment is still live, and extract the `EntryRecord`'s `pcc` (sealed
   // as a `CT = 1` hardware sentry), `cgp`, flags and stack requirement.
   Entry entry{};
-  Status status = resolve(handle, &entry);
+  Status status = resolve(entry_point, &entry);
   if (status != Status::Ok) {
     return refuse(status);
   }
@@ -489,9 +489,9 @@ extern "C" ReturnFrame* __signetos_switcher_return(Capability ret) {
   return frame;
 }
 
-Status invoke(Capability handle, uint64_t arg0, uint64_t* out_result) {
+Status invoke(Sentry entry_point, uint64_t arg0, uint64_t* out_result) {
   Status status = Status::Ok;
-  Capability hw_sentry = unseal(handle, &status);
+  Capability hw_sentry = unseal(entry_point, &status);
   if (status != Status::Ok || !capability_is_valid(hw_sentry)) {
     return status;
   }

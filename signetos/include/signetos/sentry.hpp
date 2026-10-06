@@ -147,7 +147,7 @@ Capability create_kernel(Capability comp, Capability code_cap,
 // into the `OType::EntryPoint` handle a compartment holds: Permit_Load only,
 // so the holder can invoke it and nothing else. Used by `compartment::add_entry`
 // for compartment entries and by `syscall::gate` for kernel entries.
-Capability handle_for(Capability record);
+Sentry handle_for(Capability record);
 
 // What an `OType::EntryPoint` handle resolves to.
 struct Entry {
@@ -162,13 +162,13 @@ struct Entry {
 // its record is still there, and fills `*out`. Whether the owning compartment
 // will still be there when the callee runs is `compartment::enter`'s question,
 // asked by whoever is about to run it.
-Status resolve(Capability handle, Entry* out);
+Status resolve(Sentry entry_point, Entry* out);
 
 // resolve() for a compartment entry: returns the hardware `CT = 1` sentry, or
-// null (and `*out_status`) if `handle` is not a live, invokable compartment
+// null (and `*out_status`) if `entry_point` is not a live, invokable compartment
 // entry. Kernel entries (`ENTRY_FLAG_TRUSTED`) are refused: they are only ever
 // entered through the switcher, never bound to a trap or started as a thread.
-Capability unseal(Capability handle, Status* out_status = nullptr);
+Capability unseal(Sentry entry_point, Status* out_status = nullptr);
 
 // Saved caller context pushed onto a thread's kernel stack across a
 // synchronous `sys_compartment_invoke` call. Layout matches `asm_macros.h`.
@@ -208,7 +208,7 @@ static_assert(sizeof(ReturnFrame) == 25 * sizeof(Capability),
 //     `frame->args[0]` (`ret`, checked, for a kernel entry; null for a
 //     compartment), and returns the popped `ReturnFrame*` (or null if the
 //     return sentry was replayed on an empty/mismatched stack).
-extern "C" Capability __signetos_switcher_prepare(Capability handle,
+extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame);
 extern "C" ReturnFrame* __signetos_switcher_return(Capability ret);
 
@@ -227,9 +227,9 @@ Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
                         uint64_t want, Status* out_status);
 
 
-// Validates `handle` via `unseal()` and transfers control to its entry point
+// Validates `entry_point` via `unseal()` and transfers control to its entry point
 // directly (kernel-internal; no domain switch).
-Status invoke(Capability handle, uint64_t arg0, uint64_t* out_result = nullptr);
+Status invoke(Sentry entry_point, uint64_t arg0, uint64_t* out_result = nullptr);
 
 
 }  // namespace signetos::sentry

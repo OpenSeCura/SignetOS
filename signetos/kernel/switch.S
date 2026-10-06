@@ -137,7 +137,7 @@ sys_compartment_invoke:
 
     /*
      * 3. Resolve the target record (`ca0`), validate and narrow the caller's
-     *    stack in C++ (`__signetos_switcher_prepare(handle, frame)`).
+     *    stack in C++ (`__signetos_switcher_prepare(entry_point, frame)`).
      *    On refusal (`a0 == 0`) the `Status` is already in `args[0]`: unwind
      *    the `ReturnFrame` and return it to the caller.
      */

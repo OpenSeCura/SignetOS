@@ -230,8 +230,8 @@ extern "C" void sys_compartment_destroy(capability_compartment_t comp) {
   SIGNETOS_CLEAR_RETURN();
 }
 
-extern "C" capability_sentry_t sys_sentry(capability_compartment_t comp,
-                                          capability_exec_t code) {
+extern "C" Sentry sys_sentry(capability_compartment_t comp,
+                               capability_exec_t code) {
   ::signetos::sentry::Status s_status = ::signetos::sentry::Status::Ok;
   return ::signetos::sentry::create(comp, code, ::signetos::perms::CodeRx, &s_status);
 }
@@ -266,8 +266,8 @@ extern "C" capability_data_t sys_unseal(capability_type_t key,
 
 extern "C" capability_thread_t sys_thread_create(
     capability_quota_thread_mem_t thread_mem_quota, size_t stack_size,
-    capability_sentry_t entry, capability_t initial_arg) {
-  return ::signetos::thread::create(thread_mem_quota, stack_size, entry, initial_arg);
+    Sentry entry_point, capability_t initial_arg) {
+  return ::signetos::thread::create(thread_mem_quota, stack_size, entry_point, initial_arg);
 }
 
 extern "C" void sys_thread_exit(int status) {
@@ -288,7 +288,7 @@ extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {
 
 extern "C" void sys_trap_bind(capability_compartment_t comp,
                               capability_t auth_cap,
-                              capability_sentry_t target) {
+                              Sentry target) {
   ::signetos::trap::bind(comp, auth_cap, target);
   SIGNETOS_CLEAR_RETURN();
 }

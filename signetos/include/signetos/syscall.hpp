@@ -47,7 +47,8 @@ using capability_quota_thread_mem_t = signetos::Capability;  // OTYPE_QUOTA_THRE
 using capability_compartment_t      = signetos::Capability;  // OTYPE_COMPARTMENT
 using capability_thread_t           = signetos::Capability;  // OTYPE_THREAD
 using capability_revoker_t          = signetos::Capability;  // OTYPE_REVOKER
-using capability_sentry_t           = signetos::Capability;  // OTYPE_SENTRY
+using Sentry                       = signetos::Sentry;
+using capability_sentry_t           = Sentry;                // OTYPE_SENTRY
 using capability_type_t             = signetos::Capability;  // OTYPE_TYPE_KEY
 using capability_sealed_t           = signetos::Capability;  // OTYPE_SEALED_OBJECT
 
@@ -201,15 +202,15 @@ void sys_compartment_destroy(
 // call is refused (bad handle, caller's stack unusable or too small, kernel
 // stack full) the result is the `Status`, and the callee was never entered.
 uint64_t sys_compartment_invoke(
-    capability_sentry_t entry,
-    capability_t        arg
+    Sentry       entry_point,
+    capability_t arg
 );
 
 // Mints an entry point for `comp`: records `{code, comp}` in one of `comp`'s
 // entry pages and returns a sealed pointer to that record. `code` must lie in
 // memory owned by `comp`. A new entry page is billed to `comp`'s quota when
 // the existing ones are full.
-capability_sentry_t sys_sentry(
+Sentry sys_sentry(
     capability_compartment_t comp,
     capability_exec_t        code
 );
@@ -246,7 +247,7 @@ capability_data_t sys_unseal(
 capability_thread_t sys_thread_create(
     capability_quota_thread_mem_t thread_mem_quota,
     size_t                        stack_size,
-    capability_sentry_t           entry,
+    Sentry                        entry_point,
     capability_t                  initial_arg
 );
 
@@ -279,7 +280,7 @@ uint64_t sys_thread_tid(
 void sys_trap_bind(
     capability_compartment_t comp,
     capability_t             auth_cap,
-    capability_sentry_t      target
+    Sentry                   target
 );
 
 void sys_trap_unbind(
