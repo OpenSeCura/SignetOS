@@ -1,4 +1,4 @@
-# SignetOS
+# SignetOS (Work in Progress!!)
 
 A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
 `-mabi=l64pc128d`), run under QEMU.
