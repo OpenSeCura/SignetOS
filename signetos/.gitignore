@@ -1,0 +1,7 @@
+# Build outputs
+*.o
+*.d
+*.elf
+*.bin
+disk.img
+.build_flags
