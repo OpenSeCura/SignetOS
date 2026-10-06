@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/signetos_logo.gif" alt="SignetOS Boot Animation" width="680">
+</p>
+
 # SignetOS (Work in Progress!!)
 
 A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
