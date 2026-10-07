@@ -12,6 +12,8 @@ ratified (the `YSEAL`/`YUNSEAL` instructions). No released CHERI toolchain
 has it, so you first build a patched LLVM and QEMU with
 [`../zyseal/setup.sh`](../zyseal/setup.sh).
 
+SignetOS design and vision can be found [here](DESIGN.md).
+
 ## 1. Build the CHERI toolchain
 
 Install the prerequisites (Debian/Ubuntu), then run the Zyseal setup script
