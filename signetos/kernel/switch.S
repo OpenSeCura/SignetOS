@@ -33,8 +33,8 @@
  *      return sentry in `cra`:
  *
  *        compartment callee   csp = everything below the caller's csp,
- *                             cgp = its table, ca0 = args[0], every other
- *                             register scrubbed, caller's SIE restored.
+ *                             cgp = its table, ca0..ca4 = args[0..4], every
+ *                             other register scrubbed, caller's SIE restored.
  *        kernel callee        csp = exactly `min_stack` bytes below the
  *             (ENTRY_FLAG_TRUSTED)  caller's csp, ca0..ca4 = args[0..4],
  *                             nothing scrubbed, interrupts stay masked.
@@ -42,8 +42,8 @@
  *      On return, calls `__signetos_switcher_return` to pop the `ReturnFrame`
  *      and scrub the callee's stack region, restores the caller's state and
  *      `SIE`, and scrubs all volatile registers (`ct0..ct6`, `ca1..ca7`).
- *      `ca0` carries the kernel callee's checked return value, `0` after a
- *      compartment callee, or the `Status` of a refused call.
+ *      `ca0` carries the callee's checked return value, or the `Status` of a
+ *      refused call.
  *
  *   2. THREAD CONTEXT SWITCHER (`sys_thread_switch`, `__thread_restore`,
  *      `__thread_exit_to_host`, `__thread_start`):
@@ -77,11 +77,9 @@
  * =========================================================================
  * Inputs:
  *   ca0       = target `OType::EntryPoint` handle (`CT = 12`)
- *   ca1..ca5  = arguments; a compartment callee receives ca1 as its ca0, a
- *               kernel callee receives ca1..ca5 as its ca0..ca4
+ *   ca1..ca5  = arguments; the callee receives ca1..ca5 as its ca0..ca4
  * Output:
- *   ca0       = kernel callee's return value / 0 after a compartment callee /
- *               `Status` if the call was refused
+ *   ca0       = callee's return value, or `Status` if the call was refused
  */
 
     .align 4
@@ -147,14 +145,18 @@ sys_compartment_invoke:
     beqz    a0, .Lcomp_pop_frame
 
     /*
-     * 4. Load the callee's environment. `ct0` = its `CT = 1` sentry, `ca0` =
-     *    its first argument, `cgp` = its table (null for the kernel). The
+     * 4. Load the callee's environment. `ct0` = its `CT = 1` sentry, `ca0..ca4`
+     *    = its five arguments, `cgp` = its table (null for the kernel). The
      *    `ReturnFrame` is now the hart's kernel SP, so a trap from here on
      *    nests correctly below it.
      */
     cmv     ct0, ca0
     ld      t1,  RET_FRAME_FLAGS(csp)
     clc     ca0, RET_FRAME_ARG0(csp)
+    clc     ca1, RET_FRAME_ARG1(csp)
+    clc     ca2, RET_FRAME_ARG2(csp)
+    clc     ca3, RET_FRAME_ARG3(csp)
+    clc     ca4, RET_FRAME_ARG4(csp)
     clc     cgp, RET_FRAME_CALLEE_GP(csp)
     andi    t1, t1, ENTRY_TRUSTED
     bnez    t1, .Lenter_kernel
@@ -170,8 +172,7 @@ sys_compartment_invoke:
     beqz    t1, 1f
     csrsi   sstatus, SSTATUS_SIE
 1:
-/* TODO: FIX ME! We only support one arg right now */
-    /* Everything except ct0 (sentry), csp, cgp, ca0 and cra (set by cjalr). */
+    /* Everything except ct0 (sentry), csp, cgp, ca0..ca4 and cra (set by cjalr). */
     cmv     ctp, cnull
     cmv     ct1, cnull
     cmv     ct2, cnull
@@ -191,10 +192,6 @@ sys_compartment_invoke:
     cmv     cs9, cnull
     cmv     cs10, cnull
     cmv     cs11, cnull
-    cmv     ca1, cnull
-    cmv     ca2, cnull
-    cmv     ca3, cnull
-    cmv     ca4, cnull
     cmv     ca5, cnull
     cmv     ca6, cnull
     cmv     ca7, cnull
@@ -204,7 +201,7 @@ sys_compartment_invoke:
     /*
      * 5. Callee returned via `cra` with its result in `ca0`. Mask, then
      *    validate and pop the top `ReturnFrame` and scrub the callee's stack
-     *    in C++ (`__signetos_switcher_return(ret)`), which also decides what
+     *    in C++ (`__signetos_switcher_return(ret)`), which also checks what
      *    the caller gets back in `ca0` and leaves it in `args[0]`.
      */
     csrci   sstatus, SSTATUS_SIE
@@ -294,16 +291,12 @@ sys_compartment_invoke:
 
 .Lenter_kernel:
     /*
-     *     Kernel callee (`ENTRY_FLAG_TRUSTED`): pass the remaining arguments
-     *     through, pivot onto the narrowed slice of the caller's stack, and
-     *     call. Interrupts stay masked; nothing is scrubbed, the kernel keeps
-     *     the caller's registers to itself and the return path scrubs them.
+     *     Kernel callee (`ENTRY_FLAG_TRUSTED`): pivot onto the narrowed slice
+     *     of the caller's stack and call. Interrupts stay masked; nothing is
+     *     scrubbed, the kernel keeps the caller's registers to itself and the
+     *     return path scrubs them.
      *     TODO: revisit
      */
-    clc     ca1, RET_FRAME_ARG1(csp)
-    clc     ca2, RET_FRAME_ARG2(csp)
-    clc     ca3, RET_FRAME_ARG3(csp)
-    clc     ca4, RET_FRAME_ARG4(csp)
     clc     csp, RET_FRAME_CALLEE_SP(csp)
     cjalr   cra, ct0
     j       .Lcomp_restore

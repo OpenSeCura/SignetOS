@@ -139,6 +139,7 @@ extern "C" capability_t sys_cow(capability_compartment_t comp,
   return ::signetos::compartment::cow(comp, mem_quota, src_memory, len);
 }
 
+// TODO mostly for testing, I don't want this here long term
 extern "C" uint64_t sys_vm_phys(capability_compartment_t comp,
                                 capability_t mem_capability) {
   return ::signetos::compartment::phys(comp, mem_capability);

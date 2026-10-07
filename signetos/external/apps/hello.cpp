@@ -102,17 +102,17 @@ void call(Capability entry, T* req) {
 }
 
 // Reads up to `cap - 1` bytes of `file` into `buf` and NUL-terminates them;
-// the fs status.
+// returns 0 on success or a negative `FS_*` status.
 int64_t read_into(Capability fs_read, Capability file, char* buf, size_t cap) {
-  init::FsIoRequest io;
-  zero_bytes(&io, sizeof(io));
-  io.file = file;
-  io.buf = capability_set_bounds(reinterpret_cast<Capability>(buf), cap - 1);
-  io.length = cap - 1;
-  io.status = init::FS_BAD_REQUEST;
-  call(fs_read, &io);
-  buf[io.status == init::FS_OK ? io.out_count : 0] = '\0';
-  return io.status;
+  Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), cap - 1);
+  const int64_t n =
+      invoke<int64_t>(s_invoke, fs_read, file, b, 0ULL, static_cast<uint64_t>(cap - 1));
+  if (n < 0) {
+    buf[0] = '\0';
+    return n;
+  }
+  buf[n] = '\0';
+  return init::FS_OK;
 }
 
 // The exercise: a file of our own, in a directory of our own.
@@ -123,18 +123,14 @@ void leave_a_note(Capability* rw, const char* args) {
     return;
   }
 
-  init::FsOpenRequest open;
-  zero_bytes(&open, sizeof(open));
-  open.quota = home;
-  append(open.path, 0, sizeof(open.path), "note.txt");
-  open.perms = perms::Load | perms::Store;
-  open.status = init::FS_BAD_REQUEST;
-  call(rw[SLOT_FS_CREATE], &open);
-  if (open.status != init::FS_OK) {
-    out_status("[hello]    could not create note.txt", open.status);
+  Capability file = invoke<Capability>(
+      s_invoke, rw[SLOT_FS_CREATE], home, ro_str("note.txt"),
+      static_cast<uint32_t>(perms::Load | perms::Store));
+  if (!capability_is_valid(file)) {
+    out_status("[hello]    could not create note.txt",
+               init::cap_error(file, init::FS_BAD_REQUEST));
     return;
   }
-  Capability file = open.out_file;
 
   size_t len = append(s_text, 0, sizeof(s_text), "hello was here");
   if (args[0] != '\0') {
@@ -143,15 +139,12 @@ void leave_a_note(Capability* rw, const char* args) {
   }
   len = append(s_text, len, sizeof(s_text), "\n");
 
-  init::FsIoRequest io;
-  zero_bytes(&io, sizeof(io));
-  io.file = file;
-  io.buf = capability_set_bounds(reinterpret_cast<Capability>(s_text), len);
-  io.length = len;
-  io.status = init::FS_BAD_REQUEST;
-  call(rw[SLOT_FS_WRITE], &io);
-  if (io.status != init::FS_OK) {
-    out_status("[hello]    could not write note.txt", io.status);
+  Capability text_cap =
+      capability_set_bounds(reinterpret_cast<Capability>(s_text), len);
+  const int64_t wr = invoke<int64_t>(s_invoke, rw[SLOT_FS_WRITE], file,
+                                     text_cap, 0ULL, static_cast<uint64_t>(len));
+  if (wr < 0) {
+    out_status("[hello]    could not write note.txt", wr);
   } else {
     const int64_t st = read_into(rw[SLOT_FS_READ], file, s_text, sizeof(s_text));
     if (st != init::FS_OK) {
@@ -162,11 +155,7 @@ void leave_a_note(Capability* rw, const char* args) {
     }
   }
 
-  init::FsCloseRequest close;
-  zero_bytes(&close, sizeof(close));
-  close.file = file;
-  close.status = init::FS_BAD_REQUEST;
-  call(rw[SLOT_FS_CLOSE], &close);
+  invoke<int64_t>(s_invoke, rw[SLOT_FS_CLOSE], file);
 
   init::FsQueryRequest q;
   zero_bytes(&q, sizeof(q));
@@ -183,12 +172,12 @@ void leave_a_note(Capability* rw, const char* args) {
 
 }  // namespace
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   s_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
   if (!sealing::is_sealed_as(OType::EntryPoint, s_uart)) {
-    return;  // no console, nothing to say it with
+    return -1;  // no console, nothing to say it with
   }
 
   // The request: a bounded, writable, unsealed capability from the shell.
@@ -196,7 +185,7 @@ extern "C" void compartment_main(Capability arg) {
       !capability_has_perms(arg, perms::Load | perms::Store) ||
       capability_get_length(arg) < sizeof(init::AppRequest)) {
     out("[hello]    not invoked with an AppRequest\n");
-    return;
+    return -1;
   }
   auto* req = reinterpret_cast<init::AppRequest*>(arg);
   req->args[init::APP_ARGS_MAX - 1] = '\0';  // a string, whatever was sent
@@ -231,6 +220,7 @@ extern "C" void compartment_main(Capability arg) {
   }
 
   req->status = 0;
+  return 0;
 }
 
 }  // namespace signetos::user

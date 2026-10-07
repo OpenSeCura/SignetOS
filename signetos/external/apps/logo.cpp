@@ -38,19 +38,19 @@ SIGNETOS_MANIFEST(LOGO_MANIFEST, 64 * 1024)
 
 }  // namespace
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   Capability invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability uart = rw[SLOT_UART_SENTRY];
   if (!sealing::is_sealed_as(OType::EntryPoint, uart)) {
-    return;
+    return -1;
   }
 
   if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
       !capability_has_perms(arg, perms::Load | perms::Store) ||
       capability_get_length(arg) < sizeof(init::AppRequest)) {
     print(invoke, uart, "[logo]     not invoked with an AppRequest\n");
-    return;
+    return -1;
   }
   auto* req = reinterpret_cast<init::AppRequest*>(arg);
   req->args[init::APP_ARGS_MAX - 1] = '\0';
@@ -94,6 +94,7 @@ extern "C" void compartment_main(Capability arg) {
   }
 
   req->status = 0;
+  return 0;
 }
 
 }  // namespace signetos::user

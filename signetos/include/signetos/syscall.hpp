@@ -195,12 +195,11 @@ void sys_compartment_destroy(
 // the callee used and every volatile register. See section 4.1 and
 // sentry.hpp.
 //
-// For a compartment entry the callee gets `arg` in `ca0` and nothing comes
-// back by register: the result is 0. For a kernel entry the caller's
-// `ca1..ca5` are the kernel's `ca0..ca4` and the kernel's return value comes
-// back in `ca0` -- `syscall::call` below applies the right signature. If the
-// call is refused (bad handle, caller's stack unusable or too small, kernel
-// stack full) the result is the `Status`, and the callee was never entered.
+// The caller's `ca1..ca5` become the callee's `ca0..ca4`, and the callee's
+// return value comes back in `ca0` (checked against the outbound capability
+// policy). If the call is refused (bad handle, caller's stack unusable or too
+// small, kernel stack full) the result is the `Status`, and the callee was
+// never entered.
 uint64_t sys_compartment_invoke(
     Sentry       entry_point,
     capability_t arg
@@ -372,8 +371,8 @@ Capability gate(Id id);
 //                                           comp, quota, size, flags);
 //
 // This is only the register convention written down once: the switcher takes
-// the entry in `ca0` and the kernel's `ca0..ca3` in `ca1..ca4`, and returns
-// the kernel's `ca0`. A refused call (see `sys_compartment_invoke`: wrong
+// the entry in `ca0` and the callee's `ca0..ca4` in `ca1..ca5`, and returns
+// the callee's `ca0`. A refused call (see `sys_compartment_invoke`: wrong
 // handle, unusable or too small a stack, kernel stack full) returns the
 // `Status` instead, in the same register; all of those are the caller's own
 // doing, a correct caller never sees one.
@@ -382,8 +381,8 @@ struct Via;
 
 template <typename R, typename... A>
 struct Via<R (*)(A...)> {
-  static_assert(sizeof...(A) <= 4,
-                "a kernel entry takes at most four arguments (ca1..ca4)");
+  static_assert(sizeof...(A) <= 5,
+                "an entry takes at most five arguments (ca1..ca5)");
   using Switcher = R (*)(Capability entry, A...);
   __attribute__((always_inline)) static R call(Capability invoke_gate,
                                                Capability entry, A... args) {

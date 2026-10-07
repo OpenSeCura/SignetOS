@@ -47,25 +47,42 @@ __attribute__((always_inline)) inline Capability* rw_table() {
   return rw;
 }
 
+// Invokes a compartment or kernel entry point `entry` through `invoke_gate`
+// with up to five arguments in `ca1..ca5` (callee `ca0..ca4`) and returns
+// `R` from `ca0`.
+template <typename R = uint64_t, typename... A>
+__attribute__((always_inline)) inline R invoke(Capability invoke_gate,
+                                               Capability entry, A... args) {
+  static_assert(sizeof...(A) <= 5,
+                "an entry takes at most five arguments (ca1..ca5)");
+  using Switcher = R (*)(Capability, A...);
+  return reinterpret_cast<Switcher>(invoke_gate)(entry, args...);
+}
+
+// Bounds a NUL-terminated string `s` to its bytes (including the NUL) and
+// restricts it to `perms::Load` so a callee can read it and nothing else.
+inline Capability ro_str(const char* s) {
+  if (s == nullptr) {
+    return nullptr;
+  }
+  size_t len = 0;
+  while (s[len] != '\0') {
+    len += 1;
+  }
+  Capability cap = reinterpret_cast<Capability>(const_cast<char*>(s));
+  cap = capability_set_bounds(cap, len + 1);
+  return capability_and_perms(cap, perms::Load);
+}
+
 // Prints a null-terminated string literal by invoking `uart_sentry` via
-// `invoke_gate`. The string literal capability loaded from `.got` is already
-// bounded strictly to the string's bytes and read-only (`perms::ReadOnly`).
+// `invoke_gate`.
 inline void print(Capability invoke_gate, Capability uart_sentry,
                   const char* msg) {
   if (!capability_is_valid(invoke_gate) || !capability_is_valid(uart_sentry) ||
       msg == nullptr) {
     return;
   }
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  size_t len = 0;
-  while (msg[len] != '\0') {
-    len += 1;
-  }
-  Capability str_cap =
-      reinterpret_cast<Capability>(const_cast<char*>(msg));
-  str_cap = capability_set_bounds(str_cap, len + 1);
-  str_cap = capability_and_perms(str_cap, perms::Load);
-  reinterpret_cast<FnInvoke>(invoke_gate)(uart_sentry, str_cap);
+  invoke(invoke_gate, uart_sentry, ro_str(msg));
 }
 
 // Prints `prefix`, then `value` in decimal, then `suffix`.
@@ -153,43 +170,36 @@ inline Capability mint_entry(Capability invoke_gate, Capability sentry_gate,
   return syscall::call<FnSentry>(invoke_gate, sentry_gate, self_comp, code);
 }
 
-// Naming service clients. `name` is truncated to `NAME_MAX - 1` bytes.
-inline void fill_name(init::NamingRequest& req, const char* name) {
-  size_t i = 0;
-  for (; i + 1 < init::NAME_MAX && name[i] != '\0'; ++i) {
-    req.name[i] = name[i];
-  }
-  for (; i < init::NAME_MAX; ++i) {
-    req.name[i] = '\0';
-  }
-}
-
+// Naming service clients.
 inline int64_t publish_name(Capability invoke_gate, Capability publish_entry,
                             const char* name, Capability sentry) {
-  init::NamingRequest req{};
-  fill_name(req, name);
-  req.sentry = sentry;
-  req.status = init::NAMING_BAD_REQUEST;
-  Capability req_cap = reinterpret_cast<Capability>(&req);
-  req_cap = capability_set_bounds(req_cap, sizeof(req));
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(invoke_gate)(publish_entry, req_cap);
-  return req.status;
+  if (!capability_is_valid(invoke_gate) || !capability_is_valid(publish_entry) ||
+      name == nullptr) {
+    return init::NAMING_BAD_REQUEST;
+  }
+  return invoke<int64_t>(invoke_gate, publish_entry, ro_str(name), sentry);
 }
 
 inline Capability lookup_name(Capability invoke_gate, Capability lookup_entry,
                               const char* name, int64_t* out_status = nullptr) {
-  init::NamingRequest req{};
-  fill_name(req, name);
-  req.status = init::NAMING_BAD_REQUEST;
-  Capability req_cap = reinterpret_cast<Capability>(&req);
-  req_cap = capability_set_bounds(req_cap, sizeof(req));
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(invoke_gate)(lookup_entry, req_cap);
-  if (out_status != nullptr) {
-    *out_status = req.status;
+  if (!capability_is_valid(invoke_gate) || !capability_is_valid(lookup_entry) ||
+      name == nullptr) {
+    if (out_status != nullptr) {
+      *out_status = init::NAMING_BAD_REQUEST;
+    }
+    return nullptr;
   }
-  return req.status == init::NAMING_OK ? req.sentry : nullptr;
+  Capability res = invoke<Capability>(invoke_gate, lookup_entry, ro_str(name));
+  if (capability_is_valid(res)) {
+    if (out_status != nullptr) {
+      *out_status = init::NAMING_OK;
+    }
+    return res;
+  }
+  if (out_status != nullptr) {
+    *out_status = init::cap_error(res, init::NAMING_BAD_REQUEST);
+  }
+  return nullptr;
 }
 
 // Copies a standalone compartment binary image (`img_cap`) into a fresh

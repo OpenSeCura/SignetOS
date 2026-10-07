@@ -112,7 +112,7 @@ constexpr uint64_t FOREVER_US = ~0ULL;
 // optional: `init` exits and scrubs its own table, so the shell is their
 // long-lived holder, not their user.
 #define SHELL_MANIFEST(X)                                                      \
-  M_QUOTA_THREAD(X, THREAD_QUOTA, 128 * 1024)                                  \
+  M_QUOTA_THREAD(X, THREAD_QUOTA, 160 * 1024)                                  \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                                      \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)                                  \
   M_SYSCALL(X, SYS_QUOTA_VM_DERIVE, quota_vm_derive)                           \
@@ -247,17 +247,11 @@ void out_dec(const char* prefix, uint64_t value, const char* suffix) {
   print_dec(s_gate_invoke, s_uart, prefix, value, suffix);
 }
 
-void yield() {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_yield, nullptr);
-}
+void yield() { invoke<int64_t>(s_gate_invoke, s_sched_yield); }
 
 // Sleeps until `shell_notify_entry` has run (or had already run since the
 // last time: the scheduler remembers a wake that arrives early).
-void block() {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_block, nullptr);
-}
+void block() { invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL); }
 
 // --- Files: clients of fs.* ----------------------------------------------------
 
@@ -289,14 +283,9 @@ alignas(16) uint8_t s_data[DATA_MAX];
 // Every file handle one node can hold at once (the fs demo fills a node).
 alignas(16) Capability s_handles[init::FS_OPEN_PER_NODE];
 
-void invoke(Capability entry, Capability arg) {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(entry, arg);
-}
-
 // Compartments link no C library: a request too large for the compiler to
 // zero inline (`T x{}`) would otherwise become a call to `memset`. The
-// path-carrying `fs` requests are that large, so they are zeroed by this loop
+// path-carrying `FsDeriveRequest` is that large, so it is zeroed by this loop
 // (which stays a loop under -ffreestanding) and filled field by field.
 void zero_bytes(void* p, size_t n) {
   auto* d = static_cast<uint8_t*>(p);
@@ -358,53 +347,45 @@ void fs_fail(const char* what, int64_t st) {
 int64_t fs_open_with(Capability entry, Capability quota, const char* path,
                      Capability* out_file, uint64_t* out_size = nullptr,
                      uint32_t file_perms = perms::Load | perms::Store) {
-  init::FsOpenRequest req;
-  zero_bytes(&req, sizeof(req));
-  req.quota = quota;
-  set_path(req.path, path);
-  req.status = init::FS_BAD_REQUEST;
-  req.perms = file_perms;
-  invoke(entry, bounded(&req));
-  *out_file = req.out_file;
   if (out_size != nullptr) {
-    *out_size = req.out_size;
+    *out_size = 0;
   }
-  return req.status;
+  Capability f = invoke<Capability>(
+      s_gate_invoke, entry, quota, ro_str(path), file_perms,
+      out_size != nullptr ? bounded(out_size) : nullptr);
+  if (capability_is_valid(f)) {
+    *out_file = f;
+    return init::FS_OK;
+  }
+  *out_file = nullptr;
+  return init::cap_error(f, init::FS_BAD_REQUEST);
 }
 
 int64_t fs_close(Capability file) {
-  init::FsCloseRequest req{};
-  req.file = file;
-  req.status = init::FS_BAD_REQUEST;
-  invoke(s_fs_close, bounded(&req));
-  return req.status;
+  return invoke<int64_t>(s_gate_invoke, s_fs_close, file);
 }
 
 // fs.read or fs.write (`entry`) of `length` bytes at `offset`.
 int64_t fs_io(Capability entry, Capability file, void* buf, uint64_t offset,
               uint64_t length, uint64_t* done) {
-  init::FsIoRequest req{};
-  req.file = file;
-  req.buf = capability_set_bounds(reinterpret_cast<Capability>(buf), length);
-  req.offset = offset;
-  req.length = length;
-  req.status = init::FS_BAD_REQUEST;
-  invoke(entry, bounded(&req));
-  if (done != nullptr) {
-    *done = req.out_count;
+  Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), length);
+  const int64_t res =
+      invoke<int64_t>(s_gate_invoke, entry, file, b, offset, length);
+  if (res >= 0) {
+    if (done != nullptr) {
+      *done = static_cast<uint64_t>(res);
+    }
+    return init::FS_OK;
   }
-  return req.status;
+  if (done != nullptr) {
+    *done = 0;
+  }
+  return res;
 }
 
-// fs.unlink or fs.mkdir (`entry`): the two take the same request.
+// fs.unlink or fs.mkdir (`entry`): the two take the same arguments.
 int64_t fs_path_op(Capability entry, Capability quota, const char* path) {
-  init::FsPathRequest req;
-  zero_bytes(&req, sizeof(req));
-  req.quota = quota;
-  set_path(req.path, path);
-  req.status = init::FS_BAD_REQUEST;
-  invoke(entry, bounded(&req));
-  return req.status;
+  return invoke<int64_t>(s_gate_invoke, entry, quota, ro_str(path));
 }
 
 int64_t fs_unlink(Capability quota, const char* path) {
@@ -419,25 +400,25 @@ int64_t fs_mkdir(Capability quota, const char* path) {
 // its entries whether or not they fit.
 int64_t fs_list(Capability quota, const char* path, uint64_t* count,
                 uint64_t* total) {
-  init::FsListRequest req;
-  zero_bytes(&req, sizeof(req));
-  req.quota = quota;
-  req.entries = capability_set_bounds(
+  *count = 0;
+  *total = 0;
+  Capability ents = capability_set_bounds(
       reinterpret_cast<Capability>(&s_entries[0]), sizeof(s_entries));
-  set_path(req.path, path);
-  req.capacity = LIST_MAX;
-  req.status = init::FS_BAD_REQUEST;
-  invoke(s_fs_list, bounded(&req));
-  *count = req.out_count;
-  *total = req.out_total;
-  return req.status;
+  const int64_t res = invoke<int64_t>(s_gate_invoke, s_fs_list, quota,
+                                      ro_str(path), ents,
+                                      static_cast<uint64_t>(LIST_MAX),
+                                      bounded(total));
+  if (res < 0) {
+    return res;
+  }
+  *count = static_cast<uint64_t>(res);
+  return init::FS_OK;
 }
 
 int64_t fs_query(Capability quota, init::FsQueryRequest& req) {
   req.quota = quota;
   req.status = init::FS_BAD_REQUEST;
-  invoke(s_fs_query, bounded(&req));
-  return req.status;
+  return invoke<int64_t>(s_gate_invoke, s_fs_query, bounded(&req));
 }
 
 // A sub-quota of `parent` rooted at the directory `path` names under the
@@ -459,7 +440,7 @@ int64_t fs_derive(Capability parent, const char* path, uint64_t bytes,
   req.perms = handle_perms;
   req.status = init::FS_BAD_REQUEST;
   req.flags = flags;
-  invoke(s_fs_derive, bounded(&req));
+  invoke<int64_t>(s_gate_invoke, s_fs_derive, bounded(&req));
   *out_quota = req.out_quota;
   if (out_admin != nullptr) {
     *out_admin = req.out_admin;
@@ -468,11 +449,7 @@ int64_t fs_derive(Capability parent, const char* path, uint64_t bytes,
 }
 
 int64_t fs_destroy(Capability quota) {
-  init::FsDestroyRequest req{};
-  req.quota = quota;
-  req.status = init::FS_BAD_REQUEST;
-  invoke(s_fs_destroy, bounded(&req));
-  return req.status;
+  return invoke<int64_t>(s_gate_invoke, s_fs_destroy, quota);
 }
 
 // The size of the file at `path`; false if the shell cannot open it.
@@ -523,9 +500,7 @@ void banner(Capability gate_invoke, Capability uart_sentry,
 // paid for from the shell's VM quota (spec 2.4 item 4). Stops at the first
 // failure and returns how many workers are running.
 size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
-  using FnInvoke = decltype(&sys_compartment_invoke);
   using FnThreadCreate = decltype(&sys_thread_create);
-  auto invoke = reinterpret_cast<FnInvoke>(s_gate_invoke);
 
   Shared& sh = set.shared;
   sh.invoke = s_gate_invoke;
@@ -553,7 +528,7 @@ size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
     dreq.perms = perms::Load | perms::Store;
     dreq.priority_class = cfg.priority[i];
     dreq.status = init::SCHED_BAD_REQUEST;
-    invoke(s_sched_derive, bounded(&dreq));
+    invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&dreq));
     if (dreq.status != init::SCHED_OK) {
       out_dec("[shell]    sched.quota_derive FAILED, status ",
               static_cast<uint64_t>(-dreq.status), "\n");
@@ -572,12 +547,9 @@ size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
       out("[shell]    worker thread_create FAILED\n");
       break;
     }
-    init::SchedRegisterRequest rreq{};
-    rreq.thread = t;
-    rreq.quota = set.quota[i];
-    rreq.status = init::SCHED_BAD_REQUEST;
-    invoke(s_sched_register, bounded(&rreq));
-    if (rreq.status != init::SCHED_OK) {
+    const int64_t tid =
+        invoke<int64_t>(s_gate_invoke, s_sched_register, t, set.quota[i]);
+    if (tid <= 0) {
       out("[shell]    sched.thread_register FAILED\n");
       break;
     }
@@ -602,24 +574,20 @@ void stop_workers(WorkerSet& set) {
 // Tears the nodes down. A worker that has bumped `done` may not have exited
 // yet, in which case destroy answers BUSY: yield and retry.
 size_t destroy_workers(WorkerSet& set) {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  auto invoke = reinterpret_cast<FnInvoke>(s_gate_invoke);
   size_t destroyed = 0;
   for (size_t i = 0; i < set.count; ++i) {
     if (!capability_is_valid(set.quota[i])) {
       continue;
     }
     for (int attempt = 0; attempt < DESTROY_RETRIES; ++attempt) {
-      init::SchedDestroyRequest req{};
-      req.quota = set.quota[i];
-      req.status = init::SCHED_BAD_REQUEST;
-      invoke(s_sched_destroy, bounded(&req));
-      if (req.status == init::SCHED_OK) {
+      const int64_t st =
+          invoke<int64_t>(s_gate_invoke, s_sched_destroy, set.quota[i]);
+      if (st == init::SCHED_OK) {
         destroyed += 1;
         set.quota[i] = nullptr;
         break;
       }
-      if (req.status != init::SCHED_BUSY) {
+      if (st != init::SCHED_BUSY) {
         break;
       }
       yield();
@@ -963,10 +931,7 @@ Capability s_gate_thread_kill = nullptr;
 // Sleeps until `us` have passed, or until something wakes the shell first
 // (a keystroke); callers loop on whatever they are waiting for.
 void sleep_us(uint64_t us) {
-  init::SchedBlockRequest req{};
-  req.timeout_us = us;
-  req.status = init::SCHED_BAD_REQUEST;
-  invoke(s_sched_block, bounded(&req));
+  invoke<int64_t>(s_gate_invoke, s_sched_block, us);
 }
 
 // A `quota_sched` node of the shell's for one program, or null.
@@ -980,18 +945,14 @@ Capability derive_app_node() {
   req.perms = perms::Load | perms::Store;
   req.priority_class = init::PRIORITY_INTERACTIVE;
   req.status = init::SCHED_BAD_REQUEST;
-  invoke(s_sched_derive, bounded(&req));
+  invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&req));
   return req.status == init::SCHED_OK ? req.out_quota : nullptr;
 }
 
 // sched.quota_destroy of `node`: SCHED_OK, or SCHED_BUSY while a thread is
 // still registered on it.
 int64_t destroy_sched_node(Capability node) {
-  init::SchedDestroyRequest req{};
-  req.quota = node;
-  req.status = init::SCHED_BAD_REQUEST;
-  invoke(s_sched_destroy, bounded(&req));
-  return req.status;
+  return invoke<int64_t>(s_gate_invoke, s_sched_destroy, node);
 }
 
 // Starts the program's thread at `entry` with `s_app_req`, registered on
@@ -1009,12 +970,8 @@ bool start_app_thread(Capability entry, Capability node) {
     out("[shell]    run: no thread memory left for a program\n");
     return false;
   }
-  init::SchedRegisterRequest rreq{};
-  rreq.thread = t;
-  rreq.quota = node;
-  rreq.status = init::SCHED_BAD_REQUEST;
-  invoke(s_sched_register, bounded(&rreq));
-  if (rreq.status != init::SCHED_OK) {
+  const int64_t tid = invoke<int64_t>(s_gate_invoke, s_sched_register, t, node);
+  if (tid <= 0) {
     // Never dispatched, so never inside anything: safe to end here.
     syscall::call<FnThreadKill>(s_gate_invoke, s_gate_thread_kill, t);
     out("[shell]    run: the scheduler would not take the program's thread\n");
@@ -1267,7 +1224,7 @@ bool load_image(Capability quota, uint32_t count, Capability image,
   req.image = image;
   req.out_comp = nullptr;
   req.out_sentry = nullptr;
-  invoke(s_loader, bounded(&req));
+  invoke<int64_t>(s_gate_invoke, s_loader, bounded(&req));
   *out_comp = req.out_comp;
   *out_entry = req.out_sentry;
   return sealing::is_sealed_as(OType::Compartment, req.out_comp) &&
@@ -1943,17 +1900,13 @@ bool execute(char* line) {
 // --- Console -----------------------------------------------------------------
 
 // Whatever has been typed since the last call; 0 if nothing. Every call also
-// tells `uart` whom to wake when the next byte arrives (abi.hpp,
-// `UartReadRequest`): a byte that lands between this returning 0 and the
-// `block()` below still ends up as a wake the scheduler holds for us.
+// tells `uart` whom to wake when the next byte arrives: a byte that lands
+// between this returning 0 and the `block()` below still ends up as a wake the
+// scheduler holds for us.
 size_t read_input(char* buf, size_t max) {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  init::UartReadRequest req{};
-  req.buf = capability_set_bounds(reinterpret_cast<Capability>(buf), max);
-  req.wake = s_notify_entry;
-  req.count = 0;
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_uart_read, bounded(&req));
-  return req.count;
+  Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), max);
+  return static_cast<size_t>(
+      invoke<uint64_t>(s_gate_invoke, s_uart_read, b, s_notify_entry));
 }
 
 void echo(char c) {
@@ -2002,16 +1955,14 @@ void console_loop() {
 // A worker: fixed slices of work until told to stop or the deadline passes.
 // Interactive workers yield after each slice; a batch worker never does, so it
 // is only ever displaced by the scheduler's tick handler (preemption).
-extern "C" void shell_worker_entry(Capability arg) {
+extern "C" uint64_t shell_worker_entry(Capability arg) {
   if (!capability_is_valid(arg) ||
       capability_get_length(arg) < sizeof(WorkerArg)) {
-    return;
+    return 0;
   }
   auto* wa = reinterpret_cast<WorkerArg*>(arg);
   Shared* sh = wa->shared;
   const bool greedy = sh->greedy[wa->index];
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  auto invoke = reinterpret_cast<FnInvoke>(sh->invoke);
   // A fixed slice of work per iteration, so the count measures CPU time
   // received and not how cheap a yield happened to be.
   while (__atomic_load_n(&sh->stop, __ATOMIC_SEQ_CST) == 0 &&
@@ -2022,27 +1973,23 @@ extern "C" void shell_worker_entry(Capability arg) {
     }
     sh->count[wa->index] += 1;
     if (!greedy) {
-      invoke(sh->yield, nullptr);
+      invoke<int64_t>(sh->invoke, sh->yield);
     }
   }
   __atomic_fetch_add(&sh->done, 1, __ATOMIC_SEQ_CST);
   // Returning exits the thread; the scheduler unregisters it.
+  return 0;
 }
 
 // Invoked by `uart` from interrupt context when input arrives and the shell
 // asked to be told (see `read_input`). Runs masked, on whichever thread was
 // interrupted -- possibly the shell's own, asleep in `sched.block` -- so it
 // does the one thing it is for and returns: wake the shell thread.
-extern "C" void shell_notify_entry(Capability arg) {
-  (void)arg;
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  init::SchedWakeRequest req{};
-  req.tid = s_my_tid;
-  req.status = init::SCHED_INVALID_THREAD;
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_wake, bounded(&req));
+extern "C" int64_t shell_notify_entry() {
+  return invoke<int64_t>(s_gate_invoke, s_sched_wake, s_my_tid);
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
@@ -2071,7 +2018,7 @@ extern "C" void compartment_main(Capability arg) {
       !sealing::is_sealed_as(OType::EntryPoint, uart_sentry) ||
       !sealing::is_sealed_as(OType::EntryPoint, naming_lookup) ||
       !sealing::is_sealed_as(OType::EntryPoint, loader_sentry)) {
-    return;
+    return -1;
   }
 
   if (!sealing::is_sealed_as(OType::SealedObject, arg)) {
@@ -2084,7 +2031,7 @@ extern "C" void compartment_main(Capability arg) {
       }
     }
     banner(gate_invoke, uart_sentry, naming_lookup);
-    return;
+    return 0;
   }
 
   // ---- The shell's scheduled thread ----------------------------------------
@@ -2112,7 +2059,7 @@ extern "C" void compartment_main(Capability arg) {
       !capability_is_valid(s_sched_wake) ||
       !capability_is_valid(sched_self)) {
     out("[shell]    sched.* lookup FAILED\n");
-    return;
+    return -1;
   }
   out("[shell]    Running on the scheduler; sched.* resolved by name\n");
 
@@ -2180,7 +2127,7 @@ extern "C" void compartment_main(Capability arg) {
                               reinterpret_cast<const void*>(&shell_worker_entry));
   if (!sealing::is_sealed_as(OType::EntryPoint, s_worker_entry)) {
     out("[shell]    worker entry mint FAILED\n");
-    return;
+    return -1;
   }
 
   // Nobody to talk to -- no `uart.read` was seeded -- so
@@ -2194,22 +2141,18 @@ extern "C" void compartment_main(Capability arg) {
     }
     run_demo();
     out("[shell]    shell exiting\n");
-    return;
+    return 0;
   }
 
   // The two halves of going to sleep on the keyboard: what `uart` invokes when
   // a key is pressed, and which thread that should wake. Without either the
   // console would sleep for good, so it polls instead (`read_input` passes
   // whatever `s_notify_entry` is, and `uart` ignores a non-entry).
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  init::SchedSelfRequest self_req{};
-  self_req.status = init::SCHED_INVALID_THREAD;
-  reinterpret_cast<FnInvoke>(gate_invoke)(sched_self, bounded(&self_req));
+  const uint64_t my_tid = invoke<uint64_t>(gate_invoke, sched_self);
   Capability notify = mint_entry(gate_invoke, gate_sentry, self_comp,
                                  reinterpret_cast<const void*>(&shell_notify_entry));
-  if (self_req.status == init::SCHED_OK &&
-      sealing::is_sealed_as(OType::EntryPoint, notify)) {
-    s_my_tid = self_req.out_tid;
+  if (my_tid != 0 && sealing::is_sealed_as(OType::EntryPoint, notify)) {
+    s_my_tid = my_tid;
     s_notify_entry = notify;
   } else {
     out("[shell]    WARNING: sched.self / notify entry FAILED; console input "
@@ -2231,6 +2174,7 @@ extern "C" void compartment_main(Capability arg) {
   out_dec("[shell]    Destroyed ", destroyed, " worker quotas; shell exiting\n");
   // Returning exits the shell thread. With nothing left registered, the
   // scheduler's dispatcher exits too and the kernel's host loop returns.
+  return 0;
 }
 
 }  // namespace signetos::user

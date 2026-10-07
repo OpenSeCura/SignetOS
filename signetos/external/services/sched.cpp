@@ -728,31 +728,31 @@ struct BusyScope {
 
 // --- Entry points --------------------------------------------------------------
 
-extern "C" void sched_quota_derive_entry(Capability arg) {
+extern "C" int64_t sched_quota_derive_entry(Capability arg) {
   auto* req = open_request<init::SchedDeriveRequest>(arg);
   if (req == nullptr) {
-    return;
+    return init::SCHED_BAD_REQUEST;
   }
   BusyScope busy;
   req->out_quota = nullptr;
   QuotaSched* parent = open_quota(req->parent, true);
   if (parent == nullptr) {
     req->status = init::SCHED_PERMISSION;
-    return;
+    return req->status;
   }
   if (req->budget_us == 0 || req->period_us == 0 ||
       req->budget_us > req->period_us ||
       req->priority_class > init::PRIORITY_BATCH ||
       !sealing::is_sealed_as(OType::QuotaVm, req->node_funding)) {
     req->status = init::SCHED_BAD_REQUEST;
-    return;
+    return req->status;
   }
   const uint32_t policy = (req->policy_id == init::POLICY_SCHED_DEFAULT)
                               ? init::POLICY_SCHED_ROUND_ROBIN
                               : req->policy_id;
   if (!policy_known(policy)) {
     req->status = init::SCHED_UNKNOWN_POLICY;
-    return;
+    return req->status;
   }
   // Temporal conservation (spec 2.4): C_c / T_c <= (C_p - D_p) / T_p.
   const uint64_t lhs = static_cast<uint64_t>(req->budget_us) * parent->period_us;
@@ -760,12 +760,12 @@ extern "C" void sched_quota_derive_entry(Capability arg) {
       static_cast<uint64_t>(own_budget(parent)) * req->period_us;
   if (lhs > rhs) {
     req->status = init::SCHED_BANDWIDTH;
-    return;
+    return req->status;
   }
   QuotaSched* n = alloc_node(req->node_funding, parent);
   if (n == nullptr) {
     req->status = init::SCHED_NO_MEMORY;
-    return;
+    return req->status;
   }
   n->budget_us = req->budget_us;
   n->period_us = req->period_us;
@@ -788,48 +788,37 @@ extern "C" void sched_quota_derive_entry(Capability arg) {
   if (!capability_is_valid(handle)) {
     free_node(n);
     req->status = init::SCHED_NO_MEMORY;
-    return;
+    return req->status;
   }
   req->out_quota = handle;
   req->status = init::SCHED_OK;
+  return req->status;
 }
 
-extern "C" void sched_quota_destroy_entry(Capability arg) {
-  auto* req = open_request<init::SchedDestroyRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t sched_quota_destroy_entry(Capability quota) {
   BusyScope busy;
-  QuotaSched* n = open_quota(req->quota, true);
+  QuotaSched* n = open_quota(quota, true);
   if (n == nullptr || n == s_root) {
-    req->status = init::SCHED_PERMISSION;
-    return;
+    return init::SCHED_PERMISSION;
   }
   if (n->tree.child_count != 0 || n->active_thread_count != 0 ||
       n->threads != nullptr) {
-    req->status = init::SCHED_BUSY;
-    return;
+    return init::SCHED_BUSY;
   }
   free_node(n);
-  req->status = init::SCHED_OK;
+  return init::SCHED_OK;
 }
 
-extern "C" void sched_thread_register_entry(Capability arg) {
-  auto* req = open_request<init::SchedRegisterRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t sched_thread_register_entry(Capability thread,
+                                               Capability quota) {
   BusyScope busy;
-  req->out_tid = 0;
-  QuotaSched* n = open_quota(req->quota, false);
+  QuotaSched* n = open_quota(quota, false);
   if (n == nullptr) {
-    req->status = init::SCHED_PERMISSION;
-    return;
+    return init::SCHED_PERMISSION;
   }
-  if (!sealing::is_sealed_as(OType::Thread, req->thread) ||
-      (capability_get_perms(req->thread) & perms::Load) == 0) {
-    req->status = init::SCHED_INVALID_THREAD;
-    return;
+  if (!sealing::is_sealed_as(OType::Thread, thread) ||
+      (capability_get_perms(thread) & perms::Load) == 0) {
+    return init::SCHED_INVALID_THREAD;
   }
   // The thread's name is the kernel's id for it, fetched through the handle
   // we were handed rather than supplied by the caller, so nobody can file a
@@ -837,10 +826,9 @@ extern "C" void sched_thread_register_entry(Capability arg) {
   // as a live thread (stale, or forged).
   using FnThreadTid = decltype(&sys_thread_tid);
   const uint64_t tid =
-      syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, req->thread);
+      syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, thread);
   if (tid == 0 || find_registered(tid) != nullptr) {
-    req->status = init::SCHED_INVALID_THREAD;
-    return;
+    return init::SCHED_INVALID_THREAD;
   }
   ThreadRec* rec = nullptr;
   for (size_t i = 0; i < MAX_THREADS; ++i) {
@@ -850,10 +838,9 @@ extern "C" void sched_thread_register_entry(Capability arg) {
     }
   }
   if (rec == nullptr) {
-    req->status = init::SCHED_FULL;
-    return;
+    return init::SCHED_FULL;
   }
-  rec->thread = req->thread;
+  rec->thread = thread;
   rec->node = n;
   rec->tid = tid;
   rec->runtime_us = 0;
@@ -866,43 +853,33 @@ extern "C" void sched_thread_register_entry(Capability arg) {
   n->threads = rec;
   n->active_thread_count += 1;
   s_registered += 1;
-  req->out_tid = rec->tid;
-  req->status = init::SCHED_OK;
+  return static_cast<int64_t>(rec->tid);
 }
 
-extern "C" void sched_policy_register_entry(Capability arg) {
-  auto* req = open_request<init::SchedPolicyRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t sched_policy_register_entry(Capability root,
+                                               Capability delegate) {
   BusyScope busy;
-  req->out_policy_id = 0;
-  if (open_quota(req->root, true) != s_root) {
-    req->status = init::SCHED_PERMISSION;
-    return;
+  if (open_quota(root, true) != s_root) {
+    return init::SCHED_PERMISSION;
   }
-  if (!sealing::is_sealed_as(OType::EntryPoint, req->delegate)) {
-    req->status = init::SCHED_BAD_REQUEST;
-    return;
+  if (!sealing::is_sealed_as(OType::EntryPoint, delegate)) {
+    return init::SCHED_BAD_REQUEST;
   }
   for (uint32_t id = init::POLICY_SCHED_FIRST_CUSTOM; id < MAX_POLICIES; ++id) {
     if (!s_policies[id].used) {
       s_policies[id].used = true;
-      s_policies[id].delegate = req->delegate;
-      req->out_policy_id = id;
-      req->status = init::SCHED_OK;
-      return;
+      s_policies[id].delegate = delegate;
+      return static_cast<int64_t>(id);
     }
   }
-  req->status = init::SCHED_FULL;
+  return init::SCHED_FULL;
 }
 
 // Called in the yielding thread's own context (through the domain switcher).
-extern "C" void sched_yield_entry(Capability arg) {
-  (void)arg;
+extern "C" int64_t sched_yield_entry() {
   ThreadRec* cur = s_running;
   if (cur == nullptr || s_in_delegate) {
-    return;
+    return 0;
   }
   s_busy = true;
   uint64_t now = now_us();
@@ -913,12 +890,12 @@ extern "C" void sched_yield_entry(Capability arg) {
     if (next == cur) {
       cur->state = T_RUNNING;  // still the best choice: keep going
       s_busy = false;
-      return;
+      return 0;
     }
     if (next != nullptr) {
       switch_to(next, now);  // clears s_busy before switching
       // Resumed by a later switch back to `cur`; `s_running` is already `cur`.
-      return;
+      return 0;
     }
     // Every ready node -- ours included -- is out of budget for this period:
     // idle until the earliest reset instead of running on borrowed time.
@@ -961,49 +938,35 @@ void block_until_woken(ThreadRec* cur, uint64_t now) {
 
 // Called in the blocking thread's own context. Returns when a `wake` for
 // this thread has been seen: either one that was already pending, or one
-// that made us READY again and got us picked -- or when the request's
-// timeout ran out first. See BLOCKING in the header. No request (or an
-// unusable one) is a block without a timeout.
-extern "C" void sched_block_entry(Capability arg) {
-  init::SchedBlockRequest* req = nullptr;
-  if (capability_is_valid(arg)) {
-    req = open_request<init::SchedBlockRequest>(arg);
-  }
+// that made us READY again and got us picked -- or when `timeout_us` ran out
+// first. See BLOCKING in the header. `timeout_us == 0` blocks without a
+// timeout.
+extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
   ThreadRec* cur = s_running;
   if (cur == nullptr || s_in_delegate) {
-    if (req != nullptr) {
-      req->status = init::SCHED_INVALID_THREAD;
-    }
-    return;
+    return init::SCHED_INVALID_THREAD;
   }
   s_busy = true;
   const uint64_t now = now_us();
   charge_running(now);
   cur->timed_out = false;
   cur->wake_at_us = 0;
-  if (req != nullptr && req->timeout_us != 0) {
-    const uint64_t at = now + req->timeout_us;
+  if (timeout_us != 0) {
+    const uint64_t at = now + timeout_us;
     cur->wake_at_us = at < now ? ~0ULL : at;
   }
   block_until_woken(cur, now);
   cur->wake_at_us = 0;
-  if (req != nullptr) {
-    req->status = cur->timed_out ? init::SCHED_TIMED_OUT : init::SCHED_OK;
-  }
+  return cur->timed_out ? init::SCHED_TIMED_OUT : init::SCHED_OK;
 }
 
-// Wakes the thread with `req->tid`. Safe to call from interrupt context, in
-// the middle of any other entry point: it touches one record and the wake
+// Wakes the thread with `tid`. Safe to call from interrupt context, in the
+// middle of any other entry point: it touches one record and the wake
 // counter, and never picks or switches.
-extern "C" void sched_wake_entry(Capability arg) {
-  auto* req = open_request<init::SchedWakeRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
-  ThreadRec* t = find_registered(req->tid);
+extern "C" int64_t sched_wake_entry(uint64_t tid) {
+  ThreadRec* t = find_registered(tid);
   if (t == nullptr) {
-    req->status = init::SCHED_INVALID_THREAD;
-    return;
+    return init::SCHED_INVALID_THREAD;
   }
   uint32_t expected = T_BLOCKED;
   if (!__atomic_compare_exchange_n(&t->state, &expected, T_READY, false,
@@ -1013,30 +976,20 @@ extern "C" void sched_wake_entry(Capability arg) {
     __atomic_store_n(&t->wake_pending, 1u, __ATOMIC_SEQ_CST);
   }
   s_wakeups = s_wakeups + 1;  // ends any `idle_until` in progress
-  req->status = init::SCHED_OK;
+  return init::SCHED_OK;
 }
 
 // The caller's own tid: what it hands to whoever is going to `wake` it.
-extern "C" void sched_self_entry(Capability arg) {
-  auto* req = open_request<init::SchedSelfRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
-  if (s_running == nullptr) {
-    req->out_tid = 0;
-    req->status = init::SCHED_INVALID_THREAD;
-    return;
-  }
-  req->out_tid = s_running->tid;
-  req->status = init::SCHED_OK;
+extern "C" uint64_t sched_self_entry() {
+  return s_running != nullptr ? s_running->tid : 0;
 }
 
 // IRQ_S_TIMER handler (kernel trap ABI: a0-a3 = scause/stval/sepc/stval2,
 // ca4 = this compartment's table slice). Runs masked on the interrupted
 // thread's stack; `cgp` is our table, so globals resolve as usual.
-extern "C" void sched_tick_entry(uint64_t scause, uint64_t stval,
-                                 uint64_t sepc, uint64_t stval2,
-                                 Capability cap_table_rw) {
+extern "C" uint64_t sched_tick_entry(uint64_t scause, uint64_t stval,
+                                     uint64_t sepc, uint64_t stval2,
+                                     Capability cap_table_rw) {
   (void)scause;
   (void)stval;
   (void)sepc;
@@ -1046,12 +999,8 @@ extern "C" void sched_tick_entry(uint64_t scause, uint64_t stval,
   // Nothing to do if the dispatcher itself was interrupted (it has its own
   // loop), or if scheduler state is mid-update on the interrupted thread.
   if (cur == nullptr || s_busy || s_in_delegate) {
-    return;
+    return 0;
   }
-  Capability* rw = rw_table();
-  Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
-  Capability uart_sentry = rw[SLOT_UART_SENTRY];
-  // print(gate_invoke, uart_sentry, "[sched] Interrupt found its way here\n");
   s_busy = true;
   const uint64_t now = now_us();
   charge_running(now);
@@ -1067,15 +1016,16 @@ extern "C" void sched_tick_entry(uint64_t scause, uint64_t stval,
       cur->state = T_RUNNING;  // work-conserving: a handler cannot idle
     }
     s_busy = false;
-    return;
+    return 0;
   }
   // Switch from inside the handler. `cur` stays parked here, masked, until
   // someone switches back to it; then this returns and `sret` resumes it.
   switch_to(next, now);
+  return 0;
 }
 
 // The dispatcher thread (`sched.run`), created and re-dispatched by the kernel.
-extern "C" void sched_run_entry(Capability arg) {
+extern "C" uint64_t sched_run_entry(Capability arg) {
   (void)arg;
   print(s_gate_invoke, s_uart, "[sched]    Dispatcher running\n");
   for (;;) {
@@ -1106,9 +1056,10 @@ extern "C" void sched_run_entry(Capability arg) {
   }
   print(s_gate_invoke, s_uart,
         "[sched]    No registered threads left; dispatcher exiting\n");
+  return 0;
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   s_self_comp = rw[compartment::SLOT_SELF];
@@ -1131,11 +1082,11 @@ extern "C" void compartment_main(Capability arg) {
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
       !sealing::is_sealed_as(OType::Trap, timer_irq_auth) ||
       !sealing::is_sealed_as(OType::EntryPoint, naming_publish)) {
-    return;
+    return -1;
   }
   auto* iface = open_request<init::SchedInterface>(arg);
   if (iface == nullptr) {
-    return;
+    return -1;
   }
   if (iface->timebase_hz >= 1'000'000) {
     s_ticks_per_us = iface->timebase_hz / 1'000'000;
@@ -1149,7 +1100,7 @@ extern "C" void compartment_main(Capability arg) {
       syscall::call<FnTypeMint>(s_gate_invoke, gate_type_mint,
                                 reinterpret_cast<Capability>(&s_type_record));
   if (!sealing::is_sealed_as(OType::TypeKey, s_key)) {
-    return;
+    return -1;
   }
   rw[SLOT_MINTED_TYPE_KEY] = s_key;
 
@@ -1164,7 +1115,7 @@ extern "C" void compartment_main(Capability arg) {
   // 3. Root node: the whole machine, funded from our own VM quota.
   s_root = alloc_node(vm_quota, nullptr);
   if (s_root == nullptr) {
-    return;
+    return -1;
   }
   s_root->budget_us = init::SCHED_ROOT_PERIOD_US;
   s_root->period_us = init::SCHED_ROOT_PERIOD_US;
@@ -1211,6 +1162,7 @@ extern "C" void compartment_main(Capability arg) {
   print(s_gate_invoke, s_uart,
         "[sched]    Scheduler online: root quota minted, sched.* published, "
         "tick bound\n");
+  return 0;
 }
 
 }  // namespace signetos::user

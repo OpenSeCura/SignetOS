@@ -62,10 +62,30 @@ struct alignas(16) Entry {
 Entry s_table[MAX_ENTRIES];
 size_t s_count = 0;
 
-// A name is 1..NAME_MAX-1 bytes, NUL-terminated inside the field.
-bool name_ok(const char* n) {
-  for (size_t i = 0; i < init::NAME_MAX; ++i) {
-    if (n[i] == '\0') {
+// Reads a NUL-terminated name from a Load capability into `out` (1..NAME_MAX-1
+// bytes). Returns false if `name_cap` is invalid, sealed, lacks Load, or is not
+// NUL-terminated within `NAME_MAX`.
+bool read_name(Capability name_cap, char (&out)[init::NAME_MAX]) {
+  if (!capability_is_valid(name_cap) || sealing::is_sealed(name_cap) ||
+      !capability_has_perms(name_cap, perms::Load)) {
+    return false;
+  }
+  const uint64_t end =
+      capability_get_base(name_cap) + capability_get_length(name_cap);
+  const uint64_t addr = capability_get_address(name_cap);
+  if (end <= addr) {
+    return false;
+  }
+  const uint64_t avail = end - addr;
+  const size_t limit =
+      avail < init::NAME_MAX ? static_cast<size_t>(avail) : init::NAME_MAX;
+  const auto* src = reinterpret_cast<const char*>(name_cap);
+  for (size_t i = 0; i < limit; ++i) {
+    out[i] = src[i];
+    if (out[i] == '\0') {
+      for (size_t j = i + 1; j < init::NAME_MAX; ++j) {
+        out[j] = '\0';
+      }
       return i > 0;
     }
   }
@@ -93,63 +113,43 @@ Entry* find(const char* name) {
   return nullptr;
 }
 
-init::NamingRequest* open_request(Capability arg) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      capability_get_length(arg) < sizeof(init::NamingRequest)) {
-    return nullptr;
-  }
-  return reinterpret_cast<init::NamingRequest*>(arg);
-}
-
 }  // namespace
 
-extern "C" void naming_publish_entry(Capability arg) {
-  init::NamingRequest* req = open_request(arg);
-  if (req == nullptr) {
-    return;
+extern "C" int64_t naming_publish_entry(Capability name_cap,
+                                        Capability sentry) {
+  char name[init::NAME_MAX];
+  if (!read_name(name_cap, name) ||
+      !sealing::is_sealed_as(OType::EntryPoint, sentry)) {
+    return init::NAMING_BAD_REQUEST;
   }
-  if (!name_ok(req->name) ||
-      !sealing::is_sealed_as(OType::EntryPoint, req->sentry)) {
-    req->status = init::NAMING_BAD_REQUEST;
-    return;
-  }
-  if (find(req->name) != nullptr) {
-    req->status = init::NAMING_EXISTS;
-    return;
+  if (find(name) != nullptr) {
+    return init::NAMING_EXISTS;
   }
   if (s_count >= MAX_ENTRIES) {
-    req->status = init::NAMING_FULL;
-    return;
+    return init::NAMING_FULL;
   }
   Entry& e = s_table[s_count];
   for (size_t i = 0; i < init::NAME_MAX; ++i) {
-    e.name[i] = req->name[i];
+    e.name[i] = name[i];
   }
-  e.sentry = req->sentry;
+  e.sentry = sentry;
   s_count += 1;
-  req->status = init::NAMING_OK;
+  return init::NAMING_OK;
 }
 
-extern "C" void naming_lookup_entry(Capability arg) {
-  init::NamingRequest* req = open_request(arg);
-  if (req == nullptr) {
-    return;
+extern "C" Capability naming_lookup_entry(Capability name_cap) {
+  char name[init::NAME_MAX];
+  if (!read_name(name_cap, name)) {
+    return init::status_cap(init::NAMING_BAD_REQUEST);
   }
-  req->sentry = nullptr;
-  if (!name_ok(req->name)) {
-    req->status = init::NAMING_BAD_REQUEST;
-    return;
-  }
-  Entry* e = find(req->name);
+  Entry* e = find(name);
   if (e == nullptr) {
-    req->status = init::NAMING_NOT_FOUND;
-    return;
+    return init::status_cap(init::NAMING_NOT_FOUND);
   }
-  req->sentry = e->sentry;
-  req->status = init::NAMING_OK;
+  return e->sentry;
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
@@ -158,7 +158,7 @@ extern "C" void compartment_main(Capability arg) {
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
 
   if (!sealing::is_sealed_as(OType::Compartment, self_comp)) {
-    return;
+    return -1;
   }
 
   // Hand the two operation entry points back to the caller (`init`).
@@ -177,6 +177,7 @@ extern "C" void compartment_main(Capability arg) {
 
   print(gate_invoke, uart_sentry,
         "[naming]   Service registry online (publish/lookup entry points)\n");
+  return 0;
 }
 
 }  // namespace signetos::user

@@ -179,11 +179,10 @@ struct alignas(16) ReturnFrame {
   Capability tp;         //  48: caller thread pointer (ctp)
   Capability s[12];      //  64..240: caller callee-saved registers (cs0..cs11)
   Capability prev_ksp;   // 256: previous per-hart `sscratchc` kernel SP
-  Capability args[5];    // 272..336: caller's ca1..ca5, the callee's ca0..ca4
-                         //      (a compartment callee gets args[0] only).
+  Capability args[5];    // 272..336: caller's ca1..ca5, the callee's ca0..ca4.
                          //      args[0] is reused for what the caller gets
-                         //      back in ca0: the kernel's return value, the
-                         //      Status of a refused call, or null.
+                         //      back in ca0: the callee's checked return value,
+                         //      or the Status of a refused call.
   Capability callee_sp;  // 352: narrowed stack capability for callee
   Capability callee_gp;  // 368: capability table for callee
   uint64_t sstatus;      // 384: caller's `sstatus` at entry (SIE restored on
@@ -204,10 +203,9 @@ static_assert(sizeof(ReturnFrame) == 25 * sizeof(Capability),
 //     `Status` (as an integer) in `frame->args[0]` for the caller.
 //   - `__signetos_switcher_return` validates and pops the top `ReturnFrame`
 //     from the hart's `sscratchc` kernel SP, scrubs the callee's stack region
-//     (the bounds of `callee_sp`), stores what the caller gets back in
-//     `frame->args[0]` (`ret`, checked, for a kernel entry; null for a
-//     compartment), and returns the popped `ReturnFrame*` (or null if the
-//     return sentry was replayed on an empty/mismatched stack).
+//     (the bounds of `callee_sp`), stores the callee's checked return value
+//     (`ret`) in `frame->args[0]`, and returns the popped `ReturnFrame*` (or
+//     null if the return sentry was replayed on an empty/mismatched stack).
 extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame);
 extern "C" ReturnFrame* __signetos_switcher_return(Capability ret);

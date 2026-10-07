@@ -178,75 +178,56 @@ Route* alloc_route(uint32_t source) {
 // --- Entry points
 // --------------------------------------------------------------
 
-extern "C" void trap_mgr_irq_route_entry(Capability arg) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      capability_get_length(arg) < sizeof(init::IrqRouteRequest)) {
-    return;
+extern "C" int64_t trap_mgr_irq_route_entry(Capability handler,
+                                            uint64_t raw_source) {
+  if (!s_online || raw_source == 0 || raw_source > s_ndev ||
+      !sealing::is_sealed_as(OType::EntryPoint, handler)) {
+    return init::IRQ_BAD_REQUEST;
   }
-  Capability* rw = rw_table();
-  Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
-  Capability uart_sentry = rw[SLOT_UART_SENTRY];
-  // print(gate_invoke, uart_sentry, "[trap_mgr] Interrupt routed\n");
-  auto* req = reinterpret_cast<init::IrqRouteRequest*>(arg);
-  req->status = init::IRQ_BAD_REQUEST;
-  if (!s_online || req->source == 0 || req->source > s_ndev ||
-      !sealing::is_sealed_as(OType::EntryPoint, req->handler)) {
-    return;
-  }
-  const auto source = static_cast<uint32_t>(req->source);
+  const auto source = static_cast<uint32_t>(raw_source);
   Route* r = find_route(source);
   if (r == nullptr) {
     r = alloc_route(source);
     if (r == nullptr) {
-      req->status = init::IRQ_FULL;
-      return;
+      return init::IRQ_FULL;
     }
   }
   for (uint32_t i = 0; i < r->count; ++i) {
     if (capability_get_address(r->handlers[i]) ==
-        capability_get_address(req->handler)) {
-      req->status = init::IRQ_OK;  // already routed
-      return;
+        capability_get_address(handler)) {
+      return init::IRQ_OK;  // already routed
     }
   }
   if (r->count == init::IRQ_MAX_HANDLERS) {
-    req->status = init::IRQ_FULL;
-    return;
+    return init::IRQ_FULL;
   }
   // Handler in place before the count admits it, and the source enabled
   // only after that: the interrupt handler can land between any two of these
   // stores and must never see a route with a hole in it.
-  r->handlers[r->count] = req->handler;
+  r->handlers[r->count] = handler;
   __asm__ volatile("" ::: "memory");
   r->count += 1;
   if (r->count == 1) {
     plic_enable(source);
   }
-  req->status = init::IRQ_OK;
+  return init::IRQ_OK;
 }
 
 // IRQ_S_EXT handler (kernel trap ABI: a0-a3 = scause/stval/sepc/stval2,
 // ca4 = this compartment's capability table). Runs masked on the interrupted
 // thread's stack; `cgp` is our table, so globals resolve as usual.
-extern "C" void trap_mgr_irq_entry(uint64_t scause, uint64_t stval,
-                                   uint64_t sepc, uint64_t stval2,
-                                   Capability cap_table_rw) {
+extern "C" uint64_t trap_mgr_irq_entry(uint64_t scause, uint64_t stval,
+                                       uint64_t sepc, uint64_t stval2,
+                                       Capability cap_table_rw) {
   (void)scause;
   (void)stval;
   (void)sepc;
   (void)stval2;
   (void)cap_table_rw;
   if (!capability_is_valid(s_plic)) {
-    return;
+    return 0;
   }
-  Capability* rw = rw_table();
-  Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
-  Capability uart_sentry = rw[SLOT_UART_SENTRY];
-  // print(gate_invoke, uart_sentry, "[trap_mgr] Interrupt routed\n");
 
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  auto invoke = reinterpret_cast<FnInvoke>(s_gate_invoke);
   volatile uint32_t* claim = plic_claim();
   for (;;) {
     const uint32_t source = *claim;  // highest-priority pending source, or 0
@@ -257,20 +238,16 @@ extern "C" void trap_mgr_irq_entry(uint64_t scause, uint64_t stval,
     if (r == nullptr) {
       plic_disable(source);  // nobody asked for it; do not let it storm
     } else {
-      alignas(16) init::IrqEvent event{};
-      event.source = source;
-      Capability ev = reinterpret_cast<Capability>(&event);
-      ev = capability_set_bounds(ev, sizeof(event));
-      ev = capability_and_perms(ev, perms::Load);
       for (uint32_t i = 0; i < r->count; ++i) {
-        invoke(r->handlers[i], ev);
+        invoke(s_gate_invoke, r->handlers[i], static_cast<uint64_t>(source));
       }
     }
     *claim = source;  // complete: the source may raise again
   }
+  return 0;
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
@@ -296,7 +273,7 @@ extern "C" void compartment_main(Capability arg) {
       !sealing::is_sealed_as(OType::Trap, exc_cheri) ||
       !capability_is_valid(plic) ||
       !capability_has_perms(plic, perms::Load | perms::Store)) {
-    return;
+    return -1;
   }
 
   // `init`'s handshake, or nothing (a probe). Either way the setup below
@@ -310,7 +287,7 @@ extern "C" void compartment_main(Capability arg) {
     iface->irq_route = nullptr;
   }
   if (s_online) {
-    return;
+    return 0;
   }
 
   // Devices interrupt the hart this runs on, the one the system booted on
@@ -318,7 +295,7 @@ extern "C" void compartment_main(Capability arg) {
   // and `riscv,ndev` in `TrapMgrInterface`.
   const uint64_t hart = this_hart();
   if (hart >= platform::MAX_HARTS) {
-    return;
+    return -1;
   }
   uint32_t ctx = static_cast<uint32_t>(2 * hart + 1);
   uint32_t ndev = platform::DEFAULT_PLIC_NDEV;
@@ -330,7 +307,7 @@ extern "C" void compartment_main(Capability arg) {
   }
   if (ctx == platform::PLIC_NO_CONTEXT ||
       capability_get_length(plic) < platform::plic_window_for_context(ctx)) {
-    return;
+    return -1;
   }
 
   s_plic = plic;
@@ -355,7 +332,7 @@ extern "C" void compartment_main(Capability arg) {
                  reinterpret_cast<const void*>(&trap_mgr_irq_entry));
   if (!sealing::is_sealed_as(OType::EntryPoint, e_route) ||
       !sealing::is_sealed_as(OType::EntryPoint, e_irq)) {
-    return;
+    return -1;
   }
   rw[SLOT_IRQ_ROUTE_ENTRY] = e_route;
   rw[SLOT_IRQ_ENTRY] = e_irq;
@@ -373,6 +350,7 @@ extern "C" void compartment_main(Capability arg) {
   print_dec(gate_invoke, uart_sentry, "[trap_mgr] PLIC online (hart ", hart,
             " S-mode context, threshold 0); IRQ_S_EXT bound; routes via "
             "irq_route\n");
+  return 0;
 }
 
 }  // namespace signetos::user

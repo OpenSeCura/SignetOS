@@ -59,7 +59,7 @@ SIGNETOS_MANIFEST(LOADER_MANIFEST, 128 * 1024)
 
 }  // namespace
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
@@ -73,19 +73,19 @@ extern "C" void compartment_main(Capability arg) {
 
   if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota)) {
-    return;
+    return -1;
   }
 
   // Bootstrap ping (`arg == nullptr`): verify capability table and log banner.
   if (!capability_is_valid(arg)) {
     print(gate_invoke, uart_sentry,
           "[loader]   Compartment loader ready (quota_vm + create/alloc/sentry gates)\n");
-    return;
+    return 0;
   }
 
   // Service call (`arg == LoadRequest*`): construct and load target compartment.
   if (capability_get_length(arg) < sizeof(init::LoadRequest)) {
-    return;
+    return -1;
   }
   auto* req = reinterpret_cast<init::LoadRequest*>(arg);
   req->out_comp = nullptr;
@@ -96,23 +96,23 @@ extern "C" void compartment_main(Capability arg) {
   // for nothing).
   const init::CompartmentImageHeader* hdr = init::image_header(req->image);
   if (hdr == nullptr) {
-    return;
+    return -1;
   }
   init::Manifest manifest;
   if (!init::manifest_of(req->image, hdr, &manifest)) {
-    return;
+    return -1;
   }
   const size_t seeds_len =
       capability_is_valid(req->seeds) ? capability_get_length(req->seeds) : 0;
   if (seeds_len != static_cast<size_t>(manifest.count) * sizeof(Capability)) {
-    return;
+    return -1;
   }
 
   using FnCompCreate = decltype(&sys_compartment_create);
   Capability comp = syscall::call<FnCompCreate>(gate_invoke, gate_create,
                                                 req->vm_quota, req->seeds);
   if (!capability_is_valid(comp)) {
-    return;
+    return -1;
   }
 
   Capability entry = load_compartment_image(
@@ -121,11 +121,12 @@ extern "C" void compartment_main(Capability arg) {
     using FnCompDestroy = decltype(&sys_compartment_destroy);
     Capability gate_destroy = rw[SLOT_SYS_COMP_DESTROY];
     syscall::call<FnCompDestroy>(gate_invoke, gate_destroy, comp);
-    return;
+    return -1;
   }
 
   req->out_comp = comp;
   req->out_sentry = entry;
+  return 0;
 }
 
 }  // namespace signetos::user

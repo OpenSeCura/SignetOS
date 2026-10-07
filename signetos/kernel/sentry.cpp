@@ -394,16 +394,16 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
 
   // Domain switcher entry: verify that every capability about to be loaded into a compartment
   // callee's register file (`ct0 = sentry`, `cgp = table`, `csp = narrowed`,
-  // `ca0 = args[0]`) is restricted, obeys W^X, carries no sealing/unsealing
-  // authority, and does not overlap kernel memory. The argument is the
-  // caller's own register; checking it here catches a kernel bug that handed
-  // a compartment something it should never have had before it spreads any
-  // further. A kernel entry's arguments go to the kernel and are not checked.
+  // `ca0..ca4 = args[0..4]`) is restricted, obeys W^X, carries no
+  // sealing/unsealing authority, and does not overlap kernel memory. A kernel
+  // entry's arguments go to the kernel and are not checked.
   inspect::assert_user_capability(entry.sentry, "switcher_prepare:sentry");
   inspect::assert_user_capability(entry.table, "switcher_prepare:callee_gp");
   inspect::assert_user_capability(narrowed, "switcher_prepare:callee_sp");
   if (!trusted) {
-    inspect::assert_user_capability(frame->args[0], "switcher_prepare:arg");
+    for (size_t i = 0; i < 5; ++i) {
+      inspect::assert_user_capability(frame->args[i], "switcher_prepare:arg");
+    }
   }
 
   frame->callee_sp = narrowed;
@@ -461,15 +461,10 @@ extern "C" ReturnFrame* __signetos_switcher_return(Capability ret) {
     }
   }
 
-  // What the caller gets back in `ca0`. A kernel entry's return value leaves
-  // the kernel here, so it goes through the outbound capability check; a
-  // compartment callee returns nothing by register.
-  if ((frame->flags & ENTRY_FLAG_TRUSTED) != 0) {
-    inspect::assert_user_capability(ret, "switcher_return:ca0");
-    frame->args[0] = ret;
-  } else {
-    frame->args[0] = nullptr;
-  }
+  // What the caller gets back in `ca0`: the callee's return value (whether
+  // kernel or compartment), checked against the outbound capability policy.
+  inspect::assert_user_capability(ret, "switcher_return:ca0");
+  frame->args[0] = ret;
 
   // The saved caller registers are reloaded as-is: the caller already held
   // every one of them, and CHERI monotonicity means they cannot have widened.

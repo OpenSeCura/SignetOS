@@ -104,12 +104,12 @@ volatile uint8_t* uart_regs() {
 
 }  // namespace
 
-// Interrupt context (see trap_mgr.cpp): short, no blocking, no switching.
-extern "C" void uart_irq_entry(Capability event) {
-  (void)event;  // the only source routed here is ours
+/// Interrupt context (see trap_mgr.cpp): short, no blocking, no switching.
+extern "C" uint64_t uart_irq_entry(uint64_t source) {
+  (void)source;  // the only source routed here is ours
   volatile uint8_t* uart = uart_regs();
   if (uart == nullptr) {
-    return;
+    return 0;
   }
   bool received = false;
   while ((uart[REG_LSR] & LSR_DATA_READY) != 0) {
@@ -125,25 +125,16 @@ extern "C" void uart_irq_entry(Capability event) {
   Capability waiter = s_waiter;
   if (received && capability_is_valid(waiter)) {
     s_waiter = nullptr;  // one wake per request
-    using FnInvoke = decltype(&sys_compartment_invoke);
     Capability gate = rw_table()[SLOT_SYS_COMP_INVOKE];
-    reinterpret_cast<FnInvoke>(gate)(waiter, nullptr);
+    invoke(gate, waiter);
   }
+  return 0;
 }
 
-extern "C" void uart_read_entry(Capability arg) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      capability_get_length(arg) < sizeof(init::UartReadRequest)) {
-    return;
-  }
-  auto* req = reinterpret_cast<init::UartReadRequest*>(arg);
-  req->count = 0;
-
-  Capability buf_cap = req->buf;
+extern "C" uint64_t uart_read_entry(Capability buf_cap, Capability wake) {
   if (!capability_is_valid(buf_cap) || sealing::is_sealed(buf_cap) ||
       !capability_has_perms(buf_cap, perms::Store)) {
-    return;
+    return 0;
   }
   // Room from the capability's address to the end of its bounds.
   const uint64_t end = capability_get_base(buf_cap) + capability_get_length(buf_cap);
@@ -151,28 +142,29 @@ extern "C" void uart_read_entry(Capability arg) {
   const size_t room = (end > addr) ? static_cast<size_t>(end - addr) : 0;
 
   // Arm first, look second (file comment, THE WAKE).
-  s_waiter = sealing::is_sealed_as(OType::EntryPoint, req->wake) ? req->wake
-                                                                  : nullptr;
+  s_waiter = sealing::is_sealed_as(OType::EntryPoint, wake) ? wake : nullptr;
 
   auto* buf = reinterpret_cast<uint8_t*>(buf_cap);
+  uint64_t count = 0;
   uint32_t tail = s_tail;
-  while (req->count < room && tail != s_head) {
-    buf[req->count] = s_ring[tail % RING_SIZE];
-    req->count += 1;
+  while (count < room && tail != s_head) {
+    buf[count] = s_ring[tail % RING_SIZE];
+    count += 1;
     tail += 1;
   }
   s_tail = tail;
 
-  if (req->count > 0) {
+  if (count > 0) {
     s_waiter = nullptr;  // the caller has something to do; it will be back
   }
+  return count;
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" uint64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   volatile uint8_t* uart = uart_regs();
   if (uart == nullptr || !capability_is_valid(arg)) {
-    return;
+    return 0;
   }
 
   // One-shot console-input handshake (file comment). Strings arrive Load-only
@@ -197,14 +189,15 @@ extern "C" void compartment_main(Capability arg) {
       iface->irq = irq;
       // From here on the UART raises its line whenever a byte is waiting.
       uart[REG_IER] = IER_RX_DATA;
-      return;
+      return 0;
     }
   }
 
   const char* str = reinterpret_cast<const char*>(arg);
   const size_t max_len = capability_get_length(arg);
+  size_t i = 0;
 
-  for (size_t i = 0; i < max_len && str[i] != '\0'; ++i) {
+  for (; i < max_len && str[i] != '\0'; ++i) {
     const char ch = str[i];
     if (ch == '\n') {
       while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
@@ -213,6 +206,7 @@ extern "C" void compartment_main(Capability arg) {
     while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
     uart[REG_RBR_THR] = static_cast<uint8_t>(ch);
   }
+  return i;
 }
 
 }  // namespace signetos::user

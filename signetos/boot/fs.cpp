@@ -454,16 +454,13 @@ int64_t blk_io(Capability entry, uint64_t block, void* buf, bool write) {
   if (!capability_is_valid(entry)) {
     return init::FS_IO_ERROR;
   }
-  init::BlkRequest req{};
   Capability b =
       capability_set_bounds(reinterpret_cast<Capability>(buf), BLOCK_BYTES);
-  req.buf = write ? capability_and_perms(b, perms::Load) : b;
-  req.sector = block * SECTORS_PER_BLOCK;
-  req.count = SECTORS_PER_BLOCK;
-  req.status = init::BLK_IO_ERROR;
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(entry, bounded(&req));
-  return req.status == init::BLK_OK ? init::FS_OK : init::FS_IO_ERROR;
+  Capability cap_buf = write ? capability_and_perms(b, perms::Load) : b;
+  const int64_t st = invoke<int64_t>(s_gate_invoke, entry, cap_buf,
+                                     block * SECTORS_PER_BLOCK,
+                                     SECTORS_PER_BLOCK);
+  return st == init::BLK_OK ? init::FS_OK : init::FS_IO_ERROR;
 }
 
 int64_t read_block(uint64_t block, void* buf) {
@@ -1222,40 +1219,62 @@ int64_t mount(uint64_t capacity_sectors, uint32_t* formatted) {
   return init::FS_OK;
 }
 
+// Reads a NUL-terminated path from a Load capability into `out`.
+bool read_path(Capability path_cap, char (&out)[init::FS_PATH_MAX]) {
+  if (!capability_is_valid(path_cap) || sealing::is_sealed(path_cap) ||
+      !capability_has_perms(path_cap, perms::Load)) {
+    return false;
+  }
+  const uint64_t avail = room(path_cap);
+  if (avail == 0) {
+    return false;
+  }
+  const size_t limit = avail < init::FS_PATH_MAX ? static_cast<size_t>(avail)
+                                                 : init::FS_PATH_MAX;
+  const auto* src = reinterpret_cast<const char*>(path_cap);
+  for (size_t i = 0; i < limit; ++i) {
+    out[i] = src[i];
+    if (out[i] == '\0') {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 // --- Entry points ------------------------------------------------------------------------------
 
-extern "C" void fs_quota_derive_entry(Capability arg) {
+extern "C" int64_t fs_quota_derive_entry(Capability arg) {
   auto* req = open_request<init::FsDeriveRequest>(arg);
   if (req == nullptr) {
-    return;
+    return init::FS_BAD_REQUEST;
   }
   req->out_quota = nullptr;
   req->out_admin = nullptr;
   if (!s_mounted) {
     req->status = init::FS_NOT_MOUNTED;
-    return;
+    return req->status;
   }
   BusyScope busy;
   if (!busy.taken) {
     req->status = init::FS_BUSY;
-    return;
+    return req->status;
   }
   const QuotaRef parent = open_quota(req->parent);
   if (parent.node == nullptr) {
     req->status = init::FS_INVALID_QUOTA;
-    return;
+    return req->status;
   }
   if (!parent.admin) {
     req->status = init::FS_PERMISSION;
-    return;
+    return req->status;
   }
   if (!sealing::is_sealed_as(OType::QuotaVm, req->node_funding) ||
       req->limit_bytes > ~0ULL - (BLOCK_BYTES - 1) ||
       (req->flags & ~init::FS_DERIVE_ADOPT) != 0) {
     req->status = init::FS_BAD_REQUEST;
-    return;
+    return req->status;
   }
   // The child's root: a directory under the parent's own ("" being the
   // parent's own).
@@ -1263,15 +1282,15 @@ extern "C" void fs_quota_derive_entry(Capability arg) {
   const int64_t st = walk(parent.node->root_dir, req->path, &w);
   if (st != init::FS_OK) {
     req->status = st;
-    return;
+    return req->status;
   }
   if (!w.found) {
     req->status = init::FS_NOT_FOUND;
-    return;
+    return req->status;
   }
   if (w.leaf[0] != '\0' && !inode_is_dir(w.ino)) {
     req->status = init::FS_NOT_DIR;
-    return;
+    return req->status;
   }
   // Space is handed out in whole blocks.
   const uint64_t limit_bytes =
@@ -1291,7 +1310,7 @@ extern "C" void fs_quota_derive_entry(Capability arg) {
     }
     if (adopt_bytes > limit_bytes || adopt_inodes > req->limit_inodes) {
       req->status = init::FS_QUOTA;
-      return;
+      return req->status;
     }
   }
   // The child's limits come out of what the parent has left -- counting what
@@ -1301,12 +1320,12 @@ extern "C" void fs_quota_derive_entry(Capability arg) {
   if (limit_bytes > avail_bytes(parent.node) + adopt_bytes ||
       req->limit_inodes > avail_inodes(parent.node) + adopt_inodes) {
     req->status = init::FS_QUOTA;
-    return;
+    return req->status;
   }
   QuotaDisk* n = alloc_node(req->node_funding, parent.node);
   if (n == nullptr) {
     req->status = init::FS_NO_MEMORY;
-    return;
+    return req->status;
   }
   n->root_dir = w.ino;
   n->limit_bytes = limit_bytes;
@@ -1321,7 +1340,7 @@ extern "C" void fs_quota_derive_entry(Capability arg) {
   if (!capability_is_valid(handle) || !capability_is_valid(admin_handle)) {
     free_node(n);  // refunds the parent
     req->status = init::FS_NO_MEMORY;
-    return;
+    return req->status;
   }
   if (adopt) {
     for (uint32_t i = 0; i < s_max_inodes; ++i) {
@@ -1337,34 +1356,26 @@ extern "C" void fs_quota_derive_entry(Capability arg) {
   req->out_quota = handle;
   req->out_admin = admin_handle;
   req->status = init::FS_OK;
+  return req->status;
 }
 
-extern "C" void fs_quota_destroy_entry(Capability arg) {
-  auto* req = open_request<init::FsDestroyRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t fs_quota_destroy_entry(Capability quota) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::FS_INVALID_QUOTA;
   }
   if (!q.admin || q.node == s_root) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::FS_PERMISSION;
   }
   if (q.node->tree.child_count != 0) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
   // Cascade (spec 3.8): the files it owns go, then its directories as they
   // empty out; one still holding other nodes' files, or that another node is
@@ -1401,13 +1412,13 @@ extern "C" void fs_quota_destroy_entry(Capability arg) {
     }
   }
   free_node(q.node);  // and the parent gets the limits back
-  req->status = status;
+  return status;
 }
 
-extern "C" void fs_quota_query_entry(Capability arg) {
+extern "C" int64_t fs_quota_query_entry(Capability arg) {
   auto* req = open_request<init::FsQueryRequest>(arg);
   if (req == nullptr) {
-    return;
+    return init::FS_BAD_REQUEST;
   }
   req->limit_bytes = 0;
   req->used_bytes = 0;
@@ -1417,12 +1428,12 @@ extern "C" void fs_quota_query_entry(Capability arg) {
   req->delegated_inodes = 0;
   if (!s_mounted) {
     req->status = init::FS_NOT_MOUNTED;
-    return;
+    return req->status;
   }
   const QuotaRef q = open_quota(req->quota);
   if (q.node == nullptr) {
     req->status = init::FS_INVALID_QUOTA;
-    return;
+    return req->status;
   }
   req->limit_bytes = q.node->limit_bytes;
   req->used_bytes = q.node->used_bytes;
@@ -1431,174 +1442,146 @@ extern "C" void fs_quota_query_entry(Capability arg) {
   req->used_inodes = q.node->used_inodes;
   req->delegated_inodes = q.node->delegated_inodes;
   req->status = init::FS_OK;
+  return req->status;
 }
 
-extern "C" void fs_create_entry(Capability arg) {
-  auto* req = open_request<init::FsOpenRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
-  req->out_file = nullptr;
-  req->out_size = 0;  // a new file is empty
+extern "C" Capability fs_create_entry(Capability quota, Capability path_cap,
+                                      uint32_t perms) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::status_cap(init::FS_NOT_MOUNTED);
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::status_cap(init::FS_BUSY);
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::status_cap(init::FS_INVALID_QUOTA);
   }
-  if ((req->perms & perms::Load) == 0) {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+  if ((perms & perms::Load) == 0) {
+    return init::status_cap(init::FS_BAD_REQUEST);
   }
   if (!q.admin) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::status_cap(init::FS_PERMISSION);
+  }
+  char path[init::FS_PATH_MAX];
+  if (!read_path(path_cap, path)) {
+    return init::status_cap(init::FS_BAD_REQUEST);
   }
   Walk w;
-  const int64_t st = walk(q.node->root_dir, req->path, &w);
+  const int64_t st = walk(q.node->root_dir, path, &w);
   if (st != init::FS_OK) {
-    req->status = st;
-    return;
+    return init::status_cap(st);
   }
   if (w.leaf[0] == '\0') {
-    req->status = init::FS_BAD_REQUEST;  // "" is the root directory itself
-    return;
+    return init::status_cap(init::FS_BAD_REQUEST);  // "" is the root directory itself
   }
   if (w.found) {
-    req->status = init::FS_EXISTS;
-    return;
+    return init::status_cap(init::FS_EXISTS);
   }
   if (avail_inodes(q.node) == 0) {
-    req->status = init::FS_QUOTA;
-    return;
+    return init::status_cap(init::FS_QUOTA);
   }
   OpenFile* f = alloc_file(q.node);
   if (f == nullptr) {
-    req->status = init::FS_NO_MEMORY;
-    return;
+    return init::status_cap(init::FS_NO_MEMORY);
   }
   const int64_t ino = new_inode(q.node, w.dir, w.leaf, 0);
   if (ino < 0) {
-    req->status = ino;
-    return;
+    return init::status_cap(ino);
   }
   f->inode = static_cast<uint32_t>(ino);
-  f->writable = (req->perms & perms::Store) != 0 ? 1 : 0;
+  f->writable = (perms & perms::Store) != 0 ? 1 : 0;
   f->in_use = 1;
   Capability handle = seal_file(f);
   if (!capability_is_valid(handle)) {
     unlink_inode(static_cast<uint32_t>(ino));  // releases the slot too
-    req->status = init::FS_NO_MEMORY;
-    return;
+    return init::status_cap(init::FS_NO_MEMORY);
   }
-  req->out_file = handle;
-  req->status = init::FS_OK;
+  return handle;
 }
 
-extern "C" void fs_mkdir_entry(Capability arg) {
-  auto* req = open_request<init::FsPathRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t fs_mkdir_entry(Capability quota, Capability path_cap) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::FS_INVALID_QUOTA;
   }
   if (!q.admin) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::FS_PERMISSION;
+  }
+  char path[init::FS_PATH_MAX];
+  if (!read_path(path_cap, path)) {
+    return init::FS_BAD_REQUEST;
   }
   Walk w;
-  const int64_t st = walk(q.node->root_dir, req->path, &w);
+  const int64_t st = walk(q.node->root_dir, path, &w);
   if (st != init::FS_OK) {
-    req->status = st;
-    return;
+    return st;
   }
   if (w.leaf[0] == '\0') {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+    return init::FS_BAD_REQUEST;
   }
   if (w.found) {
-    req->status = init::FS_EXISTS;
-    return;
+    return init::FS_EXISTS;
   }
   if (avail_inodes(q.node) == 0) {
-    req->status = init::FS_QUOTA;
-    return;
+    return init::FS_QUOTA;
   }
   const int64_t ino = new_inode(q.node, w.dir, w.leaf, INODE_DIR);
-  req->status = ino < 0 ? ino : init::FS_OK;
+  return ino < 0 ? ino : init::FS_OK;
 }
 
-extern "C" void fs_open_entry(Capability arg) {
-  auto* req = open_request<init::FsOpenRequest>(arg);
-  if (req == nullptr) {
-    return;
+extern "C" Capability fs_open_entry(Capability quota, Capability path_cap,
+                                    uint32_t perms, Capability out_size_cap) {
+  if (buffer_ok(out_size_cap, perms::Store, sizeof(uint64_t))) {
+    *reinterpret_cast<uint64_t*>(out_size_cap) = 0;
   }
-  req->out_file = nullptr;
-  req->out_size = 0;
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::status_cap(init::FS_NOT_MOUNTED);
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::status_cap(init::FS_BUSY);
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::status_cap(init::FS_INVALID_QUOTA);
   }
-  if ((req->perms & perms::Load) == 0) {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+  if ((perms & perms::Load) == 0) {
+    return init::status_cap(init::FS_BAD_REQUEST);
+  }
+  char path[init::FS_PATH_MAX];
+  if (!read_path(path_cap, path)) {
+    return init::status_cap(init::FS_BAD_REQUEST);
   }
   Walk w;
-  const int64_t st = walk(q.node->root_dir, req->path, &w);
+  const int64_t st = walk(q.node->root_dir, path, &w);
   if (st != init::FS_OK) {
-    req->status = st;
-    return;
+    return init::status_cap(st);
   }
   if (w.leaf[0] == '\0') {
-    req->status = init::FS_IS_DIR;
-    return;
+    return init::status_cap(init::FS_IS_DIR);
   }
   if (!w.found) {
-    req->status = init::FS_NOT_FOUND;
-    return;
+    return init::status_cap(init::FS_NOT_FOUND);
   }
   if (inode_is_dir(w.ino)) {
-    req->status = init::FS_IS_DIR;
-    return;
+    return init::status_cap(init::FS_IS_DIR);
   }
   // Under the handle's root, so there to read; the handle's own (or a
   // descendant's) and ADMIN, so there to write -- if writing was asked for.
   const bool owned = is_within(q.node, s_owner[w.ino]);
-  const bool wants_write = (req->perms & perms::Store) != 0;
+  const bool wants_write = (perms & perms::Store) != 0;
   OpenFile* f = alloc_file(q.node);
   if (f == nullptr) {
-    req->status = init::FS_NO_MEMORY;
-    return;
+    return init::status_cap(init::FS_NO_MEMORY);
   }
   f->inode = w.ino;
   f->writable = (wants_write && q.admin && owned) ? 1 : 0;
@@ -1606,70 +1589,55 @@ extern "C" void fs_open_entry(Capability arg) {
   Capability handle = seal_file(f);
   if (!capability_is_valid(handle)) {
     release_file(f);
-    req->status = init::FS_NO_MEMORY;
-    return;
+    return init::status_cap(init::FS_NO_MEMORY);
   }
-  req->out_file = handle;
-  req->out_size = s_inodes[w.ino].size;
-  req->status = init::FS_OK;
+  if (buffer_ok(out_size_cap, perms::Store, sizeof(uint64_t))) {
+    *reinterpret_cast<uint64_t*>(out_size_cap) = s_inodes[w.ino].size;
+  }
+  return handle;
 }
 
-extern "C" void fs_close_entry(Capability arg) {
-  auto* req = open_request<init::FsCloseRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t fs_close_entry(Capability file) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
-  OpenFile* f = open_file(req->file);
+  OpenFile* f = open_file(file);
   if (f == nullptr) {
-    req->status = init::FS_INVALID_FILE;
-    return;
+    return init::FS_INVALID_FILE;
   }
   release_file(f);
-  req->status = init::FS_OK;
+  return init::FS_OK;
 }
 
-extern "C" void fs_read_entry(Capability arg) {
-  auto* req = open_request<init::FsIoRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
-  req->out_count = 0;
+extern "C" int64_t fs_read_entry(Capability file, Capability buf,
+                                 uint64_t offset, uint64_t length) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
-  OpenFile* f = open_file(req->file);
+  OpenFile* f = open_file(file);
   if (f == nullptr) {
-    req->status = init::FS_INVALID_FILE;
-    return;
+    return init::FS_INVALID_FILE;
   }
   const Inode& in = s_inodes[f->inode];
-  if (req->length == 0 || req->offset >= in.size) {
-    req->status = init::FS_OK;  // nothing to read past the end
-    return;
+  if (length == 0 || offset >= in.size) {
+    return 0;  // nothing to read past the end
   }
-  uint64_t n = in.size - req->offset;
-  if (n > req->length) {
-    n = req->length;
+  uint64_t n = in.size - offset;
+  if (n > length) {
+    n = length;
   }
-  if (!buffer_ok(req->buf, perms::Store, n)) {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+  if (!buffer_ok(buf, perms::Store, n)) {
+    return init::FS_BAD_REQUEST;
   }
-  auto* dst = reinterpret_cast<uint8_t*>(req->buf);
+  auto* dst = reinterpret_cast<uint8_t*>(buf);
   uint64_t done = 0;
   int64_t status = init::FS_OK;
   while (done < n) {
-    const uint64_t pos = req->offset + done;
+    const uint64_t pos = offset + done;
     const uint32_t bi = static_cast<uint32_t>(pos / BLOCK_BYTES);
     const uint64_t within = pos % BLOCK_BYTES;
     uint64_t chunk = BLOCK_BYTES - within;
@@ -1688,50 +1656,38 @@ extern "C" void fs_read_entry(Capability arg) {
     copy_bytes(dst + done, s_io + within, chunk);
     done += chunk;
   }
-  req->out_count = done;
-  req->status = status;
+  return status != init::FS_OK ? status : static_cast<int64_t>(done);
 }
 
-extern "C" void fs_write_entry(Capability arg) {
-  auto* req = open_request<init::FsIoRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
-  req->out_count = 0;
+extern "C" int64_t fs_write_entry(Capability file, Capability buf,
+                                  uint64_t offset, uint64_t length) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
-  OpenFile* f = open_file(req->file);
+  OpenFile* f = open_file(file);
   if (f == nullptr) {
-    req->status = init::FS_INVALID_FILE;
-    return;
+    return init::FS_INVALID_FILE;
   }
   if (f->writable == 0) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::FS_PERMISSION;
   }
-  if (req->length == 0) {
-    req->status = init::FS_OK;
-    return;
+  if (length == 0) {
+    return 0;
   }
-  if (req->offset > init::FS_MAX_FILE_BYTES ||
-      req->length > init::FS_MAX_FILE_BYTES - req->offset) {
-    req->status = init::FS_TOO_LARGE;
-    return;
+  if (offset > init::FS_MAX_FILE_BYTES ||
+      length > init::FS_MAX_FILE_BYTES - offset) {
+    return init::FS_TOO_LARGE;
   }
-  if (!buffer_ok(req->buf, perms::Load, req->length)) {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+  if (!buffer_ok(buf, perms::Load, length)) {
+    return init::FS_BAD_REQUEST;
   }
   Inode& in = s_inodes[f->inode];
   QuotaDisk* owner = s_owner[f->inode];
-  const uint64_t end = req->offset + req->length;
+  const uint64_t end = offset + length;
 
   // 1. Grow first, charging the owner (including the indirect block if the
   //    file crosses DIRECT_BLOCKS): FS_QUOTA / FS_DISK_FULL leaves the file
@@ -1743,16 +1699,14 @@ extern "C" void fs_write_entry(Capability arg) {
     const uint64_t new_charged = charged_blocks_for(need);
     const uint64_t cost = (new_charged - old_charged) * BLOCK_BYTES;
     if (owner == nullptr || cost > avail_bytes(owner)) {
-      req->status = init::FS_QUOTA;
-      return;
+      return init::FS_QUOTA;
     }
     const bool need_new_indirect =
         (old_nblocks <= DIRECT_BLOCKS && need > DIRECT_BLOCKS);
     if (!need_new_indirect && need > DIRECT_BLOCKS) {
       const int64_t st_ind = load_indirect(in.indirect);
       if (st_ind != init::FS_OK) {
-        req->status = st_ind;
-        return;
+        return st_ind;
       }
     } else if (need_new_indirect) {
       zero_bytes(s_indirect, sizeof(s_indirect));
@@ -1789,8 +1743,7 @@ extern "C" void fs_write_entry(Capability arg) {
         if (need_new_indirect && new_indirect_blk != 0) {
           bit_clear(new_indirect_blk);
         }
-        req->status = init::FS_DISK_FULL;
-        return;
+        return init::FS_DISK_FULL;
       }
     }
 
@@ -1823,8 +1776,7 @@ extern "C" void fs_write_entry(Capability arg) {
         bit_clear(new_indirect_blk);
         s_indirect_blk = 0;
       }
-      req->status = st;
-      return;
+      return st;
     }
     in.indirect = new_indirect_blk;
     in.nblocks = need;
@@ -1832,16 +1784,16 @@ extern "C" void fs_write_entry(Capability arg) {
   }
 
   // 2. The data, one block at a time, read-modify-write for partial blocks.
-  const auto* src = reinterpret_cast<const uint8_t*>(req->buf);
+  const auto* src = reinterpret_cast<const uint8_t*>(buf);
   uint64_t done = 0;
   int64_t status = init::FS_OK;
-  while (done < req->length) {
-    const uint64_t pos = req->offset + done;
+  while (done < length) {
+    const uint64_t pos = offset + done;
     const uint32_t bi = static_cast<uint32_t>(pos / BLOCK_BYTES);
     const uint64_t within = pos % BLOCK_BYTES;
     uint64_t chunk = BLOCK_BYTES - within;
-    if (chunk > req->length - done) {
-      chunk = req->length - done;
+    if (chunk > length - done) {
+      chunk = length - done;
     }
     uint32_t blk = 0;
     status = inode_block_at(in, bi, &blk);
@@ -1863,113 +1815,104 @@ extern "C" void fs_write_entry(Capability arg) {
   }
 
   // 3. The inode: new size (as far as the data got) and any new blocks.
-  const uint64_t reached = req->offset + done;
+  const uint64_t reached = offset + done;
   if (reached > in.size) {
     in.size = reached;
   }
   const int64_t st_inode = write_inode_block(f->inode);
-  req->out_count = done;
-  req->status = status != init::FS_OK ? status : st_inode;
+  if (status != init::FS_OK) {
+    return status;
+  }
+  if (st_inode != init::FS_OK) {
+    return st_inode;
+  }
+  return static_cast<int64_t>(done);
 }
 
-extern "C" void fs_unlink_entry(Capability arg) {
-  auto* req = open_request<init::FsPathRequest>(arg);
-  if (req == nullptr) {
-    return;
-  }
+extern "C" int64_t fs_unlink_entry(Capability quota, Capability path_cap) {
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
   BusyScope busy;
   if (!busy.taken) {
-    req->status = init::FS_BUSY;
-    return;
+    return init::FS_BUSY;
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::FS_INVALID_QUOTA;
   }
   if (!q.admin) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::FS_PERMISSION;
+  }
+  char path[init::FS_PATH_MAX];
+  if (!read_path(path_cap, path)) {
+    return init::FS_BAD_REQUEST;
   }
   Walk w;
-  const int64_t st = walk(q.node->root_dir, req->path, &w);
+  const int64_t st = walk(q.node->root_dir, path, &w);
   if (st != init::FS_OK) {
-    req->status = st;
-    return;
+    return st;
   }
   if (w.leaf[0] == '\0') {
-    req->status = init::FS_BAD_REQUEST;  // the root directory itself
-    return;
+    return init::FS_BAD_REQUEST;  // the root directory itself
   }
   if (!w.found) {
-    req->status = init::FS_NOT_FOUND;
-    return;
+    return init::FS_NOT_FOUND;
   }
   // In view, but another node's: there to be seen, not this handle's to
   // remove.
   if (!is_within(q.node, s_owner[w.ino])) {
-    req->status = init::FS_PERMISSION;
-    return;
+    return init::FS_PERMISSION;
   }
   if (inode_is_dir(w.ino)) {
     if (!dir_empty(w.ino)) {
-      req->status = init::FS_NOT_EMPTY;
-      return;
+      return init::FS_NOT_EMPTY;
     }
     if (node_rooted_at(w.ino, nullptr)) {
-      req->status = init::FS_BUSY;
-      return;
+      return init::FS_BUSY;
     }
   }
-  req->status = unlink_inode(w.ino);
+  return unlink_inode(w.ino);
 }
 
-extern "C" void fs_list_entry(Capability arg) {
-  auto* req = open_request<init::FsListRequest>(arg);
-  if (req == nullptr) {
-    return;
+extern "C" int64_t fs_list_entry(Capability quota, Capability path_cap,
+                                 Capability entries_cap, uint64_t capacity,
+                                 Capability out_total_cap) {
+  if (buffer_ok(out_total_cap, perms::Store, sizeof(uint64_t))) {
+    *reinterpret_cast<uint64_t*>(out_total_cap) = 0;
   }
-  req->out_count = 0;
-  req->out_total = 0;
   if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return;
+    return init::FS_NOT_MOUNTED;
   }
-  const QuotaRef q = open_quota(req->quota);
+  const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return;
+    return init::FS_INVALID_QUOTA;
+  }
+  char path[init::FS_PATH_MAX];
+  if (!read_path(path_cap, path)) {
+    return init::FS_BAD_REQUEST;
   }
   Walk w;
-  const int64_t st = walk(q.node->root_dir, req->path, &w);
+  const int64_t st = walk(q.node->root_dir, path, &w);
   if (st != init::FS_OK) {
-    req->status = st;
-    return;
+    return st;
   }
   if (!w.found) {
-    req->status = init::FS_NOT_FOUND;
-    return;
+    return init::FS_NOT_FOUND;
   }
   if (w.leaf[0] != '\0' && !inode_is_dir(w.ino)) {
-    req->status = init::FS_NOT_DIR;
-    return;
+    return init::FS_NOT_DIR;
   }
   const uint32_t dir = w.ino;
-  uint64_t capacity = req->capacity;
   if (capacity > s_max_inodes) {
     capacity = s_max_inodes;  // never more entries than that
   }
   if (capacity != 0 &&
-      !buffer_ok(req->entries, perms::Store,
+      !buffer_ok(entries_cap, perms::Store,
                  capacity * sizeof(init::FsDirEntry))) {
-    req->status = init::FS_BAD_REQUEST;
-    return;
+    return init::FS_BAD_REQUEST;
   }
-  auto* entries = reinterpret_cast<init::FsDirEntry*>(req->entries);
+  auto* entries = reinterpret_cast<init::FsDirEntry*>(entries_cap);
   uint64_t count = 0;
   uint64_t total = 0;
   for (uint32_t i = 0; i < s_max_inodes; ++i) {
@@ -1993,28 +1936,29 @@ extern "C" void fs_list_entry(Capability arg) {
       count += 1;
     }
   }
-  req->out_count = count;
-  req->out_total = total;
-  req->status = init::FS_OK;
+  if (buffer_ok(out_total_cap, perms::Store, sizeof(uint64_t))) {
+    *reinterpret_cast<uint64_t*>(out_total_cap) = total;
+  }
+  return static_cast<int64_t>(count);
 }
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
 
-  // One-shot handshake: the first call with a writable argument of exactly
+  // One-shot handshake: the first call with a writable argument of
   // `FsInterface`'s size is `init` bringing us up. Anything later is a
   // status enquiry.
   if (s_first_call_done) {
     if (!s_mounted) {
       out("[fs]       not mounted\n");
-      return;
+      return init::FS_NOT_MOUNTED;
     }
     out_dec("[fs]       mounted: ", s_root->used_bytes / 1024, " KiB used of ");
     out_dec("", s_root->limit_bytes / 1024, " KiB, ");
     out_dec("", s_root->used_inodes, " inode(s) in use\n");
-    return;
+    return init::FS_OK;
   }
   s_first_call_done = true;
 
@@ -2032,13 +1976,13 @@ extern "C" void compartment_main(Capability arg) {
   if (!sealing::is_sealed_as(OType::Compartment, s_self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, s_vm_quota)) {
     out("[fs]       missing seeds; file system disabled\n");
-    return;
+    return init::FS_BAD_REQUEST;
   }
   if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
       !capability_has_perms(arg, perms::Load | perms::Store) ||
       capability_get_length(arg) != sizeof(init::FsInterface)) {
     out("[fs]       no FsInterface handshake; file system disabled\n");
-    return;
+    return init::FS_BAD_REQUEST;
   }
   auto* iface = reinterpret_cast<init::FsInterface*>(arg);
   iface->root_quota = nullptr;
@@ -2072,7 +2016,7 @@ extern "C" void compartment_main(Capability arg) {
   if (!sealing::is_sealed_as(OType::TypeKey, s_quota_key) ||
       !sealing::is_sealed_as(OType::TypeKey, s_file_key)) {
     out("[fs]       type_mint failed; file system disabled\n");
-    return;
+    return iface->status;
   }
   rw[SLOT_QUOTA_TYPE_KEY] = s_quota_key;
   rw[SLOT_FILE_TYPE_KEY] = s_file_key;
@@ -2100,7 +2044,7 @@ extern "C" void compartment_main(Capability arg) {
   if (iface->capacity_sectors == 0 || !capability_is_valid(s_blk_read) ||
       !capability_is_valid(s_blk_write)) {
     out("[fs]       no block device; file system not mounted\n");
-    return;
+    return iface->status;
   }
   uint32_t formatted = 0;
   const int64_t st = mount(iface->capacity_sectors, &formatted);
@@ -2108,7 +2052,7 @@ extern "C" void compartment_main(Capability arg) {
     out_dec("[fs]       mount failed, status -", static_cast<uint64_t>(-st),
             "; file system not mounted\n");
     iface->status = st;
-    return;
+    return iface->status;
   }
 
   // 4. Root node: the whole data area, rooted at `/`, funded from our own VM
@@ -2118,7 +2062,7 @@ extern "C" void compartment_main(Capability arg) {
   if (s_root == nullptr) {
     out("[fs]       could not allocate the root quota node\n");
     iface->status = init::FS_NO_MEMORY;
-    return;
+    return iface->status;
   }
   s_root->limit_bytes = (s_total_blocks - s_data_start) * BLOCK_BYTES;
   s_root->limit_inodes = s_max_inodes;
@@ -2137,7 +2081,7 @@ extern "C" void compartment_main(Capability arg) {
     free_node(s_root);
     s_root = nullptr;
     iface->status = init::FS_NO_MEMORY;
-    return;
+    return iface->status;
   }
   s_mounted = true;
 
@@ -2154,6 +2098,7 @@ extern "C" void compartment_main(Capability arg) {
   out_dec("", s_root->used_bytes / 1024, " KiB used, ");
   out_dec("", s_root->used_inodes, " of ");
   out_dec("", s_max_inodes, " inode(s)\n");
+  return iface->status;
 }
 
 }  // namespace signetos::user

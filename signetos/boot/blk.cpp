@@ -354,20 +354,12 @@ uint64_t self_tid() {
   if (!capability_is_valid(s_sched_self)) {
     return 0;
   }
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  init::SchedSelfRequest req{};
-  req.status = init::SCHED_INVALID_THREAD;
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_self, bounded(&req));
-  return req.status == init::SCHED_OK ? req.out_tid : 0;
+  return invoke<uint64_t>(s_gate_invoke, s_sched_self);
 }
 
 // Sleeps until woken or WAIT_TIMEOUT_US, whichever is first.
 void block() {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  init::SchedBlockRequest req{};
-  req.timeout_us = WAIT_TIMEOUT_US;
-  req.status = init::SCHED_BAD_REQUEST;
-  reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_block, bounded(&req));
+  invoke<int64_t>(s_gate_invoke, s_sched_block, WAIT_TIMEOUT_US);
 }
 
 // Submits one request and waits for it. `type` is BLK_T_IN or BLK_T_OUT; the
@@ -439,44 +431,31 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
   return init::BLK_OK;
 }
 
-// Shared by read and write: validates the request and moves the data through
+// Shared by read and write: validates the arguments and moves the data through
 // the bounce buffer.
-void handle(Capability arg, uint32_t type) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      capability_get_length(arg) < sizeof(init::BlkRequest)) {
-    return;
-  }
-  auto* req = reinterpret_cast<init::BlkRequest*>(arg);
+int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
   if (!s_present) {
-    req->status = init::BLK_NO_DEVICE;
-    return;
+    return init::BLK_NO_DEVICE;
   }
-  const uint64_t bytes = req->count * init::BLK_SECTOR_BYTES;
-  if (req->count == 0 || bytes > init::BLK_MAX_XFER_BYTES) {
-    req->status = init::BLK_BAD_REQUEST;
-    return;
+  const uint64_t bytes = count * init::BLK_SECTOR_BYTES;
+  if (count == 0 || bytes > init::BLK_MAX_XFER_BYTES) {
+    return init::BLK_BAD_REQUEST;
   }
-  if (req->sector >= s_capacity || req->count > s_capacity - req->sector) {
-    req->status = init::BLK_OUT_OF_RANGE;
-    return;
+  if (sector >= s_capacity || count > s_capacity - sector) {
+    return init::BLK_OUT_OF_RANGE;
   }
-  Capability buf = req->buf;
   const uint64_t need = (type == BLK_T_IN) ? perms::Store : perms::Load;
   if (!capability_is_valid(buf) || sealing::is_sealed(buf) ||
       !capability_has_perms(buf, need)) {
-    req->status = init::BLK_BAD_REQUEST;
-    return;
+    return init::BLK_BAD_REQUEST;
   }
   const uint64_t end = capability_get_base(buf) + capability_get_length(buf);
   const uint64_t addr = capability_get_address(buf);
   if (end < addr || end - addr < bytes) {
-    req->status = init::BLK_BAD_REQUEST;
-    return;
+    return init::BLK_BAD_REQUEST;
   }
   if (s_busy) {
-    req->status = init::BLK_BUSY;
-    return;
+    return init::BLK_BUSY;
   }
   s_busy = true;
 
@@ -487,23 +466,23 @@ void handle(Capability arg, uint32_t type) {
       bounce[i] = user[i];
     }
   }
-  const int64_t status = transfer(type, req->sector, static_cast<uint32_t>(bytes));
+  const int64_t status = transfer(type, sector, static_cast<uint32_t>(bytes));
   if (type == BLK_T_IN && status == init::BLK_OK) {
     for (uint64_t i = 0; i < bytes; ++i) {
       user[i] = bounce[i];
     }
   }
   s_busy = false;
-  req->status = status;
+  return status;
 }
 
 }  // namespace
 
 // Interrupt context (see trap_mgr.cpp): acknowledge, wake the waiter, return.
-extern "C" void blk_irq_entry(Capability event) {
-  (void)event;  // the only source routed here is ours
+extern "C" uint64_t blk_irq_entry(uint64_t source) {
+  (void)source;  // the only source routed here is ours
   if (s_regs == nullptr) {
-    return;
+    return 0;
   }
   const uint32_t pending = reg_read(R_INTERRUPT_STATUS);
   if (pending != 0) {
@@ -512,67 +491,63 @@ extern "C" void blk_irq_entry(Capability event) {
   s_irq_count = s_irq_count + 1;
   const uint64_t tid = s_waiter_tid;
   if (tid != 0 && capability_is_valid(s_sched_wake)) {
-    using FnInvoke = decltype(&sys_compartment_invoke);
-    init::SchedWakeRequest req{};
-    req.tid = tid;
-    req.status = init::SCHED_INVALID_THREAD;
-    reinterpret_cast<FnInvoke>(s_gate_invoke)(s_sched_wake, bounded(&req));
-    // A refused call never reached `wake` and left the status as it was.
-    if (req.status != init::SCHED_OK) {
+    const int64_t st = invoke<int64_t>(s_gate_invoke, s_sched_wake, tid);
+    if (st != init::SCHED_OK) {
       s_wakes_lost = s_wakes_lost + 1;
     }
   }
+  return 0;
 }
 
-extern "C" void blk_read_entry(Capability arg) { handle(arg, BLK_T_IN); }
+extern "C" int64_t blk_read_entry(Capability buf, uint64_t sector,
+                                  uint64_t count) {
+  return handle(buf, sector, count, BLK_T_IN);
+}
 
-extern "C" void blk_write_entry(Capability arg) { handle(arg, BLK_T_OUT); }
+extern "C" int64_t blk_write_entry(Capability buf, uint64_t sector,
+                                   uint64_t count) {
+  return handle(buf, sector, count, BLK_T_OUT);
+}
 
 namespace {
 
-// A later call from `init` (abi.hpp, `BlkSchedRequest`): the scheduler's
-// entries, now that there is a scheduler. Nothing else reaches our sentry,
-// so the entries are taken on the strength of their shape alone.
-void bind_sched(Capability arg) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      capability_get_length(arg) != sizeof(init::BlkSchedRequest)) {
-    return;
+// A later call from `init` (abi.hpp): the scheduler's entries (`block`,
+// `wake`, `self`), now that there is a scheduler. Nothing else reaches our
+// sentry, so the entries are taken on the strength of their shape alone.
+int64_t bind_sched(Capability block_ep, Capability wake_ep,
+                   Capability self_ep) {
+  if (!sealing::is_sealed_as(OType::EntryPoint, block_ep) ||
+      !sealing::is_sealed_as(OType::EntryPoint, wake_ep) ||
+      !sealing::is_sealed_as(OType::EntryPoint, self_ep)) {
+    return init::BLK_BAD_REQUEST;
   }
-  auto* req = reinterpret_cast<init::BlkSchedRequest*>(arg);
-  if (!sealing::is_sealed_as(OType::EntryPoint, req->block) ||
-      !sealing::is_sealed_as(OType::EntryPoint, req->wake) ||
-      !sealing::is_sealed_as(OType::EntryPoint, req->self)) {
-    req->status = init::BLK_BAD_REQUEST;
-    return;
-  }
-  s_sched_block = req->block;
-  s_sched_wake = req->wake;
-  s_sched_self = req->self;
-  req->status = init::BLK_OK;
+  s_sched_block = block_ep;
+  s_sched_wake = wake_ep;
+  s_sched_self = self_ep;
+  return init::BLK_OK;
 }
 
 }  // namespace
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
+                                    Capability arg2) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
 
   // One-shot handshake (file comment): the first call with a writable
-  // argument of exactly `BlkInterface`'s size is `init` bringing us up. Any
-  // later call can only be `init` handing over the scheduler's entries.
+  // argument of `BlkInterface`'s size is `init` bringing us up. Any later
+  // call can only be `init` handing over the scheduler's entries.
   if (s_first_call_done) {
-    bind_sched(arg);
-    return;
+    return bind_sched(arg0, arg1, arg2);
   }
   s_first_call_done = true;
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      capability_get_length(arg) != sizeof(init::BlkInterface)) {
-    return;
+  if (!capability_is_valid(arg0) || sealing::is_sealed(arg0) ||
+      !capability_has_perms(arg0, perms::Load | perms::Store) ||
+      capability_get_length(arg0) != sizeof(init::BlkInterface)) {
+    return init::BLK_BAD_REQUEST;
   }
-  auto* iface = reinterpret_cast<init::BlkInterface*>(arg);
+  auto* iface = reinterpret_cast<init::BlkInterface*>(arg0);
   iface->read = nullptr;
   iface->write = nullptr;
   iface->irq = nullptr;
@@ -590,7 +565,7 @@ extern "C" void compartment_main(Capability arg) {
       capability_get_length(dma) < ARENA_MIN || iface->dma_phys == 0 ||
       (iface->dma_phys & (vm::PAGE_SIZE - 1)) != 0) {
     out("[blk]      no usable DMA arena; block device disabled\n");
-    return;
+    return iface->status;
   }
   s_dma = reinterpret_cast<uint8_t*>(
       capability_set_address(dma, capability_get_base(dma)));
@@ -598,12 +573,12 @@ extern "C" void compartment_main(Capability arg) {
 
   if (!probe(window, iface->virtio_slot_bytes, iface->virtio_count)) {
     out("[blk]      no virtio-blk device found; block device disabled\n");
-    return;
+    return iface->status;
   }
   if (!init_device()) {
     out("[blk]      virtio-blk refused initialisation; block device disabled\n");
     s_regs = nullptr;
-    return;
+    return iface->status;
   }
   s_present = true;
 
@@ -629,6 +604,7 @@ extern "C" void compartment_main(Capability arg) {
 
   out_dec("[blk]      virtio-blk online in slot ", s_slot, ": ");
   out_dec("", s_capacity * init::BLK_SECTOR_BYTES / 1024, " KiB, 4 KiB per request\n");
+  return iface->status;
 }
 
 }  // namespace signetos::user

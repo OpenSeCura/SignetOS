@@ -330,15 +330,11 @@ struct Launcher {
         e.name[0] == '\0') {
       return nullptr;
     }
-    init::FsPathRequest mk;
-    mk.quota = fs_root;
-    set_path(mk.path, e.name);
-    mk.status = init::FS_BAD_REQUEST;
-    mk.pad_ = 0;
-    reinterpret_cast<FnInvoke>(invoke)(fs_mkdir, bounded(&mk));
-    if (mk.status != init::FS_OK && mk.status != init::FS_EXISTS) {
+    const int64_t mk_st =
+        ::signetos::user::invoke<int64_t>(invoke, fs_mkdir, fs_root, ro_str(e.name));
+    if (mk_st != init::FS_OK && mk_st != init::FS_EXISTS) {
       say_dec("[init]     WARNING: fs.mkdir failed, status -",
-              static_cast<uint64_t>(-mk.status), "\n");
+              static_cast<uint64_t>(-mk_st), "\n");
       return nullptr;
     }
 
@@ -516,19 +512,13 @@ struct Launcher {
       warn(name, "no file system to load it from");
       return nullptr;
     }
-    auto call = reinterpret_cast<FnInvoke>(invoke);
-    init::FsOpenRequest open;
-    zero_bytes(&open, sizeof(open));
-    open.quota = fs_root;
-    set_path(open.path, name);
-    open.status = init::FS_BAD_REQUEST;
-    open.perms = perms::Load;
-    call(fs_open, bounded(&open));
-    if (open.status != init::FS_OK) {
+    uint64_t size = 0;
+    Capability file = ::signetos::user::invoke<Capability>(
+        invoke, fs_open, fs_root, ro_str(name), perms::Load, bounded(&size));
+    if (!capability_is_valid(file)) {
       warn(name, "not on the disk");
       return nullptr;
     }
-    const uint64_t size = open.out_size;
     bool ok = size >= sizeof(init::CompartmentImageHeader) &&
               size <= init::FS_MAX_FILE_BYTES;
     Capability buf = nullptr;
@@ -539,19 +529,11 @@ struct Launcher {
       ok = capability_is_valid(buf);
     }
     if (ok) {
-      init::FsIoRequest io{};
-      io.file = open.out_file;
-      io.buf = buf;
-      io.offset = 0;
-      io.length = size;
-      io.status = init::FS_BAD_REQUEST;
-      call(fs_read, bounded(&io));
-      ok = io.status == init::FS_OK && io.out_count == size;
+      const int64_t n = ::signetos::user::invoke<int64_t>(
+          invoke, fs_read, file, buf, 0ULL, size);
+      ok = n >= 0 && static_cast<uint64_t>(n) == size;
     }
-    init::FsCloseRequest close{};
-    close.file = open.out_file;
-    close.status = init::FS_BAD_REQUEST;
-    call(fs_close, bounded(&close));
+    ::signetos::user::invoke<int64_t>(invoke, fs_close, file);
     if (!ok) {
       warn(name, "could not be read, or is not a compartment image");
       release(buf);
@@ -576,7 +558,7 @@ Launcher s_launcher;
 
 }  // namespace
 
-extern "C" void compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   Launcher& L = s_launcher;
 
@@ -617,7 +599,7 @@ extern "C" void compartment_main(Capability arg) {
   if (!capability_is_valid(arg) ||
       capability_get_length(arg) < sizeof(init::BootManifest)) {
     thread_exit(-1);
-    return;
+    return -1;
   }
   const auto* manifest = reinterpret_cast<const init::BootManifest*>(arg);
 
@@ -845,20 +827,20 @@ extern "C" void compartment_main(Capability arg) {
   // quota funds the node `init` derives for the shell below.
   const Capability sched_node_funding = L.vm_quota(64 * 1024);
 
-  // Now that there is a scheduler, `blk` can sleep in it instead of polling
-  // (abi.hpp, `BlkSchedRequest`). Without it the disk still works, polled.
+  // Now that there is a scheduler, `blk` can sleep in it instead of polling.
+  // Without it the disk still works, polled.
   if (blk_if.status == init::BLK_OK) {
-    init::BlkSchedRequest sreq{};
-    sreq.block = lookup("sched.block");
-    sreq.wake = lookup("sched.wake");
-    sreq.self = lookup("sched.self");
-    sreq.status = init::BLK_BAD_REQUEST;
-    if (sealing::is_sealed_as(OType::EntryPoint, sreq.block) &&
-        sealing::is_sealed_as(OType::EntryPoint, sreq.wake) &&
-        sealing::is_sealed_as(OType::EntryPoint, sreq.self)) {
-      comp_invoke(blk.sentry, bounded(&sreq));
+    const Capability s_block = lookup("sched.block");
+    const Capability s_wake = lookup("sched.wake");
+    const Capability s_self = lookup("sched.self");
+    int64_t st = init::BLK_BAD_REQUEST;
+    if (sealing::is_sealed_as(OType::EntryPoint, s_block) &&
+        sealing::is_sealed_as(OType::EntryPoint, s_wake) &&
+        sealing::is_sealed_as(OType::EntryPoint, s_self)) {
+      st = ::signetos::user::invoke<int64_t>(invoke, blk.sentry, s_block,
+                                             s_wake, s_self);
     }
-    if (sreq.status != init::BLK_OK) {
+    if (st != init::BLK_OK) {
       say("[init]     WARNING: blk has no scheduler entries; the block device "
           "will poll\n");
     }
@@ -890,12 +872,8 @@ extern "C" void compartment_main(Capability arg) {
         !sealing::is_sealed_as(OType::EntryPoint, handler)) {
       return init::IRQ_BAD_REQUEST;
     }
-    init::IrqRouteRequest route{};
-    route.handler = handler;
-    route.source = source;
-    route.status = init::IRQ_BAD_REQUEST;
-    comp_invoke(tm_if.irq_route, bounded(&route));
-    return route.status;
+    return ::signetos::user::invoke<int64_t>(
+        invoke, tm_if.irq_route, handler, static_cast<uint64_t>(source));
   };
   // The UART's, which is what makes console input interrupt driven.
   if (route_irq(uart_irq, board.uart_irq) != init::IRQ_OK) {
@@ -972,12 +950,9 @@ extern "C" void compartment_main(Capability arg) {
   if (capability_is_valid(shell_thread) &&
       capability_is_valid(sched_thread_register) &&
       capability_is_valid(shell_sched_quota)) {
-    init::SchedRegisterRequest rreq{};
-    rreq.thread = shell_thread;
-    rreq.quota = shell_sched_quota;
-    rreq.status = init::SCHED_BAD_REQUEST;
-    comp_invoke(sched_thread_register, bounded(&rreq));
-    if (rreq.status != init::SCHED_OK) {
+    const int64_t tid = ::signetos::user::invoke<int64_t>(
+        invoke, sched_thread_register, shell_thread, shell_sched_quota);
+    if (tid <= 0) {
       say("[init]     WARNING: sched.thread_register(shell) failed\n");
     }
   } else {
@@ -1046,6 +1021,7 @@ extern "C" void compartment_main(Capability arg) {
   zero_bytes(&s_seeds[0], sizeof(s_seeds));
 
   thread_exit(0);
+  return 0;
 }
 
 }  // namespace signetos::user
