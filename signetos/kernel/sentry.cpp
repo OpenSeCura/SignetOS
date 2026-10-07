@@ -355,23 +355,10 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   if (status != Status::Ok) {
     return refuse(status);
   }
+  // `trusted` means a kernel syscall gate (syscall::gate); otherwise it's a
+  // user compartment. Unmasked compartments can be interrupted at any time,
+  // so ensure enough kernel stack remains for a trap frame and handler.
   const bool trusted = (entry.flags & ENTRY_FLAG_TRUSTED) != 0;
-
-  // A compartment callee gets its caller's `SIE`. If that is set it can be
-  // interrupted at any instruction, and the trap dispatcher enters a handler
-  // only if the kernel stack has `RET_FRAME_MIN_FREE` bytes free below the
-  // `TrapFrame` (see asm_macros.h). Reserve that room here, so an unmasked
-  // compartment never sits on a kernel stack where a tick could not be
-  // handled. Refused here, the caller gets `NoKernelStack` as if the
-  // switcher's own check had failed.
-  //
-  // A callee that runs masked (called from an interrupt handler, or from
-  // other masked code) cannot be interrupted, and compartments have no ASR to
-  // unmask themselves. A synchronous fault in it needs only a `TrapFrame` plus
-  // the dispatcher's thread-ending path, which fits in what the switcher
-  // checked before pushing this frame. A kernel callee runs masked and does
-  // not fault by design; if it does, the dispatcher halts, which fits the
-  // same room.
   if (!trusted && (frame->sstatus & SSTATUS_SIE) != 0 &&
       thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
           TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE) {

@@ -170,6 +170,7 @@ sys_compartment_invoke:
     beqz    t1, 1f
     csrsi   sstatus, SSTATUS_SIE
 1:
+/* TODO: FIX ME! We only support one arg right now */
     /* Everything except ct0 (sentry), csp, cgp, ca0 and cra (set by cjalr). */
     cmv     ctp, cnull
     cmv     ct1, cnull
@@ -293,10 +294,11 @@ sys_compartment_invoke:
 
 .Lenter_kernel:
     /*
-     * 4b. Kernel callee (`ENTRY_FLAG_TRUSTED`): pass the remaining arguments
+     *     Kernel callee (`ENTRY_FLAG_TRUSTED`): pass the remaining arguments
      *     through, pivot onto the narrowed slice of the caller's stack, and
      *     call. Interrupts stay masked; nothing is scrubbed, the kernel keeps
      *     the caller's registers to itself and the return path scrubs them.
+     *     TODO: revisit
      */
     clc     ca1, RET_FRAME_ARG1(csp)
     clc     ca2, RET_FRAME_ARG2(csp)
