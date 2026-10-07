@@ -17,10 +17,7 @@
 /*
  * init.cpp - SignetOS Kernel Bootstrap for the `init` Compartment
  *
- * Implements design_spec.md section 3.1 (System Boot and Core Services
- * Bootstrap, step 2: Init compartment launch).
- *
- * All user-space compartment code lives in `src/user/` and is compiled
+ * All boot compartment code lives in `boot/` and is compiled
  * into standalone compartment binaries embedded via `kernel/boot_images.S`.
  */
 

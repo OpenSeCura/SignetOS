@@ -19,8 +19,8 @@
 /*
  * logo.hpp - SignetOS Signet-Ring Wax-Stamping ASCII Animation & Banner
  *
- * Shared between `kernel_main` (`src/kernel/main.cpp`) and the `logo.bin`
- * user-space application (`src/external/apps/logo.cpp`).
+ * Shared between `kernel_main` (`kernel/main.cpp`) and the `logo.bin`
+ * user-space application (`external/apps/logo.cpp`).
  */
 
 #include <signetos/types.hpp>

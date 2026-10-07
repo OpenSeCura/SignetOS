@@ -19,9 +19,6 @@
 //
 // compartment.hpp - SignetOS protection domains
 //
-// design_spec.md section 2.2 (struct compartment, the capability table layout
-// and the UID) and section 5.4 (sys_compartment_create).
-//
 // A compartment is not an execution context. It is a container of capabilities:
 // the tracking struct plus the capability table that is the domain's root of
 // authority. Threads are separate and can move between compartments.
@@ -115,7 +112,7 @@ constexpr uint32_t FLAG_DYING = (1u << 1);
 using Status = signetos::Status;
 using signetos::status_name;
 
-// design_spec.md section 61. The kernel's tracking anchor for one domain.
+// The kernel's tracking anchor for one domain.
 //
 // `self_page` is first because a capability must sit at a 16-byte boundary, and
 // the page base is page-aligned; putting it at offset 0 means no padding field.
@@ -166,10 +163,6 @@ static_assert(pages_for_slots(CAP_SLOTS) == COMPARTMENT_PAGES &&
 // no thread can destroy a compartment while the host, which every thread exit
 // returns to, is inside it.
 //
-// design_spec.md section 5.4 has destroy abort the frames inside the
-// compartment instead of refusing. That is not built yet (SPEC_CHANGE_NOTES.md
-// H12); the count here is what such an abort would need to know first.
-//
 
 //
 // WHO OWNS WHICH MEMORY
@@ -183,9 +176,7 @@ static_assert(pages_for_slots(CAP_SLOTS) == COMPARTMENT_PAGES &&
 // its tracking struct. A page is taken from vm::alloc_pages and CHARGED TO THE
 // QUOTA FUNDING THE ALLOCATION THAT NEEDED IT, like every other kernel
 // structure. There is no global table: a compartment that fills its chain has
-// spent its own budget doing so and has affected nobody else
-// (design_spec.md section 111 -- "no global node limit and no manager-side
-// exhaustion").
+// spent its own budget doing so and has affected nobody else.
 //
 // Being in a compartment's chain is what proves ownership, so a record carries
 // no owner field and deallocate needs no UID comparison. Another compartment
@@ -233,8 +224,8 @@ static_assert(RANGE_PAGE_HEADER + RANGES_PER_PAGE * sizeof(Range) ==
 // Prepares the subsystem. Needs the sealing authority and vm up already.
 void init();
 
-// design_spec.md section 5.4. Charges one page to `mem_quota`, builds the
-// struct and the table, and returns the sealed handle.
+// Charges one page to `mem_quota`, builds the struct and the table, and returns
+// the sealed handle.
 //
 // `initial_capabilities` is copied into the capability table starting at
 // `RW_SLOT_SEED_BASE` (slot 2, directly after `SLOT_SELF` and `SLOT_VM_QUOTA`).
@@ -264,9 +255,9 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
 // Number of entry pages in `comp`'s chain. 0 for a bad handle.
 size_t entry_pages(Capability comp);
 
-// design_spec.md section 5.1. Allocates `size` bytes rounded up to whole pages,
-// charges them to `mem_quota`, and records the range in `comp`'s chain.
-// Returns a capability bounded to exactly that range, or null.
+// Allocates `size` bytes rounded up to whole pages, charges them to
+// `mem_quota`, and records the range in `comp`'s chain. Returns a capability
+// bounded to exactly that range, or null.
 //
 // Every 127th allocation also takes a fresh range page, charged to the same
 // `mem_quota`. That is the only variable cost, and it is paid by the caller
@@ -278,9 +269,9 @@ size_t entry_pages(Capability comp);
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status = nullptr);
 
-// design_spec.md section 5.1. Frees an allocation and credits the bytes back.
-// The range is quarantined, not unmapped (see vm.hpp): capabilities to it that
-// are still tagged keep reaching its data until the revocation sweep.
+// Frees an allocation and credits the bytes back. The range is quarantined, not
+// unmapped (see vm.hpp): capabilities to it that are still tagged keep reaching
+// its data until the revocation sweep.
 //
 // `mem_capability` is used only for its BASE, to find the record in `comp`'s
 // chain; the range is then freed through a capability rebuilt from the record,
@@ -292,11 +283,10 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
 Status deallocate(Capability comp, Capability mem_quota,
                   Capability mem_capability);
 
-// design_spec.md section 5.1. Clones `len` bytes starting at `src_memory`'s
-// current address into a new allocation owned by `comp` and funded by
-// `mem_quota`. `len` must be a non-zero multiple of `vm::PAGE_SIZE`, and
-// `src_memory` must be an unsealed capability with `Permit_Load` whose bounds
-// cover `[addr, addr + len)`.
+// Clones `len` bytes starting at `src_memory`'s current address into a new
+// allocation owned by `comp` and funded by `mem_quota`. `len` must be a
+// non-zero multiple of `vm::PAGE_SIZE`, and `src_memory` must be an unsealed
+// capability with `Permit_Load` whose bounds cover `[addr, addr + len)`.
 //
 // NOTE: Implemented for now as a synchronous up-front memory copy; we will
 // return later to make this lazy page-table copy-on-write.
@@ -310,9 +300,9 @@ Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
 // always qualifies; the check is still made page by page, not assumed.
 uint64_t phys(Capability comp, Capability mem_capability);
 
-// design_spec.md section 5.4. Tears the compartment down completely: every live
-// allocation in its range chain, every page of the chain, and finally its own
-// page. Each refund goes to the quota that paid for that particular item.
+// Tears the compartment down completely: every live allocation in its range
+// chain, every page of the chain, and finally its own page. Each refund goes to
+// the quota that paid for that particular item.
 //
 // The handle is the only authority required. Holding it is what permits this.
 //
@@ -332,10 +322,9 @@ uint64_t phys(Capability comp, Capability mem_capability);
 // than unmapped, so capabilities to them stay usable until the sweep. A stale
 // handle to the compartment is refused by the cleared FLAG_LIVE.
 //
-// TODO: does NOT register the released ranges with the revoker. design_spec.md
-// section 4.2 has them registered so a sweep can clear their tags, after which
-// they could be unmapped and their frames reused. deallocate has the same gap.
-// Both need fixing when the revoker is wired up.
+// TODO: does NOT register the released ranges with the revoker so a sweep can
+// clear their tags, after which they could be unmapped and their frames reused.
+// deallocate has the same gap. Both need fixing when the revoker is wired up.
 Status destroy(Capability handle);
 
 // Counts one more thread inside the compartment whose page is `page` (as a

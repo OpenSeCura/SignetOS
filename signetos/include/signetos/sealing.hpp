@@ -65,11 +65,6 @@ inline uint64_t type_of(Capability cap) {
 }
 
 // True if `cap` is sealed, and therefore not dereferenceable.
-//
-// Derived from the CT field rather than __builtin_cheri_sealed_get(), which
-// upstream mis-selected as a bare GCTYPE returning the whole object type
-// instead of a boolean (SPEC_CHANGE_NOTES.md F1). The toolchain fix is applied,
-// but comparing CT is independent of it.
 inline bool is_sealed(Capability cap) {
     return type_of(cap) != static_cast<uint64_t>(OType::Unsealed);
 }
@@ -206,7 +201,7 @@ inline T* open_live(OType type, Capability handle, uint32_t live_flag,
 //   2. `code_cap` is unsealed.
 //   3. `code_cap` has Permit_Execute. Without it the result would be an
 //      unjumpable capability wearing an entry point's name.
-//   4. The address is even. ISA 2.9.5: JALR unseals the target only if
+//   4. The address is even. JALR unseals the target only if
 //      "rs1.address[0] is zero, and the I-immediate is zero". A sentry at an
 //      odd address would stay sealed in PCC and trap.
 //
@@ -262,7 +257,7 @@ inline Capability reconstruct(Capability authority, uint64_t addr, size_t length
     return capability_is_valid(derived) ? derived : nullptr;
 }
 
-// --- Compartment-Minted Sealing Types (design_spec.md §2.7 & §5.4) ----------
+// --- Compartment-Minted Sealing Types ---------------------------------------
 
 // `sys_type_mint`: Bounds `record` to 16 bytes, restricts permissions to
 // `Permit_Load | Permit_Store`, and seals it with `OType::TypeKey` (CT = 10).

@@ -19,9 +19,6 @@
 //
 // trap.hpp - SignetOS Hardware Trap and Interrupt Binding Subsystem
 //
-// Implements design_spec.md section 3.6 (Hardware Trap and Interrupt Handling)
-// and section 5.6 (sys_trap_bind / sys_trap_unbind).
-//
 // SEALED TRAP AUTHORITIES (OType::Trap, CT = 13)
 // ----------------------------------------------
 // Each hardware trap vector (synchronous exceptions 0..31 and asynchronous

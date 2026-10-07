@@ -42,7 +42,7 @@
  *                            strips Execute, Seal, Unseal, and ASR)
  *
  * Every mask also keeps KERNEL_LEVEL_PERMS, the three Zylevels1 bits
- * (ISA spec section 14; `perms::Levels` in types.hpp is the C++ twin):
+ * (`perms::Levels` in types.hpp is the C++ twin):
  *   Global (GL)      -- the capability stays global (1) rather than local (0)
  *   LoadGlobal (LG)  -- loads through it do not relabel loaded caps as local
  *   StoreLocal (SL)  -- stores through it keep the tag of local caps

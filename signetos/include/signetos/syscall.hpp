@@ -19,9 +19,8 @@
 //
 // syscall.hpp - SignetOS microkernel system call interface
 //
-// The complete kernel ABI: design_spec.md section 5, all 25 calls, spec-exact
-// names and signatures. Nothing outside this header is reachable by a
-// compartment.
+// The complete kernel ABI: all 25 calls. Nothing outside this header is
+// reachable by a compartment.
 //
 // Calls are `extern "C"` because they are reached by jumping through a sealed
 // sentry held in the caller's capability table, so the symbol names must be
@@ -36,7 +35,7 @@
 #include <stddef.h>
 #include <signetos/types.hpp>
 
-// --- Handle types (design_spec.md section 2) -------------------------------
+// --- Handle types ----------------------------------------------------------
 
 using capability_t             = signetos::Capability;  // any memory capability
 using capability_data_t        = signetos::Capability;  // non-executable memory
@@ -52,7 +51,7 @@ using capability_sentry_t           = Sentry;                // OTYPE_SENTRY
 using capability_type_t             = signetos::Capability;  // OTYPE_TYPE_KEY
 using capability_sealed_t           = signetos::Capability;  // OTYPE_SEALED_OBJECT
 
-// --- sys_vm_allocate flags (design_spec.md section 5.1) --------------------
+// --- sys_vm_allocate flags -------------------------------------------------
 
 constexpr uint32_t FLAG_PINNED = (1u << 0);  // never swapped or migrated
 constexpr uint32_t FLAG_ZERO   = (1u << 1);  // zero the pages before returning
@@ -60,7 +59,7 @@ constexpr uint32_t NO_ALIAS    = (1u << 2);  // refuse if the range is already m
 
 extern "C" {
 
-// --- 5.1 Virtual memory ----------------------------------------------------
+// --- Virtual memory --------------------------------------------------------
 
 // Allocates `size` bytes (rounded to page granularity), debits `mem_quota`,
 // tags the mapping to `comp`. Returns a bounded capability, or NULL.
@@ -135,7 +134,7 @@ uint64_t sys_revoke_register(
 // The highest epoch whose sweep has finished.
 uint64_t sys_revoke_query(void);
 
-// --- 5.2 Virtual memory quotas ---------------------------------------------
+// --- Virtual memory quotas -------------------------------------------------
 
 // Boot-time root quota over all system memory.
 capability_quota_vm_t sys_quota_vm_create_root(
@@ -156,7 +155,7 @@ int sys_quota_vm_destroy(
     capability_quota_vm_t quota
 );
 
-// --- 5.3 Thread memory quotas ----------------------------------------------
+// --- Thread memory quotas --------------------------------------------------
 
 capability_quota_thread_mem_t sys_quota_thread_mem_create_root(
     size_t total_bytes
@@ -172,7 +171,7 @@ int sys_quota_thread_mem_destroy(
     capability_quota_thread_mem_t quota
 );
 
-// --- 5.4 Compartments, entry points and types ------------------------------
+// --- Compartments, entry points and types ----------------------------------
 
 // Creates a protection domain funded from `mem_quota` and seeds its capability
 // table from `initial_capabilities`. The array's bounds set both the count and
@@ -192,8 +191,7 @@ void sys_compartment_destroy(
 // point from `sys_sentry`, or one of the kernel's own system calls (every
 // other slot `syscall::gate` fills). Pushes a return frame, narrows the
 // caller's stack for the callee, enters it, and on return scrubs the stack
-// the callee used and every volatile register. See section 4.1 and
-// sentry.hpp.
+// the callee used and every volatile register. See sentry.hpp.
 //
 // The caller's `ca1..ca5` become the callee's `ca0..ca4`, and the callee's
 // return value comes back in `ca0` (checked against the outbound capability
@@ -241,7 +239,7 @@ capability_data_t sys_unseal(
     capability_sealed_t handle
 );
 
-// --- 5.5 Threads -----------------------------------------------------------
+// --- Threads ---------------------------------------------------------------
 
 capability_thread_t sys_thread_create(
     capability_quota_thread_mem_t thread_mem_quota,
@@ -274,7 +272,7 @@ uint64_t sys_thread_tid(
     capability_thread_t thread
 );
 
-// --- 5.6 Traps and interrupts ----------------------------------------------
+// --- Traps and interrupts --------------------------------------------------
 
 void sys_trap_bind(
     capability_compartment_t comp,
@@ -291,7 +289,7 @@ void sys_trap_unbind(
 
 namespace signetos::syscall {
 
-// Every syscall in section 5, in declaration order. This single list drives
+// Every syscall in declaration order. This single list drives
 // the `Id` enum, the kernel entry record table in syscall.cpp, and (by
 // position) the `RW_SLOT_SYSCALL_BASE + i` seed slots in init.hpp.
 #define SIGNETOS_SYSCALLS(X) \

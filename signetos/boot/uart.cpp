@@ -21,15 +21,15 @@
  * `init`. Output is polled; input is interrupt driven.
  *
  * Three entry points (see `UartInterface` in abi.hpp):
- *   compartment_main(str)   output: prints a NUL-terminated string. This is
- *                           the sentry published as "uart".
- *   uart_irq_entry(event)   the UART's PLIC source fired: drain the receive
- *                           FIFO into the ring buffer and, if a reader asked
- *                           to be told, tell it. `trap_mgr` invokes this from
- *                           interrupt context.
- *   uart_read_entry(req)    input: hands the reader what the ring buffer
- *                           holds, without blocking, and remembers whom to
- *                           tell when more arrives.
+ *   compartment_main(str)      output: prints a NUL-terminated string. This is
+ *                              the sentry published as "uart".
+ *   uart_irq_entry(source)     the UART's PLIC source fired: drain the receive
+ *                              FIFO into the ring buffer and, if a reader asked
+ *                              to be told, tell it. `trap_mgr` invokes this from
+ *                              interrupt context.
+ *   uart_read_entry(buf, wake) input: hands the reader what the ring buffer
+ *                              holds, without blocking, and remembers whom to
+ *                              tell when more arrives.
  *
  * `read` and `irq` are minted once, on the very first invocation of
  * `compartment_main`, if the argument is a writable `UartInterface` rather

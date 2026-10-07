@@ -114,8 +114,8 @@ void assert_user_capability(Capability cap, const char* site) {
   const uint64_t ct = sealing::type_of(cap);
   const bool sealed = sealing::is_sealed(cap);
 
-  // 1. Hardware sealing authority. Compartment-minted types (`sys_type_mint`,
-  //    spec 2.7) are `OType::TypeKey` handles, not raw `Permit_Seal`/`Unseal`.
+  // 1. Hardware sealing authority. Compartment-minted types (`sys_type_mint`)
+  //    are `OType::TypeKey` handles, not raw `Permit_Seal`/`Unseal`.
   //    If raw Zyseal authority is ever delegated it must be unsealed, carry no
   //    memory/execute/ASR permission, and cover only spare OTypes above
   //    `OType::Trap`.

@@ -112,10 +112,10 @@ Capability gate(Id id) {
 // capability can leak out as a stale return value. Always the last statement.
 #define SIGNETOS_CLEAR_RETURN() __asm__ volatile("cmv ca0, cnull" ::: "ca0")
 
-// --- 5.1 Virtual memory ----------------------------------------------------
+// --- Virtual memory --------------------------------------------------------
 
-// Marshalling only. The spec gives neither call a status channel, so the
-// detailed reason is discarded: allocate reports failure as NULL, deallocate
+// Marshalling only. Neither call has a status channel, so the detailed
+// reason is discarded: allocate reports failure as NULL, deallocate
 // reports nothing at all.
 
 extern "C" capability_t sys_vm_allocate(capability_compartment_t comp,
@@ -172,7 +172,7 @@ extern "C" uint64_t sys_revoke_query(void) {
   return ::signetos::revoke::completed_epoch();
 }
 
-// --- 5.2 Virtual memory quotas ---------------------------------------------
+// --- Virtual memory quotas -------------------------------------------------
 // Not implemented: the roots are minted at boot by main.cpp, not by a call.
 extern "C" capability_quota_vm_t sys_quota_vm_create_root(
     size_t total_system_bytes) {
@@ -192,7 +192,7 @@ extern "C" int sys_quota_vm_destroy(capability_quota_vm_t quota) {
              : -1;
 }
 
-// --- 5.3 Thread memory quotas ----------------------------------------------
+// --- Thread memory quotas --------------------------------------------------
 // Not implemented: the roots are minted at boot by main.cpp, not by a call.
 extern "C" capability_quota_thread_mem_t sys_quota_thread_mem_create_root(
     size_t total_bytes) {
@@ -214,16 +214,16 @@ extern "C" int sys_quota_thread_mem_destroy(
              : -1;
 }
 
-// --- 5.4 Compartments, entry points and types ------------------------------
+// --- Compartments, entry points and types ----------------------------------
 
-// Marshalling only. The spec gives this call no status channel, so the detailed
+// Marshalling only. This call has no status channel, so the detailed
 // reason is discarded and the caller sees NULL.
 extern "C" capability_compartment_t sys_compartment_create(
     capability_quota_vm_t mem_quota, capability_data_t initial_capabilities) {
   return ::signetos::compartment::create(mem_quota, initial_capabilities);
 }
 
-// Marshalling only. The spec gives this call no status channel either, so a
+// Marshalling only. This call has no status channel either, so a
 // refusal (a handle that is not genuine, one already destroyed, or one some
 // thread is still inside) is silent.
 extern "C" void sys_compartment_destroy(capability_compartment_t comp) {
@@ -263,7 +263,7 @@ extern "C" capability_data_t sys_unseal(capability_type_t key,
   return ::signetos::sealing::user_unseal(key, handle);
 }
 
-// --- 5.5 Threads -----------------------------------------------------------
+// --- Threads ---------------------------------------------------------------
 
 extern "C" capability_thread_t sys_thread_create(
     capability_quota_thread_mem_t thread_mem_quota, size_t stack_size,
@@ -285,7 +285,7 @@ extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {
   return ::signetos::thread::tid_of(thread);
 }
 
-// --- 5.6 Traps and interrupts ----------------------------------------------
+// --- Traps and interrupts --------------------------------------------------
 
 extern "C" void sys_trap_bind(capability_compartment_t comp,
                               capability_t auth_cap,

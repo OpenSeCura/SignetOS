@@ -938,7 +938,7 @@ bool free_pages(Capability object) {
   // Quarantine, do NOT unmap or release the virtual address range yet.
   // Capabilities to this range may still be tagged, and until the revocation
   // sweep clears them they must keep reaching the same data (the accessibility
-  // invariant, design_spec.md section 4.2). Once `revoke::sweep()` clears all
+  // invariant). Once `revoke::sweep()` clears all
   // tags pointing into quarantined memory, `reclaim_quarantined()` unmaps the
   // pages, frees their physical frames, and returns the virtual addresses to
   // the reusable pool via `release()`.

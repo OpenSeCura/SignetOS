@@ -19,9 +19,6 @@
 //
 // thread.hpp - SignetOS Thread Memory Quotas and Thread Execution State
 //
-// Implements design_spec.md section 2.4.2 (struct quota_thread_mem) and
-// section 5.3 / 5.5 (sys_quota_thread_mem_* and sys_thread_*).
-//
 // TWO SEALED KERNEL OBJECTS
 // -------------------------
 // 1. `QuotaThreadMem` (OType::QuotaThreadMem, CT = 3):
@@ -91,8 +88,8 @@ constexpr size_t MAX_INSIDE = 20;
 using Status = signetos::Status;
 using signetos::status_name;
 
-// design_spec.md section 2.4.2: the thread-memory quota is a `quota::Tree`
-// (OType::QuotaThreadMem) with the same node layout as the VM quota.
+// The thread-memory quota is a `quota::Tree` (OType::QuotaThreadMem) with the
+// same node layout as the VM quota.
 using QuotaThreadMem = quota::QuotaNode;
 
 // Saved register frame pushed onto a thread's kernel stack (`kernel_sp`) across
@@ -169,7 +166,7 @@ size_t online_harts();
 // The number of the hart this is running on (the one `init_hart` was given).
 uint64_t this_hart();
 
-// --- Thread memory quota operations (design_spec.md section 5.3) -----------
+// --- Thread memory quota operations ----------------------------------------
 
 // Boot-only root thread memory quota. Its whole budget is charged to `vm_quota`
 // up front, so thread memory and VM allocations together can never promise
@@ -184,7 +181,7 @@ Status destroy_quota(Capability quota_handle);
 
 bool query_quota(Capability quota_handle, QuotaThreadMem* out_copy);
 
-// --- Thread lifecycle operations (design_spec.md section 5.5) --------------
+// --- Thread lifecycle operations -------------------------------------------
 
 Capability create(Capability thread_mem_quota, size_t stack_size,
                   Capability entry_sentry, Capability initial_arg,

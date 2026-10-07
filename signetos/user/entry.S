@@ -18,7 +18,7 @@
  * entry.S - SignetOS User Compartment Entry Header & Trampoline
  *
  * Linked at offset 0 of every standalone user compartment image
- * (`src/user/compartment.ld`).
+ * (`user/compartment.ld`).
  *
  * Layout (80 bytes, 16-byte aligned, matching `CompartmentImageHeader` in
  * `signetos/init.hpp`):

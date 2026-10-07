@@ -17,34 +17,32 @@
 /*
  * sched.cpp - SignetOS User-Space CPU Bandwidth Scheduler Compartment
  *
- * design_spec.md sections 2.4.4 (`struct quota_sched`), 2.6 (the scheduler
- * compartment) and 5.7.2 (`sched_*` operations). The kernel holds no
- * scheduling state: it provides `sys_thread_switch`, a periodic tick on
- * `IRQ_S_TIMER`, and re-dispatches this compartment's dispatcher thread
- * whenever a thread exits (SPEC_CHANGE_NOTES.md H1/H3).
+ * The kernel holds no scheduling state: it provides `sys_thread_switch`, a
+ * periodic tick on `IRQ_S_TIMER`, and re-dispatches this compartment's
+ * dispatcher thread whenever a thread exits.
  *
  * OBJECTS
  *   quota_sched   One page per node, paid for by the caller's `node_funding`
- *                 VM quota (spec 2.4 item 4). Handles are software-sealed
- *                 (spec 2.7) with the scheduler's TypeKey. `sys_seal` only
- *                 accepts fully writable objects, so the delegation bits
- *                 cannot live in hardware permissions: a page carries two
- *                 headers instead, one at offset 0 for the administrative
- *                 (Load|Store: derive/destroy/register) handle and one at
- *                 offset 16 for the operational (Load: register only) handle.
- *                 Which header a handle was sealed over is its permission.
+ *                 VM quota. Handles are software-sealed with the scheduler's
+ *                 TypeKey. `sys_seal` only accepts fully writable objects, so
+ *                 the delegation bits cannot live in hardware permissions: a
+ *                 page carries two headers instead, one at offset 0 for the
+ *                 administrative (Load|Store: derive/destroy/register) handle
+ *                 and one at offset 16 for the operational (Load: register
+ *                 only) handle. Which header a handle was sealed over is its
+ *                 permission.
  *   ThreadRec     Registered thread: its `OType::Thread` handle (the right
  *                 to `sys_thread_switch` to it), its node and accounting.
  *
  * ENTRY POINTS (each a separate `OType::EntryPoint`, published by name)
  *   sched.quota_derive     SchedDeriveRequest     Store on parent
- *   sched.quota_destroy    SchedDestroyRequest    Store on quota
- *   sched.thread_register  SchedRegisterRequest   Load on quota
- *   sched.yield            (no request)           give up the rest of the slice
- *   sched.block            SchedBlockRequest/none sleep until woken (or timeout)
- *   sched.wake             SchedWakeRequest       wake a blocked thread by tid
- *   sched.self             SchedSelfRequest       the caller's tid
- *   sched.policy_register  SchedPolicyRequest     Store on root
+ *   sched.quota_destroy    (quota)                Store on quota
+ *   sched.thread_register  (thread, quota)        Load on quota
+ *   sched.yield            ()                     give up the rest of the slice
+ *   sched.block            (timeout_us)           sleep until woken (or timeout)
+ *   sched.wake             (tid)                  wake a blocked thread by tid
+ *   sched.self             ()                     the caller's tid
+ *   sched.policy_register  (root, delegate)       Store on root
  *   sched.run              (kernel-created dispatcher thread; not published)
  *   (tick)                 bound to IRQ_S_TIMER; not published
  *
@@ -57,16 +55,15 @@
  *   dispatcher exits when nothing is registered, which ends the system.
  *
  * PREEMPTION
- *   The scheduler binds `IRQ_S_TIMER` (the kernel's fixed 10 ms tick,
- *   SPEC_CHANGE_NOTES.md H1) to `sched_tick_entry`. The handler runs on the
- *   interrupted thread's stack with interrupts masked (H2/H4): it charges the
- *   slice, picks, and if someone else should run it calls `sys_thread_switch`
- *   from inside the handler. The preempted thread stays parked in its handler
- *   until it is switched back to, when the handler returns and `sret`
- *   resumes it. The handler stands down while an entry point is mid-update
- *   (`s_busy`), while a foreign policy delegate runs, and when the
- *   interrupted context is the dispatcher itself; those cases catch up at
- *   the next tick or on their own.
+ *   The scheduler binds `IRQ_S_TIMER` (the kernel's fixed 10 ms tick) to
+ *   `sched_tick_entry`. The handler runs on the interrupted thread's stack
+ *   with interrupts masked: it charges the slice, picks, and if someone else
+ *   should run it calls `sys_thread_switch` from inside the handler. The
+ *   preempted thread stays parked in its handler until it is switched back to,
+ *   when the handler returns and `sret` resumes it. The handler stands down
+ *   while an entry point is mid-update (`s_busy`), while a foreign policy
+ *   delegate runs, and when the interrupted context is the dispatcher itself;
+ *   those cases catch up at the next tick or on their own.
  *
  * BLOCKING
  *   `block` marks the caller BLOCKED and picks someone else; a BLOCKED thread
@@ -172,8 +169,8 @@ struct ThreadRec {
   bool timed_out;         // the last `block` ended by `expire`
 };
 
-// One node per page (spec 2.4.4 `struct quota_sched`). The two sealing
-// headers come first (see the file comment); everything else is private.
+// One node per page. The two sealing headers come first (see the file
+// comment); everything else is private.
 struct alignas(16) QuotaSched {
   Capability admin_header;  // sys_seal writes the TypeKey here (ADMIN handle)
   Capability op_header;     // ... or here (OP handle)
@@ -216,8 +213,7 @@ struct Policy {
   bool used;
 };
 
-// Scheduler state: funded from the compartment's own image (`.bss`), as spec
-// 2.4 item 1 requires for a manager's internal tables.
+// Scheduler state: funded from the compartment's own image (`.bss`).
 alignas(16) Capability s_type_record = nullptr;
 Capability s_self_comp = nullptr;
 Capability s_key = nullptr;
@@ -754,7 +750,7 @@ extern "C" int64_t sched_quota_derive_entry(Capability arg) {
     req->status = init::SCHED_UNKNOWN_POLICY;
     return req->status;
   }
-  // Temporal conservation (spec 2.4): C_c / T_c <= (C_p - D_p) / T_p.
+  // Temporal conservation: C_c / T_c <= (C_p - D_p) / T_p.
   const uint64_t lhs = static_cast<uint64_t>(req->budget_us) * parent->period_us;
   const uint64_t rhs =
       static_cast<uint64_t>(own_budget(parent)) * req->period_us;
@@ -1094,7 +1090,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->root_quota = nullptr;
   iface->run = nullptr;
 
-  // 1. Private sealing type for quota handles (spec 2.6 item 1, via 2.7).
+  // 1. Private sealing type for quota handles.
   using FnTypeMint = decltype(&sys_type_mint);
   s_key =
       syscall::call<FnTypeMint>(s_gate_invoke, gate_type_mint,

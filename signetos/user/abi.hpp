@@ -91,7 +91,7 @@ struct alignas(16) UartInterface {
 };
 
 // ----------------------------------------------------------------------------
-// Interrupt routing (`external/services/trap_mgr.cpp`; spec 3.6)
+// Interrupt routing (`external/services/trap_mgr.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  trap_mgr.irq_route(Capability handler, uint64_t source) -> IRQ_*
 //   uint64_t routed_handler(uint64_t source)
@@ -109,7 +109,7 @@ struct alignas(16) TrapMgrInterface {
 };
 
 // ----------------------------------------------------------------------------
-// Scheduler service (`external/services/sched.cpp`; spec 2.4.4, 2.6, 5.7.2)
+// Scheduler service (`external/services/sched.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  sched.quota_derive(SchedDeriveRequest* req) -> SCHED_*
 //   int64_t  sched.quota_destroy(Capability quota) -> SCHED_*
@@ -228,7 +228,7 @@ struct alignas(16) BlkInterface {
 };
 
 // ----------------------------------------------------------------------------
-// File system (`boot/fs.cpp`; spec 2.4.5, 3.8)
+// File system (`boot/fs.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t    fs.quota_derive(FsDeriveRequest* req) -> FS_*
 //   int64_t    fs.quota_destroy(Capability quota) -> FS_*

@@ -21,7 +21,7 @@
  *
  * Constants only (no assembler macros: `switch.S` and `early_trap.S` write
  * every register sequence out in place). Included by `kernel/switch.S`,
- * `kernel/early_trap.S`, `tests/switch_probe.S`, and by `sentry.cpp`, which
+ * `kernel/early_trap.S`, and by `sentry.cpp`, which
  * static_asserts the offsets against the C++ structs they describe.
  *
  * PER-HART KERNEL STACK POINTER (`sscratchc`)

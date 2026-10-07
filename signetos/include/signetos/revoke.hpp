@@ -19,10 +19,6 @@
 //
 // revoke.hpp - SignetOS Revocation Authority Subsystem
 //
-// Implements design_spec.md section 2.1 (capability_revoker_t), section 4.2
-// (Direct Global Sharing / Quarantine and Revocation), and section 5.1
-// (sys_revoke_create, sys_revoke_derive, sys_revoke_register, sys_revoke_query).
-//
 // ZERO-BYTE HARDWARE REVOCATION AUTHORITIES
 // -----------------------------------------
 // A `capability_revoker_t` is a capability bounded to its authorised virtual
@@ -124,10 +120,9 @@ uint64_t completed_epoch();
 // The epoch that ranges registered right now would be assigned to.
 uint64_t pending_epoch();
 
-// Kernel-internal. NOT reachable from user space: design_spec.md section 4.2
-// requires that sweeping cannot be triggered or forced by user-space calls.
-// The kernel calls this from its own scheduling policy (memory pressure,
-// backlog thresholds, idle CPU time).
+// Kernel-internal. NOT reachable from user space: sweeping cannot be triggered
+// or forced by user-space calls. The kernel calls this from its own scheduling
+// policy (memory pressure, backlog thresholds, idle CPU time).
 //
 // Scans capability-bearing memory and saved register frames, clears the
 // hardware tag on every capability reaching a registered or quarantined range,

@@ -17,16 +17,16 @@
 /*
  * naming.cpp - SignetOS User-Space Naming & Service Registry Compartment
  *
- * design_spec.md section 3.1.3: a registry where compartments publish and
- * query service sentries.
+ * A registry where compartments publish and query service sentries.
  *
  * Two operations, each its own `OType::EntryPoint` so a client only ever
- * holds the ones it was given (`abi.hpp`, `NamingRequest`):
+ * holds the ones it was given (`abi.hpp`):
  *
- *   publish(req)  records `req->name -> req->sentry`; refuses anything that
- *                 is not an `OType::EntryPoint`, duplicates, and a full table.
- *   lookup(req)   fills `req->sentry` with the published entry point, or
- *                 `nullptr` with `NAMING_NOT_FOUND`.
+ *   publish(name, sentry)  records `name -> sentry`; refuses anything that
+ *                          is not an `OType::EntryPoint`, duplicates, and a
+ *                          full table.
+ *   lookup(name)           returns the published entry point, or a negative
+ *                          `NAMING_*` status encoded in `ca0`.
  *
  * On its first invocation (`arg` = init-owned `NamingInterface`) the
  * compartment mints both entry points over its own code and hands them back;

@@ -20,7 +20,7 @@
 // manifest.hpp - What a compartment image asks its launcher for
 //
 // A compartment holds exactly what whoever created it put in its capability
-// table, and nothing else (H20: there is no directory a program can ask). So
+// table, and nothing else (there is no directory a program can ask). So
 // the image has to say what it wants, in a form the launcher can read before
 // anything is created: the manifest, a table in the image's `.rodata` that
 // `CompartmentImageHeader::manifest_start/end` point at.

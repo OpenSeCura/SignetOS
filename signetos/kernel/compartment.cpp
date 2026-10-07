@@ -695,8 +695,7 @@ Status destroy(Capability handle) {
     }
     c->ranges = nullptr;
 
-    // Purge any hardware trap/interrupt bindings registered to this compartment
-    // (design_spec.md section 5.4).
+    // Purge any hardware trap/interrupt bindings registered to this compartment.
     trap::purge_compartment(c->uid);
 
     // Release the entry chain. Every record is cleared first so a sentry that
@@ -726,7 +725,7 @@ Status destroy(Capability handle) {
   __atomic_fetch_sub(&s_live_count, 1, __ATOMIC_RELAXED);
 
   // Last, because everything above reads through it. The UID is deliberately
-  // not reclaimed (design_spec.md section 5.4).
+  // not reclaimed.
   vm::free_pages(comp_page);
   quota::refund(funding, cost);
   return Status::Ok;

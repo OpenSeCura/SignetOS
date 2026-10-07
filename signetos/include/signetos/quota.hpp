@@ -19,9 +19,6 @@
 //
 // quota.hpp - SignetOS Hierarchical Quota Trees
 //
-// design_spec.md section 2.4 (`struct quota_vm`, `struct quota_thread_mem`),
-// section 5.2 (sys_quota_vm_*) and section 5.3 (sys_quota_thread_mem_*).
-//
 // One implementation serves every quota kind. A `Tree` is a static root node
 // plus page-backed descendants, all sealed with the tree's own `OType`, so a
 // handle from one tree can never authenticate against another. The VM tree
@@ -79,7 +76,7 @@ constexpr uint32_t FLAG_LIVE = (1u << 1);
 using Status = signetos::Status;
 using signetos::status_name;
 
-// design_spec.md section 2.4.1 / 2.4.2. `self_page` must stay at offset 0.
+// `self_page` must stay at offset 0.
 struct QuotaNode {
     Capability self_page;     // writable kernel capability to this node's page
     Capability parent;        // sealed handle to parent (nullptr for root)

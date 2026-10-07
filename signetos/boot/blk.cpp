@@ -26,12 +26,14 @@
  *
  * Three entry points (see `BlkInterface` in abi.hpp), minted once on the
  * first invocation of `compartment_main`, exactly like `uart`:
- *   blk_read_entry(req)    copies `count` sectors from the device into
- *                          `req->buf`.
- *   blk_write_entry(req)   the other way round.
- *   blk_irq_entry(event)   the device's PLIC source fired: acknowledge it and
- *                          wake whichever thread is waiting for its request.
- *                          `trap_mgr` invokes this from interrupt context.
+ *   blk_read_entry(buf, sector, count)   copies `count` sectors from the
+ *                                        device into `buf`.
+ *   blk_write_entry(buf, sector, count)  the other way round.
+ *   blk_irq_entry(source)                the device's PLIC source fired:
+ *                                        acknowledge it and wake whichever
+ *                                        thread is waiting for its request.
+ *                                        `trap_mgr` invokes this from
+ *                                        interrupt context.
  *
  * WHY A BOUNCE BUFFER
  *   The device only ever sees physical addresses inside the arena: the
@@ -52,8 +54,7 @@
  *
  *   A wake can also fail to arrive: `sched.wake` is a compartment call made
  *   from interrupt context on the interrupted thread's kernel stack, and the
- *   switcher refuses it when that stack has no room (SPEC_CHANGE_NOTES.md
- *   H23 has the case that hung the system). So the waiter never sleeps
+ *   switcher refuses it when that stack has no room. So the waiter never sleeps
  *   without a bound: it blocks for at most WAIT_TIMEOUT_US at a time and
  *   looks at the used ring again, and a lost wake costs that much and no
  *   more. The interrupt entry checks what `wake` said and counts the
@@ -68,8 +69,8 @@
  *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
  *   serves, so at its handshake there is nothing to look up and no interrupt
  *   route. Every request polls until `init` has loaded the scheduler and
- *   hands over its entries in a second call (`BlkSchedRequest`), and until
- *   `trap_mgr` is up and the device's interrupt is routed here.
+ *   hands over its entries (`block`, `wake`, `self`) in a second call, and
+ *   until `trap_mgr` is up and the device's interrupt is routed here.
  */
 
 #include "runtime.hpp"
@@ -290,7 +291,7 @@ bool probe(Capability window, uint64_t slot_bytes, uint32_t count) {
   return false;
 }
 
-// virtio 1.x initialisation (spec 3.1.1) with VIRTIO_F_VERSION_1 as the only
+// virtio 1.x initialisation with VIRTIO_F_VERSION_1 as the only
 // feature, then one split queue in the arena. Returns false if the device
 // refuses at any step; the device is then left FAILED.
 bool init_device() {

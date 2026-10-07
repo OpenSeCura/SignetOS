@@ -19,7 +19,7 @@
 //
 // runtime.hpp - Shared User-Space Compartment Runtime Helpers
 //
-// Included by standalone user-space compartments in `src/user/*.cpp`.
+// Included by standalone user-space compartments in `boot/` and `external/`.
 // Provides zero-overhead inline accessors for the compartment's capability
 // table (`cgp`), console output via the `uart` compartment sentry, and image
 // loading with `__cap_relocs` relocation.

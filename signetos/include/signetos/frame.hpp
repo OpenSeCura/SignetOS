@@ -28,8 +28,8 @@
 // WHEN A FRAME MAY BE FREED
 //
 // Quarantine is a property of VIRTUAL addresses, not of frames. Capabilities
-// name virtual addresses, and the accessibility invariant (design_spec.md
-// section 4.2) says a capability that is still tagged must keep reaching its
+// name virtual addresses, and the accessibility invariant says a capability
+// that is still tagged must keep reaching its
 // data. So when memory is freed its virtual range is quarantined but stays
 // mapped, and the frames under it stay allocated, until a revocation sweep has
 // cleared every tag that could reach the range. See "FREEING AND QUARANTINE"

@@ -17,11 +17,8 @@
 /*
  * init.cpp - SignetOS Initial User-Space Compartment (`init`)
  *
- * Implements design_spec.md section 3.1 (System Boot and Core Services
- * Bootstrap).
- *
  * Compiled as a standalone user compartment (`boot/init.bin`) and loaded by
- * `signetos::init::launch()` in `src/kernel/init.cpp`.
+ * `signetos::init::launch()` in `kernel/init.cpp`.
  *
  * `init` is the launcher of the system's services, the way the shell's `run`
  * is the launcher of programs (shell.cpp, "Programs"): every service image
@@ -742,9 +739,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   L.fs_derive = fs_if.quota_derive;
   L.fs_query = fs_if.quota_query;
   L.offer("fs", fs.sentry);
-  // Disk-quota nodes are paid for by their creator (spec 2.4 item 4), like
-  // the scheduler's: this quota funds the nodes `init` derives for DISK
-  // entries.
+  // Disk-quota nodes are paid for by their creator, like the scheduler's:
+  // this quota funds the nodes `init` derives for DISK entries.
   L.fs_node_funding = L.vm_quota(64 * 1024);
 
   // From here on every service is a file on the disk.
@@ -823,8 +819,8 @@ extern "C" int64_t compartment_main(Capability arg) {
     say("[init]     WARNING: sched.* entry points not found in naming\n");
   }
 
-  // Scheduler nodes are paid for by their creator (spec 2.4 item 4): this
-  // quota funds the node `init` derives for the shell below.
+  // Scheduler nodes are paid for by their creator: this quota funds the node
+  // `init` derives for the shell below.
   const Capability sched_node_funding = L.vm_quota(64 * 1024);
 
   // Now that there is a scheduler, `blk` can sleep in it instead of polling.
@@ -850,7 +846,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 7. `trap_mgr`
   // =========================================================================
   // Its manifest is the only one that asks for the PLIC or `IRQ_S_EXT`: it
-  // decides which handler each device interrupt reaches (spec 3.6).
+  // decides which handler each device interrupt reaches.
   const Started trap_mgr = L.start_file("trap_mgr.bin");
   // Like `uart`, `trap_mgr` hands its routing entry to whoever brings it up
   // and to nobody else: `irq_route` is not published by name.
@@ -912,9 +908,9 @@ extern "C" int64_t compartment_main(Capability arg) {
     comp_invoke(shell.sentry, hz_cap);
   }
 
-  // The shell's CPU bandwidth (spec 3.3): half the machine (50 ms per 100 ms
-  // period), interactive class, administrative handle so it can sub-divide
-  // it for its own threads.
+  // The shell's CPU bandwidth: half the machine (50 ms per 100 ms period),
+  // interactive class, administrative handle so it can sub-divide it for its
+  // own threads.
   Capability shell_sched_quota = nullptr;
   if (capability_is_valid(sched_quota_derive) &&
       capability_is_valid(L.root_sched)) {
@@ -1007,8 +1003,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   //     here may still be able to act. Every kernel gate, every IRQ and
   //     exception authority and both root quotas are cleared from the table,
   //     and the launcher's copies of everything it granted with them. What
-  //     stays is inert without a gate: the handles recorded in step 9
-  //     (`tests/exec_tests.cpp` tears the system down through them) and
+  //     stays is inert without a gate: the handles recorded in step 9 and
   //     `RW_SLOT_SCHED_RUN`, which the kernel reads next. The locals this
   //     thread still holds die with its stack.
   // =========================================================================

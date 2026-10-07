@@ -17,9 +17,9 @@
 /*
  * shell.cpp - SignetOS Initial User Shell Compartment
  *
- * design_spec.md section 3.1.4 (Shell: receives application-level VM and
- * thread-memory sub-quotas plus service sentries from `init`) and 3.3 (the
- * shell's thread starts with its `quota_sched` handle as the argument).
+ * Receives application-level VM and thread-memory sub-quotas plus service
+ * sentries from `init`; the shell's thread starts with its `quota_sched`
+ * handle as the argument.
  *
  * Two ways in:
  *   compartment_main(nullptr)  `init` probing the image: print a banner and
@@ -497,8 +497,8 @@ void banner(Capability gate_invoke, Capability uart_sentry,
 // --- Workers -----------------------------------------------------------------
 
 // One node per worker, carved out of the shell's own bandwidth; the pages are
-// paid for from the shell's VM quota (spec 2.4 item 4). Stops at the first
-// failure and returns how many workers are running.
+// paid for from the shell's VM quota. Stops at the first failure and returns
+// how many workers are running.
 size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
   using FnThreadCreate = decltype(&sys_thread_create);
 
@@ -896,8 +896,8 @@ constexpr uint32_t APP_DISK_MAX_INODES = 32;
 //   its own whose entry is the program's own entry point, so the thread
 //   starts inside the program -- its first compartment, depth 0 -- and
 //   everything the program calls nests from there (program -> fs -> blk ->
-//   sched.block is three calls, where on the shell's thread it was four;
-//   SPEC_CHANGE_NOTES.md H23). When the entry returns the thread ends, and
+//   sched.block is three calls, where on the shell's thread it was four).
+//   When the entry returns the thread ends, and
 //   so does a fault in the program: it ends the program's thread, never the
 //   shell's. The thread is paid from the shell's thread memory and scheduled
 //   under a `quota_sched` node of its own, APP_BUDGET_US per APP_PERIOD_US

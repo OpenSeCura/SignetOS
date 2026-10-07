@@ -17,11 +17,10 @@
 /*
  * trap_mgr.cpp - SignetOS User-Space Hardware Trap & Interrupt Manager
  *
- * design_spec.md sections 3.1.3 and 3.6: the service that routes hardware
- * exceptions and interrupts. The kernel delivers a vector to whoever holds
- * that vector's `OType::Trap` authority and bound it (trap.hpp); this is the
- * compartment where delivery of the *external* interrupt turns into "which
- * device, and who wants to know".
+ * The service that routes hardware exceptions and interrupts. The kernel
+ * delivers a vector to whoever holds that vector's `OType::Trap` authority
+ * and bound it (trap.hpp); this is the compartment where delivery of the
+ * *external* interrupt turns into "which device, and who wants to know".
  *
  * THE PLIC
  *   Every device interrupt on the board is a PLIC source, and the PLIC
@@ -43,11 +42,11 @@
  *   taking the interrupt.
  *
  * ROUTING
- *   `trap_mgr.irq_route(source, handler)` appends `handler`, an
+ *   `trap_mgr.irq_route(handler, source)` appends `handler`, an
  *   `OType::EntryPoint`, to the source's handler list and enables the source
  *   at the PLIC the first time. The code 9 handler claims sources until the
- *   PLIC has none pending and, for each, invokes its handlers in order with a
- *   Load-only `IrqEvent`, then completes the claim -- which is what lets a
+ *   PLIC has none pending and, for each, invokes its handlers in order with
+ *   `source` in `a0`, then completes the claim -- which is what lets a
  *   level-triggered source fire again. A claimed source nobody routed is
  *   disabled on the spot rather than left to storm.
  *

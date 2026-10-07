@@ -19,7 +19,7 @@
 //
 // pool.hpp - SignetOS Statically Provisioned Sealed Object Pool
 //
-// Implements the "Manager-Local Memory Pool" pattern from design_spec.md section 2.4
+// Implements the "Manager-Local Memory Pool" pattern
 // with ZERO dynamic kernel heap: every object lives in a fixed-size array in .bss.
 //
 // Each pool owns one hardware object type. Handles are sealed with `yseal` under

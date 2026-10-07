@@ -34,7 +34,7 @@
 // Everything else about the board -- the PLIC, its per-hart contexts, the
 // UART's interrupt, virtio transports -- is policy about devices the kernel
 // never touches. `init` reads those out of the DTB copy it is given
-// (`user/init.cpp`) and hands the right windows to the right drivers.
+// (`boot/init.cpp`) and hands the right windows to the right drivers.
 //
 // Fallback values match QEMU's default `virt` board if no valid DTB is given.
 //
@@ -58,8 +58,8 @@ constexpr size_t MAX_VIRTIO_SLOTS = 8;
 constexpr uint32_t PLIC_NO_CONTEXT = ~0u;
 
 // Standard RISC-V / SiFive PLIC architectural register offsets within the
-// PLIC MMIO window (fixed by the PLIC specification, not board-specific).
-// Used by `user/trap_mgr.cpp`; the kernel never touches the PLIC.
+// PLIC MMIO window (not board-specific).
+// Used by `external/services/trap_mgr.cpp`; the kernel never touches the PLIC.
 constexpr uint64_t PLIC_PRIORITY       = 0x000000ULL;  // + 4 * source
 constexpr uint64_t PLIC_PENDING        = 0x001000ULL;  // + 4 * (source / 32)
 constexpr uint64_t PLIC_ENABLE_STRIDE  = 0x80ULL;      // per context

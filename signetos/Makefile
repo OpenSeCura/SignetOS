@@ -24,7 +24,7 @@
 # is no software fallback.
 #
 # Zylevels1=on enables CHERI capability levels (the GL flag plus the LG/SL
-# permissions, ISA spec section 14). QEMU's `rv64` model has it off by default
+# permissions). QEMU's `rv64` model has it off by default
 # and only then advertises `zcherilevels` in the device tree. The kernel keeps
 # the three bits on every derivation (`perms::Levels`, `KERNEL_LEVEL_PERMS`) so
 # it boots either way; nothing relabels capabilities as local yet. MARCH stays

@@ -43,15 +43,15 @@ enum class OType : uint64_t {
     Compartment      = 7,
     Thread           = 8,
     Revoker          = 9,
-    TypeKey          = 10,  // design_spec.md 2.7
-    SealedObject     = 11,  // design_spec.md 2.7
+    TypeKey          = 10,
+    SealedObject     = 11,
 
     // The handle to a capability_sentry_t pool object. Distinct from Sentry:
     // Sentry (CT = 1) is the hardware-jumpable code capability kept inside the
     // slot, and yseal cannot produce it. EntryPoint is the opaque data handle
     // the caller holds, which is neither jumpable nor dereferenceable.
     EntryPoint       = 12,
-    Trap             = 13,  // design_spec.md 3.6 & 5.6
+    Trap             = 13,
 };
 
 // The range yseal and yunseal will act on. Outside it they clear the tag.
@@ -65,8 +65,8 @@ constexpr bool otype_is_sealable(OType t) {
 
 
 // Result of a kernel-internal operation. One enum serves every subsystem; each
-// uses the subset it needs. The syscall ABI itself has no status channel
-// (design_spec.md section 5), so these never cross into user space.
+// uses the subset it needs. The syscall ABI itself has no status channel,
+// so these never cross into user space (except switcher refusal codes).
 enum class Status : uint32_t {
     Ok = 0,
     NotInitialized,
@@ -183,7 +183,7 @@ namespace perms {
     constexpr uint64_t CodeRx = Load | Execute | LoadCapability | LoadMutable;
     constexpr uint64_t ReadOnly = Load | LoadCapability;
 
-    // Zylevels1 -- CHERI capability levels (ISA spec section 14). Three more
+    // Zylevels1 -- CHERI capability levels. Three more
     // bits in the same acperm/gcperm word as the permissions above:
     //   Global      The GL flag: 1 = global, 0 = local. An information-flow
     //               label rather than an access right; unlike real permissions

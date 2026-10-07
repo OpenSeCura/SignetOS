@@ -72,8 +72,8 @@ size_t s_online_harts = 0;
 // (CSR 0x480) as an untagged integer. `utidc` is readable without ASR, so a
 // compartment can learn its hart number too (`trap_mgr` does); nothing with
 // authority goes in it. Writing it takes ASR, which compartment code (CodeRx)
-// does not have, so no compartment can change the number this lookup uses
-// (SPEC_CHANGE_NOTES H15). (`stdc`, 0x163, would carry a capability and is
+// does not have, so no compartment can change the number this lookup uses.
+// (`stdc`, 0x163, would carry a capability and is
 // S-mode only, but this QEMU traps on it.)
 struct alignas(16) Cpu {
   ThreadState* current;       // thread this hart is running; null in host context

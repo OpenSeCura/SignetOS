@@ -19,9 +19,6 @@
 //
 // sentry.hpp - SignetOS Compartment Entry Points
 //
-// Implements design_spec.md section 2.5 (capability_sentry_t) and section 5.4
-// (sys_sentry / sys_compartment_invoke).
-//
 // WHY TWO HARDWARE TYPES ARE USED (CT = 12 vs CT = 1)
 // ---------------------------------------------------
 // CHERI RISC-V with Zyseal provides two distinct sealing mechanisms:

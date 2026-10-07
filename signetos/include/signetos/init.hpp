@@ -19,15 +19,12 @@
 //
 // init.hpp - SignetOS Initial User-Space Compartment (`init`) Bootstrap
 //
-// Implements design_spec.md section 3.1 (System Boot and Core Services
-// Bootstrap) and section 3.2 (Creating and Loading a New Compartment).
-//
 // PACKAGING & BOOTSTRAP OVERVIEW
 // ------------------------------
-// Each user-space compartment (`src/user/<name>.cpp`) is compiled and linked as
-// a standalone binary (`src/user/<name>.bin`) with `src/user/compartment.ld`
-// and `src/user/entry.S`, then embedded into `.rodata.boot_images` via
-// `src/kernel/boot_images.S`.
+// Each boot user-space compartment (`boot/<name>.cpp`) is compiled and linked as
+// a standalone binary (`boot/<name>.bin`) with `user/compartment.ld`
+// and `user/entry.S`, then embedded into `.rodata.boot_images` via
+// `kernel/boot_images.S`.
 //
 // At boot, `init::launch(system_quota, thread_quota)`:
 //   1. Creates the `init` compartment funded by `system_quota` and populates
@@ -38,7 +35,7 @@
 //          so its slot holds null.
 //        - All 32 hardware exception authorities (`trap::exception_authority`)
 //        - `root_quota_thread_mem`
-//   2. Loads `user/init.bin` into `init`'s own memory, processes its
+//   2. Loads `boot/init.bin` into `init`'s own memory, processes its
 //      `__cap_relocs`, and mints `init`'s entry-point sentry.
 //   3. Passes a read-only capability to a `BootManifest` struct as `init`'s
 //      `initial_arg` (`ca0`), containing the UART MMIO capability and read-only
@@ -47,7 +44,7 @@
 //      provisions quotas and capability tables for each core compartment.
 //
 // The capability-table layouts of the user-space services that `init`
-// provisions are user-space ABI and live in `src/user/abi.hpp`; the kernel
+// provisions are user-space ABI and live in `user/abi.hpp`; the kernel
 // does not depend on them.
 //
 
@@ -64,7 +61,7 @@ namespace signetos::init {
 // Default stack size for the initial `init` thread (16 KiB = 4 pages).
 constexpr size_t INIT_STACK_SIZE = 16 * 1024;
 
-// Header at offset 0 of every standalone compartment binary (`src/user/entry.S`).
+// Header at offset 0 of every standalone compartment binary (`user/entry.S`).
 constexpr uint64_t COMPARTMENT_IMAGE_MAGIC = 0x5349474e434f4d50ULL;  // "SIGNCOMP"
 
 struct CompartmentImageHeader {
@@ -189,7 +186,7 @@ inline void image_install(Capability code_mem, Capability img_cap,
 // The kernel does no device policy: which devices exist, where their
 // registers are, which PLIC source and context they use, how large a DMA
 // arena to carve - `init` works all of that out from `dtb` (fdt.hpp) and
-// narrows `mmio` down to one window per driver (`src/user/init.cpp`).
+// narrows `mmio` down to one window per driver (`boot/init.cpp`).
 //
 // Only the boot set is packaged: what `init` needs to reach the disk. Every
 // other service (`naming`, `sched`, `trap_mgr`, `shell`) is a file on the
@@ -198,10 +195,10 @@ struct alignas(16) BootManifest {
   Capability dtb;           // read-only copy of the flattened device tree
   Capability mmio;          // read/write window over [0, GIGAPAGE_SIZE): the
                             // whole device range the kernel maps
-  Capability uart_img;      // `drivers/uart.bin`
-  Capability blk_img;       // `drivers/blk.bin`
-  Capability loader_img;    // `user/loader.bin`
-  Capability fs_img;        // `user/fs.bin`
+  Capability uart_img;      // `boot/uart.bin`
+  Capability blk_img;       // `boot/blk.bin`
+  Capability loader_img;    // `boot/loader.bin`
+  Capability fs_img;        // `boot/fs.bin`
 };
 
 // `init` compartment capability table layout: the seeds the kernel installs,
@@ -221,8 +218,8 @@ constexpr size_t INIT_SEED_COUNT =
 // After the `init` thread exits, `launch()` reads this slot back; if it holds
 // an `OType::EntryPoint`, the kernel creates a thread on it from
 // `thread_quota` and re-dispatches that thread every time the running thread
-// exits. That thread is the user-level scheduler's run loop
-// (design_spec.md section 2.6); the kernel never picks threads itself.
+// exits. That thread is the user-level scheduler's run loop; the kernel never
+// picks threads itself.
 constexpr size_t RW_SLOT_SCHED_RUN = RW_SLOT_THREAD_QUOTA + 1;
 constexpr size_t SCHED_RUN_STACK_SIZE = 16 * 1024;
 

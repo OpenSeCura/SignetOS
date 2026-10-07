@@ -17,9 +17,6 @@
 /*
  * loader.cpp - SignetOS User-Space Compartment Loader Service
  *
- * Implements design_spec.md section 3.2 (Creating and Loading a New
- * Compartment).
- *
  * When invoked with `arg == nullptr`, runs its bootstrap self-check and logs
  * readiness via `uart_sentry`.
  * When invoked with a `LoadRequest*` in `arg`, creates a new compartment

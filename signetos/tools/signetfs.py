@@ -15,7 +15,7 @@
 
 """signetfs.py - host-side tool for SignetOS disk images.
 
-The on-disk format is the one `src/boot/fs.cpp` reads and writes, mirrored
+The on-disk format is the one `boot/fs.cpp` reads and writes, mirrored
 here field for field:
 
   block 0      superblock (magic "SIGNETFS", version 3, geometry)

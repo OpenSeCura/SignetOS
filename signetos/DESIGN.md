@@ -4,7 +4,7 @@ SignetOS is a single-address-space, single-privilege-level capability microkerne
 for CHERI RISC-V. Isolation is enforced by CHERI capabilities only; the MMU is
 used for backing memory, never for protection.
 
-> **This is not a final specification.** It is a snapshot of the current
+> **This is a living design document.** It is a snapshot of the current
 > state of the work: the design as we understand it today, alongside what the
 > implementation actually does. Both are expected to change, sometimes
 > substantially, as the research progresses.

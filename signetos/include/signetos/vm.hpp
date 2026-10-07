@@ -61,9 +61,8 @@
 // FREEING AND QUARANTINE
 //
 // A capability that is still tagged must always reach valid memory
-// (design_spec.md section 4.2, the accessibility invariant). Revocation works
-// by clearing tags in a sweep, never by pulling the mapping out from under a
-// capability that is still valid.
+// (the accessibility invariant). Revocation works by clearing tags in a sweep,
+// never by pulling the mapping out from under a capability that is still valid.
 //
 // So free_pages does not unmap anything. It QUARANTINES the range: the pages
 // stay mapped onto the same frames, still holding their data, and each leaf
@@ -152,9 +151,9 @@ namespace pte {
     // only provides physical backing, so a normal mapping grants everything and
     // the only reason to withhold a bit is to cause a fault we want.
     //
-    // User is never set. Everything runs in S-mode, and the privileged spec
-    // says that irrespective of SUM the supervisor may not fetch instructions
-    // from a U=1 page, so marking a page User would make it unexecutable.
+    // User is never set. Everything runs in S-mode, and irrespective of SUM
+    // the supervisor may not fetch instructions from a U=1 page, so marking a
+    // page User would make it unexecutable.
     constexpr uint64_t Permissive = Valid | Read | Write | Execute | Accessed | Dirty;
 
     // Devices. Execute withheld because there is nothing there to run.

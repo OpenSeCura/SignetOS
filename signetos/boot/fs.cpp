@@ -17,12 +17,11 @@
 /*
  * fs.cpp - SignetOS User-Space File System Compartment
  *
- * design_spec.md sections 2.4.5 (`struct quota_disk`) and 3.8 (the file
- * system compartment). A hierarchical file system on the `blk` device, with
- * every byte of disk space handed out through a tree of `quota_disk` nodes,
- * each rooted at a directory, so that no holder of a quota -- nor anything
- * derived from it -- can use more of the disk than it was given, or reach
- * anything above the directory it was given.
+ * A hierarchical file system on the `blk` device, with every byte of disk
+ * space handed out through a tree of `quota_disk` nodes, each rooted at a
+ * directory, so that no holder of a quota -- nor anything derived from it --
+ * can use more of the disk than it was given, or reach anything above the
+ * directory it was given.
  *
  * ON DISK (4 KiB blocks, eight 512-byte sectors each)
  *   block 0       Superblock: magic, version 3, geometry scaled to the disk.
@@ -49,7 +48,7 @@
  *
  * QUOTAS
  *   quota_disk    One page per node, paid for by the caller's `node_funding`
- *                 VM quota (spec 2.4 item 4), software-sealed with a private
+ *                 VM quota, software-sealed with a private
  *                 TypeKey and handled exactly like `quota_sched`: two 16-byte
  *                 headers at the front of the page, offset 0 for the ADMIN
  *                 handle (derive/destroy/create/mkdir/unlink/write) and
@@ -73,7 +72,7 @@
  *                 FS_DERIVE_ADOPT, so that the shell's node starts out owning
  *                 whatever was left in `/home`, charges and all, instead of
  *                 merely seeing it. Adoption moves only what the parent owns
- *                 at or under the child's root. `rm src/disk.img` starts from
+ *                 at or under the child's root. `rm disk.img` starts from
  *                 a blank disk -- minus the system's own images, so rebuild
  *                 it with `make disk.img` (see below).
  *   Visibility    A handle sees everything under its root directory, whoever
@@ -85,7 +84,7 @@
  *                 no "public" bit: where an inode sits and who holds a handle
  *                 rooted above it is the whole of the rule. Destroying a node
  *                 unlinks the files it owns and the directories of its that
- *                 are then empty (spec 3.8 cascade) and hands its limits back
+ *                 are then empty and hands its limits back
  *                 to the parent; a directory still holding other nodes' files,
  *                 or that another node is rooted at, passes to the parent with
  *                 them. Only its own children stand in a node's way.
@@ -109,21 +108,21 @@
  *   would sleep in is one of the files being read.
  *
  * ENTRY POINTS (each a separate `OType::EntryPoint`; `init` publishes them)
- *   fs.quota_derive   FsDeriveRequest    ADMIN on parent; child rooted at `path`;
- *                                        returns the handle asked for and the
- *                                        child's ADMIN handle (to destroy it with);
- *                                        FS_DERIVE_ADOPT moves the parent's files
- *                                        there to the child
- *   fs.quota_destroy  FsDestroyRequest   ADMIN; BUSY while children remain
- *   fs.quota_query    FsQueryRequest     either
- *   fs.create         FsOpenRequest      ADMIN: a new file owned by the node
- *   fs.mkdir          FsPathRequest      ADMIN: a new directory owned by the node
- *   fs.open           FsOpenRequest      either; writable iff asked, ADMIN and owned
- *   fs.close          FsCloseRequest
- *   fs.read           FsIoRequest
- *   fs.write          FsIoRequest        writable handle; grows the file
- *   fs.unlink         FsPathRequest      ADMIN of the owner or of an ancestor
- *   fs.list           FsListRequest      either; one directory's entries
+ *   fs.quota_derive   (FsDeriveRequest*)                   ADMIN on parent; child rooted at `path`;
+ *                                                          returns the handle asked for and the
+ *                                                          child's ADMIN handle (to destroy it with);
+ *                                                          FS_DERIVE_ADOPT moves the parent's files
+ *                                                          there to the child
+ *   fs.quota_destroy  (quota)                              ADMIN; BUSY while children remain
+ *   fs.quota_query    (FsQueryRequest*)                    either
+ *   fs.create         (quota, path, perms)                 ADMIN: a new file owned by the node
+ *   fs.mkdir          (quota, path)                        ADMIN: a new directory owned by the node
+ *   fs.open           (quota, path, perms, out_size)       either; writable iff asked, ADMIN and owned
+ *   fs.close          (file)
+ *   fs.read           (file, buf, offset, length)
+ *   fs.write          (file, buf, offset, length)          writable handle; grows the file
+ *   fs.unlink         (quota, path)                        ADMIN of the owner or of an ancestor
+ *   fs.list           (quota, path, entries, cap, out_tot) either; one directory's entries
  *
  * FILE HANDLES
  *   A software-sealed capability, under a second private TypeKey, over an
@@ -229,10 +228,9 @@ static_assert(static_cast<uint64_t>(MAX_FILE_BLOCKS) * BLOCK_BYTES ==
 
 constexpr size_t MAX_NODES = 32;
 
-// One node per page (spec 2.4.5 `struct quota_disk`). The two sealing
-// headers come first (see the file comment); everything else is private. The
-// rest of the page, after this struct, holds the node's open-file records
-// (`node_files`).
+// One node per page. The two sealing headers come first (see the file
+// comment); everything else is private. The rest of the page, after this
+// struct, holds the node's open-file records (`node_files`).
 struct alignas(16) QuotaDisk {
   Capability admin_header;  // sys_seal writes the TypeKey here (ADMIN handle)
   Capability op_header;     // ... or here (OP handle)
@@ -1377,7 +1375,7 @@ extern "C" int64_t fs_quota_destroy_entry(Capability quota) {
   if (q.node->tree.child_count != 0) {
     return init::FS_BUSY;
   }
-  // Cascade (spec 3.8): the files it owns go, then its directories as they
+  // Cascade: the files it owns go, then its directories as they
   // empty out; one still holding other nodes' files, or that another node is
   // rooted at, passes to the parent along with the limits (`free_node`).
   // Only its own children keep a node from going: were another node's root
@@ -2004,8 +2002,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->formatted = 0;
   iface->status = init::FS_NOT_MOUNTED;
 
-  // 1. Private sealing types: one for quota handles, one for file handles
-  //    (spec 2.7). Both records live in our own `.bss`.
+  // 1. Private sealing types: one for quota handles, one for file handles.
+  //    Both records live in our own `.bss`.
   using FnTypeMint = decltype(&sys_type_mint);
   s_quota_key = syscall::call<FnTypeMint>(
       s_gate_invoke, gate_type_mint,
