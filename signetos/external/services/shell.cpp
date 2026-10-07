@@ -102,6 +102,9 @@ constexpr int DESTROY_RETRIES = 64;
 constexpr size_t LINE_MAX = 64;
 constexpr uint64_t FOREVER_US = ~0ULL;
 
+// TODO This obviously isn't a real shell or a good shell, it's just enough to
+// kind of test some things for now
+
 // --- What the shell asks `init` for (user/manifest.hpp) -----------------------
 // Thread memory for its workers; the kernel entries a console that starts
 // threads and runs programs is made of; the services it talks to; its place
@@ -1989,6 +1992,9 @@ extern "C" int64_t shell_notify_entry() {
   return invoke<int64_t>(s_gate_invoke, s_sched_wake, s_my_tid);
 }
 
+// TODO: This is hacky (multiplexing one-time init/banner vs scheduled thread
+// entry by checking if `arg` is sealed as QuotaSched). Let's make this be
+// nicer.
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
@@ -2021,10 +2027,8 @@ extern "C" int64_t compartment_main(Capability arg) {
     return -1;
   }
 
-  if (!sealing::is_sealed_as(OType::SealedObject, arg)) {
-    if (capability_is_valid(arg) && !sealing::is_sealed(arg) &&
-        capability_has_perms(arg, perms::Load) &&
-        capability_get_length(arg) >= sizeof(uint64_t)) {
+  if (!sealing::is_sealed_as(OType::QuotaSched, arg)) {
+    if (capability_is_valid(arg)) {
       const uint64_t hz = *reinterpret_cast<const uint64_t*>(arg);
       if (hz >= 1'000'000) {
         s_ticks_per_us = hz / 1'000'000;
@@ -2043,8 +2047,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_thread_quota = thread_quota;
   s_my_quota = arg;
 
-  s_sched_derive = lookup_name(gate_invoke, naming_lookup, "sched.quota_derive");
-  s_sched_destroy = lookup_name(gate_invoke, naming_lookup, "sched.quota_destroy");
+  s_sched_derive =
+      lookup_name(gate_invoke, naming_lookup, "sched.quota_derive");
+  s_sched_destroy =
+      lookup_name(gate_invoke, naming_lookup, "sched.quota_destroy");
   s_sched_register =
       lookup_name(gate_invoke, naming_lookup, "sched.thread_register");
   s_sched_yield = lookup_name(gate_invoke, naming_lookup, "sched.yield");
@@ -2056,8 +2062,7 @@ extern "C" int64_t compartment_main(Capability arg) {
       !capability_is_valid(s_sched_register) ||
       !capability_is_valid(s_sched_yield) ||
       !capability_is_valid(s_sched_block) ||
-      !capability_is_valid(s_sched_wake) ||
-      !capability_is_valid(sched_self)) {
+      !capability_is_valid(s_sched_wake) || !capability_is_valid(sched_self)) {
     out("[shell]    sched.* lookup FAILED\n");
     return -1;
   }
@@ -2079,18 +2084,14 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_fs_write = lookup_name(gate_invoke, naming_lookup, "fs.write");
   s_fs_unlink = lookup_name(gate_invoke, naming_lookup, "fs.unlink");
   s_fs_list = lookup_name(gate_invoke, naming_lookup, "fs.list");
-  s_fs_ready = sealing::is_sealed_as(OType::SealedObject, s_disk_quota) &&
-               capability_is_valid(s_fs_derive) &&
-               capability_is_valid(s_fs_destroy) &&
-               capability_is_valid(s_fs_query) &&
-               capability_is_valid(s_fs_create) &&
-               capability_is_valid(s_fs_mkdir) &&
-               capability_is_valid(s_fs_open) &&
-               capability_is_valid(s_fs_close) &&
-               capability_is_valid(s_fs_read) &&
-               capability_is_valid(s_fs_write) &&
-               capability_is_valid(s_fs_unlink) &&
-               capability_is_valid(s_fs_list);
+  s_fs_ready =
+      sealing::is_sealed_as(OType::QuotaDisk, s_disk_quota) &&
+      capability_is_valid(s_fs_derive) && capability_is_valid(s_fs_destroy) &&
+      capability_is_valid(s_fs_query) && capability_is_valid(s_fs_create) &&
+      capability_is_valid(s_fs_mkdir) && capability_is_valid(s_fs_open) &&
+      capability_is_valid(s_fs_close) && capability_is_valid(s_fs_read) &&
+      capability_is_valid(s_fs_write) && capability_is_valid(s_fs_unlink) &&
+      capability_is_valid(s_fs_list);
   out(s_fs_ready
           ? "[shell]    fs.* resolved by name; quota at /home received\n"
           : "[shell]    WARNING: no file system (fs.* or the /home quota is "
@@ -2107,7 +2108,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_q_destroy = gate_q_destroy;
   s_gate_comp_destroy = gate_comp_destroy;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
-  s_run_ready = sealing::is_sealed_as(OType::SealedObject, s_bin_quota) &&
+  s_run_ready = sealing::is_sealed_as(OType::QuotaDisk, s_bin_quota) &&
                 sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&
                 capability_is_valid(s_sched_derive) &&

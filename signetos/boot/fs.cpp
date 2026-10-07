@@ -48,12 +48,10 @@
  *
  * QUOTAS
  *   quota_disk    One page per node, paid for by the caller's `node_funding`
- *                 VM quota, software-sealed with a private
- *                 TypeKey and handled exactly like `quota_sched`: two 16-byte
- *                 headers at the front of the page, offset 0 for the ADMIN
- *                 handle (derive/destroy/create/mkdir/unlink/write) and
- *                 offset 16 for the OP handle (open/read/list/query). Which
- *                 header a handle was sealed over is its permission. A node
+ *                 VM quota, hardware-sealed with `OType::QuotaDisk`:
+ *                 `Load|Store` for the ADMIN handle
+ *                 (derive/destroy/create/mkdir/unlink/write) and `Load` for
+ *                 the OP handle (open/read/list/query). A node
  *                 has a limit, a use and a delegation, in bytes and in
  *                 inodes, always `used + delegated <= limit`, and a root
  *                 directory. The root node is the data area of the disk and
@@ -108,33 +106,34 @@
  *   would sleep in is one of the files being read.
  *
  * ENTRY POINTS (each a separate `OType::EntryPoint`; `init` publishes them)
- *   fs.quota_derive   (FsDeriveRequest*)                   ADMIN on parent; child rooted at `path`;
- *                                                          returns the handle asked for and the
- *                                                          child's ADMIN handle (to destroy it with);
- *                                                          FS_DERIVE_ADOPT moves the parent's files
- *                                                          there to the child
- *   fs.quota_destroy  (quota)                              ADMIN; BUSY while children remain
- *   fs.quota_query    (FsQueryRequest*)                    either
- *   fs.create         (quota, path, perms)                 ADMIN: a new file owned by the node
- *   fs.mkdir          (quota, path)                        ADMIN: a new directory owned by the node
- *   fs.open           (quota, path, perms, out_size)       either; writable iff asked, ADMIN and owned
- *   fs.close          (file)
- *   fs.read           (file, buf, offset, length)
- *   fs.write          (file, buf, offset, length)          writable handle; grows the file
- *   fs.unlink         (quota, path)                        ADMIN of the owner or of an ancestor
- *   fs.list           (quota, path, entries, cap, out_tot) either; one directory's entries
+ *   fs.quota_derive   (FsDeriveRequest*)                   ADMIN on parent;
+ * child rooted at `path`; returns the handle asked for and the child's ADMIN
+ * handle (to destroy it with); FS_DERIVE_ADOPT moves the parent's files there
+ * to the child fs.quota_destroy  (quota)                              ADMIN;
+ * BUSY while children remain fs.quota_query    (FsQueryRequest*) either
+ *   fs.create         (quota, path, perms)                 ADMIN: a new file
+ * owned by the node fs.mkdir          (quota, path) ADMIN: a new directory
+ * owned by the node fs.open           (quota, path, perms, out_size) either;
+ * writable iff asked, ADMIN and owned fs.close          (file) fs.read (file,
+ * buf, offset, length) fs.write          (file, buf, offset, length) writable
+ * handle; grows the file fs.unlink         (quota, path) ADMIN of the owner or
+ * of an ancestor fs.list           (quota, path, entries, cap, out_tot) either;
+ * one directory's entries
  *
  * FILE HANDLES
- *   A software-sealed capability, under a second private TypeKey, over an
- *   `OpenFile` record in the page of the node the file was opened through
+ *   A hardware-sealed capability (`OType::QuotaDisk`) over an `OpenFile`
+ *   record in the page of the node the file was opened through
  *   (the part of the page after the `QuotaDisk` struct: FS_OPEN_PER_NODE
- *   records). So the records are the holder's own memory, bought with the
- *   node: a holder that opens too much exhausts its node and nobody else's,
- *   and when a node is destroyed every handle opened through it dies with the
- *   page. Closing clears the record and its sealing header, so the handle
- *   stops unsealing; a record reused by a later open through the same node is
- *   indistinguishable from the old one to a stale handle, as with any object
- *   named by its address -- but that later open is the same holder's.
+ *   records). TODO: ideally transition to a dedicated sealing key/OType for
+ *   file handles rather than sharing `OType::QuotaDisk`. So the records are the
+ *   holder's own memory, bought with the node: a holder that opens too much
+ *   exhausts its node and nobody else's, and when a node is destroyed every
+ *   handle opened through it dies with the page. Closing clears `in_use`; a
+ *   record reused by a later open through the same node is indistinguishable
+ *   from the old one to a stale handle, as with any object named by its
+ *   address -- but that later open is the same holder's.
+ *   TODO: change this! This fs is just a dumb toy version to make progress
+ *   but clearly such a limited number of files makes no sense.
  *
  * ONE CALLER AT A TIME
  *   A disk request parks the calling thread in `sched.block` (inside `blk`);
@@ -147,6 +146,9 @@
 namespace signetos::user {
 namespace {
 
+// TODO this isn't a real or good or robust fs, a better one is needed, this is
+// for early testing
+
 // --- What `fs` asks `init` for (user/manifest.hpp) ----------------------------
 // `blk.read` / `blk.write` are asked for here and nowhere else: `fs` is the
 // only compartment that can touch the disk, and it only ever does so on behalf
@@ -154,24 +156,18 @@ namespace {
 // block device still boots -- the file system then reports itself unmounted.
 // No `naming` entry: `fs` hands its entry points back in the `FsInterface`
 // handshake and `init` publishes them.
-#define FS_MANIFEST(X)                                   \
-  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
-  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
-  M_SYSCALL(X, SYS_TYPE_MINT, type_mint)                 \
-  M_SYSCALL(X, SYS_SEAL, seal)                           \
-  M_SYSCALL(X, SYS_UNSEAL, unseal)                       \
-  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
-  M_SYSCALL(X, SYS_SENTRY, sentry)                       \
-  M_SERVICE(X, UART_SENTRY, "uart")                      \
-  M_SERVICE_OPT(X, BLK_READ, "blk.read")                 \
+#define FS_MANIFEST(X)                                \
+  M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaDisk) \
+  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)             \
+  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)         \
+  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)   \
+  M_SYSCALL(X, SYS_SENTRY, sentry)                    \
+  M_SERVICE(X, UART_SENTRY, "uart")                   \
+  M_SERVICE_OPT(X, BLK_READ, "blk.read")              \
   M_SERVICE_OPT(X, BLK_WRITE, "blk.write")
 // 128 KiB for code, stack, `.bss` and the root quota node; `init` adds what
 // the in-memory tables need for the disk it found (see init.cpp, step 4).
 SIGNETOS_MANIFEST(FS_MANIFEST, 128 * 1024)
-// Runtime slots: the sealing types for `quota_disk` handles and for open-file
-// handles, kept in the table past the seeds.
-constexpr size_t SLOT_QUOTA_TYPE_KEY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 0;
-constexpr size_t SLOT_FILE_TYPE_KEY  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 1;
 
 // --- On-disk format -----------------------------------------------------------
 
@@ -228,12 +224,9 @@ static_assert(static_cast<uint64_t>(MAX_FILE_BLOCKS) * BLOCK_BYTES ==
 
 constexpr size_t MAX_NODES = 32;
 
-// One node per page. The two sealing headers come first (see the file
-// comment); everything else is private. The rest of the page, after this
+// One node per page. The rest of the page, after this
 // struct, holds the node's open-file records (`node_files`).
 struct alignas(16) QuotaDisk {
-  Capability admin_header;  // sys_seal writes the TypeKey here (ADMIN handle)
-  Capability op_header;     // ... or here (OP handle)
   struct {
     QuotaDisk* parent;
     QuotaDisk* first_child;
@@ -255,24 +248,18 @@ struct alignas(16) QuotaDisk {
   Capability node_page;       // this page, as returned by sys_vm_allocate
   Capability node_funding;    // the QuotaVm that paid for it
 };
-static_assert(__builtin_offsetof(QuotaDisk, admin_header) ==
-              init::QUOTA_DISK_ADMIN_HEADER);
-static_assert(__builtin_offsetof(QuotaDisk, op_header) ==
-              init::QUOTA_DISK_OP_HEADER);
 static_assert(sizeof(QuotaDisk) % 16 == 0);
 
-// An open file: the 16-byte sealing header, then what the handle names. The
-// records sit in the page of the node the file was opened through, so a
-// holder that opens too much runs out of its own node's page and nobody
-// else's, and its handles die with the node.
+// An open file. The records sit in the page of the node the file was opened
+// through, so a holder that opens too much runs out of its own node's page and
+// nobody else's, and its handles die with the node.
 struct alignas(16) OpenFile {
-  Capability header;  // sys_seal writes the TypeKey here
   uint32_t inode;
   uint32_t in_use;
   uint32_t writable;  // opened through an ADMIN handle (or by create)
   uint32_t pad_;
 };
-static_assert(sizeof(OpenFile) == 32);
+static_assert(sizeof(OpenFile) == 16);
 
 constexpr size_t FILES_PER_NODE =
     (vm::PAGE_SIZE - sizeof(QuotaDisk)) / sizeof(OpenFile);
@@ -283,16 +270,11 @@ static_assert(sizeof(QuotaDisk) + FILES_PER_NODE * sizeof(OpenFile) <=
 
 // --- State -------------------------------------------------------------------------
 
-alignas(16) Capability s_quota_type_record = nullptr;
-alignas(16) Capability s_file_type_record = nullptr;
 Capability s_self_comp = nullptr;
 Capability s_vm_quota = nullptr;
-Capability s_quota_key = nullptr;
-Capability s_file_key = nullptr;
+Capability s_seal_auth = nullptr;
 Capability s_gate_alloc = nullptr;
 Capability s_gate_dealloc = nullptr;
-Capability s_gate_seal = nullptr;
-Capability s_gate_unseal = nullptr;
 Capability s_gate_invoke = nullptr;
 Capability s_uart = nullptr;
 Capability s_blk_read = nullptr;
@@ -597,42 +579,27 @@ bool node_rooted_at(uint32_t dir, const QuotaDisk* except) {
 
 struct QuotaRef {
   QuotaDisk* node;  // nullptr: not one of our handles
-  bool admin;       // sealed over the ADMIN header
+  bool admin;       // Load|Store on the handle
 };
 
-// Unseals a quota handle and tells which header it was sealed over.
+// Unseals a quota handle and checks its permissions.
 QuotaRef open_quota(Capability handle) {
   QuotaRef ref{nullptr, false};
-  using FnUnseal = decltype(&sys_unseal);
-  Capability payload = syscall::call<FnUnseal>(s_gate_invoke, s_gate_unseal,
-                                               s_quota_key, handle);
-  if (!capability_is_valid(payload)) {
+  Capability payload = sealing::unseal_with(s_seal_auth, handle);
+  if (!capability_is_valid(payload) ||
+      capability_get_length(payload) != vm::PAGE_SIZE ||
+      (capability_get_perms(payload) & perms::Load) == 0) {
     return ref;
   }
-  // `sys_unseal` returns the payload *after* the 16-byte header it checked,
-  // so the header this handle was sealed over sits 16 bytes below its base.
-  const uint64_t base = capability_get_base(payload);
-  const uint64_t off = base & (vm::PAGE_SIZE - 1);
-  if (off < sizeof(Capability)) {
-    return ref;
-  }
-  const uint64_t header = off - sizeof(Capability);
-  if (header != init::QUOTA_DISK_ADMIN_HEADER &&
-      header != init::QUOTA_DISK_OP_HEADER) {
-    return ref;
-  }
-  ref.node = node_for_page(base - off);
-  ref.admin = (header == init::QUOTA_DISK_ADMIN_HEADER);
+  ref.node = node_for_page(capability_get_base(payload));
+  ref.admin = (capability_get_perms(payload) & perms::Store) != 0;
   return ref;
 }
 
 Capability seal_node(QuotaDisk* node, bool admin) {
-  using FnSeal = decltype(&sys_seal);
-  const uint64_t off =
-      admin ? init::QUOTA_DISK_ADMIN_HEADER : init::QUOTA_DISK_OP_HEADER;
-  Capability obj = capability_set_address(
-      node->node_page, capability_get_base(node->node_page) + off);
-  return syscall::call<FnSeal>(s_gate_invoke, s_gate_seal, s_quota_key, obj);
+  const uint64_t p = admin ? (perms::Load | perms::Store) : perms::Load;
+  Capability obj = capability_and_perms(node->node_page, p);
+  return sealing::seal_with(s_seal_auth, obj);
 }
 
 // A node under `parent` (or the root, for nullptr), rooted where the parent
@@ -725,8 +692,6 @@ void free_node(QuotaDisk* n) {
   // The page is quarantined by the kernel, not reused; scrub what we can.
   n->node_page = nullptr;
   n->node_funding = nullptr;
-  n->admin_header = nullptr;
-  n->op_header = nullptr;
   using FnDealloc = decltype(&sys_vm_deallocate);
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_dealloc, s_self_comp, funding,
                            page);
@@ -739,19 +704,17 @@ void free_node(QuotaDisk* n) {
 // and the offset one of its records; a handle into a destroyed node's page
 // finds no node and is dead.
 OpenFile* open_file(Capability handle) {
-  using FnUnseal = decltype(&sys_unseal);
-  Capability payload = syscall::call<FnUnseal>(s_gate_invoke, s_gate_unseal,
-                                               s_file_key, handle);
-  if (!capability_is_valid(payload)) {
+  Capability payload = sealing::unseal_with(s_seal_auth, handle);
+  if (!capability_is_valid(payload) ||
+      capability_get_length(payload) != sizeof(OpenFile)) {
     return nullptr;
   }
-  // The payload starts right after the record's header (see open_quota).
   const uint64_t base = capability_get_base(payload);
   const uint64_t off = base & (vm::PAGE_SIZE - 1);
-  if (off < sizeof(QuotaDisk) + sizeof(Capability)) {
+  if (off < sizeof(QuotaDisk)) {
     return nullptr;
   }
-  const uint64_t rec = off - sizeof(Capability) - sizeof(QuotaDisk);
+  const uint64_t rec = off - sizeof(QuotaDisk);
   if (rec % sizeof(OpenFile) != 0 || rec / sizeof(OpenFile) >= FILES_PER_NODE) {
     return nullptr;
   }
@@ -779,14 +742,12 @@ OpenFile* alloc_file(QuotaDisk* n) {
 }
 
 Capability seal_file(OpenFile* f) {
-  using FnSeal = decltype(&sys_seal);
   Capability obj = capability_set_bounds(reinterpret_cast<Capability>(f),
                                          sizeof(OpenFile));
-  return syscall::call<FnSeal>(s_gate_invoke, s_gate_seal, s_file_key, obj);
+  return sealing::seal_with(s_seal_auth, obj);
 }
 
 void release_file(OpenFile* f) {
-  f->header = nullptr;  // the handle stops unsealing from here on
   f->inode = 0;
   f->writable = 0;
   f->in_use = 0;
@@ -1962,17 +1923,16 @@ extern "C" int64_t compartment_main(Capability arg) {
 
   s_self_comp = rw[compartment::SLOT_SELF];
   s_vm_quota = rw[compartment::SLOT_VM_QUOTA];
-  Capability gate_type_mint = rw[SLOT_SYS_TYPE_MINT];
+  s_seal_auth = rw[SLOT_SEAL_AUTH];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];
   s_gate_dealloc = rw[SLOT_SYS_VM_DEALLOC];
-  s_gate_seal = rw[SLOT_SYS_SEAL];
-  s_gate_unseal = rw[SLOT_SYS_UNSEAL];
   s_blk_read = rw[SLOT_BLK_READ];
   s_blk_write = rw[SLOT_BLK_WRITE];
 
   if (!sealing::is_sealed_as(OType::Compartment, s_self_comp) ||
-      !sealing::is_sealed_as(OType::QuotaVm, s_vm_quota)) {
+      !sealing::is_sealed_as(OType::QuotaVm, s_vm_quota) ||
+      !capability_has_perms(s_seal_auth, perms::Seal | perms::Unseal)) {
     out("[fs]       missing seeds; file system disabled\n");
     return init::FS_BAD_REQUEST;
   }
@@ -2002,24 +1962,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->formatted = 0;
   iface->status = init::FS_NOT_MOUNTED;
 
-  // 1. Private sealing types: one for quota handles, one for file handles.
-  //    Both records live in our own `.bss`.
-  using FnTypeMint = decltype(&sys_type_mint);
-  s_quota_key = syscall::call<FnTypeMint>(
-      s_gate_invoke, gate_type_mint,
-      reinterpret_cast<Capability>(&s_quota_type_record));
-  s_file_key = syscall::call<FnTypeMint>(
-      s_gate_invoke, gate_type_mint,
-      reinterpret_cast<Capability>(&s_file_type_record));
-  if (!sealing::is_sealed_as(OType::TypeKey, s_quota_key) ||
-      !sealing::is_sealed_as(OType::TypeKey, s_file_key)) {
-    out("[fs]       type_mint failed; file system disabled\n");
-    return iface->status;
-  }
-  rw[SLOT_QUOTA_TYPE_KEY] = s_quota_key;
-  rw[SLOT_FILE_TYPE_KEY] = s_file_key;
-
-  // 2. Entry points, handed back whether or not the mount below succeeds: a
+  // 1. Entry points, handed back whether or not the mount below succeeds: a
   //    client that reaches them gets FS_NOT_MOUNTED, not nothing. There is no
   //    naming service yet to publish them with (`naming` is loaded from this
   //    very disk); `init` publishes them as "fs.*" once there is.

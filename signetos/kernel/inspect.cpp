@@ -116,16 +116,20 @@ void assert_user_capability(Capability cap, const char* site) {
 
   // 1. Hardware sealing authority. Compartment-minted types (`sys_type_mint`)
   //    are `OType::TypeKey` handles, not raw `Permit_Seal`/`Unseal`.
-  //    If raw Zyseal authority is ever delegated it must be unsealed, carry no
-  //    memory/execute/ASR permission, and cover only spare OTypes above
-  //    `OType::Trap`.
+  //    Delegated raw Zyseal authorities must be unsealed, carry no
+  //    memory/execute/ASR permission, and cover only `QuotaSched`, `QuotaDisk`,
+  //    or spare OTypes above `OType::Trap`.
   if ((perms & (perms::Seal | perms::Unseal)) != 0) {
     constexpr uint64_t kFirstUserOType = static_cast<uint64_t>(OType::Trap) + 1;
     constexpr uint64_t kForbidden = perms::Load | perms::Store | perms::Execute |
                                     perms::LoadCapability | perms::LoadMutable |
                                     perms::AccessSystemRegs;
-    if (sealed || (perms & kForbidden) != 0 || len == 0 ||
-        base < kFirstUserOType || len > (kOTypeMax + 1 - base)) {
+    const bool user_otype =
+        (base == static_cast<uint64_t>(OType::QuotaSched) && len == 1) ||
+        (base == static_cast<uint64_t>(OType::QuotaDisk) && len == 1) ||
+        base >= kFirstUserOType;
+    if (sealed || (perms & kForbidden) != 0 || len == 0 || !user_otype ||
+        len > (kOTypeMax + 1 - base)) {
       panic(site, "Seal/Unseal authority over reserved OTypes or with memory perms",
             cap);
     }
@@ -179,7 +183,9 @@ void assert_user_capability(Capability cap, const char* site) {
   // 6. Kernel object handles (`yseal`ed with a kernel OType) cannot be
   //    dereferenced without `g_type_root`; their bounds are a kernel descriptor
   //    in dynamic memory or `.bss` and nothing more needs checking.
-  const bool user_sealed = ct == static_cast<uint64_t>(OType::TypeKey) ||
+  const bool user_sealed = ct == static_cast<uint64_t>(OType::QuotaSched) ||
+                           ct == static_cast<uint64_t>(OType::QuotaDisk) ||
+                           ct == static_cast<uint64_t>(OType::TypeKey) ||
                            ct == static_cast<uint64_t>(OType::SealedObject) ||
                            ct > static_cast<uint64_t>(OType::Trap);
   if (sealed && !user_sealed) {

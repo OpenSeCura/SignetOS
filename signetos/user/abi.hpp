@@ -119,8 +119,6 @@ struct alignas(16) TrapMgrInterface {
 //   int64_t  sched.block(uint64_t timeout_us) -> SCHED_OK or SCHED_TIMED_OUT
 //   int64_t  sched.wake(uint64_t tid) -> SCHED_OK or SCHED_INVALID_THREAD
 //   uint64_t sched.self() -> tid (0 if unregistered)
-constexpr size_t QUOTA_SCHED_ADMIN_HEADER = 0;   // Load|Store: derive/destroy/register
-constexpr size_t QUOTA_SCHED_OP_HEADER    = 16;  // Load: register only
 
 constexpr uint8_t PRIORITY_RT          = 0;
 constexpr uint8_t PRIORITY_INTERACTIVE = 1;
@@ -139,7 +137,7 @@ constexpr uint32_t SCHED_ROOT_PERIOD_US = 1'000'000;
 constexpr int64_t SCHED_OK             = 0;
 constexpr int64_t SCHED_BAD_REQUEST    = -1;
 constexpr int64_t SCHED_INVALID_QUOTA  = -2;
-constexpr int64_t SCHED_PERMISSION     = -3;  // handle lacks the needed header
+constexpr int64_t SCHED_PERMISSION     = -3;  // handle lacks Store permission
 constexpr int64_t SCHED_BANDWIDTH      = -4;  // temporal conservation violated
 constexpr int64_t SCHED_NO_MEMORY      = -5;  // node_funding could not pay
 constexpr int64_t SCHED_BUSY           = -6;  // node still has children/threads
@@ -241,8 +239,6 @@ struct alignas(16) BlkInterface {
 //   int64_t    fs.mkdir(Capability quota, const char* path) -> FS_*
 //   int64_t    fs.unlink(Capability quota, const char* path) -> FS_*
 //   int64_t    fs.list(Capability quota, const char* path, Capability entries, uint64_t capacity, uint64_t* out_total) -> count (>=0) or FS_* (<0)
-constexpr size_t QUOTA_DISK_ADMIN_HEADER = 0;   // Load|Store: derive/destroy/create/mkdir/unlink
-constexpr size_t QUOTA_DISK_OP_HEADER    = 16;  // Load: open/read/list only
 
 constexpr size_t   FS_NAME_MAX       = 32;         // one component, including the NUL
 constexpr size_t   FS_PATH_MAX       = 96;         // a path, including the NUL
@@ -255,7 +251,7 @@ constexpr uint64_t FS_MAX_FILE_BYTES = FS_MAX_FILE_BLOCKS * FS_BLOCK_BYTES;  // 
 constexpr int64_t FS_OK            = 0;
 constexpr int64_t FS_BAD_REQUEST   = -1;   // malformed request or path
 constexpr int64_t FS_INVALID_QUOTA = -2;   // not a quota_disk handle
-constexpr int64_t FS_PERMISSION    = -3;   // handle lacks the header, or the file is not its to change
+constexpr int64_t FS_PERMISSION    = -3;   // handle lacks Store, or the file is not its to change
 constexpr int64_t FS_QUOTA         = -4;   // the quota's bytes or inodes are used up
 constexpr int64_t FS_NO_MEMORY     = -5;   // node_funding could not pay; node table or the node's open files full
 constexpr int64_t FS_BUSY          = -6;   // quota has children; directory is a node's root
@@ -299,7 +295,7 @@ struct alignas(16) FsQueryRequest {
   uint64_t pad2_;
 };
 
-constexpr size_t FS_OPEN_PER_NODE = 122;
+constexpr size_t FS_OPEN_PER_NODE = 246;
 
 constexpr uint32_t FS_OWNER_OTHER = 0;  // another node's: read-only to this handle
 constexpr uint32_t FS_OWNER_SELF  = 1;  // the listing node's own

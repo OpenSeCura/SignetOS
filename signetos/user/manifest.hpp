@@ -91,7 +91,8 @@ constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
 //   IRQ, EXC      count = the interrupt number / exception code
 //   QUOTA_THREAD  amount = bytes of thread memory, as an ADMIN QuotaThreadMem
 //   ROOT          count = ROOT_*: one of the system's root quotas
-// The last five are the system's own: no launcher but `init` can meet them.
+//   OTYPE         count = OType: hardware sealing authority for a service OType
+// The last six are the system's own: no launcher but `init` can meet them.
 constexpr uint32_t MANIFEST_SYSCALL      = 1;
 constexpr uint32_t MANIFEST_SERVICE      = 2;
 constexpr uint32_t MANIFEST_DISK         = 3;
@@ -102,6 +103,7 @@ constexpr uint32_t MANIFEST_IRQ          = 7;
 constexpr uint32_t MANIFEST_EXC          = 8;
 constexpr uint32_t MANIFEST_QUOTA_THREAD = 9;
 constexpr uint32_t MANIFEST_ROOT         = 10;
+constexpr uint32_t MANIFEST_OTYPE        = 11;
 
 constexpr uint32_t MANIFEST_REQUIRED = 1;  // flags: do not start me without it
 
@@ -126,7 +128,7 @@ struct alignas(16) ManifestEntry {
   uint32_t kind;            // MANIFEST_*
   uint32_t flags;           // MANIFEST_REQUIRED, or 0
   uint32_t perms;           // DISK, FILE
-  uint32_t count;           // DISK: inodes; SYSCALL: id; IRQ/EXC: number; ROOT
+  uint32_t count;           // DISK: inodes; SYSCALL: id; IRQ/EXC: number; ROOT; OTYPE
   uint64_t amount;          // DISK, DMA, QUOTA_THREAD: bytes
   uint64_t reserved_;
   char name[FS_PATH_MAX];   // SERVICE, DISK, FILE, MMIO; NUL-terminated
@@ -206,6 +208,7 @@ inline const char* manifest_kind_name(uint32_t kind) {
     case MANIFEST_EXC: return "exception";
     case MANIFEST_QUOTA_THREAD: return "thread memory";
     case MANIFEST_ROOT: return "root quota";
+    case MANIFEST_OTYPE: return "otype";
     default: return "unknown";
   }
 }
@@ -259,6 +262,9 @@ inline const char* manifest_syscall_name(uint32_t id) {
     ::signetos::init::MANIFEST_REQUIRED, 0, 0, bytes, "")
 #define M_ROOT_OPT(X, slot, which)                                           \
   X(slot, ::signetos::init::MANIFEST_ROOT, 0, 0, which, 0, "")
+#define M_OTYPE(X, slot, otype)                                              \
+  X(slot, ::signetos::init::MANIFEST_OTYPE, ::signetos::init::MANIFEST_REQUIRED, \
+    0, static_cast<uint32_t>(otype), 0, "")
 
 #define SIGNETOS_MANIFEST_INDEX_(slot, kind, flags, perms, count, amount, name) \
   MANIFEST_INDEX_##slot,

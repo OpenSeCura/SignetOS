@@ -147,10 +147,10 @@ more of what they hold out of the kernel's hands, is an ongoing goal.
 SignetOS uses the hardware object type (`CT`, currently a few bits under
 Zyseal, but this is an area of active investigation!) to distinguish the
 handles of its resource managers. Each hardware type belongs to the manager of
-that resource, which holds the authority to seal and unseal it. Today the
-kernel holds all of them. The user-space managers (scheduler, filesystem)
-currently use compartment-minted types instead (§2.7) and may later be given
-their reserved hardware types.
+that resource, which holds the authority to seal and unseal it. The kernel
+delegates `QuotaSched` and `QuotaDisk` to the user-space scheduler and
+filesystem via `init` (§2.8, §5.8), and holds the remaining hardware types
+itself.
 
 | `OType` (`types.hpp`) | C type name | What it is |
 | --- | --- | --- |
@@ -159,8 +159,8 @@ their reserved hardware types.
 | `QuotaVm` | `capability_quota_vm_t` | Hierarchical virtual-memory budget (§2.4). |
 | `QuotaThreadMem` | `capability_quota_thread_mem_t` | Budget for thread stacks and thread state (§2.4). |
 | `QuotaHeap` | — | Reserved for the heap allocator (§5.7.1), which does not exist yet. |
-| `QuotaSched` | — | Reserved for the scheduler's quotas; unused for now (§2.7). |
-| `QuotaDisk` | — | Reserved for the filesystem's quotas; unused for now. |
+| `QuotaSched` | — | Scheduler CPU-bandwidth quotas (§2.4, §2.6). |
+| `QuotaDisk` | — | Filesystem disk quotas and open-file handles (§2.4, §5.7.3). |
 | `Compartment` | `capability_compartment_t` | Handle to a compartment (§2.2). |
 | `Thread` | `capability_thread_t` | Handle to a thread; Load → switch to it, Store → kill it. |
 | `Revoker` | `capability_revoker_t` | Authority over a VA range, used to register it for revocation. |
@@ -171,8 +171,7 @@ their reserved hardware types.
 
 **Permission convention on handles:** `Permit_Load` is the *operational*
 right (use it) and `Permit_Store` the *administrative* right (derive from it,
-destroy it, kill it). Quotas, threads, revokers, type keys and the services'
-software-sealed quota nodes all follow it.
+destroy it, kill it). Quotas, threads, revokers and type keys all follow it.
 
 #### Global vs. local capabilities
 
@@ -313,8 +312,8 @@ what has been delegated to its children.
 | `quota_vm` | kernel VM | `OType::QuotaVm` | As above. The root covers all pool memory left after boot. |
 | `quota_thread_mem` | kernel threads | `OType::QuotaThreadMem` | As above. The root is carved out of the VM root at boot. |
 | `quota_heap` | heap allocator | `OType::QuotaHeap` | Sub-page allocation budgets. **Does not exist yet**: there is no malloc and no sub-page allocator. |
-| `quota_sched` | scheduler (user space) | compartment-minted type key | Recurring CPU bandwidth (C per T). |
-| `quota_disk` | filesystem (user space) | compartment-minted type key | Disk space and inodes. |
+| `quota_sched` | scheduler (user space) | `OType::QuotaSched` | Recurring CPU bandwidth (C per T). |
+| `quota_disk` | filesystem (user space) | `OType::QuotaDisk` | Disk space and inodes. |
 
 When the dimension is not memory (`quota_sched`, `quota_disk`), the caller
 passes a `node_funding` `QuotaVm`. The manager allocates the node page against
@@ -322,13 +321,6 @@ it with `sys_vm_allocate(manager_comp, node_funding, …)`, so the bytes are
 debited from the caller while the mapping and its capability stay with the
 manager. The caller cannot withdraw the grant while nodes are live, because a
 VM quota with live allocations cannot be destroyed.
-
-**"The header is the permission."** The user-space managers implement the
-Load/Store split without hardware permissions on the sealed handle. Each node
-page carries two sealing headers, an ADMIN view and an OP view. An ADMIN
-handle and an OP handle to the same node are two different sealed objects over
-the same page, and the header a handle opens under determines what the caller
-may do.
 
 ##### `quota_sched` node
 
@@ -503,8 +495,8 @@ still define its own object types, all sharing the one hardware type
     compartment from its peers, not from its creator.** Nothing provisions
     types this way yet.
 
-Users today: the scheduler (`quota_sched` ADMIN/OP handles) and the
-filesystem (`quota_disk` handles and open-file handles).
+Users today: none in the default image (`sched` and `fs` now use their
+dedicated hardware `OType`s; see §2.1, §2.4).
 
 ### 2.8 Images, manifests and the loader
 
@@ -544,6 +536,7 @@ header points to.
   * `IRQ` / `EXC`: trap authorities.
   * `QUOTA_THREAD`: a thread-memory quota.
   * `ROOT`: one of the system's root quotas.
+  * `OTYPE`: a hardware sealing authority (`OType::QuotaSched`, `OType::QuotaDisk`).
 
   Only `init` can meet the hardware and root kinds.
 * `MANIFEST_REQUIRED` tells the launcher not to start the image without that
@@ -607,9 +600,9 @@ filesystem; which is which is a build detail.
 | 2 | `uart` | Its MMIO window. Handshake returns its `read` and IRQ entries; init offers `uart` (print) and `uart.read`. |
 | 3 | `loader` | The syscalls it needs and `uart` printing. It gets no quotas or resources of its own and is used for every later step. |
 | 4 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init**. Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
-| 5 | `fs` | Memory and sealing syscalls, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
+| 5 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
 | 6 | `naming` | Once it is up, init publishes `uart`, `loader` and the `fs.*` entries. |
-| 7 | `sched` | The timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
+| 7 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
 | 8 | `trap_mgr` | The PLIC window, the external-interrupt authority and the exception authorities it asks for. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
 | 9 | `shell` | Per its manifest: a thread-memory quota, `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, with the shell's ADMIN `quota_sched` (`INTERACTIVE`) as its argument, registered with the scheduler. |
 | 10 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
@@ -876,7 +869,7 @@ usual leak is physical memory held in quarantine until a sweep.
 | Model | Description |
 | --- | --- |
 | 1. Ephemeral borrowing (local capabilities) | A caller lends a buffer by passing a local capability in a register argument. The callee cannot store it outside a stack, and access ends with the call, so no sweep is needed. |
-| 2. Persistent sharing via sealed handles | The owner mints a type (§2.7) and hands out sealed handles that only it can open. Used for `fs` file handles and for both services' quota handles. |
+| 2. Persistent sharing via sealed handles | The owner seals handles under its hardware `OType` (§2.1) or a compartment-minted type (§2.7) and hands out handles that only it can open. Used for `fs` file handles and for both services' quota handles. |
 | 3. Direct global sharing with quarantine + revocation | Raw global capabilities shared across compartments require the memory to be revoked before it is reused. The mechanism is complete, but the **sweep trigger policy is missing** (see below). |
 
 **Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):** (Early, janky and very much an area of active thought and design)
@@ -887,7 +880,7 @@ usual leak is physical memory held in quarantine until a sweep.
 | --- | --- |
 | Capabilities are the sole source of authority; the MMU is never used for access control, only for backing, demand paging and CoW write detection | Page permissions are permissive everywhere. Demand paging and CoW write detection do not exist yet, so the MMU currently does *only* backing. |
 | Accessibility invariant: never unmap under a valid capability | Quarantine keeps freed pages mapped until the sweep has cleared every tag. |
-| Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities use hardware types. Service quotas and compartment objects use compartment-minted types, whose identity is a hardware tag and cannot be made by writing memory. |
+| Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities and service quotas (`QuotaSched`, `QuotaDisk`) use hardware types. Compartment-minted objects use software types (§2.7), whose identity is a hardware tag and cannot be made by writing memory. |
 | Compartment UID permanence | UIDs are never reused, so UID-tagged records can never be misattributed. |
 | Type identity (address of the type record) | Subject to the sweep caveat in §2.7. |
 | Deterministic quotas and write guarantees | All memory is backed at allocation time; nothing is lazy, so nothing can fail later. |
@@ -1077,6 +1070,7 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_IRQ_BASE` … | The interrupt `Trap` authorities |
 | `RW_SLOT_EXC_BASE` … | The exception `Trap` authorities |
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
+| `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
 
 `init`'s entry argument is the boot manifest.

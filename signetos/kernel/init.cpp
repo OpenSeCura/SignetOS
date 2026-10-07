@@ -124,6 +124,8 @@ Status launch(Capability system_quota, Capability thread_quota,
     uart::print_cap("exception auth", trap::exception_authority(i));
   }
   init_seeds[idx++] = thread_quota;
+  init_seeds[idx++] = sealing::authority_for(OType::QuotaSched);
+  init_seeds[idx++] = sealing::authority_for(OType::QuotaDisk);
 
   // Check the init seed table: these kernel-minted authorities
   // are written straight into `init`'s capability table.

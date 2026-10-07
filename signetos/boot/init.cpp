@@ -413,6 +413,15 @@ struct Launcher {
         }
       case init::MANIFEST_DISK:
         return disk_node(who, e);
+      case init::MANIFEST_OTYPE:
+        switch (static_cast<OType>(e.count)) {
+          case OType::QuotaSched:
+            return rw[init::RW_SLOT_SEAL_SCHED];
+          case OType::QuotaDisk:
+            return rw[init::RW_SLOT_SEAL_DISK];
+          default:
+            return nullptr;
+        }
       default:
         return nullptr;  // FILE, and kinds this init does not know
     }
@@ -505,7 +514,7 @@ struct Launcher {
     if (!sealing::is_sealed_as(OType::EntryPoint, fs_open) ||
         !sealing::is_sealed_as(OType::EntryPoint, fs_read) ||
         !sealing::is_sealed_as(OType::EntryPoint, fs_close) ||
-        !sealing::is_sealed_as(OType::SealedObject, fs_root)) {
+        !sealing::is_sealed_as(OType::QuotaDisk, fs_root)) {
       warn(name, "no file system to load it from");
       return nullptr;
     }

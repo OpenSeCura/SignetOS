@@ -23,14 +23,9 @@
  *
  * OBJECTS
  *   quota_sched   One page per node, paid for by the caller's `node_funding`
- *                 VM quota. Handles are software-sealed with the scheduler's
- *                 TypeKey. `sys_seal` only accepts fully writable objects, so
- *                 the delegation bits cannot live in hardware permissions: a
- *                 page carries two headers instead, one at offset 0 for the
- *                 administrative (Load|Store: derive/destroy/register) handle
- *                 and one at offset 16 for the operational (Load: register
- *                 only) handle. Which header a handle was sealed over is its
- *                 permission.
+ *                 VM quota. Handles are hardware-sealed with `OType::QuotaSched`:
+ *                 `Load|Store` for the administrative (derive/destroy/register)
+ *                 handle and `Load` for the operational (register only) handle.
  *   ThreadRec     Registered thread: its `OType::Thread` handle (the right
  *                 to `sys_thread_switch` to it), its node and accounting.
  *
@@ -112,29 +107,25 @@ namespace {
 // --- What `sched` asks `init` for (user/manifest.hpp) -------------------------
 // The timer interrupt is the scheduler's clock; `trap_bind` is how it attaches
 // to it; `thread_switch`/`thread_tid` are what dispatching is made of;
-// `type_mint`/`seal`/`unseal` make `quota_sched` handles; the VM entries fund
+// `OType::QuotaSched` makes `quota_sched` handles; the VM entries fund
 // the per-node pages. `naming.publish` is asked for because the scheduler
 // publishes its own entry points as it mints them, rather than handing them
 // all back in the handshake; `naming.lookup` is spare.
 #define SCHED_MANIFEST(X)                                \
   M_IRQ(X, IRQ_TIMER, 5)                                 \
+  M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched)   \
   M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
   M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
   M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)         \
   M_SYSCALL(X, SYS_THREAD_TID, thread_tid)               \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
-  M_SYSCALL(X, SYS_TYPE_MINT, type_mint)                 \
-  M_SYSCALL(X, SYS_SEAL, seal)                           \
-  M_SYSCALL(X, SYS_UNSEAL, unseal)                       \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
   M_SERVICE(X, UART_SENTRY, "uart")                      \
   M_SERVICE_OPT(X, NAMING_LOOKUP, "naming.lookup")       \
   M_SERVICE(X, NAMING_PUBLISH, "naming.publish")
 SIGNETOS_MANIFEST(SCHED_MANIFEST, 256 * 1024)
-// Runtime slot: the sealing type for `quota_sched` handles.
-constexpr size_t SLOT_MINTED_TYPE_KEY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 0;
 
 using init::PolicyRequest;
 using init::PolicyView;
@@ -169,11 +160,8 @@ struct ThreadRec {
   bool timed_out;         // the last `block` ended by `expire`
 };
 
-// One node per page. The two sealing headers come first (see the file
-// comment); everything else is private.
+// One node per page.
 struct alignas(16) QuotaSched {
-  Capability admin_header;  // sys_seal writes the TypeKey here (ADMIN handle)
-  Capability op_header;     // ... or here (OP handle)
   struct {
     QuotaSched* parent;
     QuotaSched* first_child;
@@ -202,10 +190,6 @@ struct alignas(16) QuotaSched {
   Capability node_funding;       // the QuotaVm that paid for it
   ThreadRec* threads;
 };
-static_assert(__builtin_offsetof(QuotaSched, admin_header) ==
-              init::QUOTA_SCHED_ADMIN_HEADER);
-static_assert(__builtin_offsetof(QuotaSched, op_header) ==
-              init::QUOTA_SCHED_OP_HEADER);
 static_assert(sizeof(QuotaSched) <= vm::PAGE_SIZE);
 
 struct Policy {
@@ -214,13 +198,10 @@ struct Policy {
 };
 
 // Scheduler state: funded from the compartment's own image (`.bss`).
-alignas(16) Capability s_type_record = nullptr;
 Capability s_self_comp = nullptr;
-Capability s_key = nullptr;
+Capability s_seal_auth = nullptr;
 Capability s_gate_alloc = nullptr;
 Capability s_gate_dealloc = nullptr;
-Capability s_gate_seal = nullptr;
-Capability s_gate_unseal = nullptr;
 Capability s_gate_switch = nullptr;
 Capability s_gate_thread_tid = nullptr;
 Capability s_gate_invoke = nullptr;
@@ -288,37 +269,22 @@ QuotaSched* node_for_page(uint64_t page_addr) {
 // Unseals a quota handle. `need_store`: the handle must be the
 // administrative one. Returns the node or nullptr.
 QuotaSched* open_quota(Capability handle, bool need_store) {
-  using FnUnseal = decltype(&sys_unseal);
-  Capability payload =
-      syscall::call<FnUnseal>(s_gate_invoke, s_gate_unseal, s_key, handle);
-  if (!capability_is_valid(payload)) {
+  Capability payload = sealing::unseal_with(s_seal_auth, handle);
+  if (!capability_is_valid(payload) ||
+      capability_get_length(payload) != vm::PAGE_SIZE ||
+      (capability_get_perms(payload) & perms::Load) == 0) {
     return nullptr;
   }
-  // `sys_unseal` returns the payload *after* the 16-byte header it checked,
-  // so the header this handle was sealed over sits 16 bytes below its base.
-  const uint64_t base = capability_get_base(payload);
-  const uint64_t off = base & (vm::PAGE_SIZE - 1);
-  if (off < sizeof(Capability)) {
+  if (need_store && (capability_get_perms(payload) & perms::Store) == 0) {
     return nullptr;
   }
-  const uint64_t header = off - sizeof(Capability);
-  if (header != init::QUOTA_SCHED_ADMIN_HEADER &&
-      header != init::QUOTA_SCHED_OP_HEADER) {
-    return nullptr;
-  }
-  if (need_store && header != init::QUOTA_SCHED_ADMIN_HEADER) {
-    return nullptr;
-  }
-  return node_for_page(base - off);
+  return node_for_page(capability_get_base(payload));
 }
 
 Capability seal_node(QuotaSched* node, bool admin) {
-  using FnSeal = decltype(&sys_seal);
-  const uint64_t off =
-      admin ? init::QUOTA_SCHED_ADMIN_HEADER : init::QUOTA_SCHED_OP_HEADER;
-  Capability obj = capability_set_address(
-      node->node_page, capability_get_base(node->node_page) + off);
-  return syscall::call<FnSeal>(s_gate_invoke, s_gate_seal, s_key, obj);
+  const uint64_t p = admin ? (perms::Load | perms::Store) : perms::Load;
+  Capability obj = capability_and_perms(node->node_page, p);
+  return sealing::seal_with(s_seal_auth, obj);
 }
 
 // Budget available to the node's own threads: what it has not delegated.
@@ -404,8 +370,6 @@ void free_node(QuotaSched* n) {
   // The page is quarantined by the kernel, not reused; scrub what we can.
   n->node_page = nullptr;
   n->node_funding = nullptr;
-  n->admin_header = nullptr;
-  n->op_header = nullptr;
   using FnDealloc = decltype(&sys_vm_deallocate);
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_dealloc, s_self_comp, funding,
                            page);
@@ -1061,14 +1025,12 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_self_comp = rw[compartment::SLOT_SELF];
   Capability vm_quota = rw[compartment::SLOT_VM_QUOTA];
   Capability timer_irq_auth = rw[SLOT_IRQ_TIMER];
+  s_seal_auth = rw[SLOT_SEAL_AUTH];
   Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
-  Capability gate_type_mint = rw[SLOT_SYS_TYPE_MINT];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   Capability naming_publish = rw[SLOT_NAMING_PUBLISH];
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];
   s_gate_dealloc = rw[SLOT_SYS_VM_DEALLOC];
-  s_gate_seal = rw[SLOT_SYS_SEAL];
-  s_gate_unseal = rw[SLOT_SYS_UNSEAL];
   s_gate_switch = rw[SLOT_SYS_THREAD_SWITCH];
   s_gate_thread_tid = rw[SLOT_SYS_THREAD_TID];
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
@@ -1077,6 +1039,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   if (!sealing::is_sealed_as(OType::Compartment, s_self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
       !sealing::is_sealed_as(OType::Trap, timer_irq_auth) ||
+      !capability_has_perms(s_seal_auth, perms::Seal | perms::Unseal) ||
       !sealing::is_sealed_as(OType::EntryPoint, naming_publish)) {
     return -1;
   }
@@ -1090,17 +1053,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->root_quota = nullptr;
   iface->run = nullptr;
 
-  // 1. Private sealing type for quota handles.
-  using FnTypeMint = decltype(&sys_type_mint);
-  s_key =
-      syscall::call<FnTypeMint>(s_gate_invoke, gate_type_mint,
-                                reinterpret_cast<Capability>(&s_type_record));
-  if (!sealing::is_sealed_as(OType::TypeKey, s_key)) {
-    return -1;
-  }
-  rw[SLOT_MINTED_TYPE_KEY] = s_key;
-
-  // 2. Built-in policy catalogue.
+  // 1. Built-in policy catalogue.
   for (size_t i = 0; i < MAX_POLICIES; ++i) {
     s_policies[i] = Policy{};
   }
