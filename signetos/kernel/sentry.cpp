@@ -430,10 +430,17 @@ extern "C" ReturnFrame* __signetos_switcher_return(Capability ret) {
     return nullptr;
   }
 
+  // `prev_ksp` is the kernel SP from before this frame was pushed: a
+  // capability with the kernel stack's own bounds, which no compartment can
+  // hold. Checking the bounds as well as the address means only a frame the
+  // switcher pushed passes; on a `TrapFrame` this slot is the interrupted
+  // code's `s5`, a user value.
   ReturnFrame* frame = reinterpret_cast<ReturnFrame*>(ksp);
   if (!capability_is_valid(frame->prev_ksp) ||
       capability_get_address(frame->prev_ksp) !=
-          frame_addr + sizeof(ReturnFrame)) {
+          frame_addr + sizeof(ReturnFrame) ||
+      capability_get_base(frame->prev_ksp) != kstack_base ||
+      capability_get_length(frame->prev_ksp) != kstack_top - kstack_base) {
     return nullptr;
   }
 

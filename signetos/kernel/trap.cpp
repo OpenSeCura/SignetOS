@@ -772,7 +772,30 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
 }
 
 extern "C" TrapFrame* __signetos_trap_return() {
-  TrapFrame* frame = reinterpret_cast<TrapFrame*>(thread::current_kernel_sp());
+  // The top frame must be a `TrapFrame` the dispatcher pushed for a handler,
+  // not something else reached through a stashed trap-return sentry (e.g. a
+  // handler's own `ReturnFrame` from a call into itself). Its
+  // `active_kernel_sp` is the kernel SP from before it was pushed: the kernel
+  // stack's own bounds, which no compartment can hold, and the address just
+  // above the frame. Checked before anything is read from the frame.
+  const Capability ksp = thread::current_kernel_sp();
+  const uint64_t kstack_base = capability_get_base(ksp);
+  const uint64_t kstack_top = kstack_base + capability_get_length(ksp);
+  const uint64_t frame_addr = capability_get_address(ksp);
+  TrapFrame* frame = reinterpret_cast<TrapFrame*>(ksp);
+  if (frame_addr + sizeof(TrapFrame) > kstack_top ||
+      !capability_is_valid(frame->active_kernel_sp) ||
+      capability_get_address(frame->active_kernel_sp) !=
+          frame_addr + sizeof(TrapFrame) ||
+      capability_get_base(frame->active_kernel_sp) != kstack_base ||
+      capability_get_length(frame->active_kernel_sp) !=
+          kstack_top - kstack_base) {
+    uart::print("[trap] ending thread ");
+    uart::print_dec(thread::current_tid());
+    uart::print(": trap return without a matching trap frame\n");
+    thread::exit(-1);
+    uart::panic("trap: trap return without a matching trap frame");
+  }
   thread::set_kernel_sp(frame->active_kernel_sp);
 
   // Scrub the stack region loaned to the handler, `[base, top)` of the
