@@ -105,10 +105,6 @@ constexpr size_t RW_SLOT_SEED_BASE = 2;  // first seed slot in the table
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
 
-// Set by destroy before it looks at `inside`, cleared again if it has to give
-// up. `enter` refuses while it is set. See WHO IS INSIDE below.
-constexpr uint32_t FLAG_DYING = (1u << 1);
-
 using Status = signetos::Status;
 using signetos::status_name;
 
@@ -127,8 +123,6 @@ struct Compartment {
     uint64_t   uid;        // monotonic, never reused. 0 is never issued.
     uint64_t   table_slots;  // slots in the table behind this header
     uint32_t   flags;
-    uint32_t   inside;     // threads running, parked or handling a trap in this
-                           // compartment's code. See WHO IS INSIDE below.
     SpinLock   lock;       // protects `ranges` and `entries` chains
 };
 
@@ -141,27 +135,21 @@ static_assert(pages_for_slots(CAP_SLOTS) == COMPARTMENT_PAGES &&
               "pages_for_slots must round up exactly at the page boundary");
 
 //
-// WHO IS INSIDE
+// DESTROY WHILE THREADS ARE INSIDE
 //
-// A compartment's code and table must not be freed while a thread is running
-// them, or is parked part-way through them waiting to be switched back in.
-// `inside` counts those threads: one for every thread that was started in the
-// compartment, every call into it through the switcher that has not returned,
-// and every trap handler of its that is still running. Each of those paths
-// calls `enter` on the way in and `leave` on the way out, and a thread that
-// ends leaves everything it was still inside (thread.cpp).
-//
-// destroy marks the compartment FLAG_DYING and then reads `inside`; `enter`
-// adds to `inside` and then reads the flags. Both write before they read, so
-// whichever order two harts interleave them in, at least one sees the other:
-// either destroy finds the count non-zero and backs out with Status::Busy, or
-// `enter` finds the mark and refuses. A thread can only get in while the
-// compartment is going to stay.
-//
-// The boot/host context is not counted. It is the kernel's own code (boot,
-// the test suites), it never runs a compartment in the production image, and
-// no thread can destroy a compartment while the host, which every thread exit
-// returns to, is inside it.
+// Nothing counts the threads running, parked or handling a trap in a
+// compartment's code, and destroy does not wait for them. It can afford not
+// to: every page it releases is quarantined, not unmapped (vm.hpp), so a
+// thread inside keeps running intact code on an intact table until the
+// revocation sweep clears every capability into the compartment. From then on
+// such a thread's next return into the compartment -- through the switcher or
+// out of a trap handler -- finds the saved return address untagged, and the
+// kernel pops that frame and resumes the nearest live one beneath with
+// Status::CompartmentDestroyed (unwind.hpp). What the compartment can no
+// longer do once destroy has run is anything that needs its handle: allocate,
+// mint entries, bind traps. A thread created to start in it, and not yet run,
+// ends at its first instruction once the sweep has cleared its entry sentry
+// (`__thread_start`).
 //
 
 //
@@ -306,10 +294,9 @@ uint64_t phys(Capability comp, Capability mem_capability);
 //
 // The handle is the only authority required. Holding it is what permits this.
 //
-// Refused with Status::Busy while any thread is inside the compartment (WHO IS
-// INSIDE above): started in it and not yet ended, called into it and not yet
-// returned, or running one of its trap handlers. Nothing is released then.
-// Kill or wait for the threads first.
+// Succeeds whatever threads are inside the compartment: started in it and not
+// yet ended, called into it and not yet returned, or running one of its trap
+// handlers (DESTROY WHILE THREADS ARE INSIDE above).
 //
 // There is no "still has allocations" refusal. Nothing outside can enumerate a
 // compartment's ranges, so a caller could not empty it first even if asked to,
@@ -326,15 +313,6 @@ uint64_t phys(Capability comp, Capability mem_capability);
 // clear their tags, after which they could be unmapped and their frames reused.
 // deallocate has the same gap. Both need fixing when the revoker is wired up.
 Status destroy(Capability handle);
-
-// Counts one more thread inside the compartment whose page is `page` (as a
-// `sentry::Entry::owner` names it). False, and nothing counted, if destroy has
-// already marked it dying or it is gone. `leave` takes the count back. Callers
-// are the switcher, the trap dispatcher and thread creation, through
-// `thread::enter_compartment` / `thread::left_compartment`, which also keep
-// the per-thread record of what to leave when a thread ends.
-bool enter(Capability page);
-void leave(Capability page);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Capability handle, Compartment* out_copy);

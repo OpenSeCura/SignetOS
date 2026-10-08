@@ -68,8 +68,8 @@ using quota::QUOTA_NODE_PAGES;
 // handler chain (an interrupt -> the driver's IRQ entry -> `sched.wake`) only
 // over a thread at depth 3 or less, so a program launched by the shell on
 // the shell's thread (shell -> program -> fs -> blk -> sched.block, depth 4)
-// lost its disk completion. Two pages allow thirteen nested calls and that
-// chain over a thread at depth 12. The cost is billed to the thread's
+// lost its disk completion. Two pages allow fourteen nested calls and that
+// chain over a thread at depth 13. The cost is billed to the thread's
 // funding quota like the stack is.
 constexpr size_t THREAD_STATE_PAGES = 2;
 constexpr uint64_t THREAD_STATE_COST = THREAD_STATE_PAGES * vm::PAGE_SIZE;
@@ -78,12 +78,6 @@ constexpr uint64_t THREAD_STATE_COST = THREAD_STATE_PAGES * vm::PAGE_SIZE;
 constexpr uint32_t FLAG_LIVE = (1u << 1);
 constexpr uint32_t FLAG_RUNNING = (1u << 2);
 constexpr uint32_t FLAG_EXITED = (1u << 3);
-
-// Most compartments a thread can be inside at once: the one it started in,
-// plus one per frame on its kernel pages that entered another (a `ReturnFrame`
-// for a call through the switcher, a `TrapFrame` for a handler). The
-// static_assert below `ThreadState` shows the pages fill before this does.
-constexpr size_t MAX_INSIDE = 20;
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -99,11 +93,11 @@ struct alignas(16) SwitchFrame {
   Capability ra;
   Capability sp;
   Capability gp;
-  Capability tp;
+  Capability active_kernel_sp;  // 48: FRAME LINK (asm_macros.h)
   Capability t[7];
   Capability s[12];
   Capability a[8];
-  Capability active_kernel_sp;
+  Capability tp;                // 496
 };
 
 static_assert(sizeof(SwitchFrame) == 32 * sizeof(Capability),
@@ -125,24 +119,11 @@ struct alignas(16) ThreadState {
   uint64_t total_billed;     // THREAD_STATE_COST + stack_bytes
   uint32_t flags;
   int32_t exit_status;
-  uint32_t inside_count;     // entries used in `inside`
-
-  // The compartments this thread is inside, innermost last (compartment.hpp,
-  // WHO IS INSIDE): the one it started in, then one per call through the
-  // switcher and per trap handler still in progress. Pushed by
-  // `enter_compartment`, popped by `left_compartment`, and every one left
-  // when the thread ends -- the frames on the kernel page say nothing about
-  // which compartment they entered, this does.
-  Capability inside[MAX_INSIDE];
 };
 
 static_assert(sizeof(ThreadState) + sizeof(SwitchFrame) <= 1024,
               "ThreadState must leave room in the allocation for the kernel "
               "return stack");
-static_assert(1 + (THREAD_STATE_COST - sizeof(ThreadState)) /
-                      sizeof(sentry::ReturnFrame) <=
-                  MAX_INSIDE,
-              "the kernel stack must fill before the inside list does");
 
 // Kernel-wide initialisation, once, before any hart runs threads.
 void init();
@@ -211,20 +192,6 @@ uint64_t tid_of(Capability thread_handle);
 
 // The id of the thread running on this hart, or 0 in host context.
 uint64_t current_tid();
-
-// --- Which compartments a thread is inside (compartment.hpp, WHO IS INSIDE) --
-
-// Counts the current thread into the compartment whose page is `page`
-// (`compartment::enter`) and remembers it in `ThreadState::inside`, so it is
-// left again when the matching return comes through `left_compartment`, or
-// when the thread ends without returning. The switcher calls it for a
-// compartment callee, the trap dispatcher for a handler. Status::Busy if the
-// compartment is being destroyed. In host context nothing is counted and
-// Status::Ok comes back.
-Status enter_compartment(Capability page);
-
-// The current thread has come back out of the compartment it entered last.
-void left_compartment();
 
 // Reads the current hart's active kernel stack capability from `sscratchc`
 // (the boot kernel stack when executing in host context).

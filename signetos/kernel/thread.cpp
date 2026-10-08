@@ -18,7 +18,6 @@
  * thread.cpp - SignetOS Thread Memory Quotas and Thread Execution State
  */
 
-#include <signetos/compartment.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
@@ -102,15 +101,6 @@ void teardown_thread(ThreadState* t) {
   Capability stack_cap = t->stack_alloc;
   Capability quota_cap = t->funding_quota;
   const uint64_t billed = t->total_billed;
-
-  // Out of every compartment it was still inside, innermost first: the one
-  // it started in, and any it had called into or was handling a trap for
-  // when it ended. Those compartments can be destroyed once it is gone.
-  while (t->inside_count > 0) {
-    t->inside_count -= 1;
-    compartment::leave(t->inside[t->inside_count]);
-    t->inside[t->inside_count] = nullptr;
-  }
 
   // Clear liveness and scrub stored capabilities in the state page.
   t->flags = 0;
@@ -249,40 +239,6 @@ uint64_t this_hart() { return cpu()->hart_id; }
 
 size_t live_threads() {
   return __atomic_load_n(&s_live_threads, __ATOMIC_RELAXED);
-}
-
-Status enter_compartment(Capability page) {
-  ThreadState* t = cpu()->current;
-  if (t == nullptr) {
-    return Status::Ok;  // host context: not counted (compartment.hpp)
-  }
-  // Cannot happen: the kernel page fills before the list does (thread.hpp,
-  // MAX_INSIDE). Refused all the same rather than written past the end.
-  if (t->inside_count >= MAX_INSIDE) {
-    return Status::NoKernelStack;
-  }
-  if (!compartment::enter(page)) {
-    return Status::Busy;
-  }
-  t->inside[t->inside_count] = page;
-  t->inside_count += 1;
-  return Status::Ok;
-}
-
-void left_compartment() {
-  ThreadState* t = cpu()->current;
-  if (t == nullptr) {
-    return;  // host context: nothing was counted
-  }
-  // A thread is always inside at least the compartment it started in while
-  // it runs, so a return with nothing to leave is a kernel bug: some path
-  // entered without counting, or left twice.
-  if (t->inside_count == 0) {
-    uart::panic("thread: left a compartment it was not inside");
-  }
-  t->inside_count -= 1;
-  compartment::leave(t->inside[t->inside_count]);
-  t->inside[t->inside_count] = nullptr;
 }
 
 Capability create_root_quota(Capability vm_quota, uint64_t total_bytes) {
@@ -460,7 +416,6 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
   t->initial_arg = initial_arg;
   t->user_sp = user_sp;
   t->kernel_sp = kernel_sp;
-  t->inside_count = 0;
 
   // Seal the handle bounded strictly to `sizeof(ThreadState)`.
   Capability handle = capability_set_bounds(state_page, sizeof(ThreadState));
@@ -475,18 +430,9 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     return fail_with(out_status, Status::InvalidCapability);
   }
 
-  // The thread is inside its entry's compartment from now until it ends
-  // (compartment.hpp, WHO IS INSIDE) -- from creation, not from its first
-  // run, so the compartment cannot go away under a thread still waiting to
-  // be scheduled. Last of the refusals.
-  if (!compartment::enter(entry.owner)) {
-    vm::free_pages(stack_mem);
-    vm::free_pages(state_page);
-    refund_q();
-    return fail_with(out_status, Status::Busy);
-  }
-  t->inside[0] = entry.owner;
-  t->inside_count = 1;
+  // Nothing ties the thread to its entry's compartment: if that is destroyed
+  // and swept before the thread first runs, the sentry in its initial frame
+  // loses its tag and `__thread_start` ends the thread (switch.S).
 
   // Thread creation and initial SwitchFrame: verify every capability seeded into the new thread's initial register frame
   // (`csp = user_sp`, `cgp = entry_table`, `ct0 = hw_sentry`,
@@ -553,7 +499,8 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
     return fail(Status::InvalidCapability);
   }
 
-  saved_frame->active_kernel_sp = current_kernel_sp();
+  // `saved_frame->active_kernel_sp` was written by `sys_thread_switch` at
+  // push (asm_macros.h, FRAME LINK).
 
   // What the outgoing context sees in `a0` when it is resumed: 0, i.e.
   // `Status::Ok`, never the handle it passed in.

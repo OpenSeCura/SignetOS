@@ -89,9 +89,8 @@ struct alignas(16) EntryRecord {
   Capability pcc;      // CodeRx entry point, unsealed; null means the record is free
   Capability cgp;      // the owning compartment's writable capability table slice
                        // (null for a kernel entry: kernel code never uses cgp)
-  Capability owner;    // the owning compartment's page (kernel capability), so
-                       // whoever enters through this record can be counted
-                       // into it (compartment.hpp, WHO IS INSIDE). Null for a
+  Capability owner;    // the owning compartment's page (kernel capability):
+                       // which compartment the record belongs to. Null for a
                        // kernel entry: the kernel is not a compartment.
   uint64_t flags;      // ENTRY_FLAG_*
   uint64_t min_stack;  // bytes the caller must have free below csp; a trusted
@@ -156,9 +155,9 @@ struct Entry {
 };
 
 // Authenticates an `OType::EntryPoint` handle, verifies Permit_Load and that
-// its record is still there, and fills `*out`. Whether the owning compartment
-// will still be there when the callee runs is `compartment::enter`'s question,
-// asked by whoever is about to run it.
+// its record is still there, and fills `*out`. Nothing keeps the owning
+// compartment alive while the callee runs: if it is destroyed and swept in
+// the meantime, the return into it is resolved by `unwind::resume`.
 Status resolve(Sentry entry_point, Entry* out);
 
 // resolve() for a compartment entry: returns the hardware `CT = 1` sentry, or
@@ -173,9 +172,10 @@ struct alignas(16) ReturnFrame {
   Capability ra;         //   0: caller return address (cra)
   Capability sp;         //  16: caller stack pointer (csp, full bounds)
   Capability gp;         //  32: caller capability table (cgp)
-  Capability tp;         //  48: caller thread pointer (ctp)
+  Capability prev_ksp;   //  48: FRAME LINK -- kernel SP above this frame
+                         //      (asm_macros.h)
   Capability s[12];      //  64..240: caller callee-saved registers (cs0..cs11)
-  Capability prev_ksp;   // 256: previous per-hart `sscratchc` kernel SP
+  Capability tp;         // 256: caller thread pointer (ctp)
   Capability args[5];    // 272..336: caller's ca1..ca5, the callee's ca0..ca4.
                          //      args[0] is reused for what the caller gets
                          //      back in ca0: the callee's checked return value,
@@ -198,14 +198,18 @@ static_assert(sizeof(ReturnFrame) == 25 * sizeof(Capability),
 //     hart's `sscratchc` kernel SP to `frame`, and returns the callee's
 //     `CT = 1` hardware sentry. On refusal it returns null and leaves the
 //     `Status` (as an integer) in `frame->args[0]` for the caller.
-//   - `__signetos_switcher_return` validates and pops the top `ReturnFrame`
-//     from the hart's `sscratchc` kernel SP, scrubs the callee's stack region
-//     (the bounds of `callee_sp`), stores the callee's checked return value
-//     (`ret`) in `frame->args[0]`, and returns the popped `ReturnFrame*` (or
-//     null if the return sentry was replayed on an empty/mismatched stack).
+//   - `__signetos_switcher_return` is `unwind::resume(KIND_RETURN_FRAME, ret)`
+//     (unwind.hpp): pops the top `ReturnFrame`, scrubs the callee's stack
+//     region (the bounds of `callee_sp`), and, if the caller is still there,
+//     stores the callee's checked return value in `frame->args[0]` and
+//     returns UNWIND_RETURN_FRAME. If the caller's compartment has been
+//     destroyed and swept it keeps popping; what it returns is the kind of
+//     the frame it stopped at (UNWIND_TRAP_FRAME if that is an interrupted
+//     context), or UNWIND_NONE if the return sentry was replayed on an
+//     empty/mismatched stack or nothing beneath is live.
 extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame);
-extern "C" ReturnFrame* __signetos_switcher_return(Capability ret);
+extern "C" uint64_t __signetos_switcher_return(Capability ret);
 
 // The stack rule. Validates `caller_sp` as a stack anyone may be run on --
 // tagged, unsealed, carrying every load/store permission a stack needs

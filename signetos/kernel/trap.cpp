@@ -58,6 +58,7 @@
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/uart.hpp>
+#include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 #include <stddef.h>
 #include <stdint.h>
@@ -694,68 +695,63 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
                                scause, stval, stval2, frame);
       }
 
-      // The interrupted thread is inside the handler's compartment while the
-      // handler runs (compartment.hpp, WHO IS INSIDE). If that compartment is
-      // being destroyed, the binding is as good as gone: the trap is handled
-      // below as unbound.
-      if (thread::enter_compartment(entry.owner) == Status::Ok) {
-        frame->active_kernel_sp = thread::current_kernel_sp();
-        thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
-        frame->handler_sp = h_sp;
-        frame->handler_rw_table = compartment::table_writable(slot.owner_comp);
+      // `frame->active_kernel_sp` was written by the trap vector at push
+      // (asm_macros.h, FRAME LINK).
+      thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
+      frame->handler_sp = h_sp;
+      frame->handler_rw_table = compartment::table_writable(slot.owner_comp);
 
-        // The SIE the handler runs with (asm_macros.h, INTERRUPT MASKING
-        // RULE): an interrupt handler, masked; an exception handler, the
-        // interrupted code's. Unmasked, it can be interrupted at its first
-        // instruction, so, like an unmasked callee (KERNEL-STACK ROOM, check
-        // 2), it also needs room for one more `TrapFrame` that still passes
-        // check 3; with less it runs masked.
-        //
-        // `sstatus` is as the trap left it: its SPIE is the SIE the
-        // interrupted code had (the dispatcher runs masked, so nothing has
-        // changed it since). The copy recorded here is what
-        // `__signetos_trap_return` resumes the interrupted code with.
-        uint64_t sstatus = 0;
-        __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
-        const bool unmasked =
-            !async && (sstatus & SSTATUS_SPIE) != 0 &&
-            thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
-                TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
-        frame->sstatus = sstatus;
-        frame->handler_sie = unmasked ? SSTATUS_SIE : 0;
+      // The SIE the handler runs with (asm_macros.h, INTERRUPT MASKING
+      // RULE): an interrupt handler, masked; an exception handler, the
+      // interrupted code's. Unmasked, it can be interrupted at its first
+      // instruction, so, like an unmasked callee (KERNEL-STACK ROOM, check
+      // 2), it also needs room for one more `TrapFrame` that still passes
+      // check 3; with less it runs masked.
+      //
+      // `sstatus` is as the trap left it: its SPIE is the SIE the
+      // interrupted code had (the dispatcher runs masked, so nothing has
+      // changed it since). The copy recorded here is what
+      // `__signetos_trap_return` resumes the interrupted code with.
+      uint64_t sstatus = 0;
+      __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+      const bool unmasked =
+          !async && (sstatus & SSTATUS_SPIE) != 0 &&
+          thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
+              TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
+      frame->sstatus = sstatus;
+      frame->handler_sie = unmasked ? SSTATUS_SIE : 0;
 
-        // User-space trap delivery: verify that the bound handler's hardware sentry (`ct0`), narrowed
-        // stack capability (`csp`), and capability table (`ca4`/`cgp`) are
-        // restricted and do not overlap kernel memory before `early_trap.S`
-        // enters the handler.
-        inspect::assert_user_capability(entry.sentry,
-                                        "trap_dispatch:hw_sentry");
-        inspect::assert_user_capability(frame->handler_sp,
-                                        "trap_dispatch:handler_sp");
-        inspect::assert_user_capability(frame->handler_rw_table,
-                                        "trap_dispatch:rw_table");
+      // User-space trap delivery: verify that the bound handler's hardware sentry (`ct0`), narrowed
+      // stack capability (`csp`), and capability table (`ca4`/`cgp`) are
+      // restricted and do not overlap kernel memory before `early_trap.S`
+      // enters the handler.
+      inspect::assert_user_capability(entry.sentry,
+                                      "trap_dispatch:hw_sentry");
+      inspect::assert_user_capability(frame->handler_sp,
+                                      "trap_dispatch:handler_sp");
+      inspect::assert_user_capability(frame->handler_rw_table,
+                                      "trap_dispatch:rw_table");
 
-        if (async) {
-          if (scause == IRQ_S_TIMER) {
-            // Re-arm before the handler runs: this clears STIP, so a handler
-            // that simply returns is safe, and the period does not drift
-            // with the handler's running time.
-            sbi::set_timer(sbi::now() + tick_ticks());
-          }
-        } else if (scause != EXC_INST_PAGE_FAULT &&
-                   scause != EXC_LOAD_PAGE_FAULT &&
-                   scause != EXC_STORE_PAGE_FAULT) {
-          frame->sepcc = advance_sync_sepcc(frame->sepcc);
+      if (async) {
+        if (scause == IRQ_S_TIMER) {
+          // Re-arm before the handler runs: this clears STIP, so a handler
+          // that simply returns is safe, and the period does not drift
+          // with the handler's running time.
+          sbi::set_timer(sbi::now() + tick_ticks());
         }
-        return entry.sentry;
+      } else if (scause != EXC_INST_PAGE_FAULT &&
+                 scause != EXC_LOAD_PAGE_FAULT &&
+                 scause != EXC_STORE_PAGE_FAULT) {
+        frame->sepcc = advance_sync_sepcc(frame->sepcc);
       }
+      return entry.sentry;
     }
   }
 
   // Unbound asynchronous interrupt: silence that source on this hart only
   // and return to the interrupted PC. With `sie` following the table this is
-  // a hart whose poke has not arrived yet, or a binding whose owner is being
-  // destroyed. The timer is disarmed (STIP can only be cleared by
+  // a hart whose poke has not arrived yet, or a binding whose owner has just
+  // been destroyed. The timer is disarmed (STIP can only be cleared by
   // reprogramming it); any other source has its `sie` bit cleared.
   if (async) {
     if (scause == IRQ_S_TIMER) {
@@ -771,59 +767,24 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
               stval2, capability_get_address(frame->sp));
 }
 
-extern "C" TrapFrame* __signetos_trap_return() {
-  // The top frame must be a `TrapFrame` the dispatcher pushed for a handler,
-  // not something else reached through a stashed trap-return sentry (e.g. a
-  // handler's own `ReturnFrame` from a call into itself). Its
-  // `active_kernel_sp` is the kernel SP from before it was pushed: the kernel
-  // stack's own bounds, which no compartment can hold, and the address just
-  // above the frame. Checked before anything is read from the frame.
-  const Capability ksp = thread::current_kernel_sp();
-  const uint64_t kstack_base = capability_get_base(ksp);
-  const uint64_t kstack_top = kstack_base + capability_get_length(ksp);
-  const uint64_t frame_addr = capability_get_address(ksp);
-  TrapFrame* frame = reinterpret_cast<TrapFrame*>(ksp);
-  if (frame_addr + sizeof(TrapFrame) > kstack_top ||
-      !capability_is_valid(frame->active_kernel_sp) ||
-      capability_get_address(frame->active_kernel_sp) !=
-          frame_addr + sizeof(TrapFrame) ||
-      capability_get_base(frame->active_kernel_sp) != kstack_base ||
-      capability_get_length(frame->active_kernel_sp) !=
-          kstack_top - kstack_base) {
+extern "C" uint64_t __signetos_trap_return() {
+  // Pop the handler's `TrapFrame`, scrub the stack loaned to the handler and
+  // resume the interrupted code with the SIE it had -- or, if its
+  // compartment has been destroyed and swept while the handler ran, the
+  // nearest live frame beneath (unwind.hpp). The top frame must be a
+  // `TrapFrame` the dispatcher pushed for a handler, not something else
+  // reached through a stashed trap-return sentry (e.g. a handler's own
+  // `ReturnFrame` from a call into itself); `resume` refuses anything else
+  // before it reads from the frame.
+  const unwind::Kind kind = unwind::resume(unwind::KIND_TRAP_FRAME, nullptr);
+  if (kind == unwind::KIND_NONE) {
     uart::print("[trap] ending thread ");
     uart::print_dec(thread::current_tid());
-    uart::print(": trap return without a matching trap frame\n");
+    uart::print(": trap return with nothing to return to\n");
     thread::exit(-1);
-    uart::panic("trap: trap return without a matching trap frame");
+    uart::panic("trap: trap return with nothing to return to");
   }
-  thread::set_kernel_sp(frame->active_kernel_sp);
-
-  // Scrub the stack region loaned to the handler, `[base, top)` of the
-  // narrowed `handler_sp`, so nothing the handler left behind reaches the
-  // interrupted thread (the same rule `__signetos_switcher_return` applies
-  // to a callee's stack).
-  Capability h_sp = frame->handler_sp;
-  if (capability_is_valid(h_sp)) {
-    const uint64_t base = capability_get_base(h_sp);
-    const size_t count = capability_get_length(h_sp) / sizeof(Capability);
-    Capability* slot =
-        reinterpret_cast<Capability*>(capability_set_address(h_sp, base));
-    for (size_t i = 0; i < count; ++i) {
-      slot[i] = nullptr;
-    }
-  }
-
-  // `sret` sets `SIE := SPIE`. The SPIE the hardware holds now is stale if
-  // anything trapped or switched threads while the handler ran, so set it
-  // from the `sstatus` recorded when this trap was taken: the interrupted
-  // code resumes with exactly the SIE it had.
-  thread::left_compartment();
-  if ((frame->sstatus & SSTATUS_SPIE) != 0) {
-    __asm__ volatile("csrs sstatus, %0" : : "r"(SSTATUS_SPIE));
-  } else {
-    __asm__ volatile("csrc sstatus, %0" : : "r"(SSTATUS_SPIE));
-  }
-  return frame;
+  return kind;
 }
 
 }  // namespace signetos::trap

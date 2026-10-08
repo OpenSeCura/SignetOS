@@ -110,7 +110,7 @@ sys_compartment_invoke:
     csc     cra,   0(ct1)               /* ReturnFrame::ra */
     csc     csp,  FRAME_SP(ct1)         /* ReturnFrame::sp (full bounds) */
     csc     cgp,  32(ct1)               /* ReturnFrame::gp */
-    csc     ctp,  48(ct1)               /* ReturnFrame::tp */
+    csc     ct0, FRAME_LINK(ct1)        /* ReturnFrame::prev_ksp */
     csc     cs0,  64(ct1)               /* ReturnFrame::s[0..11] */
     csc     cs1,  80(ct1)
     csc     cs2,  96(ct1)
@@ -123,7 +123,7 @@ sys_compartment_invoke:
     csc     cs9, 208(ct1)
     csc     cs10, 224(ct1)
     csc     cs11, 240(ct1)
-    csc     ct0, RET_FRAME_PREV_KSP(ct1)
+    csc     ctp, RET_FRAME_TP(ct1)      /* ReturnFrame::tp */
     csc     ca1, RET_FRAME_ARG0(ct1)
     csc     ca2, RET_FRAME_ARG1(ct1)
     csc     ca3, RET_FRAME_ARG2(ct1)
@@ -199,16 +199,30 @@ sys_compartment_invoke:
 
 .Lcomp_restore:
     /*
-     * 5. Callee returned via `cra` with its result in `ca0`. Mask, then
-     *    validate and pop the top `ReturnFrame` and scrub the callee's stack
-     *    in C++ (`__signetos_switcher_return(ret)`), which also checks what
-     *    the caller gets back in `ca0` and leaves it in `args[0]`.
+     * 5. Callee returned via `cra` with its result in `ca0`. Mask, then pop
+     *    the top `ReturnFrame` and scrub the callee's stack in C++
+     *    (`__signetos_switcher_return(ret)` = `unwind::resume`), which also
+     *    checks what the caller gets back in `ca0` and leaves it in
+     *    `args[0]`. If the caller's compartment has been destroyed and swept
+     *    it unwinds further; `a0` says what kind of frame it stopped at
+     *    (UNWIND_*), and that frame sits just below the new `sscratchc`.
      */
     csrci   sstatus, SSTATUS_SIE
     csrr    csp, sscratchc
     cjal    cra, __signetos_switcher_return
     beqz    a0, .Lcomp_bad_return
-    cmv     ct1, ca0                    /* ct1 = popped ReturnFrame* */
+    li      t0, UNWIND_TRAP_FRAME
+    beq     a0, t0, .Lresume_trap_frame
+
+    /*
+     *    Resume a `ReturnFrame`: the one just popped, directly below the
+     *    kernel SP. Also the trap vector's way out when its unwind stops at a
+     *    `ReturnFrame` (early_trap.S step 4).
+     */
+    .globl __signetos_resume_return_frame
+__signetos_resume_return_frame:
+    csrr    ct1, sscratchc
+    caddi   ct1, ct1, -RET_FRAME_SIZE   /* ct1 = ReturnFrame* to resume */
 
 .Lcomp_pop_frame:
     /*
@@ -219,7 +233,7 @@ sys_compartment_invoke:
     clc     cra,   0(ct1)               /* ReturnFrame::ra */
     clc     csp,  FRAME_SP(ct1)         /* ReturnFrame::sp (full bounds) */
     clc     cgp,  32(ct1)               /* ReturnFrame::gp */
-    clc     ctp,  48(ct1)               /* ReturnFrame::tp */
+    clc     ctp, RET_FRAME_TP(ct1)      /* ReturnFrame::tp */
     clc     cs0,  64(ct1)               /* ReturnFrame::s[0..11] */
     clc     cs1,  80(ct1)
     clc     cs2,  96(ct1)
@@ -238,7 +252,7 @@ sys_compartment_invoke:
     csc     cnull,   0(ct1)             /* ra */
     csc     cnull,  FRAME_SP(ct1)       /* sp */
     csc     cnull,  32(ct1)             /* gp */
-    csc     cnull,  48(ct1)             /* tp */
+    csc     cnull, FRAME_LINK(ct1)      /* prev_ksp */
     csc     cnull,  64(ct1)             /* s[0..11] */
     csc     cnull,  80(ct1)
     csc     cnull,  96(ct1)
@@ -251,7 +265,7 @@ sys_compartment_invoke:
     csc     cnull, 208(ct1)
     csc     cnull, 224(ct1)
     csc     cnull, 240(ct1)
-    csc     cnull, RET_FRAME_PREV_KSP(ct1)
+    csc     cnull, RET_FRAME_TP(ct1)    /* tp */
     csc     cnull, RET_FRAME_ARG0(ct1)
     csc     cnull, RET_FRAME_ARG1(ct1)
     csc     cnull, RET_FRAME_ARG2(ct1)
@@ -312,13 +326,24 @@ sys_compartment_invoke:
 
 .Lcomp_bad_return:
     /*
-     * A return sentry was used without a matching `ReturnFrame` (replayed, or
-     * the frame was consumed by an earlier return). The thread cannot be
-     * trusted to continue: end it. `csp` is the kernel stack here.
+     * Nothing to return to: a return sentry was used without a matching
+     * `ReturnFrame` (replayed, or consumed by an earlier return), or every
+     * frame beneath was in a destroyed compartment (`unwind::resume` says
+     * which on the console). Either way the thread ends. `csp` is the kernel
+     * stack here.
      */
     li      a0, -1
     cjal    cra, sys_thread_exit
     unimp                               /* host context: thread::exit returned */
+
+.Lresume_trap_frame:
+    /*
+     * The unwind stopped at a `TrapFrame` (the frames above it were in
+     * destroyed compartments): leave through the trap vector's restore
+     * sequence, which derives the frame from `sscratchc` and `sret`s.
+     * Interrupts are masked, as that sequence requires.
+     */
+    j       __signetos_resume_trap_frame
     .size sys_compartment_invoke, . - sys_compartment_invoke
 
 
@@ -350,12 +375,13 @@ sys_thread_switch:
     caddi   ct0, ct0, -SWITCH_FRAME_SIZE /* ct0 = frame base */
     csc     ct1,  80(ct0)               /* frame->t[1]; ct1 is scratch below */
     caddi   ct1, ct0, SWITCH_FRAME_SIZE /* ct1 = original ksp */
+    csc     ct1, FRAME_LINK(ct0)        /* frame->active_kernel_sp */
     csrrw   ct1, sscratchc, ct1         /* ct1 = caller's ct0, sscratchc = ksp */
     csc     ct1,  64(ct0)               /* frame->t[0] = caller's ct0 */
     csc     cra,   0(ct0)
     csc     csp,  16(ct0)
     csc     cgp,  32(ct0)
-    csc     ctp,  48(ct0)
+    csc     ctp, FRAME_TP(ct0)
     csc     ct2,  96(ct0)
     csc     ct3, 112(ct0)
     csc     ct4, 128(ct0)
@@ -424,8 +450,8 @@ __thread_restore:
     csc     cnull, 0(ct6)
     clc     cgp,  32(ct6)
     csc     cnull, 32(ct6)
-    clc     ctp,  48(ct6)
-    csc     cnull, 48(ct6)
+    clc     ctp, FRAME_TP(ct6)
+    csc     cnull, FRAME_TP(ct6)
     clc     ct0,  64(ct6)
     csc     cnull, 64(ct6)
     clc     ct1,  80(ct6)
@@ -478,7 +504,7 @@ __thread_restore:
     csc     cnull, 464(ct6)
     clc     ca7, 480(ct6)
     csc     cnull, 480(ct6)
-    csc     cnull, 496(ct6)             /* active_kernel_sp */
+    csc     cnull, FRAME_LINK(ct6)      /* active_kernel_sp */
     clc     csp,  16(ct6)
     csc     cnull, 16(ct6)
     caddi   ct6, ct6, SWITCH_FRAME_SIZE /* ct6 = kernel SP above the frame */
@@ -510,16 +536,28 @@ __thread_exit_to_host:
      * A new thread is plain user code, so it starts unmasked. If the entry
      * ever returns, the thread ends: `thread::exit` runs on the thread's own
      * kernel stack (the user stack is whatever the entry left behind).
+     *
+     * The entry sentry was resolved when the thread was created. If its
+     * compartment has been destroyed and swept since, `ct0` has lost its tag
+     * (the sweep scans the frame it was loaded from): jumping to it would
+     * fault in kernel text and halt the machine, so the thread ends instead.
      */
     .align 4
     .globl __thread_start
     .type __thread_start, @function
 __thread_start:
+    gctag   t1, ct0
+    beqz    t1, 1f
     csrsi   sstatus, SSTATUS_SIE
     cjalr   cra, ct0
     csrci   sstatus, SSTATUS_SIE
     csrr    csp, sscratchc
     li      a0, 0
+    cjal    cra, sys_thread_exit
+    unimp
+1:
+    csrr    csp, sscratchc
+    li      a0, -1
     cjal    cra, sys_thread_exit
     unimp
     .size __thread_start, . - __thread_start

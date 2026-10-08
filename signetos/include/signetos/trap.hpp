@@ -145,11 +145,12 @@ struct alignas(16) TrapFrame {
   Capability ra;                //   0
   Capability sp;                //  16
   Capability gp;                //  32
-  Capability tp;                //  48
+  Capability active_kernel_sp;  //  48 FRAME LINK (asm_macros.h), written
+                                //     by the trap vector at push
   Capability t[7];              //  64..160
   Capability s[12];             // 176..352
   Capability a[8];              // 368..480
-  Capability active_kernel_sp;  // 496
+  Capability tp;                // 496
   Capability sepcc;             // 512
   Capability handler_sp;        // 528 (populated by __signetos_trap_dispatch)
   Capability handler_rw_table;  // 544 (populated by __signetos_trap_dispatch)

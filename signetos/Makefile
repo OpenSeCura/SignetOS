@@ -148,6 +148,7 @@ CXX_SRCS = kernel/kstring.cpp \
            kernel/revoke.cpp \
            kernel/sentry.cpp \
            kernel/thread.cpp \
+           kernel/unwind.cpp \
            kernel/syscall.cpp \
            kernel/inspect.cpp \
            kernel/init.cpp \

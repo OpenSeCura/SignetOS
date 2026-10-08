@@ -76,7 +76,7 @@ count.
 | **Single virtual address space**: kernel, services, drivers and applications share one 64-bit space; no page-table switches | One root page table; nothing is remapped on a context switch. |
 | **Single privilege level**: everything runs at one CPU privilege level; only the kernel holds ASR | Everything runs in S-mode with permissive page-table entries; the only thing separating compartments is CHERI. Only kernel entry points run with ASR (§2.5). |
 | **CHERI-enforced isolation** | Bounds, permissions, sealing and tags are the only isolation mechanism. |
-| **Thread migration model**: threads are not owned by compartments and migrate through a domain switcher | `sys_compartment_invoke` is the switcher (§3.4). A thread records the compartments it is currently inside. |
+| **Thread migration model**: threads are not owned by compartments and migrate through a domain switcher | `sys_compartment_invoke` is the switcher (§3.4). A thread's kernel stack records the calls and traps it is inside; nothing records which compartments (§2.2, Lifecycle). |
 | **Capability system call interface**: syscalls are cross-compartment invocations into the kernel | Kernel syscalls are entry points (§2.5) invoked through the *same* switcher gate as any other compartment call. That gate is the only hardware sentry the kernel gives a compartment. |
 | **Zero-kernel-heap architecture** | There is no `kmalloc`. Every kernel object (quota node, compartment, thread, entry page, revocation backlog page) is whole pages billed to the requester's quota (§4.3); the only static roots live in `.bss`. |
 
@@ -200,10 +200,9 @@ the kernel reaches through the compartment's sealed handle.
 followed by the capability table. It grows to more pages if a
 large seed array is passed. The pages are billed to the compartment's funding
 `QuotaVm`. The descriptor holds the funding quota, the chain of owned
-ranges, the chain of entry pages, the UID, liveness flags and a *count* of
-threads currently inside. It does not record which threads they are: each
-thread keeps its own list of the compartments it is inside (§2.3). The kernel
-keeps no global list of compartments, or of threads.
+ranges, the chain of entry pages, the UID and liveness flags. It does not
+record which threads are inside it, or how many. The kernel keeps no global
+list of compartments, or of threads.
 
 #### Compartment UID
 
@@ -235,12 +234,18 @@ chains only grow while the compartment lives.
 
 * `sys_compartment_create(quota, seeds)` fills slot 0, slot 1 and the seeds,
   assigns the UID and bills the pages to `quota`.
-* `sys_compartment_destroy(comp)` marks the compartment as dying, then:
-  * **Refuses with `Busy` while any thread is inside.** The design aborts
-    threads that are executing in or unwinding through the compartment with
-    `ERR_COMPARTMENT_DESTROYED`; that is not built yet. Until it is, a
-    supervisor has to get the threads out, or wait for them to exit, before
-    destroying the compartment, which is what the shell does (§3.8).
+* `sys_compartment_destroy(comp)` marks the compartment as no longer live
+  (its handle stops working at once), then:
+  * **Succeeds whatever threads are inside.** Their code and table are
+    quarantined, not unmapped, so they keep running until the revocation
+    sweep (§4.2) clears every capability into the compartment, including the
+    return addresses saved on kernel stacks. After that, a return into the
+    compartment is unwound by the kernel (`unwind.hpp`): the dead frame is
+    popped and the nearest live caller receives `ERR_COMPARTMENT_DESTROYED`
+    (`Status::CompartmentDestroyed`) in `a0`. A trap handler's frame is
+    resumed if the code it interrupted is still live (as if the handler had
+    returned) and skipped otherwise. A thread with no live frame left ends,
+    and a thread that has not started yet ends at its first instruction.
   * Purges the compartment's trap bindings.
   * Releases every owned range, its entry pages and its own pages by
     **quarantining** them (§4.2), and refunds the funding quota.
@@ -265,7 +270,7 @@ between compartments.
 | Billing | State and stack are debited from the `QuotaThreadMem` and refunded at teardown. |
 | Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. |
 | Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the child quota is destroyed, its bandwidth returns to the parent node. |
-| Exit | `sys_thread_exit` leaves every compartment the thread is inside (so they become destroyable), quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
+| Exit | `sys_thread_exit` quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
 | Kill | `sys_thread_kill` tears down a **parked** thread only. A running thread cannot be killed asynchronously yet. |
 
 ### 2.4 Quotas and allocation authorities
@@ -353,8 +358,7 @@ pages sit on the owner's chain so they can be freed with it (§2.2).
 An entry point is a record, not a bare sealed code pointer, because the
 switcher needs more than a code address:
 
-* which compartment it is entering, to find the callee's capability table and
-  to count the thread as *inside* it;
+* which compartment it is entering, to find the callee's capability table;
 * per-entry metadata, such as whether the entry is a trusted kernel entry and
   the minimum stack it requires.
 
@@ -378,7 +382,7 @@ sentry over its own code and handing it to a peer; the outbound check
 not a domain crossing, though:
 
 * the code runs on the caller's stack, with the caller's capability table;
-* there is no scrubbing, no return frame and no *inside* count;
+* there is no scrubbing and no return frame;
 * the target can still reach whatever its own code capability covers, such as
   its GOT and through it its globals.
 
@@ -676,8 +680,8 @@ Caller                       Switcher (switch.S + sentry.cpp)                 Ca
   |                            |-- mask interrupts; check kernel-stack room     |
   |                            |-- push return frame                            |
   |                            |-- open EntryPoint, check record, W^X,          |
-  |                            |   ASR only if TRUSTED, enter compartment       |
-  |                            |   (Busy if dying), narrow stack,               |
+  |                            |   ASR only if TRUSTED, check owner is live,    |
+  |                            |   narrow stack,                                |
   |                            |   inspect outbound capabilities (a0..a4)       |
   |                            |-- scrub non-argument registers                 |
   |                            |-- jump to entry, cgp = callee table ---------->|
@@ -830,7 +834,7 @@ parent in O(1). The shell does this after a program's thread has exited:
 
 ```c
 // shell `run`, after the program thread is gone
-sys_compartment_destroy(prog_comp);      // refused (Busy) while a thread is inside
+sys_compartment_destroy(prog_comp);      // the program's thread has already exited
 fs.close / fs.unlink / fs.quota_destroy  // program's files and /home/<prog> node
 sched.quota_destroy(prog_sched);         // refused while threads are registered
 sys_vm_deallocate(image & buffers);
@@ -840,7 +844,7 @@ sys_quota_vm_destroy(prog_vm_quota);     // last: it funded the nodes above
 | Step | Behaviour |
 | --- | --- |
 | Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
-| Resident threads | The design aborts threads executing in or unwinding through the compartment. Today destroy is **refused** instead, so the shell **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds. There is no join, no timeout and no way to kill a running program yet. |
+| Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join, no timeout and no way to kill a running program yet. |
 | `sys_quota_vm_destroy` | Requires no children and nothing allocated; O(1) refund. |
 | `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
@@ -939,7 +943,7 @@ status.
 | Syscall | Behaviour |
 | --- | --- |
 | `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. The bounds of the seed array set the seed count. |
-| `void sys_compartment_destroy(comp)` | §2.2. Refuses silently while threads are inside, quarantines the memory, and does not abort threads. |
+| `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry). |
 | `Sentry sys_sentry(comp, code)` | §2.5. |
 | `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |

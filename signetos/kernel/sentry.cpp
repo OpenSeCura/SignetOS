@@ -31,13 +31,15 @@
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/uart.hpp>
+#include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 
 namespace signetos::sentry {
 namespace {
 
 // The assembly switcher addresses the frame by these offsets.
-static_assert(offsetof(ReturnFrame, prev_ksp) == RET_FRAME_PREV_KSP);
+static_assert(offsetof(ReturnFrame, prev_ksp) == FRAME_LINK);
+static_assert(offsetof(ReturnFrame, tp) == RET_FRAME_TP);
 static_assert(offsetof(ReturnFrame, args) == RET_FRAME_ARG0);
 static_assert(offsetof(ReturnFrame, args) + 4 * sizeof(Capability) ==
               RET_FRAME_ARG4);
@@ -382,16 +384,6 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
     return refuse(Status::InvalidSentry);  // a compartment entry always has one
   }
 
-  // Count the thread into the compartment it is about to run (compartment.hpp,
-  // WHO IS INSIDE). Last of the refusals, so nothing is counted for a call
-  // that does not happen. Refused if destroy has got there first.
-  if (!trusted) {
-    status = thread::enter_compartment(entry.owner);
-    if (status != Status::Ok) {
-      return refuse(status);
-    }
-  }
-
   // Domain switcher entry: verify that every capability about to be loaded into a compartment
   // callee's register file (`ct0 = sentry`, `cgp = table`, `csp = narrowed`,
   // `ca0..ca4 = args[0..4]`) is restricted, obeys W^X, carries no
@@ -413,69 +405,15 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   return entry.sentry;
 }
 
-extern "C" ReturnFrame* __signetos_switcher_return(Capability ret) {
-  Capability ksp = thread::current_kernel_sp();
-  if (!capability_is_valid(ksp)) {
-    return nullptr;
-  }
-
-  // Verify that `ksp` points to a valid `ReturnFrame` within the thread's
-  // kernel stack bounds so a stashed/replayed `cra` return sentry cannot
-  // underflow the kernel stack or confuse a `TrapFrame` for a `ReturnFrame`.
-  const uint64_t kstack_base = capability_get_base(ksp);
-  const uint64_t kstack_top = kstack_base + capability_get_length(ksp);
-  const uint64_t frame_addr = capability_get_address(ksp);
-  if (frame_addr < kstack_base ||
-      frame_addr + sizeof(ReturnFrame) > kstack_top) {
-    return nullptr;
-  }
-
-  // `prev_ksp` is the kernel SP from before this frame was pushed: a
-  // capability with the kernel stack's own bounds, which no compartment can
-  // hold. Checking the bounds as well as the address means only a frame the
-  // switcher pushed passes; on a `TrapFrame` this slot is the interrupted
-  // code's `s5`, a user value.
-  ReturnFrame* frame = reinterpret_cast<ReturnFrame*>(ksp);
-  if (!capability_is_valid(frame->prev_ksp) ||
-      capability_get_address(frame->prev_ksp) !=
-          frame_addr + sizeof(ReturnFrame) ||
-      capability_get_base(frame->prev_ksp) != kstack_base ||
-      capability_get_length(frame->prev_ksp) != kstack_top - kstack_base) {
-    return nullptr;
-  }
-
-  // Pop the `ReturnFrame` from the current hart's kernel stack.
-  thread::set_kernel_sp(frame->prev_ksp);
-
-  // The thread is out of the compartment it called (nothing was counted for
-  // a kernel callee).
-  if ((frame->flags & ENTRY_FLAG_TRUSTED) == 0) {
-    thread::left_compartment();
-  }
-
-  // Scrub the stack the callee ran on -- the whole of `callee_sp`'s bounds --
-  // so nothing it left behind, data or capability, reaches the caller. For a
-  // compartment that is everything below the caller's `csp`; for a kernel
-  // entry it is the `min_stack` slice.
-  Capability callee_sp = frame->callee_sp;
-  if (capability_is_valid(callee_sp)) {
-    const uint64_t base = capability_get_base(callee_sp);
-    const size_t count = capability_get_length(callee_sp) / sizeof(Capability);
-    Capability* slot =
-        reinterpret_cast<Capability*>(capability_set_address(callee_sp, base));
-    for (size_t i = 0; i < count; ++i) {
-      slot[i] = nullptr;
-    }
-  }
-
-  // What the caller gets back in `ca0`: the callee's return value (whether
-  // kernel or compartment), checked against the outbound capability policy.
-  inspect::assert_user_capability(ret, "switcher_return:ca0");
-  frame->args[0] = ret;
-
-  // The saved caller registers are reloaded as-is: the caller already held
-  // every one of them, and CHERI monotonicity means they cannot have widened.
-  return frame;
+extern "C" uint64_t __signetos_switcher_return(Capability ret) {
+  // Pop the callee's `ReturnFrame`, scrub the stack it ran on and hand `ret`
+  // to the caller -- or, if the caller's compartment has been destroyed and
+  // swept since the call, to the nearest live frame beneath (unwind.hpp).
+  // The top frame must be a `ReturnFrame`, so a stashed/replayed `cra`
+  // return sentry cannot underflow the kernel stack or confuse a `TrapFrame`
+  // for a `ReturnFrame`. The assembly resumes whatever kind of frame this
+  // stops at.
+  return unwind::resume(unwind::KIND_RETURN_FRAME, ret);
 }
 
 Status invoke(Sentry entry_point, uint64_t arg0, uint64_t* out_result) {

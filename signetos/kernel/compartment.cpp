@@ -307,7 +307,6 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   c->uid = uid;
   c->table_slots = slots;
   c->flags = FLAG_LIVE;
-  c->inside = 0;
   c->lock = SpinLock{};
 
   // The table is filled through the same view the compartment itself gets
@@ -349,8 +348,7 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Locked hold(c->lock);
-  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
-       (FLAG_LIVE | FLAG_DYING)) != FLAG_LIVE) {
+  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
     return fail_with(out_status, Status::InvalidCapability);
   }
 
@@ -434,8 +432,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Locked hold(c->lock);
-  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
-       (FLAG_LIVE | FLAG_DYING)) != FLAG_LIVE) {
+  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
     return fail_with(out_status, Status::InvalidCapability);
   }
 
@@ -502,8 +499,7 @@ Status deallocate(Capability comp, Capability mem_quota,
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Locked hold(c->lock);
-  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
-       (FLAG_LIVE | FLAG_DYING)) != FLAG_LIVE) {
+  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
     return Status::InvalidCapability;
   }
 
@@ -637,27 +633,19 @@ Status destroy(Capability handle) {
   uint64_t cost = 0;
   {
     Locked hold(c->lock);
-    if ((__atomic_load_n(&c->flags, __ATOMIC_SEQ_CST) &
-         (FLAG_LIVE | FLAG_DYING)) != FLAG_LIVE) {
+    if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
       return Status::InvalidCapability;
     }
 
-    // Mark first, then look (WHO IS INSIDE, compartment.hpp). `enter` does the
-    // opposite -- counts first, then looks -- so one of the two always sees the
-    // other. Full-strength atomics on both sides: this is the one place where
-    // the ordering of a write and a read on different harts is the whole point.
-    __atomic_fetch_or(&c->flags, FLAG_DYING, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&c->inside, __ATOMIC_SEQ_CST) != 0) {
-      __atomic_fetch_and(&c->flags, ~FLAG_DYING, __ATOMIC_SEQ_CST);
-      // While the mark was up, an interrupt bound to this compartment that
-      // arrived on another hart was treated as unbound and silenced there
-      // (trap.cpp). The binding stands, so bring every hart back in line.
-      trap::sync_all_harts();
-      return Status::Busy;
-    }
-
-    // That was the last check. Everything after this point must succeed,
+    // That was the only check. Everything after this point must succeed,
     // because once the first page is released there is nothing to roll back to.
+    //
+    // The flag goes first: from here on the handle no longer unseals on any
+    // hart (`unseal` reads it without the lock), and anyone already holding
+    // the unsealed page and waiting for the lock re-reads it once they get in
+    // (add_entry, allocate, deallocate). Threads inside the compartment are
+    // not consulted (compartment.hpp, DESTROY WHILE THREADS ARE INSIDE).
+    __atomic_fetch_and(&c->flags, ~FLAG_LIVE, __ATOMIC_RELEASE);
 
     // Copied out now: it lives in the page this function frees last, and a
     // freed page is not to be read, even though it is still mapped. The
@@ -713,12 +701,9 @@ Status destroy(Capability handle) {
     }
     c->entries = nullptr;
 
-    // This is what kills a stale handle. The page is quarantined below, not
-    // unmapped, so a stale handle still unseals and still reaches the struct;
-    // unseal() refuses it because this flag is clear and self_page is null.
-    // FLAG_DYING stays set, so an `enter` that read its record just before it
-    // was cleared is refused by that too.
-    __atomic_fetch_and(&c->flags, ~FLAG_LIVE, __ATOMIC_SEQ_CST);
+    // The page is quarantined below, not unmapped, so a stale handle still
+    // reaches the struct; unseal() refuses it because FLAG_LIVE is clear
+    // (above) and self_page is null.
     c->self_page = nullptr;
   }
 
@@ -729,29 +714,6 @@ Status destroy(Capability handle) {
   vm::free_pages(comp_page);
   quota::refund(funding, cost);
   return Status::Ok;
-}
-
-bool enter(Capability page) {
-  if (!capability_is_valid(page)) {
-    return false;
-  }
-  Compartment* c = reinterpret_cast<Compartment*>(page);
-  // Count first, then look: the mirror image of destroy.
-  __atomic_fetch_add(&c->inside, 1, __ATOMIC_SEQ_CST);
-  const uint32_t flags = __atomic_load_n(&c->flags, __ATOMIC_SEQ_CST);
-  if ((flags & (FLAG_LIVE | FLAG_DYING)) != FLAG_LIVE) {
-    __atomic_fetch_sub(&c->inside, 1, __ATOMIC_SEQ_CST);
-    return false;
-  }
-  return true;
-}
-
-void leave(Capability page) {
-  if (!capability_is_valid(page)) {
-    return;
-  }
-  Compartment* c = reinterpret_cast<Compartment*>(page);
-  __atomic_fetch_sub(&c->inside, 1, __ATOMIC_SEQ_CST);
 }
 
 bool query(Capability handle, Compartment* out_copy) {

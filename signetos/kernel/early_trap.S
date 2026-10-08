@@ -68,12 +68,13 @@ _early_trap_entry:
     caddi   ct0, ct0, -TRAP_FRAME_SIZE  /* ct0 = frame base */
     csc     ct1,  80(ct0)               /* frame->t[1]; ct1 is scratch below */
     caddi   ct1, ct0, TRAP_FRAME_SIZE   /* ct1 = original ksp */
+    csc     ct1, FRAME_LINK(ct0)        /* frame->active_kernel_sp */
     csrrw   ct1, sscratchc, ct1         /* ct1 = trapped ct0, sscratchc = ksp */
     csc     ct1,  64(ct0)               /* frame->t[0] = trapped ct0 */
     csc     cra,   0(ct0)
     csc     csp,  16(ct0)
     csc     cgp,  32(ct0)
-    csc     ctp,  48(ct0)
+    csc     ctp, FRAME_TP(ct0)
     csc     ct2,  96(ct0)
     csc     ct3, 112(ct0)
     csc     ct4, 128(ct0)
@@ -175,12 +176,27 @@ _early_trap_entry:
      *    interrupts enabled; an interrupt taken before this instruction is
      *    an ordinary nested trap, as in step 3), scrub the handler's
      *    narrowed stack and pop the `TrapFrame` from the hart's `sscratchc`
-     *    in C++.
+     *    in C++ (`__signetos_trap_return` = `unwind::resume`). If the
+     *    interrupted code's compartment has been destroyed and swept it
+     *    unwinds further; `a0` says what kind of frame it stopped at
+     *    (UNWIND_*; UNWIND_NONE does not come back), and that frame sits
+     *    just below the new `sscratchc`.
      */
     csrci   sstatus, SSTATUS_SIE
     csrr    csp, sscratchc
     cjal    cra, __signetos_trap_return
-    cmv     csp, ca0
+    li      t0, UNWIND_RETURN_FRAME
+    beq     a0, t0, .Lresume_return_frame
+
+    /*
+     *    Resume a `TrapFrame`: the one just popped, directly below the kernel
+     *    SP. Also the switcher's way out when its unwind stops at a
+     *    `TrapFrame` (switch.S, `.Lresume_trap_frame`).
+     */
+    .globl __signetos_resume_trap_frame
+__signetos_resume_trap_frame:
+    csrr    csp, sscratchc
+    caddi   csp, csp, -TRAP_FRAME_SIZE  /* csp = TrapFrame* to resume */
 
 .Ltrap_restore:
     /*
@@ -217,8 +233,8 @@ _early_trap_entry:
     csc     cnull, 0(ct6)
     clc     cgp,  32(ct6)
     csc     cnull, 32(ct6)
-    clc     ctp,  48(ct6)
-    csc     cnull, 48(ct6)
+    clc     ctp, FRAME_TP(ct6)
+    csc     cnull, FRAME_TP(ct6)
     clc     ct0,  64(ct6)
     csc     cnull, 64(ct6)
     clc     ct1,  80(ct6)
@@ -271,9 +287,18 @@ _early_trap_entry:
     csc     cnull, 464(ct6)
     clc     ca7, 480(ct6)
     csc     cnull, 480(ct6)
-    csc     cnull, 496(ct6)             /* active_kernel_sp */
+    csc     cnull, FRAME_LINK(ct6)      /* active_kernel_sp */
     clc     csp,  16(ct6)
     csc     cnull, 16(ct6)
     caddi   ct6, ct6, TRAP_FRAME_SIZE   /* ct6 = kernel SP above the frame */
     csrrw   ct6, sscratchc, ct6         /* sscratchc = kernel SP, ct6 = saved ct6 */
     sret
+
+.Lresume_return_frame:
+    /*
+     * The unwind stopped at a `ReturnFrame` (the handler's `TrapFrame`, and
+     * whatever was above it, belonged to destroyed compartments): leave
+     * through the switcher's restore sequence, which derives the frame from
+     * `sscratchc`, gives the caller `args[0]` and `ret`s.
+     */
+    j       __signetos_resume_return_frame

@@ -111,6 +111,10 @@ enum class Status : uint32_t {
     // a call; NoKernelStack is produced by the assembly entry itself, so its
     // value is pinned and mirrored in asm_macros.h)
     StackTooSmall,
+    // what a caller gets back in a0 when the compartment it called, or one it
+    // called through, was destroyed and swept while the call was in progress
+    // (unwind.hpp). DESIGN.md's ERR_COMPARTMENT_DESTROYED.
+    CompartmentDestroyed,
     NoKernelStack = 40,
 };
 
@@ -149,6 +153,7 @@ inline const char* status_name(Status s) {
         case Status::ThreadCreateFailed:      return "ThreadCreateFailed";
         case Status::DispatchFailed:          return "DispatchFailed";
         case Status::StackTooSmall:           return "StackTooSmall";
+        case Status::CompartmentDestroyed:    return "CompartmentDestroyed";
         case Status::NoKernelStack:           return "NoKernelStack";
     }
     return "Unknown";
