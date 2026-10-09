@@ -304,10 +304,13 @@ or disk space etc.
 4. **Immutable partitions.** Budgets are fixed at derivation. There is no
    resize and no renegotiation (§3.5).
 5. **No reparenting.** Destroying a node never moves its children to another
-   parent. What else it does is the manager's policy. The kernel's memory trees **close and
-   drain**: a destroyed node refuses new charges and derives, returns its
-   unused budget at once, and is freed when everything it funded has gone,
-   because memory can only come back through the revoker. `sched` is to
+   parent. What else it does is the manager's policy. The kernel's memory trees **close**:
+   a destroyed node and every node beneath it refuse new charges and
+   derives, every unused byte in the subtree returns to the destroyed node's
+   parent at once, a closed node keeps only what is outstanding and passes
+   every later refund straight to its first live ancestor, and it is freed
+   when nothing is outstanding, because memory can only come back through
+   the revoker. `sched` is to
    **cascade**: destroying a node kills the threads registered under it and
    its subtree, because bandwidth is a promise the parent needs back at once
    and stopping a thread is free. (Not yet implemented: today `sched` refuses
@@ -317,21 +320,32 @@ or disk space etc.
 
 The kernel has **one generic tree** (`quota::Tree`), instantiated once for
 `QuotaVm` and once for `QuotaThreadMem`. Each node is a kernel page that holds
-the tree links, the limit, what is allocated against the node directly, and
-what has been delegated to its children.
+the tree links, the node's allowance, and what it has handed out of it. A
+child node is just another thing handed out: it counts for its own allowance
+plus the cost of its page, so there is one ledger, not one for allocations
+and one for children.
 
-* **Conservation:** allocated + delegated ≤ limit.
+* **Conservation:** handed out ≤ allowance.
 * **Node funding:** deriving a child debits the child's budget *plus the cost
   of the node page itself* from the parent. Runaway derivation is therefore
-  bounded by the delegated budget. Both come back when the node is freed, and
+  bounded by the parent's budget. Both come back when the node is freed, and
   its page is quarantined.
-* **Destroy** requires `Permit_Store` and nothing else. It closes the node:
-  no more charges or derives, and the unused part of the budget is refunded to
-  the parent at once. What the node funded (allocations, threads, children)
-  carries on and keeps refunding into it. The node is freed when it holds
-  nothing, and if that leaves a closed parent holding nothing, the parent is
-  freed too. A quota that funded a long-lived allocation stays, closed, until
-  that allocation is freed; it is never a reason to refuse.
+* **Destroy** requires `Permit_Store` and nothing else. It closes the node
+  and every node beneath it: no more charges or derives through any of them,
+  and every unused byte at every depth is refunded to the parent in the same
+  call. What the subtree funded (allocations, threads) carries on and keeps
+  refunding into it, and **a closed node never holds unused allowance**: each
+  refund into it passes straight through closed ancestors to the first live
+  one. A node is freed when it holds nothing, and if that leaves a closed
+  parent holding nothing, the parent is freed too. A quota that funded a
+  long-lived allocation stays, closed, until that allocation is freed; it is
+  never a reason to refuse.
+* **Locking:** every node has its own lock and nothing locks a whole tree, so
+  there is no lock that every holder of a quota has to get through. Charge,
+  refund and derive each lock one node, and allowance going back up the tree
+  locks one node at a time. Destroy also holds the locks on its path down
+  the subtree it is closing, so the only work it can hold up is inside that
+  subtree.
 
 #### The five quota kinds (so far, there will be more and at finer granularity!!!!)
 
@@ -773,9 +787,9 @@ the scheduler's and filesystem's trees:
    refuses admission.
 3. **No runtime renegotiation.** A workload that needs a different footprint
    is torn down and re-provisioned by its supervisor.
-4. **Reclamation.** Destroying a quota refunds its unused
-   allowance to the parent at once; the rest follows as what it funded is
-   freed.
+4. **Reclamation.** Destroying a quota refunds the unused allowance of its
+   whole subtree to the parent at once; the rest follows, refund by refund,
+   as what it funded is freed.
 
 Rough edges:
 
@@ -865,7 +879,7 @@ sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded
 | --- | --- |
 | Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
 | Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join or timeout. A running program can be killed (§2.3). |
-| `sys_quota_vm_destroy` | Closes the quota and refunds its unused budget at once. The node is freed, and the rest refunded, when everything it funded has been released. Fails only for a bad handle or missing `Permit_Store`. |
+| `sys_quota_vm_destroy` | Closes the quota and its whole subtree and refunds every unused byte in it at once. Each node is freed, and the rest refunded, when everything it funded has been released. Fails only for a bad or already-closed handle or missing `Permit_Store`. |
 | `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. Today refused while threads or child nodes remain; the intended policy is to cascade instead (§2.6). |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
 | Funding order | None required. A VM quota that funds another manager's nodes may be destroyed before them: it closes, and is freed once the manager releases the node pages. Destroying a compartment never takes manager-held nodes with it. |
@@ -949,14 +963,14 @@ status.
 | Syscall | Behaviour |
 | --- | --- |
 | `capability_quota_vm_t sys_quota_vm_derive(parent, amount_bytes, permissions)` | Needs `Permit_Store`. Debits the amount plus the node's own cost from the parent and returns the sealed child, restricted to `permissions`. |
-| `int sys_quota_vm_destroy(quota)` | 0 on success, -1 otherwise. Requires `Permit_Store`. Closes the quota (§2.6): its unused budget is refunded now, and the node is freed once everything it funded has been released. |
+| `int sys_quota_vm_destroy(quota)` | 0 on success, -1 otherwise. Requires `Permit_Store`. Closes the quota and every quota derived beneath it (§2.4): all their unused budget is refunded now, and each node is freed once everything it funded has been released. |
 
 ### 5.3 Thread memory quotas
 
 | Syscall | Behaviour |
 | --- | --- |
 | `sys_quota_thread_mem_derive(parent, amount_bytes, permissions)` | As in 5.2, on the thread-memory tree. |
-| `int sys_quota_thread_mem_destroy(quota)` | As in 5.2, on the thread-memory tree. Threads it funded keep running; the node is freed when the last of them has exited. |
+| `int sys_quota_thread_mem_destroy(quota)` | As in 5.2, on the thread-memory tree. Threads the subtree funded keep running; each node is freed when the last of its threads has exited. |
 
 ### 5.4 Compartments, entry points and types
 

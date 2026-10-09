@@ -27,17 +27,32 @@
 // Quotas are IMMUTABLE once derived: a budget cannot be resized or
 // renegotiated. The only transition out of a fixed budget is destruction.
 //
+// ONE LEDGER
+//
+// A node has an allowance (`limit_bytes`) and a record of what it has handed
+// out of it (`allocated_bytes`): to allocations, to threads, and to each child
+// node, which counts for the child's allowance plus the cost of the child's
+// page. A child is therefore nothing more than an allocation its parent made,
+// and giving allowance back up the tree is the same operation as refunding an
+// allocation into a node: `refund` and `refund_unused` move the same counter.
+//
 // DESTROY CLOSES, IT DOES NOT KILL
 //
 // Destroying a node never waits for it to be empty and never touches what it
-// paid for. It CLOSES the node: no handle can charge, derive or destroy
-// through it again, and its unused budget goes straight back to the parent.
-// Everything it funded -- allocations, threads, child quotas -- carries on and
-// still refunds into it. Once a closed node holds nothing it is RECLAIMED: its
-// page is freed and the rest of its allowance (limit + QUOTA_NODE_COST) goes
-// back to the parent, which is reclaimed in turn if it is closed and now holds
-// nothing either. Killing what a quota paid for is compartment and thread
-// destruction, not this.
+// paid for. It CLOSES the node AND EVERY NODE BENEATH IT: no handle can
+// charge, derive or destroy through any of them again. A budget is a tree, so
+// a child's headroom is part of the parent's; leaving it open would let it
+// keep consuming bytes the parent has taken back, through handles the parent
+// cannot see. Everything the subtree funded -- allocations, threads -- carries
+// on and still refunds into it.
+//
+// A CLOSED NODE NEVER HOLDS UNUSED ALLOWANCE. Whatever it is not using goes
+// to its parent: all of it the moment it is closed, and the rest refund by
+// refund as its outstanding allocations come back, passing straight through
+// closed ancestors to the first live one. Once a closed node holds nothing it
+// is RECLAIMED: its page is freed and the last of its allowance, by then
+// exactly QUOTA_NODE_COST, goes back as well. Killing what a quota paid for
+// is compartment and thread destruction, not this.
 //
 // WHERE NODES LIVE
 //
@@ -61,6 +76,38 @@
 //   Permit_Load  -> operational authority     (charge / refund / fund threads)
 //   Permit_Store -> administrative authority  (derive children / destroy)
 //
+// LOCKING
+//
+// Every node has its own lock and nothing locks a whole tree, so there is no
+// lock that every holder of a quota has to get through. Charge, refund, query
+// and derive lock one node: the node itself, or for derive the parent. Two
+// things go from node to node:
+//
+//   - Allowance a closed node gives back goes up one node at a time. The node
+//     gives it back under its own lock and lets go; then the parent takes it
+//     back under the parent's lock, and passes it on the same way if it is
+//     closed too. The parent cannot be freed in between: until it has taken
+//     the bytes back it still counts them as handed out, so it is not empty.
+//   - Destroy walks down the subtree holding the lock of every node on its
+//     path, from the destroyed node to wherever it has got to, so nothing on
+//     that path can be unlinked or freed under it. Outside the subtree it
+//     locks only the ancestors its unused allowance goes up through, one at a
+//     time, like a refund.
+//
+// Two locks are only ever held together parent first, so they cannot
+// deadlock. A node is freed by whichever operation empties it: clearing
+// FLAG_EXISTS under the node's lock claims it, and since every operation
+// refuses a node without that flag, exactly one caller goes on to unlink it,
+// under the parent's lock, and free it.
+//
+// Destroy returns once everything unused in the subtree is with the parent,
+// apart from bytes that a refund or destroy running on another hart has
+// already picked up and is still carrying; those arrive before that
+// operation returns.
+//
+// `vm::alloc_pages` is never called with a node lock held: it can run a
+// revocation sweep, which refunds into the tree.
+//
 
 #include <stdint.h>
 #include <stddef.h>
@@ -77,38 +124,45 @@ constexpr size_t   QUOTA_NODE_PAGES = 1;
 constexpr uint64_t QUOTA_NODE_COST  = QUOTA_NODE_PAGES * vm::PAGE_SIZE;
 
 constexpr uint32_t FLAG_ROOT = (1u << 0);
-// Set until the node is destroyed (closed). This is what makes a closed node's
-// handles fail: they still unseal and still reach the node, so only this flag
-// says it is closed. Charge, derive, destroy and query require it. Safe to keep
-// in the node because callers never obtain a writable capability to it.
+// Set until the node is destroyed (closed), directly or as part of an
+// ancestor's subtree. This is what makes a closed node's handles fail: they
+// still unseal and still reach the node, so only this flag says it is closed.
+// Charge, derive, destroy and query require it. Safe to keep in the node
+// because callers never obtain a writable capability to it.
 constexpr uint32_t FLAG_LIVE = (1u << 1);
-// Set until the node is reclaimed. Refunds and thread releases require only
-// this, so a closed node keeps draining until it holds nothing.
+// Set until the node is reclaimed. Refunds require only this, so a closed node
+// keeps taking refunds until nothing is outstanding. Cleared under the node's
+// lock by the operation that empties it, which claims the node: that
+// operation, and only that one, unlinks and frees it (LOCKING above).
 constexpr uint32_t FLAG_EXISTS = (1u << 2);
 
 using Status = signetos::Status;
 using signetos::status_name;
 
-// `self_page` must stay at offset 0.
+// `self_page` must stay at offset 0. `lock` protects the counters, the flags
+// and `first_child`. A node's sibling links are part of its parent's child
+// list, so the parent's lock protects those. `parent` is set before the node
+// is linked and stays put until it is unlinked, under the parent's lock.
 struct QuotaNode {
     Capability self_page;     // writable kernel capability to this node's page
-    Capability parent;        // sealed handle to parent (nullptr for root)
+    QuotaNode* parent;        // null for the root
     QuotaNode* first_child;
     QuotaNode* next_sibling;
     QuotaNode* prev_sibling;
-    uint64_t child_count;
 
-    uint64_t limit_bytes;     // immutable total budget
-    uint64_t allocated_bytes; // bytes charged against this node
-    uint64_t delegated_bytes; // sum of (limit + QUOTA_NODE_COST) given to children
-    uint32_t active_threads;  // thread-memory trees: threads funded by this node
+    uint64_t limit_bytes;     // allowance: fixed at derive, shrinks only as a
+                              // closed node refunds what it is not using
+    uint64_t allocated_bytes; // handed out: allocations, threads, and each
+                              // child as its limit + QUOTA_NODE_COST
     uint32_t flags;
-    SpinLock lock;            // protects ledger counters and child list
+    SpinLock lock;
 
-    // Conservation invariant: allocated_bytes + delegated_bytes <= limit_bytes
+    // Conservation invariant: allocated_bytes <= limit_bytes. Nothing handed
+    // out costs less than a page, so a node with allocated_bytes == 0 has no
+    // children and no threads either.
     uint64_t available() const {
-        const uint64_t used = allocated_bytes + delegated_bytes;
-        return (used >= limit_bytes) ? 0 : (limit_bytes - used);
+        return (allocated_bytes >= limit_bytes) ? 0
+                                                : (limit_bytes - allocated_bytes);
     }
 };
 
@@ -117,12 +171,14 @@ using QuotaVm = QuotaNode;
 static_assert(sizeof(QuotaNode) <= QUOTA_NODE_COST,
               "a quota node must fit in one page");
 
-// A quota tree: the OType its handles are sealed with, and its static root.
+// A quota tree: the OType its handles are sealed with, its static root, and
+// how many nodes it has. There is no lock for the tree as a whole (LOCKING
+// above).
 struct Tree {
     OType type;
     QuotaNode root;
     bool root_taken;
-    size_t live_nodes;
+    size_t live_nodes;        // updated atomically
 };
 
 // --- Generic operations on any tree -----------------------------------------
@@ -132,7 +188,7 @@ void init(Tree& t, OType type);
 
 // Unseals `handle` under `t`'s type and returns the node, or null if it is not
 // genuine or the node has been freed. A closed node is returned: operations
-// that need it open check FLAG_LIVE under its lock.
+// that need it open check FLAG_LIVE under the node's lock.
 QuotaNode* unseal(Tree& t, Capability handle);
 
 // Boot-time root. Occupies the static root node, costs no frames. Returns a
@@ -146,21 +202,18 @@ Capability create_root(Tree& t, uint64_t total_bytes);
 Capability derive(Tree& t, Capability parent_handle, uint64_t amount_bytes,
                   uint64_t perms_mask, Status* out_status = nullptr);
 
-// Closes a quota (DESTROY CLOSES, IT DOES NOT KILL above): clears FLAG_LIVE
-// and gives its unused budget back to the parent at once. The rest follows when
-// the node is reclaimed, immediately if it already holds nothing. Requires
-// Permit_Store. Fails only for a bad or closed handle, or the root.
+// Closes a quota and its whole subtree (DESTROY CLOSES, IT DOES NOT KILL
+// above): clears FLAG_LIVE on every node in it and gives every unused byte in
+// it back to the parent at once. The rest follows refund by refund as what is
+// outstanding comes back; a node with nothing outstanding is freed at once.
+// Requires Permit_Store. Fails only for a bad or closed handle, or the root.
 Status destroy(Tree& t, Capability handle);
 
 // Charges / credits bytes. Requires Permit_Load. Refund also accepts a closed
-// node, and reclaims it if that leaves it holding nothing.
+// node; what a closed node is credited passes straight on to its parent, and
+// the node is reclaimed once it holds nothing.
 Status charge(Tree& t, Capability handle, uint64_t bytes);
 Status refund(Tree& t, Capability handle, uint64_t bytes);
-
-// Thread-memory trees: releases one thread the node funded, crediting `bytes`
-// and dropping `active_threads`. Like refund, accepts a closed node and
-// reclaims it if that leaves it holding nothing.
-void release_thread(Tree& t, Capability handle, uint64_t bytes);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Tree& t, Capability handle, QuotaNode* out_copy);
@@ -193,7 +246,7 @@ inline size_t live_nodes() {
 }
 
 #ifdef SIGNETOS_QUOTA_SELFTEST
-// Boot-time check of destroy, drain and reclaim against a scratch subtree of
+// Boot-time check of destroy, refund and reclaim against a scratch subtree of
 // `root` (QUOTA_SELFTEST=1). Panics on the first failure.
 void self_test(Capability root);
 #endif

@@ -118,7 +118,7 @@ void teardown_thread(ThreadState* t) {
 
   // Through quota.cpp rather than the node itself: the quota may have been
   // destroyed while this thread ran, and this may be what empties it.
-  quota::release_thread(s_quota_tree, quota_cap, billed);
+  quota::refund(s_quota_tree, quota_cap, billed);
 
   if (capability_is_valid(state_page)) {
     vm::free_pages(state_page);
@@ -293,14 +293,6 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     return fail_with(out_status, Status::InvalidCapability);
   }
 
-  QuotaThreadMem* q = quota::unseal(s_quota_tree, thread_mem_quota);
-  if (q == nullptr) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (!capability_has_perms(thread_mem_quota, perms::Load)) {
-    return fail_with(out_status, Status::InsufficientPermission);
-  }
-
   const size_t stack_pages = (stack_size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
   const uint64_t stack_bytes = stack_pages * vm::PAGE_SIZE;
   const uint64_t total_cost = THREAD_STATE_COST + stack_bytes;
@@ -308,21 +300,17 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     return fail_with(out_status, Status::OutOfQuota);
   }
 
-  {
-    Locked hold(q->lock);
-    if ((q->flags & quota::FLAG_LIVE) == 0) {
-      return fail_with(out_status, Status::InvalidCapability);
-    }
-    if (total_cost > q->available()) {
-      return fail_with(out_status, Status::OutOfQuota);
-    }
-    q->allocated_bytes += total_cost;
-    q->active_threads += 1;
+  // charge() is also the check on the handle: it must be a genuine, open
+  // thread-memory quota carrying Permit_Load with room for the thread.
+  const Status charged =
+      quota::charge(s_quota_tree, thread_mem_quota, total_cost);
+  if (charged != Status::Ok) {
+    return fail_with(out_status, charged);
   }
-  // Through the handle, not `q`: the quota may have been destroyed since the
-  // charge above, and this may be what empties it.
+  // Through the handle: the quota may be destroyed before the thread exits,
+  // and the refund then reaches it like any other closed node.
   auto refund_q = [&]() {
-    quota::release_thread(s_quota_tree, thread_mem_quota, total_cost);
+    quota::refund(s_quota_tree, thread_mem_quota, total_cost);
   };
 
   Capability state_page = vm::alloc_pages(THREAD_STATE_PAGES);

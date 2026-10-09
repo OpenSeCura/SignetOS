@@ -24,10 +24,11 @@
  *
  *   1. `Compartment::lock`  per-compartment lock protecting `ranges` and
  *                           `entries` chains (at most one held at a time).
- *   2. `QuotaNode::lock`    per-quota-node lock protecting ledger counters and
- *                           the child list (`parent->lock` is acquired before
- *                           `node->lock` in `quota::destroy`; nothing else
- *                           holds two).
+ *   2. `QuotaNode::lock`    per-quota-node lock protecting the node's ledger
+ *                           counters, flags and child list. Only
+ *                           `quota::destroy`'s walk down a subtree holds more
+ *                           than one, each parent's taken before its
+ *                           child's (quota.hpp, LOCKING).
  *   3. `revoke::s_lock`     protects the pending revocation table `g_pending`
  *                           and serializes `revoke::sweep()`.
  *   4. `vm::s_lock`         protects the virtual address free list and Sv39
