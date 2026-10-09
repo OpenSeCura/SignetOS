@@ -31,7 +31,7 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 ### 0.1 Current target and toolchain (eventual target is CherIoT)
 
 * **ISA:** pure-capability CHERI RISC-V; freestanding C++ with no libc.
-* **Required ISA extensions** (patched LLVM and QEMU, see `../zyseal/setup.sh`):
+* **Required ISA extensions** (patched LLVM and QEMU, see `zyseal/setup.sh`):
   * `Zyseal`: seal/unseal instructions and permissions plus a small hardware
     object-type field. All kernel handles are hardware-sealed with it (§2.1).
   * `Zylevels1`: capability levels (global/local), used for stack-bound

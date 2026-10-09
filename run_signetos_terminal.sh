@@ -18,7 +18,7 @@
 # in QEMU interactive terminal CLI mode.
 #
 # The toolchain location comes from the Makefile: CHERI_ROOT (default ~/cheri,
-# as for ../zyseal/setup.sh), or CHERI_SDK_BIN / QEMU individually, from the
+# as for zyseal/setup.sh), or CHERI_SDK_BIN / QEMU individually, from the
 # environment.
 set -e
 

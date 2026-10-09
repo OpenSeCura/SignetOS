@@ -17,7 +17,7 @@
 #
 # The SDK and QEMU below carry the Zyseal extension: the YSEAL/YUNSEAL
 # instructions, the SE/US permissions, and a 4-bit CT field. Zyseal is a local
-# non-ratified dialect; ../zyseal/setup.sh fetches, patches and builds the
+# non-ratified dialect; zyseal/setup.sh fetches, patches and builds the
 # toolchain (see README.md).
 #
 # Zyseal is mandatory. The kernel's object model is hardware sealing and there
@@ -32,7 +32,7 @@
 # whether the toolchain defines the level macros, and both headers fall back
 # to the fixed ISA bit positions.
 #
-# CHERI_ROOT is the install root ../zyseal/setup.sh used (its default is
+# CHERI_ROOT is the install root zyseal/setup.sh used (its default is
 # ~/cheri); the patched tools are under $(CHERI_ROOT)/zyseal. Override it (or
 # CHERI_SDK_BIN / QEMU individually) on the command line or in the environment
 # to use a toolchain somewhere else.
@@ -54,7 +54,7 @@ OBJDUMP = $(CHERI_SDK_BIN)/llvm-objdump
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifeq ($(wildcard $(CXX)),)
 $(error CHERI clang not found at $(CXX). Build the toolchain with \
-../zyseal/setup.sh, or set CHERI_ROOT / CHERI_SDK_BIN)
+zyseal/setup.sh, or set CHERI_ROOT / CHERI_SDK_BIN)
 endif
 endif
 

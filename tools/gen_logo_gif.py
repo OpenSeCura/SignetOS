@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-gen_logo_gif.py - Generates signetos/assets/signetos_logo.gif from logo.hpp
+gen_logo_gif.py - Generates assets/signetos_logo.gif from logo.hpp
 using PyCairo and ImageMagick. Renders ANSI-colored frames directly on a dark
 terminal background with the typewriter cursor, without window card chrome.
 """

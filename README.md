@@ -10,7 +10,7 @@ A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
 SignetOS depends on **Zyseal**, a CHERI RISC-V sealing extension that isn't
 ratified (the `YSEAL`/`YUNSEAL` instructions). No released CHERI toolchain
 has it, so you first build a patched LLVM and QEMU with
-[`../zyseal/setup.sh`](../zyseal/setup.sh).
+[`zyseal/setup.sh`](zyseal/setup.sh).
 
 SignetOS design and vision can be found [here](DESIGN.md).
 
@@ -29,9 +29,9 @@ zyseal/setup.sh
 The script takes about an hour and ~30 GB of disk, nearly all of it LLVM. It
 uses [cheribuild](https://github.com/CTSRD-CHERI/cheribuild) to fetch the
 upstream CHERI LLVM and QEMU, applies the patches in
-[`zyseal/patches`](../zyseal/patches), and builds them. If it stops partway,
+[`zyseal/patches`](zyseal/patches), and builds them. If it stops partway,
 run it again: steps that are already done are skipped. See
-[`zyseal/README.md`](../zyseal/README.md) for details.
+[`zyseal/README.md`](zyseal/README.md) for details.
 
 Everything goes into `~/cheri` by default (set `CHERI_ROOT` to change that).
 SignetOS uses these two outputs:
@@ -43,7 +43,7 @@ SignetOS uses these two outputs:
 
 ## 2. Build and run SignetOS
 
-From this directory (`signetos/`):
+From the repository root:
 
 ```bash
 ./run_signetos_terminal.sh
