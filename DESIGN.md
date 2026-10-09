@@ -303,8 +303,15 @@ or disk space etc.
    authority (derive children, destroy).
 4. **Immutable partitions.** Budgets are fixed at derivation. There is no
    resize and no renegotiation (§3.5).
-5. **Bottom-up destruction, no reparenting.** A node with live children or
-   live allocations is refused rather than reparented.
+5. **No reparenting.** Destroying a node never moves its children to another
+   parent. What else it does is the manager's policy. The kernel's memory trees **close and
+   drain**: a destroyed node refuses new charges and derives, returns its
+   unused budget at once, and is freed when everything it funded has gone,
+   because memory can only come back through the revoker. `sched` is to
+   **cascade**: destroying a node kills the threads registered under it and
+   its subtree, because bandwidth is a promise the parent needs back at once
+   and stopping a thread is free. (Not yet implemented: today `sched` refuses
+   while threads or children remain.)
 
 #### The kernel's quota tree
 
@@ -316,10 +323,15 @@ what has been delegated to its children.
 * **Conservation:** allocated + delegated ≤ limit.
 * **Node funding:** deriving a child debits the child's budget *plus the cost
   of the node page itself* from the parent. Runaway derivation is therefore
-  bounded by the delegated budget. Destruction refunds both in O(1) and
-  quarantines the page.
-* **Destroy** requires `Permit_Store`, no children and nothing allocated, and
-  for thread memory, no live threads.
+  bounded by the delegated budget. Both come back when the node is freed, and
+  its page is quarantined.
+* **Destroy** requires `Permit_Store` and nothing else. It closes the node:
+  no more charges or derives, and the unused part of the budget is refunded to
+  the parent at once. What the node funded (allocations, threads, children)
+  carries on and keeps refunding into it. The node is freed when it holds
+  nothing, and if that leaves a closed parent holding nothing, the parent is
+  freed too. A quota that funded a long-lived allocation stays, closed, until
+  that allocation is freed; it is never a reason to refuse.
 
 #### The five quota kinds (so far, there will be more and at finer granularity!!!!)
 
@@ -335,8 +347,8 @@ When the dimension is not memory (`quota_sched`, `quota_disk`), the caller
 passes a `node_funding` `QuotaVm`. The manager allocates the node page against
 it with `sys_vm_allocate(manager_comp, node_funding, …)`, so the bytes are
 debited from the caller while the mapping and its capability stay with the
-manager. The caller cannot withdraw the grant while nodes are live, because a
-VM quota with live allocations cannot be destroyed.
+manager. Destroying the funding quota while nodes are live does not take them
+away: the quota closes and is freed once the manager releases its pages.
 
 ##### `quota_sched` node
 
@@ -761,12 +773,9 @@ the scheduler's and filesystem's trees:
    refuses admission.
 3. **No runtime renegotiation.** A workload that needs a different footprint
    is torn down and re-provisioned by its supervisor.
-4. **Clean O(1) reclamation.** Destroying a quota returns its whole allowance
-   to the parent; a refund is arithmetic on the parent node.
-5. **Bottom-up destruction, no reparenting.** A node with children or live
-   allocations cannot be destroyed, so every live quota keeps an unbroken
-   chain of deliberate delegations. A quota node is manager state and does not
-   need its holder to stay alive.
+4. **Reclamation.** Destroying a quota refunds its unused
+   allowance to the parent at once; the rest follows as what it funded is
+   freed.
 
 Rough edges:
 
@@ -841,7 +850,7 @@ store, is future work. Nothing in user space depends on CoW yet.
 ### 3.8 Termination and resource teardown
 
 Tearing down a child reclaims everything and returns every allowance to its
-parent in O(1). The shell does this after a program's thread has exited:
+parent. The shell does this after a program's thread has exited:
 
 ```c
 // shell `run`, after the program thread is gone
@@ -849,17 +858,17 @@ sys_compartment_destroy(prog_comp);      // the program's thread has already exi
 fs.close / fs.unlink / fs.quota_destroy  // program's files and /home/<prog> node
 sched.quota_destroy(prog_sched);         // refused while threads are registered
 sys_vm_deallocate(image & buffers);
-sys_quota_vm_destroy(prog_vm_quota);     // last: it funded the nodes above
+sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded remains
 ```
 
 | Step | Behaviour |
 | --- | --- |
 | Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
 | Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join or timeout. A running program can be killed (§2.3). |
-| `sys_quota_vm_destroy` | Requires no children and nothing allocated; O(1) refund. |
-| `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. |
+| `sys_quota_vm_destroy` | Closes the quota and refunds its unused budget at once. The node is freed, and the rest refunded, when everything it funded has been released. Fails only for a bad handle or missing `Permit_Store`. |
+| `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. Today refused while threads or child nodes remain; the intended policy is to cascade instead (§2.6). |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
-| Funding order | A VM quota that funds another manager's nodes must be destroyed last. The kernel enforces this, because a quota with live allocations cannot be destroyed. Destroying a compartment never takes manager-held nodes with it. |
+| Funding order | None required. A VM quota that funds another manager's nodes may be destroyed before them: it closes, and is freed once the manager releases the node pages. Destroying a compartment never takes manager-held nodes with it. |
 
 The shell prints a warning when a step fails and carries on. In practice the
 usual leak is physical memory held in quarantine until a sweep.
@@ -940,14 +949,14 @@ status.
 | Syscall | Behaviour |
 | --- | --- |
 | `capability_quota_vm_t sys_quota_vm_derive(parent, amount_bytes, permissions)` | Needs `Permit_Store`. Debits the amount plus the node's own cost from the parent and returns the sealed child, restricted to `permissions`. |
-| `int sys_quota_vm_destroy(quota)` | 0 on success, -1 otherwise. Requires `Permit_Store`, no children and nothing allocated. |
+| `int sys_quota_vm_destroy(quota)` | 0 on success, -1 otherwise. Requires `Permit_Store`. Closes the quota (§2.6): its unused budget is refunded now, and the node is freed once everything it funded has been released. |
 
 ### 5.3 Thread memory quotas
 
 | Syscall | Behaviour |
 | --- | --- |
 | `sys_quota_thread_mem_derive(parent, amount_bytes, permissions)` | As in 5.2, on the thread-memory tree. |
-| `int sys_quota_thread_mem_destroy(quota)` | As in 5.2, and also requires that no threads are live. |
+| `int sys_quota_thread_mem_destroy(quota)` | As in 5.2, on the thread-memory tree. Threads it funded keep running; the node is freed when the last of them has exited. |
 
 ### 5.4 Compartments, entry points and types
 
@@ -1014,7 +1023,7 @@ from page-granular `sys_vm_allocate` and static arrays.
 | Entry | Purpose |
 | --- | --- |
 | `sched.quota_derive` | Derive a child node (budget, period, class, policy, optional deadline) from a parent ADMIN handle. Admission-checked. Returns an ADMIN or an OP handle depending on the requested rights. |
-| `sched.quota_destroy` | Destroy a node through its ADMIN handle. Refused while it has children or registered threads. The shell uses this as a stand-in for join. |
+| `sched.quota_destroy` | Destroy a node through its ADMIN handle. Refused while it has children or registered threads; the intended policy is to cascade instead (§2.6). The shell uses this as a stand-in for join. |
 | `sched.thread_register` | Register a thread under a node. The thread is unregistered automatically when it exits. |
 | `sched.yield` | Charge the running node and pick again. |
 | `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. It may return spuriously, so callers loop. |

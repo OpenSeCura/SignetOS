@@ -149,8 +149,10 @@ capability_quota_vm_t sys_quota_vm_derive(
     uint32_t              permissions
 );
 
-// Refunds the full limit to the parent. Requires Permit_Store, no children and
-// no live allocations.
+// Closes the quota: nothing more can be charged or derived through it, and its
+// unused budget goes back to the parent now. What it funded carries on; the
+// rest of the budget follows once all of that is freed (quota.hpp, DESTROY
+// CLOSES, IT DOES NOT KILL). Requires Permit_Store.
 int sys_quota_vm_destroy(
     capability_quota_vm_t quota
 );
@@ -167,6 +169,7 @@ capability_quota_thread_mem_t sys_quota_thread_mem_derive(
     uint32_t                      permissions
 );
 
+// As sys_quota_vm_destroy. Threads the quota funded keep running.
 int sys_quota_thread_mem_destroy(
     capability_quota_thread_mem_t quota
 );

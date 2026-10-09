@@ -92,6 +92,10 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   const Capability thread_quota =
       thread::create_root_quota(system_quota, THREAD_MEMORY_BYTES);
 
+#ifdef SIGNETOS_QUOTA_SELFTEST
+  quota::self_test(system_quota);
+#endif
+
   (void)hartid;
 
   // Scrub the stack-local root capability before entering user compartments.

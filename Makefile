@@ -71,13 +71,22 @@ else
 TRACE_DEFS =
 endif
 
+# QUOTA_SELFTEST=1 runs `quota::self_test` (`kernel/quota.cpp`) at boot, before
+# `init` starts, and panics on the first failed check. Off by default.
+QUOTA_SELFTEST ?= 0
+ifeq ($(QUOTA_SELFTEST),1)
+TEST_DEFS = -DSIGNETOS_QUOTA_SELFTEST
+else
+TEST_DEFS =
+endif
+
 CXXFLAGS = -target riscv64-unknown-freebsd -march=$(MARCH) -mabi=l64pc128d \
            -std=c++20 -ffreestanding -nostdlib -nostdinc++ -nostdinc -U__FreeBSD__ \
            -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables \
            -fno-threadsafe-statics -fno-use-cxa-atexit -fno-common -fno-jump-tables \
            -mcmodel=medany $(OPT) -Wall -Wextra \
            -Wno-cheri-capability-misuse -Wno-cheri-implicit-conversion -Wno-cheri-pointer-conversion \
-           -Iinclude -Iinclude/libc -g $(TRACE_DEFS)
+           -Iinclude -Iinclude/libc -g $(TRACE_DEFS) $(TEST_DEFS)
 
 ASFLAGS  = -target riscv64-unknown-freebsd -march=$(MARCH) -mabi=l64pc128d \
            -mcmodel=medany -ffreestanding -nostdlib -nostdinc -U__FreeBSD__ \
@@ -240,12 +249,12 @@ clean:
 # (Re)write the disk image on its own.
 disk: $(DISK_IMG)
 
-# Objects whose contents depend on TRACE_SWITCH are rebuilt
+# Objects whose contents depend on TRACE_SWITCH or QUOTA_SELFTEST are rebuilt
 # whenever a flag flips, via a stamp file that only changes when a value does.
 FLAGS_STAMP = .build_flags
-FLAG_VALUES = $(TRACE_SWITCH)
+FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST)
 $(FLAGS_STAMP): FORCE
 	@echo $(FLAG_VALUES) | cmp -s - $@ 2>/dev/null || echo $(FLAG_VALUES) > $@
-kernel/thread.o: $(FLAGS_STAMP)
+kernel/thread.o kernel/quota.o kernel/main.o: $(FLAGS_STAMP)
 FORCE:
 .PHONY: FORCE

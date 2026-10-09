@@ -116,18 +116,9 @@ void teardown_thread(ThreadState* t) {
     vm::free_pages(stack_cap);
   }
 
-  QuotaThreadMem* q = quota::unseal(s_quota_tree, quota_cap);
-  if (q != nullptr) {
-    Locked hold(q->lock);
-    if (q->allocated_bytes >= billed) {
-      q->allocated_bytes -= billed;
-    } else {
-      q->allocated_bytes = 0;
-    }
-    if (q->active_threads > 0) {
-      q->active_threads -= 1;
-    }
-  }
+  // Through quota.cpp rather than the node itself: the quota may have been
+  // destroyed while this thread ran, and this may be what empties it.
+  quota::release_thread(s_quota_tree, quota_cap, billed);
 
   if (capability_is_valid(state_page)) {
     vm::free_pages(state_page);
@@ -328,10 +319,10 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     q->allocated_bytes += total_cost;
     q->active_threads += 1;
   }
+  // Through the handle, not `q`: the quota may have been destroyed since the
+  // charge above, and this may be what empties it.
   auto refund_q = [&]() {
-    Locked hold(q->lock);
-    q->allocated_bytes -= total_cost;
-    q->active_threads -= 1;
+    quota::release_thread(s_quota_tree, thread_mem_quota, total_cost);
   };
 
   Capability state_page = vm::alloc_pages(THREAD_STATE_PAGES);

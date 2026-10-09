@@ -26,7 +26,8 @@
  *                           `entries` chains (at most one held at a time).
  *   2. `QuotaNode::lock`    per-quota-node lock protecting ledger counters and
  *                           the child list (`parent->lock` is acquired before
- *                           `node->lock` in `quota::destroy`).
+ *                           `node->lock` in `quota::destroy`; nothing else
+ *                           holds two).
  *   3. `revoke::s_lock`     protects the pending revocation table `g_pending`
  *                           and serializes `revoke::sweep()`.
  *   4. `vm::s_lock`         protects the virtual address free list and Sv39
@@ -40,6 +41,10 @@
  * innermost). Pure capability-derivation and read-only syscalls (`sys_seal`,
  * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_revoke_derive`,
  * `sys_revoke_query`, `sys_thread_tid`) take no lock at all.
+ *
+ * `vm::alloc_pages` may run a revocation sweep, which takes `revoke::s_lock`
+ * and then refunds into quota nodes. So it is never called with a
+ * `QuotaNode::lock` or `revoke::s_lock` held.
  *
  * HOW IT IS SAFE TO HOLD
  * ----------------------

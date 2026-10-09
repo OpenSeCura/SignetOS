@@ -25,15 +25,26 @@
 // lives here; the thread-memory tree is instantiated by `thread.cpp`.
 //
 // Quotas are IMMUTABLE once derived: a budget cannot be resized or
-// renegotiated. The only transition out of a fixed budget is destruction, which
-// refunds the full allowance to the parent in O(1).
+// renegotiated. The only transition out of a fixed budget is destruction.
+//
+// DESTROY CLOSES, IT DOES NOT KILL
+//
+// Destroying a node never waits for it to be empty and never touches what it
+// paid for. It CLOSES the node: no handle can charge, derive or destroy
+// through it again, and its unused budget goes straight back to the parent.
+// Everything it funded -- allocations, threads, child quotas -- carries on and
+// still refunds into it. Once a closed node holds nothing it is RECLAIMED: its
+// page is freed and the rest of its allowance (limit + QUOTA_NODE_COST) goes
+// back to the parent, which is reclaimed in turn if it is closed and now holds
+// nothing either. Killing what a quota paid for is compartment and thread
+// destruction, not this.
 //
 // WHERE NODES LIVE
 //
 // Each derived node occupies one page, billed to the parent that asked for it.
-// There is no pool, no free list and no slot recycling. A destroyed node's page
+// There is no pool, no free list and no slot recycling. A reclaimed node's page
 // is quarantined (vm.hpp): it stays mapped, so its handles still reach it, and
-// they are refused because destroy cleared FLAG_LIVE. The revocation sweep will
+// they are refused because its flags are clear. The revocation sweep will
 // eventually clear their tags too.
 //
 // Root nodes are the exception. They have no parent to bill, so each tree's
@@ -66,12 +77,14 @@ constexpr size_t   QUOTA_NODE_PAGES = 1;
 constexpr uint64_t QUOTA_NODE_COST  = QUOTA_NODE_PAGES * vm::PAGE_SIZE;
 
 constexpr uint32_t FLAG_ROOT = (1u << 0);
-// Set while the node is in use, cleared on destroy. This is what makes a stale
-// handle fail: a destroyed node's page is quarantined, not unmapped, so the
-// handle still unseals and still reaches the node. Only this flag says it is
-// dead. Safe to keep in the node because callers never obtain a writable
-// capability to it.
+// Set until the node is destroyed (closed). This is what makes a closed node's
+// handles fail: they still unseal and still reach the node, so only this flag
+// says it is closed. Charge, derive, destroy and query require it. Safe to keep
+// in the node because callers never obtain a writable capability to it.
 constexpr uint32_t FLAG_LIVE = (1u << 1);
+// Set until the node is reclaimed. Refunds and thread releases require only
+// this, so a closed node keeps draining until it holds nothing.
+constexpr uint32_t FLAG_EXISTS = (1u << 2);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -117,7 +130,9 @@ struct Tree {
 // Resets `t`. Requires the sealing authority for `t.type`.
 void init(Tree& t, OType type);
 
-// Unseals `handle` under `t`'s type and returns the live node, or null.
+// Unseals `handle` under `t`'s type and returns the node, or null if it is not
+// genuine or the node has been freed. A closed node is returned: operations
+// that need it open check FLAG_LIVE under its lock.
 QuotaNode* unseal(Tree& t, Capability handle);
 
 // Boot-time root. Occupies the static root node, costs no frames. Returns a
@@ -131,14 +146,21 @@ Capability create_root(Tree& t, uint64_t total_bytes);
 Capability derive(Tree& t, Capability parent_handle, uint64_t amount_bytes,
                   uint64_t perms_mask, Status* out_status = nullptr);
 
-// Destroys a quota, refunding limit + QUOTA_NODE_COST to its parent in O(1),
-// clearing FLAG_LIVE and quarantining its page. Requires Permit_Store, no
-// children, nothing allocated, no active threads.
+// Closes a quota (DESTROY CLOSES, IT DOES NOT KILL above): clears FLAG_LIVE
+// and gives its unused budget back to the parent at once. The rest follows when
+// the node is reclaimed, immediately if it already holds nothing. Requires
+// Permit_Store. Fails only for a bad or closed handle, or the root.
 Status destroy(Tree& t, Capability handle);
 
-// Charges / credits bytes. Requires Permit_Load.
+// Charges / credits bytes. Requires Permit_Load. Refund also accepts a closed
+// node, and reclaims it if that leaves it holding nothing.
 Status charge(Tree& t, Capability handle, uint64_t bytes);
 Status refund(Tree& t, Capability handle, uint64_t bytes);
+
+// Thread-memory trees: releases one thread the node funded, crediting `bytes`
+// and dropping `active_threads`. Like refund, accepts a closed node and
+// reclaims it if that leaves it holding nothing.
+void release_thread(Tree& t, Capability handle, uint64_t bytes);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Tree& t, Capability handle, QuotaNode* out_copy);
@@ -169,6 +191,12 @@ inline bool query(Capability handle, QuotaVm* out_copy) {
 inline size_t live_nodes() {
     return __atomic_load_n(&vm_tree().live_nodes, __ATOMIC_RELAXED);
 }
+
+#ifdef SIGNETOS_QUOTA_SELFTEST
+// Boot-time check of destroy, drain and reclaim against a scratch subtree of
+// `root` (QUOTA_SELFTEST=1). Panics on the first failure.
+void self_test(Capability root);
+#endif
 
 
 } // namespace signetos::quota

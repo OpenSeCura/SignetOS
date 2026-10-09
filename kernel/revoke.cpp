@@ -95,12 +95,20 @@ PendingPage* find_room(Capability mem_quota) {
   return nullptr;
 }
 
-// Frees every pending page back into quarantine and refunds its funder. Caller
-// holds `s_lock`. The pages are reclaimed by the sweep after the one that
-// retires them, like any other freed kernel bookkeeping page.
-void release_pages() {
+// Detaches the whole backlog and returns its chain of pages. Caller holds
+// `s_lock`.
+Capability take_pages() {
   Capability p = g_pending_pages;
   g_pending_pages = nullptr;
+  return p;
+}
+
+// Frees a chain detached by take_pages() back into quarantine and refunds each
+// page's funder. Caller must NOT hold `s_lock`: a refund takes quota node
+// locks, which come before it (lock.hpp). The pages are reclaimed by the sweep
+// after the one that retires them, like any other freed kernel bookkeeping
+// page.
+void release_pages(Capability p) {
   while (capability_is_valid(p)) {
     const Capability next = page_of(p)->next;
     const Capability funder = page_of(p)->funder;
@@ -150,7 +158,8 @@ Capability seal_revoker(Capability cap, uint64_t perms_mask) {
 
 void init() {
   s_lock = SpinLock{};
-  release_pages();  // a no-op at boot; the tests re-init with ranges queued
+  // A no-op at boot; the tests re-init with ranges queued.
+  release_pages(take_pages());
   g_pending_epoch = 1;
   g_completed_epoch = EPOCH_NONE;
 }
@@ -425,8 +434,11 @@ namespace {
     return capability_get_address(c);            \
   }())
 
-__attribute__((noinline)) void do_sweep() {
+// The sweep proper, under `s_lock`. Returns the backlog it retired, for the
+// caller to release once the lock is dropped.
+Capability sweep_locked() {
   Locked hold(s_lock);
+  Capability retired = nullptr;
   if (capability_is_valid(g_pending_pages) || vm::quarantined_pages() > 0) {
     // 1. Scan kernel `.data`, `.bss.stack`, and `.bss` (`[_data_start,
     //    _kernel_end)`), which includes the boot stack and all static state.
@@ -460,13 +472,19 @@ __attribute__((noinline)) void do_sweep() {
     //    reusable pool.
     vm::reclaim_quarantined();
 
-    // 4. The backlog is retired: give its pages back and refund whoever paid.
-    release_pages();
+    // 4. The backlog is retired. Its pages are given back and whoever paid is
+    //    refunded by the caller, outside `s_lock`.
+    retired = take_pages();
   }
 
   const uint64_t swept = g_pending_epoch;
   __atomic_store_n(&g_completed_epoch, swept, __ATOMIC_RELEASE);
   __atomic_store_n(&g_pending_epoch, swept + 1, __ATOMIC_RELEASE);
+  return retired;
+}
+
+__attribute__((noinline)) void do_sweep() {
+  release_pages(sweep_locked());
 }
 
 }  // namespace
