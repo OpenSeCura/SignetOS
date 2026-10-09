@@ -204,6 +204,8 @@ ranges, the chain of entry pages, the UID and liveness flags. It does not
 record which threads are inside it, or how many. The kernel keeps no global
 list of compartments, or of threads.
 
+TODO: a capability table is currently 1 page!!!! That's not really very useful right now.
+
 #### Compartment UID
 
 A UID is a 64-bit value from a monotonic counter, assigned at creation and
@@ -560,7 +562,7 @@ and BSS, and the location of the manifest.
 
 #### The manifest (`user/manifest.hpp`)
 
-A compartment holds exactly what its creator put in its capability table and
+A compartment holds exactly what the loader put in its capability table and
 nothing else. An image therefore has to state what it wants in a form the
 launcher can read before anything exists: the `.manifest` block, which the
 header points to.
