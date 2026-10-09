@@ -36,6 +36,7 @@
  *   sched.yield            ()                     give up the rest of the slice
  *   sched.block            (timeout_us)           sleep until woken (or timeout)
  *   sched.wake             (tid)                  wake a blocked thread by tid
+ *   sched.thread_kill      (thread)               Store on thread: end it
  *   sched.self             ()                     the caller's tid
  *   sched.policy_register  (root, delegate)       Store on root
  *   sched.run              (kernel-created dispatcher thread; not published)
@@ -80,6 +81,14 @@
  *   A thread that keeps the CPU without yielding still gets ticked, and the
  *   tick picks, so a timeout is late by at most a tick.
  *
+ * KILLING
+ *   `thread_kill` asks the kernel to end a thread (`sys_thread_kill`, see
+ *   unwind.hpp). The thread only ends once it runs, so a killed thread never
+ *   sleeps: `thread_kill` wakes it as `wake` does, and every later `block`
+ *   returns SCHED_KILLED at once. Its record is reaped like any exited
+ *   thread's, or, if the kernel tore it down before it ever ran, on the next
+ *   refused switch to it.
+ *
  * IDLE
  *   When nothing is runnable the CPU idles in the scheduler (`idle_until`):
  *   a spin with `s_running` clear, so the tick has nothing to charge or
@@ -118,6 +127,7 @@ namespace {
   M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
   M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)         \
   M_SYSCALL(X, SYS_THREAD_TID, thread_tid)               \
+  M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)             \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
@@ -158,6 +168,7 @@ struct ThreadRec {
   uint32_t wake_pending;  // a wake arrived while not BLOCKED (file comment)
   uint64_t wake_at_us;    // BLOCKED with a timeout: READY again at this time
   bool timed_out;         // the last `block` ended by `expire`
+  bool killed;            // `thread_kill` was called: `block` never sleeps it
 };
 
 // One node per page.
@@ -204,6 +215,7 @@ Capability s_gate_alloc = nullptr;
 Capability s_gate_dealloc = nullptr;
 Capability s_gate_switch = nullptr;
 Capability s_gate_thread_tid = nullptr;
+Capability s_gate_thread_kill = nullptr;
 Capability s_gate_invoke = nullptr;
 Capability s_uart = nullptr;
 
@@ -608,10 +620,23 @@ uint64_t next_event(uint64_t now) {
   return at < now ? now : at;
 }
 
-// Hands the CPU to `t`. Returns 0 when something switches back to the caller,
-// or at once with the `Status` of a refused switch (`t->thread` is not a
-// live, halted thread handle), in which case `s_running` still names `t`.
+void reap(ThreadRec* t, uint64_t now);
+
+// Hands the CPU to `t`. Returns 0 when something switches back to the caller.
+//
+// A refused switch means one of two things. Either `t` is gone (it exited or
+// was killed, and the kernel no longer knows its handle as a live thread):
+// then nothing ran, `t` is reaped here, and the caller gets back the state it
+// had, `s_busy` held, to pick again; the kernel's `Status` is returned. Or `t`
+// is the thread running right now, i.e. the caller itself under a stale
+// `s_running`: a tick can land between the stores below and the kernel
+// masking interrupts, see `s_running == t` and act on it before it is true,
+// and if it picks the interrupted thread the kernel refuses, as it is running.
+// The kernel reports both as InvalidCapability; `sys_thread_tid` tells them
+// apart, 0 only for a dead thread. For a live one `s_running = t` and
+// `t->state = T_RUNNING` are already right, so that case reports success.
 uint64_t switch_to(ThreadRec* t, uint64_t now) {
+  ThreadRec* const prev = s_running;
   t->state = T_RUNNING;
   t->last_run_us = now;
   s_running = t;
@@ -620,6 +645,17 @@ uint64_t switch_to(ThreadRec* t, uint64_t now) {
   using FnSwitch = decltype(&sys_thread_switch);
   const uint64_t status =
       syscall::call<FnSwitch>(s_gate_invoke, s_gate_switch, t->thread);
+  if (status != 0) {
+    using FnThreadTid = decltype(&sys_thread_tid);
+    if (syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid,
+                                   t->thread) != 0) {
+      return 0;  // alive, so it is us: nothing to undo
+    }
+    s_busy = true;
+    reap(t, now);  // clears `s_running`, which was `t`
+    s_running = prev;
+    s_slice_start_us = now;
+  }
   // Back on this thread: whoever switched to us left `s_busy` clear.
   return status;
 }
@@ -669,6 +705,7 @@ void reap(ThreadRec* t, uint64_t now) {
   t->next = nullptr;
   t->state = T_FREE;
   t->wake_at_us = 0;
+  t->killed = false;
   if (s_registered > 0) {
     s_registered -= 1;
   }
@@ -808,6 +845,7 @@ extern "C" int64_t sched_thread_register_entry(Capability thread,
   rec->wake_pending = 0;
   rec->wake_at_us = 0;
   rec->timed_out = false;
+  rec->killed = false;
   rec->state = T_READY;
   rec->next = n->threads;
   n->threads = rec;
@@ -853,9 +891,12 @@ extern "C" int64_t sched_yield_entry() {
       return 0;
     }
     if (next != nullptr) {
-      switch_to(next, now);  // clears s_busy before switching
-      // Resumed by a later switch back to `cur`; `s_running` is already `cur`.
-      return 0;
+      // `switch_to` clears s_busy before switching.
+      if (switch_to(next, now) == 0) {
+        // Resumed by a later switch back to `cur`; `s_running` is already `cur`.
+        return 0;
+      }
+      continue;  // `next` was dead and is reaped: pick again
     }
     // Every ready node -- ours included -- is out of budget for this period:
     // idle until the earliest reset instead of running on borrowed time.
@@ -885,10 +926,12 @@ void block_until_woken(ThreadRec* cur, uint64_t now) {
       return;
     }
     if (next != nullptr) {
-      switch_to(next, now);
-      // Back here only because a `wake` made us READY and someone picked us;
-      // `switch_to` on their side already made us RUNNING.
-      return;
+      if (switch_to(next, now) == 0) {
+        // Back here because a `wake` made us READY and someone picked us;
+        // `switch_to` on their side already made us RUNNING.
+        return;
+      }
+      continue;  // `next` was dead and is reaped: look again
     }
     // Nothing runnable: idle until the earliest period reset, timeout or
     // wake (`~0`, i.e. a wake only, if every thread is blocked for good).
@@ -906,6 +949,9 @@ extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
   if (cur == nullptr || s_in_delegate) {
     return init::SCHED_INVALID_THREAD;
   }
+  if (__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST)) {
+    return init::SCHED_KILLED;  // a killed thread never sleeps
+  }
   s_busy = true;
   const uint64_t now = now_us();
   charge_running(now);
@@ -917,6 +963,9 @@ extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
   }
   block_until_woken(cur, now);
   cur->wake_at_us = 0;
+  if (__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST)) {
+    return init::SCHED_KILLED;  // woken by `thread_kill`
+  }
   return cur->timed_out ? init::SCHED_TIMED_OUT : init::SCHED_OK;
 }
 
@@ -936,6 +985,39 @@ extern "C" int64_t sched_wake_entry(uint64_t tid) {
     __atomic_store_n(&t->wake_pending, 1u, __ATOMIC_SEQ_CST);
   }
   s_wakeups = s_wakeups + 1;  // ends any `idle_until` in progress
+  return init::SCHED_OK;
+}
+
+// Ends the thread behind `thread` (needs Store) through `sys_thread_kill`,
+// then wakes it so it runs to where the kernel ends it (KILLING above). Like
+// `wake`, this only touches one record and the wake counter, so it is safe
+// from interrupt context.
+extern "C" int64_t sched_thread_kill_entry(Capability thread) {
+  if (!sealing::is_sealed_as(OType::Thread, thread)) {
+    return init::SCHED_INVALID_THREAD;
+  }
+  // The id first: a thread that never ran is torn down by the kill.
+  using FnThreadTid = decltype(&sys_thread_tid);
+  const uint64_t tid =
+      syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, thread);
+  using FnThreadKill = decltype(&sys_thread_kill);
+  const uint64_t st =
+      syscall::call<FnThreadKill>(s_gate_invoke, s_gate_thread_kill, thread);
+  if (st != static_cast<uint64_t>(Status::Ok)) {
+    return st == static_cast<uint64_t>(Status::InsufficientPermission)
+               ? init::SCHED_PERMISSION
+               : init::SCHED_INVALID_THREAD;
+  }
+  ThreadRec* t = tid != 0 ? find_registered(tid) : nullptr;
+  if (t == nullptr) {
+    return init::SCHED_OK;  // not registered with us
+  }
+  // `killed` is set before the wake. A full `wake` is needed, not just the
+  // BLOCKED -> READY flip: a kill from interrupt context can land between
+  // `block`'s test of `killed` and the thread going to sleep, and only
+  // `wake_pending` makes that sleep return at once.
+  __atomic_store_n(&t->killed, true, __ATOMIC_SEQ_CST);
+  sched_wake_entry(tid);
   return init::SCHED_OK;
 }
 
@@ -980,7 +1062,13 @@ extern "C" uint64_t sched_tick_entry(uint64_t scause, uint64_t stval,
   }
   // Switch from inside the handler. `cur` stays parked here, masked, until
   // someone switches back to it; then this returns and `sret` resumes it.
-  switch_to(next, now);
+  if (switch_to(next, now) != 0) {
+    // `next` was dead and is reaped. Keep running `cur`; the next tick picks.
+    if (cur->state == T_READY) {
+      cur->state = T_RUNNING;
+    }
+    s_busy = false;
+  }
   return 0;
 }
 
@@ -1007,11 +1095,11 @@ extern "C" uint64_t sched_run_entry(Capability arg) {
     }
     const uint64_t status = switch_to(t, now);
     if (status != 0) {
-      // Refused: `t->thread` is not a live, halted thread. `s_running` is
-      // still `t`, so the next time round reaps it, as if it had exited.
+      // Refused: `t->thread` was not a live, halted thread. `switch_to` has
+      // reaped it and left `s_running` clear, so the next round picks afresh.
       print_dec(s_gate_invoke, s_uart,
                 "[sched]    thread_switch refused, status ", status,
-                "; unregistering the thread\n");
+                "; the thread is unregistered\n");
     }
   }
   print(s_gate_invoke, s_uart,
@@ -1033,6 +1121,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_dealloc = rw[SLOT_SYS_VM_DEALLOC];
   s_gate_switch = rw[SLOT_SYS_THREAD_SWITCH];
   s_gate_thread_tid = rw[SLOT_SYS_THREAD_TID];
+  s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
 
@@ -1087,6 +1176,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability e_yield = entry(reinterpret_cast<const void*>(&sched_yield_entry));
   Capability e_block = entry(reinterpret_cast<const void*>(&sched_block_entry));
   Capability e_wake = entry(reinterpret_cast<const void*>(&sched_wake_entry));
+  Capability e_kill = entry(reinterpret_cast<const void*>(&sched_thread_kill_entry));
   Capability e_self = entry(reinterpret_cast<const void*>(&sched_self_entry));
   Capability e_policy = entry(reinterpret_cast<const void*>(&sched_policy_register_entry));
   Capability e_run = entry(reinterpret_cast<const void*>(&sched_run_entry));
@@ -1096,6 +1186,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   publish_name(s_gate_invoke, naming_publish, "sched.yield", e_yield);
   publish_name(s_gate_invoke, naming_publish, "sched.block", e_block);
   publish_name(s_gate_invoke, naming_publish, "sched.wake", e_wake);
+  publish_name(s_gate_invoke, naming_publish, "sched.thread_kill", e_kill);
   publish_name(s_gate_invoke, naming_publish, "sched.self", e_self);
   publish_name(s_gate_invoke, naming_publish, "sched.policy_register", e_policy);
 

@@ -75,6 +75,13 @@ namespace signetos::sentry {
 // `sys_thread_create` / `sys_trap_bind` refuse trusted entries.
 constexpr uint64_t ENTRY_FLAG_TRUSTED = 1u << 0;
 
+// ENTRY_FLAG_TRUSTED_TO_FINISH is never in an `EntryRecord`. The switcher
+// sets it in a `ReturnFrame` when the callee is the kernel or its compartment
+// is trusted to finish, and the trap dispatcher in a `TrapFrame` when the
+// handler's compartment is, for the unwinder to test (unwind.hpp, KILLED
+// THREADS).
+constexpr uint64_t ENTRY_FLAG_TRUSTED_TO_FINISH = 1u << 1;
+
 // Stack a `sys_sentry` entry is promised: the switcher refuses a call whose
 // caller has less than this free below `csp`, so a callee is never entered on
 // a stack too small to run its prologue and fault half way through an update.

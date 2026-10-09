@@ -208,7 +208,7 @@ __signetos_resume_trap_frame:
      *    and returned from a trap of its own, `SPP` is stale by the time this
      *    context resumes. Everything in SignetOS runs in S-mode.
      *
-     *    The trap-only slots (512..560) are wiped first, while `csp` is
+     *    The trap-only slots (512..576) are wiped first, while `csp` is
      *    still the frame. Then `ct6` becomes the base for the 32 shared slots:
      *    it is the last register reloaded, so its saved value is parked in
      *    `sscratchc` meanwhile and swapped back by the final `csrrw`, which at
@@ -225,6 +225,7 @@ __signetos_resume_trap_frame:
     csc     cnull, TRAP_FRAME_HANDLER_SP(csp)
     csc     cnull, TRAP_FRAME_RW_TABLE(csp)
     csc     cnull, TRAP_FRAME_SSTATUS(csp)  /* sstatus and handler_sie */
+    csc     cnull, TRAP_FRAME_FLAGS(csp)    /* flags and reserved */
     cmv     ct6, csp                    /* ct6 = frame base; csp reloaded last */
     clc     ct5, 160(ct6)               /* ct5 = saved ct6 */
     csrw    sscratchc, ct5              /* park saved ct6 in sscratchc */

@@ -1858,6 +1858,90 @@ void print_help() {
       "  shutdown   stop the workers and power the machine off\n");
 }
 
+// killtest: a temporary check of thread kill, not part of the shell.
+// `killtest spin|sleep|fs|stuck` starts a thread whose own code
+// is the shell, lets it run for 100 ms, kills it with `sched.thread_kill`, and
+// says how long it took to go. What the thread is doing when the kill lands:
+//   spin      running its own code
+//   sleep     asleep in `sched.block` with nobody to wake it
+//   fs        reading a file: inside fs, and blk, most of the time
+//   stuck     inside a call to the shell that never returns
+uint64_t s_killtest_mode = 0;
+Capability s_killtest_stuck = nullptr;
+alignas(16) char s_killtest_buf[4096];
+
+// Never returns. Reached through a sentry, so a thread in here is inside a
+// call to the shell -- which is not trusted to finish.
+uint64_t killtest_stuck() {
+  for (;;) {
+    __asm__ volatile("" ::: "memory");
+  }
+}
+
+uint64_t killtest_thread(Capability) {
+  Capability file = nullptr;
+  if (s_killtest_mode == 2) {
+    fs_open_with(s_fs_open, s_bin_quota, "logo.bin", &file, nullptr, perms::Load);
+  }
+  for (;;) {
+    if (s_killtest_mode == 1) {
+      invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL);
+    } else if (s_killtest_mode == 2) {
+      uint64_t got = 0;
+      fs_io(s_fs_read, file, s_killtest_buf, 0, sizeof(s_killtest_buf), &got);
+    } else if (s_killtest_mode == 3) {
+      invoke<int64_t>(s_gate_invoke, s_killtest_stuck);
+    }
+  }
+}
+
+void cmd_killtest(const char* mode) {
+  const char* modes[] = {"spin", "sleep", "fs", "stuck"};
+  s_killtest_mode = 4;
+  for (uint64_t i = 0; i < 4; ++i) {
+    if (str_eq(mode, modes[i])) {
+      s_killtest_mode = i;
+    }
+  }
+  if (s_killtest_mode == 4) {
+    out("[killtest] usage: killtest spin|sleep|fs|stuck\n");
+    return;
+  }
+  Capability* rw = rw_table();
+  auto mint = [&](const void* fn) {
+    return mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp, fn);
+  };
+  s_killtest_stuck = mint(reinterpret_cast<const void*>(&killtest_stuck));
+  const Capability entry = mint(reinterpret_cast<const void*>(&killtest_thread));
+  const Capability kill =
+      lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
+  const Capability node = derive_app_node();
+  using FnThreadCreate = decltype(&sys_thread_create);
+  const Capability t = syscall::call<FnThreadCreate>(
+      s_gate_invoke, s_gate_thread_create, s_thread_quota, APP_STACK, entry,
+      nullptr);
+  if (!capability_is_valid(kill) || !capability_is_valid(node) ||
+      !sealing::is_sealed_as(OType::Thread, t) ||
+      invoke<int64_t>(s_gate_invoke, s_sched_register, t, node) <= 0) {
+    out("[killtest] could not start the test thread\n");
+    return;
+  }
+  sleep_us(100'000);
+  const uint64_t t0 = now_us();
+  const int64_t st = invoke<int64_t>(s_gate_invoke, kill, t);
+  out_dec("[killtest] sched.thread_kill: status -", static_cast<uint64_t>(-st),
+          "\n");
+  while (destroy_sched_node(node) == init::SCHED_BUSY) {
+    if (now_us() - t0 > 2'000'000) {
+      out("[killtest] the thread is still there 2 s after the kill\n");
+      return;
+    }
+    sleep_us(1'000);
+  }
+  out_dec("[killtest] the thread was gone ", (now_us() - t0) / 1000,
+          " ms after the kill\n");
+}
+
 // Runs one command line (edited in place to split off arguments). False means
 // the console should end.
 bool execute(char* line) {
@@ -1890,6 +1974,8 @@ bool execute(char* line) {
     const char* name = first_word(rest, &args);
     int64_t status = RUN_NOT_RUN;
     cmd_run(name, args, &status);
+  } else if (str_eq(cmd, "killtest")) {
+    cmd_killtest(rest);
   } else if (str_eq(cmd, "shutdown")) {
     return false;
   } else {

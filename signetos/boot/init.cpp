@@ -967,6 +967,24 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // =========================================================================
+  // Trusted to finish: a killed thread inside one of these finishes its call
+  // instead of being cut (unwind.hpp, KILLED THREADS), so a kill never
+  // leaves a core service half-updated. The shell is not marked.
+  // =========================================================================
+  {
+    using Fn = decltype(&sys_compartment_trust_to_finish);
+    const Capability gate_trust =
+        rw[init::syscall_slot(syscall::Id::compartment_trust_to_finish)];
+    const Started* trusted[] = {&uart,   &loader, &blk,     &fs,
+                                &naming, &sched,  &trap_mgr};
+    for (const Started* s : trusted) {
+      if (capability_is_valid(s->comp)) {
+        syscall::call<Fn>(invoke, gate_trust, s->comp);
+      }
+    }
+  }
+
+  // =========================================================================
   // 9. Record all provisioned handles in `init`'s capability table
   // =========================================================================
   rw[init::RW_SLOT_UART_QUOTA] = uart.quota;

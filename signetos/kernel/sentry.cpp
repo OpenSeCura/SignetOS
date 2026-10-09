@@ -400,6 +400,16 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
 
   frame->callee_sp = narrowed;
   frame->callee_gp = entry.table;
+  if (trusted) {
+    entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;  // the kernel always finishes
+  } else if (entry.owner != nullptr) {
+    const auto* c =
+        reinterpret_cast<const compartment::Compartment*>(entry.owner);
+    if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
+         compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
+      entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;
+    }
+  }
   frame->flags = entry.flags;
   thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
   return entry.sentry;

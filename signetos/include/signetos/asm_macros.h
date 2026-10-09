@@ -45,7 +45,7 @@
  * layouts follow.
  *
  * 1. `SwitchFrame` (512 bytes = 32 capabilities, `thread.hpp`) and
- *    `TrapFrame`   (576 bytes = 35 capabilities + 2 integers, `trap.hpp`)
+ *    `TrapFrame`   (592 bytes = 35 capabilities + 4 integers, `trap.hpp`)
  *    share the same layout for offsets 0..496:
  *
  *      Offset    Field              Register(s)
@@ -59,8 +59,8 @@
  *      368..480  a[0..7]            ca0..ca7
  *      496       tp                 ctp
  *
- *    `TrapFrame` appends three trap-specific capability slots, then two
- *    integers that share one more 16-byte slot:
+ *    `TrapFrame` appends three trap-specific capability slots, then four
+ *    integers in two more 16-byte slots:
  *      512       sepcc              interrupted PC capability
  *      528       handler_sp         narrowed stack for bound trap handler
  *      544       handler_rw_table   handler compartment cap table (`cgp`)
@@ -70,6 +70,10 @@
  *      568       handler_sie        `SSTATUS_SIE` or 0: what the trap vector
  *                                   sets in `sstatus` just before it enters
  *                                   the bound handler
+ *      576       flags              ENTRY_FLAG_TRUSTED_TO_FINISH or 0: set
+ *                                   for a bound handler whose compartment
+ *                                   is trusted to finish
+ *      584       reserved
  *
  * 2. `ReturnFrame` (400 bytes = 25 capability slots, `sentry.hpp`):
  *    Saves the caller's callee-saved state across a synchronous
@@ -142,7 +146,8 @@
 #define TRAP_FRAME_RW_TABLE     544
 #define TRAP_FRAME_SSTATUS      560
 #define TRAP_FRAME_HANDLER_SIE  568
-#define TRAP_FRAME_SIZE         576
+#define TRAP_FRAME_FLAGS        576
+#define TRAP_FRAME_SIZE         592
 
 #define RET_FRAME_ARG0          272
 #define RET_FRAME_ARG1          288
@@ -205,7 +210,7 @@
  * the interrupted thread's kernel stack, so how deep a handler chain can nest
  * depends on how deep that thread was: a two-call chain fits over a thread
  * at compartment depth 13 (2848 free before the `TrapFrame`) but not depth
- * 14 (its second call is refused at 1472 free), and an exception handler
+ * 14 (its second call is refused at 1456 free), and an exception handler
  * runs unmasked over a thread at compartment depth 0 to 13 but masked at 14.
  * With one page (3792 bytes) the numbers were four nested calls, the chain
  * over depth 3 but not 4, unmasked over depth 0 to 2 -- and a program the

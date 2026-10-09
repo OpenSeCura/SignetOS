@@ -402,6 +402,10 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
 
   // Sleep until the used ring moves. Polling instead if we are not a
   // scheduled thread or no interrupt has ever arrived (no route).
+  // A killed thread never sleeps (`block` returns SCHED_KILLED at once), so
+  // for one this loop polls. It must still wait for the completion: the
+  // device owns the request until then, and `s_busy`, `s_waiter_tid` and
+  // `s_last_used` are only right again after it.
   volatile VirtqUsed* us = used();
   for (;;) {
     fence();

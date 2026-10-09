@@ -78,6 +78,12 @@ constexpr uint64_t THREAD_STATE_COST = THREAD_STATE_PAGES * vm::PAGE_SIZE;
 constexpr uint32_t FLAG_LIVE = (1u << 1);
 constexpr uint32_t FLAG_RUNNING = (1u << 2);
 constexpr uint32_t FLAG_EXITED = (1u << 3);
+// Set by the first dispatch and never cleared: the thread has run, so it may
+// be inside a compartment call, and `kill` only marks it.
+constexpr uint32_t FLAG_STARTED = (1u << 4);
+// Set by `kill` on a thread that has run. The thread ends the next time the
+// kernel is about to resume its own code (unwind.hpp, KILLED THREADS).
+constexpr uint32_t FLAG_KILL_PENDING = (1u << 5);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -181,9 +187,17 @@ Status dispatch(Capability thread_handle) __asm__("sys_thread_switch");
 // caller of `dispatch()`.
 void exit(int exit_status);
 
-// Terminates a suspended thread (requires Permit_Store on `thread_handle`),
-// reclaiming its stack and state page back to its `funding_quota`.
+// Ends a thread (requires Permit_Store on `thread_handle`). A thread that has
+// never run is torn down here, its stack and state page refunded to its
+// `funding_quota`. A thread that has run is only marked (FLAG_KILL_PENDING):
+// it keeps running until the kernel is about to resume its own code, and ends
+// there (unwind.hpp, KILLED THREADS). Keeping it runnable until then is the
+// scheduler's job (`sched.thread_kill`). InvalidCapability if it is not a
+// live thread or is already ending.
 Status kill(Capability thread_handle);
+
+// True if the thread running on this hart has been killed.
+bool current_kill_pending();
 
 // The kernel's id of the thread behind `thread_handle` (any live handle:
 // nothing beyond what every handle carries is required), or 0 if it is not a

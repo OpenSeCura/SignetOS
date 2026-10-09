@@ -104,6 +104,9 @@ constexpr size_t RW_SLOT_SEED_BASE = 2;  // first seed slot in the table
 // (vm.hpp), so the handle still unseals and still reaches the struct until the
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
+// Set by `trust_to_finish`, never cleared: a killed thread inside this
+// compartment is left to finish its call (unwind.hpp, KILLED THREADS).
+constexpr uint32_t FLAG_TRUSTED_TO_FINISH = (1u << 1);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -316,6 +319,11 @@ Status destroy(Capability handle);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Capability handle, Compartment* out_copy);
+
+// `sys_compartment_trust_to_finish`: marks the compartment behind `handle`
+// trusted to finish (FLAG_TRUSTED_TO_FINISH). `init` marks the core services
+// with it at boot.
+Status trust_to_finish(Capability handle);
 
 // The record for the allocation based at `va` within `comp`'s chain.
 // `out_funder`, if given, receives the quota that paid for it -- which is the

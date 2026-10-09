@@ -116,9 +116,15 @@ struct alignas(16) TrapMgrInterface {
 //   int64_t  sched.thread_register(Capability thread, Capability quota) -> tid (>0) or SCHED_* (<0)
 //   int64_t  sched.policy_register(Capability root, Capability delegate) -> policy_id (>0) or SCHED_* (<0)
 //   int64_t  sched.yield() -> 0
-//   int64_t  sched.block(uint64_t timeout_us) -> SCHED_OK or SCHED_TIMED_OUT
+//   int64_t  sched.block(uint64_t timeout_us) -> SCHED_OK, SCHED_TIMED_OUT or SCHED_KILLED
 //   int64_t  sched.wake(uint64_t tid) -> SCHED_OK or SCHED_INVALID_THREAD
+//   int64_t  sched.thread_kill(Capability thread) -> SCHED_OK, SCHED_PERMISSION or SCHED_INVALID_THREAD
 //   uint64_t sched.self() -> tid (0 if unregistered)
+//
+// A killed thread never sleeps: every `block` it makes returns SCHED_KILLED
+// at once. A caller waiting for something certain to happen (a device
+// finishing a request it was given) keeps waiting, and so polls; one waiting
+// for something that may never happen (input, another thread) gives up.
 
 constexpr uint8_t PRIORITY_RT          = 0;
 constexpr uint8_t PRIORITY_INTERACTIVE = 1;
@@ -145,6 +151,7 @@ constexpr int64_t SCHED_FULL           = -7;
 constexpr int64_t SCHED_INVALID_THREAD = -8;
 constexpr int64_t SCHED_UNKNOWN_POLICY = -9;
 constexpr int64_t SCHED_TIMED_OUT      = -10;  // block: the timeout ran out first
+constexpr int64_t SCHED_KILLED         = -11;  // block: the caller was killed; it did not sleep
 
 // sched.quota_derive: needs the ADMIN handle of `parent`.
 struct alignas(16) SchedDeriveRequest {

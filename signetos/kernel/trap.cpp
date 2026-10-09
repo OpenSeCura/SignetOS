@@ -75,6 +75,7 @@ static_assert(offsetof(trap::TrapFrame, handler_rw_table) ==
 static_assert(offsetof(trap::TrapFrame, sstatus) == TRAP_FRAME_SSTATUS);
 static_assert(offsetof(trap::TrapFrame, handler_sie) ==
               TRAP_FRAME_HANDLER_SIE);
+static_assert(offsetof(trap::TrapFrame, flags) == TRAP_FRAME_FLAGS);
 static_assert(sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE);
 
 // Standard RISC-V synchronous causes, indexed by exception code.
@@ -633,6 +634,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
                                                TrapFrame* frame) {
   const bool async = (scause & INTERRUPT_BIT) != 0;
   const uint64_t sepc = capability_get_address(frame->sepcc);
+  frame->flags = 0;
 
   // A synchronous fault raised by kernel code is a kernel bug, and no handler
   // a compartment bound may stand in for the kernel: report and halt. Kernel
@@ -700,6 +702,13 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
       thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
       frame->handler_sp = h_sp;
       frame->handler_rw_table = compartment::table_writable(slot.owner_comp);
+      // What a kill does to the handler (unwind.hpp, KILLED THREADS).
+      const auto* owner =
+          reinterpret_cast<const compartment::Compartment*>(entry.owner);
+      if ((__atomic_load_n(&owner->flags, __ATOMIC_ACQUIRE) &
+           compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
+        frame->flags = sentry::ENTRY_FLAG_TRUSTED_TO_FINISH;
+      }
 
       // The SIE the handler runs with (asm_macros.h, INTERRUPT MASKING
       // RULE): an interrupt handler, masked; an exception handler, the

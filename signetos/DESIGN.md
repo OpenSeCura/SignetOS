@@ -271,7 +271,18 @@ between compartments.
 | Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. |
 | Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the child quota is destroyed, its bandwidth returns to the parent node. |
 | Exit | `sys_thread_exit` quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
-| Kill | `sys_thread_kill` tears down a **parked** thread only. A running thread cannot be killed asynchronously yet. |
+| Kill | `sys_thread_kill`. A thread that never ran is torn down at once. Otherwise it is marked, and the kernel acts on the mark each time it resumes compartment code on it (return from a call, end of a trap) (`unwind.hpp`, KILLED THREADS). See the table below. `sched.thread_kill` wakes the thread and keeps it from sleeping again, so a kill takes effect within a tick of its CPU time. |
+
+Code about to resume on a killed thread (trap handlers included):
+
+| Code | Result |
+| --- | --- |
+| The thread's original compartment (inside no call) | The thread ends. |
+| The kernel, or a compartment trusted to finish | Runs on; the call completes. |
+| Any other compartment | Cut: its frame is skipped and its caller gets `Status::Killed`. |
+
+* **Trusted to finish**: `sys_compartment_trust_to_finish(comp)` sets `FLAG_TRUSTED_TO_FINISH`. `init` sets it on uart, loader, blk, fs, naming, sched and trap_mgr. The switcher copies it into the call's `ReturnFrame::flags`, and the trap dispatcher into the handler's `TrapFrame::flags` (`ENTRY_FLAG_TRUSTED_TO_FINISH`); kernel entries always get it. Trusted code must never wait forever.
+* **No cleanup runs on a killed thread.** A compartment that is not trusted to finish must cope with a call being cut at any point, e.g. by recording the owner's tid in its locks and repairing state when the owner is found dead.
 
 ### 2.4 Quotas and allocation authorities
 
@@ -844,7 +855,7 @@ sys_quota_vm_destroy(prog_vm_quota);     // last: it funded the nodes above
 | Step | Behaviour |
 | --- | --- |
 | Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
-| Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join, no timeout and no way to kill a running program yet. |
+| Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join or timeout. A running program can be killed (§2.3). |
 | `sys_quota_vm_destroy` | Requires no children and nothing allocated; O(1) refund. |
 | `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
@@ -946,6 +957,7 @@ status.
 | `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry). |
 | `Sentry sys_sentry(comp, code)` | §2.5. |
+| `uint64_t sys_compartment_trust_to_finish(comp)` | §2.3. Permanent. Returns a `Status`. |
 | `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |
 | `capability_type_t sys_type_derive(key, permissions)` | Re-issues `key` with a subset of its unseal (Load) and seal (Store) rights. |
 | `capability_sealed_t sys_seal(key, obj)` | §2.7. Returns the `SealedObject` handle, or NULL. |
@@ -957,7 +969,7 @@ status.
 | --- | --- |
 | `capability_thread_t sys_thread_create(thread_mem_quota, stack_size, entry_point, initial_arg)` | `entry_point` is an `EntryPoint` and `initial_arg` must be global. Returns a suspended handle with both rights. |
 | `void sys_thread_exit(status)` | Tears down the thread and returns to the host context. The scheduler is not notified directly: it is re-dispatched and notices the exit (§2.6). |
-| `void sys_thread_kill(thread)` | `Permit_Store`. Works only on a parked thread. |
+| `uint64_t sys_thread_kill(thread)` | `Permit_Store`. §2.3. Returns a `Status`: `InvalidCapability` if not live or already ending. |
 | `uint64_t sys_thread_switch(thread)` | `Permit_Load`. Parks the caller; returns 0 when resumed, or a `Status` if refused. |
 | `uint64_t sys_thread_tid(thread)` | The kernel tid, or 0. |
 
@@ -1007,6 +1019,7 @@ from page-granular `sys_vm_allocate` and static arrays.
 | `sched.yield` | Charge the running node and pick again. |
 | `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. It may return spuriously, so callers loop. |
 | `sched.wake` | Wake a tid. Safe to call from interrupt context. **Unprotected**: anyone holding the entry and a tid can wake that thread. |
+| `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping. Safe to call from interrupt context. |
 | `sched.self` | Return the caller's tid, for use with `wake`. |
 | `sched.policy_register` | Register a custom policy engine. Not reachable yet (§2.6). |
 | `run` | The scheduler's main loop. Not published; `init` hands it to the kernel (§2.6). |

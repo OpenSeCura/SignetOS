@@ -727,6 +727,19 @@ bool query(Capability handle, Compartment* out_copy) {
   return true;
 }
 
+Status trust_to_finish(Capability handle) {
+  // TODO: no permission is required of `handle`; only the syscall slot gates
+  // this, and only `init` has it. Require one (e.g. Store) before any other
+  // compartment is given the slot.
+  Capability page = unseal(handle);
+  if (!capability_is_valid(page)) {
+    return Status::InvalidCapability;
+  }
+  Compartment* c = reinterpret_cast<Compartment*>(page);
+  __atomic_fetch_or(&c->flags, FLAG_TRUSTED_TO_FINISH, __ATOMIC_RELEASE);
+  return Status::Ok;
+}
+
 bool query_range(Capability comp, uint64_t va, Range* out_copy,
                  Capability* out_funder) {
   Capability comp_page = unseal(comp);

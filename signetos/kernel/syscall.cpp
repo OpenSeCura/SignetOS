@@ -231,6 +231,11 @@ extern "C" void sys_compartment_destroy(capability_compartment_t comp) {
   SIGNETOS_CLEAR_RETURN();
 }
 
+extern "C" uint64_t sys_compartment_trust_to_finish(
+    capability_compartment_t comp) {
+  return static_cast<uint64_t>(::signetos::compartment::trust_to_finish(comp));
+}
+
 extern "C" Sentry sys_sentry(capability_compartment_t comp,
                                capability_exec_t code) {
   ::signetos::sentry::Status s_status = ::signetos::sentry::Status::Ok;
@@ -276,9 +281,8 @@ extern "C" void sys_thread_exit(int status) {
   SIGNETOS_CLEAR_RETURN();
 }
 
-extern "C" void sys_thread_kill(capability_thread_t thread) {
-  ::signetos::thread::kill(thread);
-  SIGNETOS_CLEAR_RETURN();
+extern "C" uint64_t sys_thread_kill(capability_thread_t thread) {
+  return static_cast<uint64_t>(::signetos::thread::kill(thread));
 }
 
 extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {

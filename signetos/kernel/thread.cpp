@@ -482,7 +482,8 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
     if ((old & (FLAG_RUNNING | FLAG_EXITED)) != 0) {
       return fail(Status::InvalidCapability);
     }
-  } while (!__atomic_compare_exchange_n(&t->flags, &old, old | FLAG_RUNNING,
+  } while (!__atomic_compare_exchange_n(&t->flags, &old,
+                                        old | FLAG_RUNNING | FLAG_STARTED,
                                         false, __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED));
 
@@ -581,22 +582,31 @@ Status kill(Capability thread_handle) {
   if (!capability_has_perms(thread_handle, perms::Store)) {
     return Status::InsufficientPermission;
   }
-  // Claim `t` the way `__signetos_thread_dispatch` does: one compare-and-swap
-  // that fails if it is running (on any hart, this one included) or already
-  // ending. A kill here and a switch to `t` on another hart therefore cannot
-  // both proceed -- whichever flips `flags` first shuts the other out -- and
-  // the frame about to be torn down is never the one another hart is loading.
+  // A thread that has never run is claimed with the same compare-and-swap as
+  // `__signetos_thread_dispatch`, so a first dispatch and a kill cannot both
+  // proceed, and torn down here. A thread that has run is only marked; it
+  // calls `exit` itself when it next reaches its own code (unwind.cpp).
   uint32_t old = __atomic_load_n(&t->flags, __ATOMIC_RELAXED);
+  uint32_t desired;
   do {
-    if ((old & (FLAG_RUNNING | FLAG_EXITED)) != 0) {
-      return Status::Busy;
+    if ((old & FLAG_EXITED) != 0) {
+      return Status::InvalidCapability;  // already ending
     }
-  } while (!__atomic_compare_exchange_n(&t->flags, &old, old | FLAG_EXITED,
+    desired = (old & FLAG_STARTED) == 0 ? old | FLAG_EXITED
+                                        : old | FLAG_KILL_PENDING;
+  } while (!__atomic_compare_exchange_n(&t->flags, &old, desired,
                                         false, __ATOMIC_ACQUIRE,
                                         __ATOMIC_RELAXED));
-
-  teardown_thread(t);
+  if ((old & FLAG_STARTED) == 0) {
+    teardown_thread(t);
+  }
   return Status::Ok;
+}
+
+bool current_kill_pending() {
+  ThreadState* t = cpu()->current;
+  return t != nullptr &&
+         (__atomic_load_n(&t->flags, __ATOMIC_ACQUIRE) & FLAG_KILL_PENDING) != 0;
 }
 
 uint64_t tid_of(Capability thread_handle) {

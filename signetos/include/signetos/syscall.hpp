@@ -187,6 +187,14 @@ void sys_compartment_destroy(
     capability_compartment_t comp
 );
 
+// Marks `comp` trusted to finish: a killed thread inside it is left to finish
+// its call instead of being cut (unwind.hpp, KILLED THREADS). Permanent.
+// `init` marks the core services with it. Returns a `Status`: Ok, or
+// InvalidCapability if `comp` is not a live compartment handle.
+uint64_t sys_compartment_trust_to_finish(
+    capability_compartment_t comp
+);
+
 // The switcher. `entry` is an `OType::EntryPoint` handle: a compartment entry
 // point from `sys_sentry`, or one of the kernel's own system calls (every
 // other slot `syscall::gate` fills). Pushes a return frame, narrows the
@@ -252,7 +260,13 @@ void sys_thread_exit(
     int status
 );
 
-void sys_thread_kill(
+// Ends `thread` (requires Permit_Store). Never run: torn down now. Has run:
+// marked, and it ends when the kernel is next about to resume its own code
+// (unwind.hpp, KILLED THREADS); until then it must be kept runnable, which is
+// the scheduler's job (`sched.thread_kill`). Returns a `Status`: Ok,
+// InvalidCapability (not a live thread, or already ending) or
+// InsufficientPermission.
+uint64_t sys_thread_kill(
     capability_thread_t thread
 );
 
@@ -321,7 +335,8 @@ namespace signetos::syscall {
   X(thread_switch)                \
   X(thread_tid)                   \
   X(trap_bind)                    \
-  X(trap_unbind)
+  X(trap_unbind)                  \
+  X(compartment_trust_to_finish)
 
 enum class Id : uint32_t {
 #define SIGNETOS_SYSCALL_ID(n) n,

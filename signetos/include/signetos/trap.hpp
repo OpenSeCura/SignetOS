@@ -160,10 +160,15 @@ struct alignas(16) TrapFrame {
                                 //     interrupted code's SIE
   uint64_t handler_sie;         // 568 SSTATUS_SIE if the handler runs with
                                 //     interrupts enabled, else 0
+  uint64_t flags;               // 576 ENTRY_FLAG_TRUSTED_TO_FINISH if the
+                                //     handler's compartment is trusted to
+                                //     finish, else 0 (unwind.hpp, KILLED
+                                //     THREADS)
+  uint64_t reserved;            // 584
 };
 
-static_assert(sizeof(TrapFrame) == 36 * sizeof(Capability),
-              "TrapFrame must be 35 capabilities and two integers (576 "
+static_assert(sizeof(TrapFrame) == 37 * sizeof(Capability),
+              "TrapFrame must be 35 capabilities and four integers (592 "
               "bytes)");
 
 // One routing entry per supported `scause`; the slot index encodes the cause.
