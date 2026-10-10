@@ -268,7 +268,7 @@ between compartments.
 | --- | --- |
 | Descriptor | The thread's descriptor (saved registers and bookkeeping, reached through the thread handle) sits at the front of its allocation; the rest is a small **kernel return stack** that holds only switcher and trap frames. Syscall bodies run on a slice of the **caller's own stack**, not on the kernel stack (§3.4). Nesting depth is bounded by this stack; when it runs out, the call is refused with `NoKernelStack`. |
 | Thread stack | Allocated from the same quota and made local (§2.1). When the thread migrates, the switcher narrows the stack so the callee sees only the unused part below the current stack pointer. |
-| TLS | Not provisioned yet. A compartment decides where a thread's sched quota lives: `init` passes the shell its quota as the thread argument, and programs started by the shell get none. |
+| TLS | Not implemented yet.|
 | Billing | State and stack are debited from the `QuotaThreadMem` and refunded at teardown. |
 | Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. |
 | Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the child quota is destroyed, its bandwidth returns to the parent node. |
