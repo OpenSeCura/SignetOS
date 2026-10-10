@@ -372,8 +372,6 @@ A node holds a budget and period (C/T), the bandwidth delegated to its
 children, a priority class, an optional deadline, a policy, the remaining
 budget for the current period, and the count of registered threads. The root
 covers 100 % of CPU bandwidth and is funded from the scheduler's own quota.
-Temporal conservation (`C_c/T_c ≤ (C_p − D_p)/T_p`) is enforced at derive
-time.
 
 ##### `quota_disk` node
 
@@ -446,7 +444,7 @@ binds.
 3. **Run queues and bandwidth tracking in user memory**, debited with no
    syscalls.
 4. **Verified policy delegates.** A sub-quota selects a vetted policy engine
-   (`EDF`, `FIFO`, `WORK_STEALING`, `ROUND_ROBIN`) that orders threads within
+   (`EDF`, `FIFO`, `ROUND_ROBIN`) that orders threads within
    its subtree.
 5. **Exhaustion and replenishment.** A thread that runs out of budget waits
    for the next period without affecting its siblings.
@@ -471,7 +469,7 @@ interrupt.
 
 * run queues: tables are static and every pick is a linear scan;
 * a replenishment queue: replenishment is computed lazily at pick time;
-* `WORK_STEALING`: RR, FIFO and EDF exist as built-in intra-node orderings,
+* RR, FIFO and EDF exist as built-in intra-node orderings,
   and custom policy registration cannot be reached yet;
 * bandwidth inheritance;
 * locks of any kind: blocking is `block` plus `wake(tid)`, and **anyone may
