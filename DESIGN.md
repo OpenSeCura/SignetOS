@@ -356,7 +356,7 @@ and one for children.
 | `quota_vm` | kernel VM | `OType::QuotaVm` | As above. The root covers all pool memory left after boot. |
 | `quota_thread_mem` | kernel threads | `OType::QuotaThreadMem` | As above. The root is carved out of the VM root at boot. |
 | `quota_heap` | heap allocator | `OType::QuotaHeap` | Sub-page allocation budgets. **Does not exist yet**: there is no malloc and no sub-page allocator. |
-| `quota_sched` | scheduler (user space) | `OType::QuotaSched` | Recurring CPU bandwidth (C per T). |
+| `quota_sched` | scheduler (user space) | `OType::QuotaSched` | CPU bandwidth. |
 | `quota_disk` | filesystem (user space) | `OType::QuotaDisk` | Disk space and inodes. |
 
 When the dimension is not memory (`quota_sched`, `quota_disk`), the caller
