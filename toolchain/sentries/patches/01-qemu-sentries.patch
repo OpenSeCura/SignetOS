@@ -1,0 +1,212 @@
+--- a/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
++++ b/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
+@@ -203,14 +203,19 @@
+     CC128R_MAX_REPRESENTABLE_OTYPE = ((1u << CC128R_OTYPE_BITS) - 1u),
+     _CC_SPECIAL_OTYPE(OTYPE_UNSEALED, 0),
+     _CC_SPECIAL_OTYPE(OTYPE_SENTRY, 1),
++    // sentries (SignetOS local extension, not ratified): the link cjal/cjalr
++    // writes when the sentries CPU property is on.  It is local, so only a
++    // stack can hold it, and only a return can use it.
++    _CC_SPECIAL_OTYPE(OTYPE_RETURN, 2),
+     _CC_N(MIN_RESERVED_OTYPE) = _CC_N(OTYPE_UNSEALED),
+-    _CC_N(MAX_RESERVED_OTYPE) = _CC_N(OTYPE_SENTRY),
++    _CC_N(MAX_RESERVED_OTYPE) = _CC_N(OTYPE_RETURN),
+     _CC_N(MIN_ZYSEAL_OTYPE) = 8,
+ };
+ 
+ #define CC128R_LS_SPECIAL_OTYPES(ITEM, ...)                                                                            \
+     ITEM(OTYPE_UNSEALED, __VA_ARGS__)                                                                                  \
+-    ITEM(OTYPE_SENTRY, __VA_ARGS__)
++    ITEM(OTYPE_SENTRY, __VA_ARGS__)                                                                                    \
++    ITEM(OTYPE_RETURN, __VA_ARGS__)
+ 
+ _CC_STATIC_ASSERT_SAME(CC128R_MANTISSA_WIDTH, CC128R_FIELD_EXP_ZERO_BOTTOM_SIZE);
+ 
+--- a/target/cheri-common/cheri_defs.h
++++ b/target/cheri-common/cheri_defs.h
+@@ -133,6 +133,17 @@
+ #define CAP_HAS_ZYSEAL 0
+ #endif
+ 
++/*
++ * sentries: the return sentry type sits in the CT 2..7 block that Zyseal's
++ * widened CT keeps for sentry types, so it exists only where Zyseal does.
++ */
++#if CAP_HAS_ZYSEAL
++#define CAP_HAS_RETURN_SENTRIES 1
++#define CAP_OTYPE_RETURN CAP_CC(OTYPE_RETURN)
++#else
++#define CAP_HAS_RETURN_SENTRIES 0
++#endif
++
+ #ifdef TARGET_AARCH64
+ #define CAP_OTYPE_LOAD_PAIR_BRANCH CAP_CC(OTYPE_LOAD_PAIR_BRANCH)
+ #define CAP_OTYPE_LOAD_BRANCH CAP_CC(OTYPE_LOAD_BRANCH)
+--- a/target/cheri-common/cheri_utils.h
++++ b/target/cheri-common/cheri_utils.h
+@@ -421,6 +421,52 @@
+     CAP_cc(update_otype)(c, CAP_OTYPE_SENTRY);
+ }
+ 
++#if CAP_HAS_RETURN_SENTRIES
++/*
++ * sentries (SignetOS local extension, not ratified).  With the CPU property
++ * on, the link cjal/cjalr writes is a return sentry (CT 2) instead of a CT 1
++ * sentry.  It is local (GL clear), so only memory reached through a
++ * capability with SL -- a stack -- can hold it.
++ *
++ * The link is the caller's own PCC, so arriving through it as-is would leave
++ * the caller running from a local PCC after every call, and everything it
++ * derived from PCC afterwards would be local too.  Arriving therefore sets GL
++ * again.  That is exact because code never runs from a local PCC: a call or
++ * jump to local code faults (cheri_jump_and_link_checked), so every link was
++ * made by global code.  The one way left to run local, an exception return
++ * to a local xEPCC, gets an untagged link from any call it makes, so it can
++ * never come back global.
++ *
++ * Only the hardware makes these: yseal starts at 8, sentry makes CT 1, and
++ * cbld does not rebuild them.  A return (jalr x0, 0(ra)) accepts nothing
++ * else, and they are accepted by nothing but a return.
++ */
++static inline bool cap_is_return_sentry(const cap_register_t *c)
++{
++    return cap_get_otype_unsigned(c) == CAP_OTYPE_RETURN;
++}
++
++static inline void cap_make_return_sentry(cap_register_t *c)
++{
++    assert(c->cr_tag && cap_is_unsealed(c) &&
++           "Should only be used with unsealed capabilities");
++    const target_ulong perms = cap_get_all_perms(c);
++    if ((perms & CAP_PERM_GLOBAL) == 0) {
++        c->cr_tag = 0; /* a call from local code is never returned from */
++    }
++    CAP_cc(set_permissions)(c, perms & ~(target_ulong)CAP_PERM_GLOBAL);
++    CAP_cc(update_otype)(c, CAP_OTYPE_RETURN);
++}
++
++static inline void cap_unseal_return_sentry(cap_register_t *c)
++{
++    assert(c->cr_tag && cap_is_return_sentry(c) &&
++           "Should only be used with return sentries");
++    CAP_cc(update_otype)(c, CAP_OTYPE_UNSEALED);
++    CAP_cc(set_permissions)(c, cap_get_all_perms(c) | CAP_PERM_GLOBAL);
++}
++#endif /* CAP_HAS_RETURN_SENTRIES */
++
+ // Check if num_bytes bytes at addr can be read using capability c
+ static inline bool cap_is_in_bounds(const cap_register_t *c, target_ulong addr,
+                                     size_t num_bytes)
+--- a/target/cheri-common/cheri-helper-utils.h
++++ b/target/cheri-common/cheri-helper-utils.h
+@@ -212,6 +212,13 @@
+                          PRINT_CAP_ARGS(pcc));
+             pcc->cr_tag = false;
+         }
++#if CAP_HAS_RETURN_SENTRIES
++    } else if (pcc->cr_tag && cap_is_return_sentry(pcc) &&
++               new_cursor == cap_get_cursor(pcc)) {
++        /* sentries: an exception return may resume through one as well. */
++        cap_unseal_return_sentry(pcc);
++        return;
++#endif
+     } else if (pcc->cr_tag && !cap_is_unsealed(pcc)) {
+         if (new_cursor == cap_get_cursor(pcc)) {
+             // Don't detag, we should get a seal violation on the next inst fetch
+--- a/target/cheri-common/op_helper_cheri_common.c
++++ b/target/cheri-common/op_helper_cheri_common.c
+@@ -359,6 +359,9 @@
+ 
+ #if CHERI_CONTROLFLOW_CHECK_AT_TARGET
+     update_target_for_jump(env, &next_pcc, cjalr_flags);
++#elif CAP_HAS_RETURN_SENTRIES
++    cheri_debug_assert(cap_is_unsealed(target) || cap_is_sealed_entry(target) ||
++                       cap_is_return_sentry(target));
+ #else
+     cheri_debug_assert(cap_is_unsealed(target) || cap_is_sealed_entry(target));
+ #endif
+@@ -368,6 +371,13 @@
+         cap_unseal_entry(&next_pcc);
+         assert(cap_get_cursor(&next_pcc) == addr &&
+                "Should have raised an exception");
++#if CAP_HAS_RETURN_SENTRIES
++    } else if (next_pcc.cr_tag && cap_is_return_sentry(&next_pcc)) {
++        /* sentries: unseal, giving back the caller's PCC level. */
++        cap_unseal_return_sentry(&next_pcc);
++        assert(cap_get_cursor(&next_pcc) == addr &&
++               "Should have raised an exception");
++#endif
+     } else if (cjalr_flags & CJALR_MUST_BE_SENTRY) {
+         qemu_log_mask_and_addr(CPU_LOG_INSTR | LOG_GUEST_ERROR,
+                        cpu_get_recent_pc(env),
+@@ -409,7 +419,15 @@
+                "Link addr must be representable");
+         // The return capability should always be a sentry
+         if (!(cjalr_flags & CJALR_DONT_MAKE_SENTRY)) {
+-            cap_make_sealed_entry(&result);
++#if CAP_HAS_RETURN_SENTRIES
++            if (env_archcpu(env)->cfg.ext_sentries) {
++                /* sentries: a local return sentry, usable only to return. */
++                cap_make_return_sentry(&result);
++            } else
++#endif
++            {
++                cap_make_sealed_entry(&result);
++            }
+         }
+         update_capreg(env, link_reg, &result);
+     }
+@@ -447,6 +465,21 @@
+          * immediate offset is 0, i.e. target_addr==target.address.
+          */
+         raise_cheri_exception_branch(env, CapEx_SealViolation, target_reg);
++#if CAP_HAS_RETURN_SENTRIES
++    } else if (env_archcpu(env)->cfg.ext_sentries &&
++               cap_is_return_sentry(target) !=
++                   (link_reg == NULL_CAPREG_INDEX && target_reg == 1)) {
++        /*
++         * sentries: a return (jalr x0, 0(ra)) must go through a return
++         * sentry, and a return sentry can only be used by a return.
++         */
++        raise_cheri_exception_branch(env, CapEx_SealViolation, target_reg);
++    } else if (env_archcpu(env)->cfg.ext_sentries &&
++               !cap_is_return_sentry(target) &&
++               !cap_has_perms(target, CAP_PERM_GLOBAL)) {
++        /* sentries: code never runs from a local PCC (cheri_utils.h). */
++        raise_cheri_exception_branch(env, CapEx_GlobalViolation, target_reg);
++#endif
+     } else if (!cap_has_perms(target, CAP_PERM_EXECUTE)) {
+         raise_cheri_exception_branch(env, CapEx_PermitExecuteViolation,
+                                      target_reg);
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -1335,6 +1335,11 @@
+         }
+         /* When Zylevels1 is enabled we have 1 level bits (local/global). */
+         cpu->cfg.lvbits = (uint8_t)cpu->cfg.ext_zylevels1;
++        /* Return sentries are local, which only means something with levels. */
++        if (cpu->cfg.ext_sentries && !cpu->cfg.ext_zylevels1) {
++            error_setg(errp, "sentries requires Zylevels1");
++            return;
++        }
+ #endif
+     }
+     riscv_set_feature(env, RISCV_FEATURE_STID);
+@@ -1476,6 +1481,7 @@
+     DEFINE_PROP_BOOL("Zyhybrid", RISCVCPU, cfg.ext_zyhybrid, true),
+     DEFINE_PROP_BOOL("Zylevels1", RISCVCPU, cfg.ext_zylevels1, false),
+     DEFINE_PROP_BOOL("Zyseal", RISCVCPU, cfg.ext_zyseal, false),
++    DEFINE_PROP_BOOL("sentries", RISCVCPU, cfg.ext_sentries, false),
+     DEFINE_PROP_UINT8("cheri_levels", RISCVCPU, cfg._compat_cheri_levels, 0),
+     DEFINE_PROP_BOOL("cheri_pte", RISCVCPU, cfg.cheri_pte, false),
+     DEFINE_PROP_BOOL("Svucrg", RISCVCPU, cfg.cheri_pte, false),
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -603,6 +603,7 @@
+     bool ext_zyhybrid;
+     bool ext_zylevels1;
+     bool ext_zyseal;
++    bool ext_sentries; /* call + local return sentries (toolchain/sentries) */
+     /* number of levels (Zcherilevels): 0 invalid, 1 disabled (default)) */
+     uint8_t _compat_cheri_levels; /* To keep existing scripts working */
+     uint8_t lvbits; /* Only 0 and 1 (Zylevels1) are currently supported. */

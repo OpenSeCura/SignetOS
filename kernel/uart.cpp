@@ -115,6 +115,7 @@ const char* otype_name(uint64_t ct) {
     switch (static_cast<OType>(ct)) {
         case OType::Unsealed:       return "Unsealed";
         case OType::Sentry:         return "Sentry";
+        case OType::ReturnSentry:   return "ReturnSentry";
         case OType::QuotaVm:        return "QuotaVm";
         case OType::QuotaThreadMem: return "QuotaThreadMem";
         case OType::QuotaHeap:      return "QuotaHeap";

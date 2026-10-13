@@ -27,10 +27,15 @@
 # permissions). QEMU's `rv64` model has it off by default
 # and only then advertises `zcherilevels` in the device tree. The kernel keeps
 # the three bits on every derivation (`perms::Levels`, `KERNEL_LEVEL_PERMS`) so
-# it boots either way; nothing relabels capabilities as local yet. MARCH stays
+# it boots either way. MARCH stays
 # without `_zcherilevels` on purpose: the flag changes no code generation, only
 # whether the toolchain defines the level macros, and both headers fall back
 # to the fixed ISA bit positions.
+#
+# sentries=on (toolchain/sentries) makes the link a call writes a return sentry
+# (CT 2). Only a return can use one, a return can use nothing else, and it is
+# local, so only a stack can hold it. Code never runs from a local capability.
+# It needs Zylevels1.
 #
 # CHERI_ROOT is the install root toolchain/setup.sh used (its default is
 # ~/cheri); the patched tools are under $(CHERI_ROOT)/zyseal. Override it (or
@@ -41,7 +46,7 @@ CHERI_ROOT    ?= $(HOME)/cheri
 CHERI_SDK_BIN ?= $(CHERI_ROOT)/zyseal/llvm-build/bin
 QEMU          ?= $(CHERI_ROOT)/zyseal/qemu-build/qemu-system-riscv64cheristd
 MARCH         = rv64gc_zcheripurecap_zyseal
-QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on
+QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on,sentries=on
 EXTRA_LDFLAGS =
 
 CXX     = $(CHERI_SDK_BIN)/clang++

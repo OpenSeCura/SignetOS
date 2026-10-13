@@ -36,6 +36,7 @@ extern "C" void __thread_restore(signetos::Capability next_ksp);
 extern "C" void __thread_exit_to_host(signetos::thread::ThreadState* t,
                                       signetos::Capability host_ksp);
 extern "C" void __thread_start(void);
+extern "C" signetos::Capability __thread_start_link(void);
 
 extern "C" void secondary_hart_init(uint64_t hartid) {
   signetos::thread::init_hart(hartid);
@@ -375,12 +376,15 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
   frame->t[0] = hw_sentry;
   frame->a[0] = initial_arg;
   frame->active_kernel_sp = kstack_top;
-  Capability pcc;
-  __asm__ volatile("auipcc %0, 0" : "=C"(pcc));
-  Capability start_ra = capability_set_address(
-      pcc,
-      capability_get_address(reinterpret_cast<Capability>(&__thread_start)));
-  frame->ra = sealing::seal_entry(start_ra);
+  // `__thread_restore` ends in `ret`, and a return only goes through a return
+  // sentry (toolchain/sentries), which only the hardware makes: the link of a
+  // jump from just before `__thread_start` (switch.S).
+  const Capability start_ra = __thread_start_link();
+  if (capability_get_address(start_ra) !=
+      capability_get_address(reinterpret_cast<Capability>(&__thread_start))) {
+    uart::panic("thread::create: __thread_start_link does not link to __thread_start");
+  }
+  frame->ra = start_ra;
 
   ThreadState* t = reinterpret_cast<ThreadState*>(state_page);
   const uint64_t tid = __atomic_fetch_add(&s_next_tid, 1, __ATOMIC_RELAXED) + 1;

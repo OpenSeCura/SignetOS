@@ -29,7 +29,7 @@
  *      Pushes a `ReturnFrame` (callee-saved registers, the five argument
  *      registers `ca1..ca5`) onto the thread's kernel stack (`sscratchc`),
  *      calls `__signetos_switcher_prepare` to resolve the target record and
- *      narrow the caller's stack, then enters the callee with a `CT = 1`
+ *      narrow the caller's stack, then enters the callee with a `CT = 2`
  *      return sentry in `cra`:
  *
  *        compartment callee   csp = everything below the caller's csp,
@@ -164,7 +164,7 @@ sys_compartment_invoke:
     /*
      * 4a. Compartment callee: give it the caller's `SIE`, scrub every other
      *     register, and jump (`cjalr` seals `.Lcomp_restore` into `cra` as a
-     *     `CT = 1` return sentry).
+     *     `CT = 2` return sentry).
      */
     ld      t1,  RET_FRAME_SSTATUS(csp)
     clc     csp, RET_FRAME_CALLEE_SP(csp)
@@ -541,8 +541,21 @@ __thread_exit_to_host:
      * compartment has been destroyed and swept since, `ct0` has lost its tag
      * (the sweep scans the frame it was loaded from): jumping to it would
      * fault in kernel text and halt the machine, so the thread ends instead.
+     *
+     * A new thread reaches it through `__thread_restore`'s `ret`, and a return
+     * only goes through a return sentry, which only the hardware makes, as
+     * the link of a jump (toolchain/sentries). `__thread_start_link` makes one
+     * by jumping from the instruction just before `__thread_start`, so
+     * nothing may come between the two.
      */
     .align 4
+    .globl __thread_start_link
+    .type __thread_start_link, @function
+__thread_start_link:
+    cmv     ct1, cra
+    cjal    cra, .Lthread_start_linked  /* cra = return sentry to __thread_start */
+    .size __thread_start_link, . - __thread_start_link
+
     .globl __thread_start
     .type __thread_start, @function
 __thread_start:
@@ -561,3 +574,9 @@ __thread_start:
     cjal    cra, sys_thread_exit
     unimp
     .size __thread_start, . - __thread_start
+
+    /* The rest of `__thread_start_link`: hand the link back in `ca0`. */
+.Lthread_start_linked:
+    cmv     ca0, cra
+    cmv     cra, ct1
+    ret

@@ -20,7 +20,8 @@
 #
 #   1. fetch the upstream CHERI toolchain with cheribuild
 #   2. copy the LLVM and QEMU trees to $CHERI_ROOT/zyseal/
-#   3. apply each extension's patches to the copies (zyseal/, mmodemmu/)
+#   3. apply each extension's patches to the copies (zyseal/, mmodemmu/,
+#      sentries/)
 #   4. build the patched LLVM and QEMU
 #
 #   ./toolchain/setup.sh                    installs under $HOME/cheri
@@ -101,9 +102,10 @@ else
 fi
 
 # --------------------------------------------------------------------- patch
-# Order matters: mmodemmu's QEMU patch applies on top of Zyseal's.
+# Order matters: each QEMU patch applies on top of the ones before it.
 "$HERE/zyseal/setup.sh"
 "$HERE/mmodemmu/setup.sh"
+"$HERE/sentries/setup.sh"
 
 # --------------------------------------------------------------------- build
 echo "### building patched LLVM"

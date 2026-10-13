@@ -8,8 +8,9 @@ A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
 `-mabi=l64pc128d`), run under QEMU.
 
 SignetOS depends on **Zyseal**, a CHERI RISC-V sealing extension that isn't
-ratified (the `YSEAL`/`YUNSEAL` instructions). No released CHERI toolchain
-has it, so you first build a patched LLVM and QEMU with
+ratified (the `YSEAL`/`YUNSEAL` instructions), and on **sentries**, a QEMU
+extension that makes return addresses local return sentries. No released
+CHERI toolchain has them, so you first build a patched LLVM and QEMU with
 [`toolchain/setup.sh`](toolchain/setup.sh).
 
 SignetOS design and vision can be found [here](DESIGN.md).
@@ -32,8 +33,9 @@ The script takes about an hour and ~30 GB of disk, nearly all of it LLVM. It:
    upstream CHERI LLVM and QEMU, and copies them to `~/cheri/zyseal/`;
 2. runs the extension scripts, which only apply patches to those copies:
    [`toolchain/zyseal/setup.sh`](toolchain/zyseal/setup.sh) (Zyseal, LLVM and
-   QEMU) and [`toolchain/mmodemmu/setup.sh`](toolchain/mmodemmu/setup.sh)
-   (M-mode MMU, QEMU);
+   QEMU), [`toolchain/mmodemmu/setup.sh`](toolchain/mmodemmu/setup.sh)
+   (M-mode MMU, QEMU) and [`toolchain/sentries/setup.sh`](toolchain/sentries/setup.sh)
+   (call and local return sentries, QEMU);
 3. builds the patched LLVM and QEMU.
 
 If it stops partway, run it again: steps that are already done are skipped.
@@ -108,5 +110,5 @@ external/    compartments loaded from disk.img: services/ (naming, sched,
              trap_mgr, shell) and apps/ (programs the shell can `run`)
 tools/       signetfs.py, which writes disk.img
 toolchain/   patches and scripts that build the CHERI LLVM and QEMU (Zyseal,
-             mmodemmu)
+             mmodemmu, sentries)
 ```

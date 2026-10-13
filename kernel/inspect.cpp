@@ -155,13 +155,19 @@ void assert_user_capability(Capability cap, const char* site) {
   const KernelLayout& k = layout();
   const bool in_dyn = within(base, top, vm::DYNAMIC_BASE, vm::DYNAMIC_TOP);
 
-  // 4. CT = 1 hardware sentries: executable, read-only. With ASR it must be a
-  //    kernel syscall gate bounded exactly to `[_kernel_start, _got_end)`;
-  //    without ASR it is a compartment entry point in dynamic memory (or, for
+  // 4. Hardware sentries: executable, read-only. With ASR it must be a kernel
+  //    syscall gate bounded exactly to `[_kernel_start, _got_end)`; without
+  //    ASR it is a compartment entry point in dynamic memory (or, for
   //    `sentry::create_kernel` test stubs, inside the kernel's code span).
-  if (sealed && ct == static_cast<uint64_t>(OType::Sentry)) {
+  //    A return sentry (CT = 2) passes the same test: a caller may hand on
+  //    its own `cra`, no more than a raw sentry over its own code, and the
+  //    ones the kernel hands out (a new thread's first link, the switcher's)
+  //    are in the kernel gate span.
+  const bool hw_sentry = ct == static_cast<uint64_t>(OType::Sentry) ||
+                         ct == static_cast<uint64_t>(OType::ReturnSentry);
+  if (sealed && hw_sentry) {
     if ((perms & perms::Execute) == 0 || (perms & perms::Store) != 0) {
-      panic(site, "CT=1 sentry lacks Execute or carries Store", cap);
+      panic(site, "Sentry lacks Execute or carries Store", cap);
     }
     if ((perms & perms::AccessSystemRegs) != 0) {
       if (base != k.k_start || top != k.got_end) {

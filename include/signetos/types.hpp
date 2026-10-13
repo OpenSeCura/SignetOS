@@ -27,8 +27,14 @@ using Sentry = Capability;
 // CHERI hardware object types (the capability CT field, 5 bits wide).
 //
 //   CT = 0        unsealed
-//   CT = 1        hardware sentry, produced by the `sentry` instruction.
-//   CT = 2..7     reserved for sentry types.
+//   CT = 1        call sentry, produced by the `sentry` instruction.
+//   CT = 2        return sentry (toolchain/sentries): the link `cjal`/`cjalr`
+//                 writes. Only the hardware makes one. Only a return (`ret`)
+//                 can use it, and a return can use nothing else. It is local,
+//                 so only a stack can hold it; a return through it makes the
+//                 caller's PCC global again. That is exact because code never
+//                 runs from a local capability: entering one faults.
+//   CT = 3..7     reserved for more sentry types.
 //   CT = 8..31    object types, applied with yseal and removed with yunseal.
 //                 yseal/yunseal accept only these, so they cannot make or
 //                 open a sentry.
@@ -37,6 +43,7 @@ using Sentry = Capability;
 enum class OType : uint64_t {
     Unsealed         = 0,
     Sentry           = 1,
+    ReturnSentry     = 2,
     QuotaVm          = 8,
     QuotaThreadMem   = 9,
     QuotaHeap        = 10,
