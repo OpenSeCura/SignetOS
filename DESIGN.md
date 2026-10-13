@@ -152,15 +152,13 @@ delegates `QuotaSched` and `QuotaDisk` to the user-space scheduler and
 filesystem via `init` (§2.8, §5.8), and holds the remaining hardware types
 itself.
 
+Sealed types managed by the kernel:
+
 | `OType` (`types.hpp`) | C type name | What it is |
 | --- | --- | --- |
-| `Unsealed` | `capability_t`, `capability_data_t`, `capability_exec_t` | Ordinary memory capabilities. |
 | `Sentry` | — | A hardware sentry (jumpable). The only one the kernel hands out is the switcher gate; compartments can make their own over their own code (§2.5). |
 | `QuotaVm` | `capability_quota_vm_t` | Hierarchical virtual-memory budget (§2.4). |
 | `QuotaThreadMem` | `capability_quota_thread_mem_t` | Budget for thread stacks and thread state (§2.4). |
-| `QuotaHeap` | — | Reserved for the heap allocator (§5.7.1), which does not exist yet. |
-| `QuotaSched` | — | Scheduler CPU-bandwidth quotas (§2.4, §2.6). |
-| `QuotaDisk` | — | Filesystem disk quotas and open-file handles (§2.4, §5.7.3). |
 | `Compartment` | `capability_compartment_t` | Handle to a compartment (§2.2). |
 | `Thread` | `capability_thread_t` | Handle to a thread; Load → switch to it, Store → kill it. |
 | `Revoker` | `capability_revoker_t` | Authority over a VA range, used to register it for revocation. |
@@ -168,6 +166,15 @@ itself.
 | `SealedObject` | `capability_sealed_t` | Compartment-sealed object (§2.7). |
 | `EntryPoint` | `Sentry` | Sealed pointer to an entry record describing a compartment or kernel entry point (§2.5). |
 | `Trap` | — | Per-vector trap authority minted at boot (§3.6). |
+
+Sealed types managed by user-space services, which hold the authority to
+seal and unseal them:
+
+| `OType` (`types.hpp`) | Manager | What it is |
+| --- | --- | --- |
+| `QuotaSched` | scheduler | CPU-bandwidth quotas (§2.4, §2.6). |
+| `QuotaDisk` | filesystem | Disk quotas and open-file handles (§2.4, §5.7.3). |
+| `QuotaHeap` | heap allocator | Reserved for the heap allocator (§5.7.1), which does not exist yet. |
 
 **Permission convention on handles:** `Permit_Load` is the *operational*
 right (use it) and `Permit_Store` the *administrative* right (derive from it,
