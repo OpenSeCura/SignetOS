@@ -172,7 +172,7 @@ EntryRecord* find_free_entry(Capability comp_page) {
 // page the compartment occupies.
 //
 // `yunseal` proves the handle came from this kernel, since only the holder of
-// the OTYPE_COMPARTMENT authority can produce CT 7. The handle is bounded to
+// the OTYPE_COMPARTMENT authority can produce CT 13. The handle is bounded to
 // `sizeof(Compartment)` and stores `self_page` at offset 0 so the kernel loads
 // the full-page capability directly from the unsealed struct.
 Capability unseal(Capability handle) {

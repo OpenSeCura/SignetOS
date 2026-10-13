@@ -24,8 +24,9 @@
  *
  * rs1 is the authority: its address is the type, its bounds are the types it
  * may name, SE (perm bit 24) lets it seal and US (bit 25) lets it unseal.
- * CT is 4 bits: 0 = unsealed, 1 = sentry, 2..15 = objects. Neither instruction
- * traps; on refusal they write rs2 to rd with the tag cleared.
+ * CT is 5 bits: 0 = unsealed, 1 = sentry, 2..7 = kept for more sentry types,
+ * 8..31 = objects. Neither instruction traps; on refusal they write rs2 to rd
+ * with the tag cleared.
  *
  * THE TESTS
  *   T1, T2    yseal sets CT and changes nothing else; yunseal puts it back
@@ -173,7 +174,7 @@ static void test_seal_sets_type_and_nothing_else(uart_t u, cap_t obj,
         : [auth]"C"(auth), [obj]"C"(obj)
         : "ca2");
     report(u, "T1a yseal keeps the tag         ", tag, 1);
-    report(u, "T1b yseal sets CT to 2          ", type, 2);
+    report(u, "T1b yseal sets CT to 8          ", type, 8);
     report(u, "T1c yseal leaves base alone     ", base,
            (u64)__builtin_cheri_base_get(obj));
     report(u, "T1d yseal leaves length alone   ", len,
@@ -274,7 +275,7 @@ static void test_authority_must_be_entitled(uart_t u, cap_t root, cap_t obj,
     put_str(u, "-- the authority must be entitled to the type --\n");
 
     /*
-     * T5: the shared authority, entitled to [2,18), with its address moved to
+     * T5: the shared authority, entitled to [8,24), with its address moved to
      * 900. Still tagged, unsealed and holding SE. Only the address is wrong.
      */
     __asm__ volatile(
@@ -289,57 +290,57 @@ static void test_authority_must_be_entitled(uart_t u, cap_t root, cap_t obj,
     report(u, "T5b address out of bounds -> 0  ", tag, 0);
 
     /*
-     * T6: an authority with US, tagged, unsealed, address EXACTLY 2 - the
-     * right type - but whose bounds are [20,36) so it was never entitled to 2.
+     * T6: an authority with US, tagged, unsealed, address EXACTLY 8 - the
+     * right type - but whose bounds are [20,36) so it was never entitled to 8.
      * Built from root rather than the shared authority, because the wrong
      * bounds are the point.
      *
-     * T6a is the control. Moving the address to 2 puts it outside the bounds,
+     * T6a is the control. Moving the address to 8 puts it outside the bounds,
      * and an out-of-bounds address must NOT by itself clear the tag - only an
      * unrepresentable one does. Without T6a, T6b would also pass if the
      * authority were simply untagged, which proves nothing about bounds.
      */
     __asm__ volatile(
-        "yseal    ca2, %[auth], %[obj]   \n\t"  /* legitimate type-2 object */
+        "yseal    ca2, %[auth], %[obj]   \n\t"  /* legitimate type-8 object */
 
         "scaddr   ca3, %[root], %[twenty]\n\t"  /* now the bogus authority: */
         "scbndsr  ca3, ca3, %[sixteen]   \n\t"  /*   bounds [20,36)         */
         "acperm   ca3, ca3, %[seus]      \n\t"  /*   has US                 */
-        "scaddr   ca3, ca3, %[two]       \n\t"  /*   address 2 - right type */
+        "scaddr   ca3, ca3, %[eight]     \n\t"  /*   address 8 - right type */
         "gctag    %[perm], ca3           \n\t"  /*   ...and still tagged    */
         "yunseal  ca4, ca3, ca2          \n\t"
         "gctag    %[tag], ca4            \n\t"
         : [tag]"=&r"(tag), [perm]"=&r"(perm)
         : [root]"C"(root), [auth]"C"(auth), [obj]"C"(obj),
-          [two]"r"(2ULL), [twenty]"r"(20ULL), [sixteen]"r"(16ULL),
+          [eight]"r"(8ULL), [twenty]"r"(20ULL), [sixteen]"r"(16ULL),
           [seus]"r"(SE | US)
         : "ca2", "ca3", "ca4");
     report(u, "T6a bogus authority is tagged   ", perm, 1);
     report(u, "T6b right type, bad bounds -> 0 ", tag, 0);
 
-    /* T7: authority names 3, object is type 2. Address 3 is inside [2,18),
+    /* T7: authority names 9, object is type 8. Address 9 is inside [8,24),
      * so T7a should be uncontroversial - it is here to rule out the same
      * "failed because untagged" reading as T6a. */
     __asm__ volatile(
-        "yseal    ca2, %[auth], %[obj]   \n\t"  /* object is type 2         */
-        "scaddr   ca3, %[auth], %[three] \n\t"  /* same authority, type 3   */
+        "yseal    ca2, %[auth], %[obj]   \n\t"  /* object is type 8         */
+        "scaddr   ca3, %[auth], %[nine]  \n\t"  /* same authority, type 9   */
         "gctag    %[perm], ca3           \n\t"
         "yunseal  ca4, ca3, ca2          \n\t"
         "gctag    %[tag], ca4            \n\t"
         : [tag]"=&r"(tag), [perm]"=&r"(perm)
-        : [auth]"C"(auth), [obj]"C"(obj), [three]"r"(3ULL)
+        : [auth]"C"(auth), [obj]"C"(obj), [nine]"r"(9ULL)
         : "ca2", "ca3", "ca4");
-    report(u, "T7a type-3 authority is tagged  ", perm, 1);
-    report(u, "T7b wrong type (3 vs 2) -> 0    ", tag, 0);
+    report(u, "T7a type-9 authority is tagged  ", perm, 1);
+    report(u, "T7b wrong type (9 vs 8) -> 0    ", tag, 0);
 }
 
 /* ========================================================================
  * T8 - spot checks on reserved and out-of-range type numbers.
  *
  *   type 1  = the sentry type; yseal must not mint it
- *   type 16 = one past the 4-bit maximum
- *   type 18 = would alias type 2 if the field were truncated: 18 & 15 == 2
- *   type 15 = the 4-bit maximum, which must work
+ *   type 32 = one past the 5-bit maximum
+ *   type 40 = would alias type 8 if the field were truncated: 40 & 31 == 8
+ *   type 31 = the 5-bit maximum, which must work
  *
  * The `wide` authority is entitled to [0,64) so all four addresses are IN
  * BOUNDS. Any refusal therefore comes from the type-range check, not bounds.
@@ -349,7 +350,7 @@ static void test_authority_must_be_entitled(uart_t u, cap_t root, cap_t obj,
  * ======================================================================== */
 static void test_reserved_and_out_of_range_types(uart_t u, cap_t obj, cap_t wide)
 {
-    u64 t1, t16, t18, t15;
+    u64 t1, t32, t40, t31;
 
     put_str(u, "-- reserved and out-of-range types --\n");
     __asm__ volatile(
@@ -357,62 +358,63 @@ static void test_reserved_and_out_of_range_types(uart_t u, cap_t obj, cap_t wide
         "yseal    ca3, ca2, %[obj]       \n\t"
         "gctag    %[r1], ca3             \n\t"
 
-        "scaddr   ca2, %[wide], %[m16]   \n\t"
+        "scaddr   ca2, %[wide], %[m32]   \n\t"
         "yseal    ca3, ca2, %[obj]       \n\t"
-        "gctag    %[r16], ca3            \n\t"
+        "gctag    %[r32], ca3            \n\t"
 
-        "scaddr   ca2, %[wide], %[m18]   \n\t"
+        "scaddr   ca2, %[wide], %[m40]   \n\t"
         "yseal    ca3, ca2, %[obj]       \n\t"
-        "gctag    %[r18], ca3            \n\t"
+        "gctag    %[r40], ca3            \n\t"
 
-        "scaddr   ca2, %[wide], %[m15]   \n\t"
+        "scaddr   ca2, %[wide], %[m31]   \n\t"
         "yseal    ca3, ca2, %[obj]       \n\t"
-        "gctype   %[r15], ca3            \n\t"
-        : [r1]"=&r"(t1), [r16]"=&r"(t16),
-          [r18]"=&r"(t18), [r15]"=&r"(t15)
+        "gctype   %[r31], ca3            \n\t"
+        : [r1]"=&r"(t1), [r32]"=&r"(t32),
+          [r40]"=&r"(t40), [r31]"=&r"(t31)
         : [wide]"C"(wide), [obj]"C"(obj),
-          [one]"r"(1ULL), [m16]"r"(16ULL), [m18]"r"(18ULL), [m15]"r"(15ULL)
+          [one]"r"(1ULL), [m32]"r"(32ULL), [m40]"r"(40ULL), [m31]"r"(31ULL)
         : "ca2", "ca3");
     report(u, "T8a type 1 (sentry) refused     ", t1, 0);
-    report(u, "T8b type 16 refused (past max)  ", t16, 0);
-    report(u, "T8c type 18 refused (no alias)  ", t18, 0);
-    report(u, "T8d type 15 (4-bit max) accepted", t15, 15);
+    report(u, "T8b type 32 refused (past max)  ", t32, 0);
+    report(u, "T8c type 40 refused (no alias)  ", t40, 0);
+    report(u, "T8d type 31 (5-bit max) accepted", t31, 31);
 }
 
 /* ========================================================================
  * T30 - EVERY CT value, exhaustively. No spot checks.
  *
- * CT is 4 bits, so there are exactly 16 encodable values:
+ * CT is 5 bits, so there are exactly 32 encodable values:
  *
  *     0        unsealed      yseal must refuse (0 means "not sealed")
  *     1        sentry        reserved by the base architecture; must refuse
- *     2..15    object types  must be accepted, with CT set to exactly t
+ *     2..7     sentry types  kept for sentry extensions; must refuse
+ *     8..31    object types  must be accepted, with CT set to exactly t
  *
- * and every value from 16 up must be REFUSED rather than truncated into that
- * range. Truncation is the dangerous failure: 16->0, 17->1, 18->2, ... 31->15.
- * If type 18 quietly became type 2, one compartment could open another's
- * objects. So the sweep runs 0..31 and checks all 32.
+ * and every value from 32 up must be REFUSED rather than truncated into that
+ * range. Truncation is the dangerous failure: 32->0, 33->1, 40->8, ... 63->31.
+ * If type 40 quietly became type 8, one compartment could open another's
+ * objects. So the sweep runs 0..63 and checks all 64.
  *
  * The authority has bounds [0,64), so every value tested is IN BOUNDS and the
  * only thing that can reject it is the type-range check itself.
  *
- * Then, for the 14 usable types:
+ * Then, for the 24 usable types:
  *   - each must round-trip back to CT 0 through yunseal
  *   - no type may unseal an object sealed with a DIFFERENT type. That is all
- *     14*13 = 182 ordered pairs, not a sample.
+ *     24*23 = 552 ordered pairs, not a sample.
  * ======================================================================== */
 static void test_every_ct_value(uart_t u, cap_t obj, cap_t wide)
 {
-    u64 low_accepted = 0;    /* types 0,1   wrongly sealed                 */
-    u64 mid_sealed = 0;      /* types 2..15 sealed with the exact CT       */
-    u64 high_accepted = 0;   /* types 16..31 wrongly sealed                */
-    u64 round_tripped = 0;   /* types 2..15 that yunseal restored          */
+    u64 low_accepted = 0;    /* types 0..7   wrongly sealed                */
+    u64 mid_sealed = 0;      /* types 8..31  sealed with the exact CT      */
+    u64 high_accepted = 0;   /* types 32..63 wrongly sealed                */
+    u64 round_tripped = 0;   /* types 8..31  that yunseal restored         */
     u64 cross_unsealed = 0;  /* pairs where the WRONG type unsealed        */
     u64 pairs_tried = 0;
 
-    put_str(u, "-- every CT value (exhaustive sweep, 0..31) --\n");
+    put_str(u, "-- every CT value (exhaustive sweep, 0..63) --\n");
 
-    for (u64 t = 0; t < 32; ++t) {
+    for (u64 t = 0; t < 64; ++t) {
         u64 tag, ct;
         __asm__ volatile(
             "scaddr   ca1, %[wide], %[t]   \n\t"  /* name type t            */
@@ -423,9 +425,9 @@ static void test_every_ct_value(uart_t u, cap_t obj, cap_t wide)
             : [wide]"C"(wide), [obj]"C"(obj), [t]"r"(t)
             : "ca1", "ca2");
 
-        if (t < 2) {
+        if (t < 8) {
             low_accepted += (tag != 0);
-        } else if (t <= 15) {
+        } else if (t <= 31) {
             /* Both conditions matter: tagged AND the exact type, not an alias. */
             mid_sealed += (tag == 1 && ct == t);
         } else {
@@ -433,11 +435,11 @@ static void test_every_ct_value(uart_t u, cap_t obj, cap_t wide)
         }
     }
 
-    report(u, "T30a types 0 and 1 are refused          ", low_accepted, 0);
-    report(u, "T30b all of 2..15 seal with exact CT    ", mid_sealed, 14);
-    report(u, "T30c types 16..31 refused, not truncated", high_accepted, 0);
+    report(u, "T30a types 0..7 are refused             ", low_accepted, 0);
+    report(u, "T30b all of 8..31 seal with exact CT    ", mid_sealed, 24);
+    report(u, "T30c types 32..63 refused, not truncated", high_accepted, 0);
 
-    for (u64 t = 2; t <= 15; ++t) {
+    for (u64 t = 8; t <= 31; ++t) {
         cap_t sealed_t;
         u64 tag, ct;
 
@@ -453,7 +455,7 @@ static void test_every_ct_value(uart_t u, cap_t obj, cap_t wide)
         round_tripped += (tag == 1 && ct == 0);
 
         /* Now every OTHER type must fail to open it. */
-        for (u64 other = 2; other <= 15; ++other) {
+        for (u64 other = 8; other <= 31; ++other) {
             u64 otag;
             if (other == t) {
                 continue;
@@ -470,7 +472,7 @@ static void test_every_ct_value(uart_t u, cap_t obj, cap_t wide)
         }
     }
 
-    report(u, "T30d all of 2..15 round-trip to CT 0    ", round_tripped, 14);
+    report(u, "T30d all of 8..31 round-trip to CT 0    ", round_tripped, 24);
     put_str(u, "       cross-type attempts made = ");
     put_dec(u, pairs_tried);
     put_ch(u, '\n');
@@ -680,7 +682,7 @@ static void test_type_survives_memory(uart_t u, cap_t obj, cap_t slot, cap_t aut
         : [sc]"C"(sealed), [slot]"C"(slot)
         : "ca2", "memory");
     report(u, "T16a tag survives csc/clc       ", tag, 1);
-    report(u, "T16b CT survives csc/clc        ", type, 2);
+    report(u, "T16b CT survives csc/clc        ", type, 8);
 }
 
 /* ========================================================================
@@ -712,7 +714,7 @@ static void test_cbld_cannot_forge(uart_t u, cap_t root, cap_t obj, cap_t auth)
     __asm__ volatile("gctype %[t], %[c]" : [t]"=r"(type) : [c]"C"(templ));
     __asm__ volatile("gctag  %[t], %[c]" : [t]"=r"(tag)  : [c]"C"(templ));
     report(u, "T17a template: untagged         ", tag, 0);
-    report(u, "T17b template: still carries CT2", type, 2);
+    report(u, "T17b template: still carries CT8", type, 8);
 
     __asm__ volatile(
         "cbld   ca2, %[root], %[t]       \n\t"
@@ -933,7 +935,7 @@ void test_main(cap_t root, cap_t code_root)
     /*
      * The authorities, built once here rather than re-derived in every test.
      *
-     *   auth     names type 2, entitled to [2,18), SE|US
+     *   auth     names type 8, entitled to [8,24), SE|US
      *   auth_gl  the same but keeps GL. acperm is an AND, so a bare SE|US mask
      *            leaves a LOCAL authority, and under Zylevels1 spec 17.6.2
      *            makes yunseal strip GL from whatever it opens.
@@ -945,7 +947,7 @@ void test_main(cap_t root, cap_t code_root)
      */
     cap_t auth, auth_gl, wide;
     __asm__ volatile(
-        "scaddr   %[a],  %[root], %[two]     \n\t"
+        "scaddr   %[a],  %[root], %[eight]   \n\t"
         "scbndsr  %[a],  %[a],    %[sixteen] \n\t"
         "acperm   %[ag], %[a],    %[seusgl]  \n\t"
         "acperm   %[a],  %[a],    %[seus]    \n\t"
@@ -954,7 +956,7 @@ void test_main(cap_t root, cap_t code_root)
         "acperm   %[w],  %[w],    %[seus]    \n\t"
         : [a]"=&C"(auth), [ag]"=&C"(auth_gl), [w]"=&C"(wide)
         : [root]"C"(root),
-          [two]"r"(2ULL), [zero]"r"(0ULL),
+          [eight]"r"(8ULL), [zero]"r"(0ULL),
           [sixteen]"r"(16ULL), [span]"r"(64ULL),
           [seus]"r"(SE | US), [seusgl]"r"(SE | US | GL));
 

@@ -364,7 +364,7 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
     return nullptr;
   };
 
-  // Unseal `entry_point` (`OType::EntryPoint`, CT = 12), verify its owning
+  // Unseal `entry_point` (`OType::EntryPoint`, CT = 18), verify its owning
   // compartment is still live, and extract the `EntryRecord`'s `pcc` (sealed
   // as a `CT = 1` hardware sentry), `cgp`, flags and stack requirement.
   Entry entry{};

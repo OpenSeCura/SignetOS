@@ -19,7 +19,7 @@
 //
 // trap.hpp - SignetOS Hardware Trap and Interrupt Binding Subsystem
 //
-// SEALED TRAP AUTHORITIES (OType::Trap, CT = 13)
+// SEALED TRAP AUTHORITIES (OType::Trap, CT = 19)
 // ----------------------------------------------
 // Each hardware trap vector (synchronous exceptions 0..31 and asynchronous
 // interrupts 0..15) has a dedicated slot in the kernel's static trap table.
@@ -28,7 +28,7 @@
 //
 // Holding a sealed `OType::Trap` capability with `Permit_Load` authorizes
 // binding (`sys_trap_bind`) and unbinding (`sys_trap_unbind`) a compartment
-// `OType::EntryPoint` (CT = 12) sentry to that hardware vector.
+// `OType::EntryPoint` (CT = 18) sentry to that hardware vector.
 //
 // When a bound trap or interrupt fires:
 //   1. `_early_trap_entry` saves all 31 capability registers (`cra`, `csp`,
@@ -203,7 +203,7 @@ void init_hart();
 // and `purge_compartment` call it after changing the table.
 void sync_all_harts();
 
-// Returns the sealed `OType::Trap` (CT = 13) authority handle for `scause`,
+// Returns the sealed `OType::Trap` (CT = 19) authority handle for `scause`,
 // or `nullptr` if `scause` is outside the supported vector range or is
 // `IRQ_S_SOFT`, which nobody may bind (THE SOFTWARE INTERRUPT IS THE
 // KERNEL'S, above).

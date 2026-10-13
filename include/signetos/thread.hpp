@@ -21,14 +21,14 @@
 //
 // TWO SEALED KERNEL OBJECTS
 // -------------------------
-// 1. `QuotaThreadMem` (OType::QuotaThreadMem, CT = 3):
+// 1. `QuotaThreadMem` (OType::QuotaThreadMem, CT = 9):
 //    Hierarchical, page-backed quota governing thread execution memory
 //    (user stacks, `ThreadState`, and kernel return stacks). A second
 //    `quota::Tree` instance, identical to `QuotaVm` except for its OType.
 //      - Permit_Load  -> operational authority (fund threads via create)
 //      - Permit_Store -> administrative authority (derive / destroy quotas)
 //
-// 2. `ThreadState` (OType::Thread, CT = 8):
+// 2. `ThreadState` (OType::Thread, CT = 14):
 //    Occupies `THREAD_STATE_PAGES` pages (`THREAD_STATE_COST = 8192`): the
 //    `ThreadState` struct at the front (`[0, sizeof(ThreadState))`), and the
 //    thread's kernel-private return stack behind it (`[sizeof(ThreadState),
@@ -116,7 +116,7 @@ struct alignas(16) ThreadState {
   Capability self_page;      // writable kernel capability to this thread's page
   Capability funding_quota;  // sealed OTYPE_QUOTA_THREAD_MEM that paid
   Capability stack_alloc;    // unsealed DataRw allocation for user stack
-  Capability entry_sentry;   // validated OType::EntryPoint (CT = 12)
+  Capability entry_sentry;   // validated OType::EntryPoint (CT = 18)
   Capability initial_arg;    // initial value for ca0
   Capability user_sp;        // top of user stack ([base, base + stack_bytes))
   Capability kernel_sp;      // saved kernel stack pointer (SwitchFrame* when halted)

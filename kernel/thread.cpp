@@ -273,7 +273,7 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     return fail_with(out_status, Status::BadStackSize);
   }
 
-  // Validate that entry_sentry is a genuine OType::EntryPoint (CT = 12) with
+  // Validate that entry_sentry is a genuine OType::EntryPoint (CT = 18) with
   // Permit_Load, and fetch the owning compartment's table for `cgp`. A kernel
   // entry is not a thread entry: it has no table and is only ever reached
   // through the switcher.

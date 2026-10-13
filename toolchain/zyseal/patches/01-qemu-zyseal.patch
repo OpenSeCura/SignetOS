@@ -1,6 +1,6 @@
 --- a/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
 +++ b/target/cheri-common/cheri-compressed-cap/cheri_compressed_cap_128r.h
-@@ -75,15 +75,36 @@
+@@ -75,15 +75,38 @@
  #pragma GCC diagnostic push
  #pragma GCC diagnostic ignored "-Wpedantic"
  enum {
@@ -26,11 +26,13 @@
 +     *    AP_M (the combined AP+MODE field) is gone: MODE is no longer
 +     *    adjacent to AP.  Only the Sail test harness referenced it.
 +     *
-+     * 2. OTYPE/CT is 4 bits: 0 unsealed, 1 sentry, 2..15 Zyseal object types.
-+     *    Deliberately narrow so software cannot depend on more types than the
-+     *    64-bit capability format (RV32) could offer -- the spec's own
-+     *    microcontroller encoding uses a 3-bit CT.  RESERVED0 (106:95) is
-+     *    free, so widening means changing only the two field lines below.
++     * 2. OTYPE/CT is 5 bits: 0 unsealed, 1 sentry, 2..7 reserved for more
++     *    sentry types, 8..31 Zyseal object types.  Kept narrow so software
++     *    cannot come to depend on many hardware types: the spec's own
++     *    microcontroller encoding uses a 3-bit CT, and CHERIoT splits its
++     *    types into code (1..7) and data much as this layout does.
++     *    RESERVED0 (106:96) is free, so widening means changing only the two
++     *    field lines below.
 +     */
 +    _CC_FIELD(SDP, 127, 124),
 +    _CC_FIELD(MODE, 123, 123),
@@ -40,12 +42,12 @@
      _CC_FIELD(LEVEL, 107, 107),
 -    _CC_FIELD(RESERVED0, 106, 92),
 -    _CC_FIELD(OTYPE, 91, 91),
-+    _CC_FIELD(RESERVED0, 106, 95),
-+    _CC_FIELD(OTYPE, 94, 91),
++    _CC_FIELD(RESERVED0, 106, 96),
++    _CC_FIELD(OTYPE, 95, 91),
      _CC_FIELD(EBT, 90, 64),
  
      _CC_FIELD(EXPONENT_FORMAT, 90, 90),
-@@ -122,23 +143,65 @@
+@@ -122,23 +145,67 @@
  #define CC128R_PERM_ACCESS_SYS_REGS (1 << 16)
  #define CC128R_PERM_EXECUTE (1 << 17)
  #define CC128R_PERM_READ (1 << 18)
@@ -102,21 +104,23 @@
  
 -// Currently, only one type (sentry) is defined.
 -// However, other extensions (e.g. CHERIoT) define additional otypes beyond this.
-+// CT values 0 (unsealed) and 1 (sentry) are architecturally reserved.
-+// Zyseal object types occupy 2 .. MAX_REPRESENTABLE_OTYPE (15 for a 4-bit CT),
-+// i.e. 14 usable types.  Everything below is derived from CC128R_OTYPE_BITS,
-+// so the width is changed in exactly one place (the _CC_FIELD above).
++// CT values 0 (unsealed) and 1 (sentry) are architecturally reserved, and
++// 2..7 are kept for further sentry types.  Nothing here produces 2..7, and
++// until an extension defines them they behave like sealed objects.  Zyseal
++// object types occupy 8 .. MAX_REPRESENTABLE_OTYPE (31 for a 5-bit CT), i.e.
++// 24 usable types.  Everything below is derived from CC128R_OTYPE_BITS, so
++// the width is changed in exactly one place (the _CC_FIELD above).
  enum _CC_N(OTypes) {
      CC128R_MAX_REPRESENTABLE_OTYPE = ((1u << CC128R_OTYPE_BITS) - 1u),
      _CC_SPECIAL_OTYPE(OTYPE_UNSEALED, 0),
      _CC_SPECIAL_OTYPE(OTYPE_SENTRY, 1),
      _CC_N(MIN_RESERVED_OTYPE) = _CC_N(OTYPE_UNSEALED),
      _CC_N(MAX_RESERVED_OTYPE) = _CC_N(OTYPE_SENTRY),
-+    _CC_N(MIN_ZYSEAL_OTYPE) = 2,
++    _CC_N(MIN_ZYSEAL_OTYPE) = 8,
  };
  
  #define CC128R_LS_SPECIAL_OTYPES(ITEM, ...)                                                                            \
-@@ -191,6 +254,11 @@
+@@ -191,6 +258,11 @@
          // Levels extension not supported -> treat as reserved one-bits.
          result |= CC128R_PERM_LEVEL | CC128R_PERM_STORE_LEVEL | CC128R_PERM_ELEVATE_LEVEL;
      }
@@ -128,7 +132,7 @@
      result |= _CC_N(PERMS_RESERVED_ONES); // Finally include the hardcoded one-bits
      return result;
  }
-@@ -223,6 +291,12 @@
+@@ -223,6 +295,12 @@
          unsigned new_level = permissions & CC128R_PERM_LEVEL ? 1 : 0;
          cap->cr_pesbt = _CC_DEPOSIT_FIELD(cap->cr_pesbt, new_level, LEVEL);
      }
@@ -335,7 +339,7 @@
 +    /*
 +     * 17.6 requires exact equality between the authority's address and the
 +     * sealed capability's CT field -- unlike YSUNSEAL, which uses a subset
-+     * test.  Sentries (CT == 1) are not unsealable this way.
++     * test.  Sentry types (CT 1..7) are not unsealable this way.
 +     */
 +    bool ok = src->cr_tag && auth->cr_tag &&
 +              cap_has_perms(auth, CAP_PERM_UNSEAL) &&

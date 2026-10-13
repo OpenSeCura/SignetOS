@@ -24,39 +24,41 @@ namespace signetos {
 using Capability = void* __capability;
 using Sentry = Capability;
 
-// CHERI hardware object types (the capability CT field, 4 bits wide).
+// CHERI hardware object types (the capability CT field, 5 bits wide).
 //
 //   CT = 0        unsealed
-//   CT = 1        hardware sentry, produced by the `sentry` instruction. Cannot
-//                 be produced or opened by yseal/yunseal, which only accept 2..15.
-//   CT = 2..15    object types, applied with yseal and removed with yunseal.
+//   CT = 1        hardware sentry, produced by the `sentry` instruction.
+//   CT = 2..7     reserved for sentry types.
+//   CT = 8..31    object types, applied with yseal and removed with yunseal.
+//                 yseal/yunseal accept only these, so they cannot make or
+//                 open a sentry.
 //
-// 14 types are available and 11 are used, so 13..15 are spare.
+// 24 object types are available and 12 are used, so 20..31 are spare.
 enum class OType : uint64_t {
     Unsealed         = 0,
     Sentry           = 1,
-    QuotaVm          = 2,
-    QuotaThreadMem   = 3,
-    QuotaHeap        = 4,
-    QuotaSched       = 5,
-    QuotaDisk        = 6,
-    Compartment      = 7,
-    Thread           = 8,
-    Revoker          = 9,
-    TypeKey          = 10,
-    SealedObject     = 11,
+    QuotaVm          = 8,
+    QuotaThreadMem   = 9,
+    QuotaHeap        = 10,
+    QuotaSched       = 11,
+    QuotaDisk        = 12,
+    Compartment      = 13,
+    Thread           = 14,
+    Revoker          = 15,
+    TypeKey          = 16,
+    SealedObject     = 17,
 
     // The handle to a capability_sentry_t pool object. Distinct from Sentry:
     // Sentry (CT = 1) is the hardware-jumpable code capability kept inside the
     // slot, and yseal cannot produce it. EntryPoint is the opaque data handle
     // the caller holds, which is neither jumpable nor dereferenceable.
-    EntryPoint       = 12,
-    Trap             = 13,
+    EntryPoint       = 18,
+    Trap             = 19,
 };
 
 // The range yseal and yunseal will act on. Outside it they clear the tag.
-constexpr uint64_t kOTypeMin = 2;
-constexpr uint64_t kOTypeMax = 15;
+constexpr uint64_t kOTypeMin = 8;
+constexpr uint64_t kOTypeMax = 31;
 
 constexpr bool otype_is_sealable(OType t) {
     return static_cast<uint64_t>(t) >= kOTypeMin &&

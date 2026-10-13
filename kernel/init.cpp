@@ -61,7 +61,7 @@ Capability boot_image_cap(const uint8_t* img_sym) {
 }
 
 // Loads a standalone compartment image (`img_cap`) into `target_comp` funded
-// by `target_quota` and mints its `OType::EntryPoint` (`CT = 12`) sentry.
+// by `target_quota` and mints its `OType::EntryPoint` (`CT = 18`) sentry.
 // Same steps as `user::load_compartment_image`, but calling the kernel
 // entry points directly instead of through syscall gates.
 Capability load_image_kernel(Capability target_comp, Capability target_quota,

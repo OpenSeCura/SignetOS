@@ -21,7 +21,7 @@
 //
 // Two sealing mechanisms, both performed by hardware:
 //
-//   seal_as(t, cap)  DATA HANDLE. CT = t, for t in 2..15. Applied with `yseal`
+//   seal_as(t, cap)  DATA HANDLE. CT = t, for t in 8..31. Applied with `yseal`
 //                    under a sealing authority, removed with `yunseal` under the
 //                    same authority. Not dereferenceable and not jumpable.
 //
@@ -96,8 +96,8 @@ inline bool init_type_root(Capability root) {
 //
 // Bounding to a single type is what stops one authority from standing in for
 // another. The address of a capability can be moved freely, but yseal checks
-// the address against the authority's own bounds, so an authority for type 3
-// retargeted at type 4 is refused by the hardware.
+// the address against the authority's own bounds, so an authority for type 9
+// retargeted at type 10 is refused by the hardware.
 inline Capability authority_for(OType t) {
     if (!otype_is_sealable(t) || !capability_is_valid(g_type_root)) {
         return nullptr;
@@ -260,7 +260,7 @@ inline Capability reconstruct(Capability authority, uint64_t addr, size_t length
 // --- Compartment-Minted Sealing Types ---------------------------------------
 
 // `sys_type_mint`: Bounds `record` to 16 bytes, restricts permissions to
-// `Permit_Load | Permit_Store`, and seals it with `OType::TypeKey` (CT = 10).
+// `Permit_Load | Permit_Store`, and seals it with `OType::TypeKey` (CT = 16).
 // Requires `record` to be tagged, unsealed, carry `Permit_Store`, and have at
 // least 16 bytes available from its current address.
 inline Capability type_mint(Capability record) {
@@ -306,7 +306,7 @@ inline Capability type_derive(Capability key, uint32_t permissions) {
 // permissionless, tagged `OType::TypeKey` copy of `key` into the 16-byte header
 // at `obj`, and returns a capability addressed at the payload, bounded over
 // header + payload, retaining `Permit_Load_Capability`, and sealed with
-// `OType::SealedObject` (CT = 11).
+// `OType::SealedObject` (CT = 17).
 inline Capability user_seal(Capability key, Capability obj) {
     if (!is_sealed_as(OType::TypeKey, key) ||
         (capability_get_perms(key) & perms::Store) == 0) {

@@ -76,7 +76,7 @@
  * 1. THE SWITCHER (`sys_compartment_invoke`)
  * =========================================================================
  * Inputs:
- *   ca0       = target `OType::EntryPoint` handle (`CT = 12`)
+ *   ca0       = target `OType::EntryPoint` handle (`CT = 18`)
  *   ca1..ca5  = arguments; the callee receives ca1..ca5 as its ca0..ca4
  * Output:
  *   ca0       = callee's return value, or `Status` if the call was refused

@@ -56,7 +56,7 @@ struct alignas(16) LoadRequest {
   Capability seeds;         // in: bounded capability to initial seed array
   Capability image;         // in: read-only capability to compartment `.bin`
   Capability out_comp;      // out: created `OType::Compartment` handle
-  Capability out_sentry;    // out: minted `OType::EntryPoint` (CT = 12) sentry
+  Capability out_sentry;    // out: minted `OType::EntryPoint` (CT = 18) sentry
 };
 
 // ----------------------------------------------------------------------------

@@ -36,6 +36,10 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
     object-type field. All kernel handles are hardware-sealed with it (§2.1).
   * `Zylevels1`: capability levels (global/local), used for stack-bound
     capabilities (§2.1).
+  * `sentries`: the link a call writes is a return sentry (CT 2). Only a
+    return can use one, a return can use nothing else, and it is local, so
+    only a stack can hold it. Code never runs from a local capability
+    (`toolchain/sentries`).
 * **Machine:** multi-hart QEMU `virt` with one virtio-blk disk (`disk.img`).
   There is no OpenSBI: the kernel ships a tiny M-mode stub that services the
   timer and IPI "SBI" calls.

@@ -23,7 +23,7 @@
  * A synchronous fault raised by kernel code (`sepcc` carries AccessSystemRegs)
  * is a kernel bug: `trap_report()` prints it and halts, whatever is bound.
  *
- * Otherwise, if a compartment has bound an `OType::EntryPoint` (CT = 12)
+ * Otherwise, if a compartment has bound an `OType::EntryPoint` (CT = 18)
  * handler sentry to the vector via `sys_trap_bind`, `__signetos_trap_dispatch`
  * resolves it and `_early_trap_entry` invokes it with the interrupted context
  * saved in a `TrapFrame` on the active kernel stack -- provided the

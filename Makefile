@@ -16,7 +16,7 @@
 # Toolchain.
 #
 # The SDK and QEMU below carry the Zyseal extension: the YSEAL/YUNSEAL
-# instructions, the SE/US permissions, and a 4-bit CT field. Zyseal is a local
+# instructions, the SE/US permissions, and a 5-bit CT field. Zyseal is a local
 # non-ratified dialect; toolchain/setup.sh fetches, patches and builds the
 # toolchain (see README.md).
 #

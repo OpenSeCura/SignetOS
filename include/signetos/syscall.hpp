@@ -373,7 +373,7 @@ void init();
 //   - `Id::compartment_invoke`: the switcher itself, a `CT = 1` hardware
 //     sentry bounded to the kernel image with `CodeRx | AccessSystemRegs`.
 //     It is the only `CT = 1` sentry a compartment ever holds.
-//   - every other id: an `OType::EntryPoint` handle (`CT = 12`, Permit_Load
+//   - every other id: an `OType::EntryPoint` handle (`CT = 18`, Permit_Load
 //     only) over a kernel-owned `sentry::EntryRecord` marked
 //     `ENTRY_FLAG_TRUSTED`. It cannot be jumped to; it is passed to the
 //     switcher in `ca0`, exactly like a compartment entry point.

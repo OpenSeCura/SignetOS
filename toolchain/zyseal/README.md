@@ -30,8 +30,8 @@ The 128-bit `128r` format. Bits 0–63 are the address; the metadata is:
 | 122–118 | RESERVED1 | |
 | **117–108** | **AP** | architectural permissions — **AP[9]=US, AP[8]=SE** |
 | 107 | LEVEL | |
-| 106–95 | RESERVED0 | free; widening CT takes bits from here |
-| **94–91** | **CT** | object type, 4 bits |
+| 106–96 | RESERVED0 | free; widening CT takes bits from here |
+| **95–91** | **CT** | object type, 5 bits |
 | 90–64 | EBT | bounds |
 
 Only the two bold entries are ours. CT was widened from the base architecture's
@@ -43,10 +43,13 @@ Only the two bold entries are ours. CT was widened from the base architecture's
 |---|---|---|---|
 | 0 | unsealed | allowed | allowed |
 | 1 | sentry | faults | allowed iff offset 0, unsealed on arrival |
-| 2–15 | sealed object | faults | faults |
+| 2–7 | reserved for sentry types | faults | faults |
+| 8–31 | sealed object | faults | faults |
 
-14 usable types. `yseal` can only ever produce 2–15, and `yunseal` only accepts
-2–15, so neither can mint or open a sentry.
+24 usable types. `yseal` can only ever produce 8–31, and `yunseal` only accepts
+8–31, so neither can mint or open a sentry. Nothing in Zyseal makes 2–7: they
+are kept for sentry extensions such as [`../sentries`](../sentries/README.md),
+and until one defines them they behave like sealed objects.
 
 ### SE and US permissions
 
@@ -74,7 +77,7 @@ tag cleared.
 ```
 rs2.tag  &&  rs1.tag  &&  rs2 is unsealed  &&  rs1 grants SE
          &&  ct is within rs1's bounds
-         &&  2 <= ct <= 15
+         &&  8 <= ct <= 31
 ```
 
 Result is `rs2` with CT set to `ct`. Nothing else changes — bounds, address and
@@ -85,7 +88,7 @@ permissions are untouched.
 ```
 rs2.tag  &&  rs1.tag  &&  rs1 grants US
          &&  ct is within rs1's bounds
-         &&  ct >= 2  &&  ct == rs2's CT
+         &&  ct >= 8  &&  ct == rs2's CT
 ```
 
 Exact equality, not a subset test. Result is `rs2` with CT set to 0. If

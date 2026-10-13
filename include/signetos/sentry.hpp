@@ -19,7 +19,7 @@
 //
 // sentry.hpp - SignetOS Compartment Entry Points
 //
-// WHY TWO HARDWARE TYPES ARE USED (CT = 12 vs CT = 1)
+// WHY TWO HARDWARE TYPES ARE USED (CT = 18 vs CT = 1)
 // ---------------------------------------------------
 // CHERI RISC-V with Zyseal provides two distinct sealing mechanisms:
 //
@@ -29,10 +29,10 @@
 //      itself (`sys_compartment_invoke`); the switcher also uses CT = 1 for
 //      its final branch into a callee.
 //
-//   2. `yseal` with OType::EntryPoint (CT = 12):
+//   2. `yseal` with OType::EntryPoint (CT = 18):
 //      Authority-gated instruction requiring the kernel's `g_type_root`.
 //      Cannot be produced by user compartments, cannot be dereferenced, and
-//      CANNOT be jumped to directly by `cjalr` (which only unseals CT = 1).
+//      CANNOT be jumped to directly by `cjalr` (which only unseals sentries).
 //
 // WHAT A SENTRY POINTS AT
 // -----------------------
@@ -40,7 +40,7 @@
 // to `perms::CodeRx` (W^X), checks that `code` lies in `comp`'s own memory,
 // and writes `{pcc, cgp, owner, flags, min_stack}` into an `EntryRecord` on
 // one of `comp`'s entry pages (billed to `comp`'s funding quota). The sentry
-// is that record's address, sealed as `OType::EntryPoint` (CT = 12).
+// is that record's address, sealed as `OType::EntryPoint` (CT = 18).
 //
 // Entering through it (`sys_compartment_invoke`, `sys_thread_create`) unseals
 // the record, loads `pcc` to jump to, and loads `cgp` (the compartment's

@@ -205,7 +205,7 @@ inline Capability lookup_name(Capability invoke_gate, Capability lookup_entry,
 // Copies a standalone compartment binary image (`img_cap`) into a fresh
 // allocation inside `target_comp` funded by `target_quota`, resolves its
 // internal `__cap_relocs` entries into `.got`, and mints its `OType::EntryPoint`
-// (`CT = 12`) entry sentry. `alloc_gate` and `sentry_gate` are the
+// (`CT = 18`) entry sentry. `alloc_gate` and `sentry_gate` are the
 // `vm_allocate` and `sentry` kernel entries, reached through the switcher
 // `invoke_gate`.
 inline Capability load_compartment_image(Capability invoke_gate,

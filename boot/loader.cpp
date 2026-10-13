@@ -22,7 +22,7 @@
  * When invoked with a `LoadRequest*` in `arg`, creates a new compartment
  * funded by `req->vm_quota`, seeds its capability table with `req->seeds`,
  * allocates code memory, copies `req->image`, processes its `__cap_relocs`,
- * and mints its `OType::EntryPoint` (CT = 12) sentry into `req->out_sentry`.
+ * and mints its `OType::EntryPoint` (CT = 18) sentry into `req->out_sentry`.
  *
  * THE MANIFEST CHECK
  *   The loader holds nothing it could give a new compartment, and interprets
