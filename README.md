@@ -10,28 +10,34 @@ A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
 SignetOS depends on **Zyseal**, a CHERI RISC-V sealing extension that isn't
 ratified (the `YSEAL`/`YUNSEAL` instructions). No released CHERI toolchain
 has it, so you first build a patched LLVM and QEMU with
-[`zyseal/setup.sh`](zyseal/setup.sh).
+[`toolchain/setup.sh`](toolchain/setup.sh).
 
 SignetOS design and vision can be found [here](DESIGN.md).
 
 ## 1. Build the CHERI toolchain
 
-Install the prerequisites (Debian/Ubuntu), then run the Zyseal setup script
-from the repository root:
+Install the prerequisites (Debian/Ubuntu), then run the toolchain setup
+script from the repository root:
 
 ```bash
 sudo apt install -y cmake ninja-build clang lld python3 pkg-config \
                     libglib2.0-dev libpixman-1-dev flex bison
 
-zyseal/setup.sh
+toolchain/setup.sh
 ```
 
-The script takes about an hour and ~30 GB of disk, nearly all of it LLVM. It
-uses [cheribuild](https://github.com/CTSRD-CHERI/cheribuild) to fetch the
-upstream CHERI LLVM and QEMU, applies the patches in
-[`zyseal/patches`](zyseal/patches), and builds them. If it stops partway,
-run it again: steps that are already done are skipped. See
-[`zyseal/README.md`](zyseal/README.md) for details.
+The script takes about an hour and ~30 GB of disk, nearly all of it LLVM. It:
+
+1. uses [cheribuild](https://github.com/CTSRD-CHERI/cheribuild) to fetch the
+   upstream CHERI LLVM and QEMU, and copies them to `~/cheri/zyseal/`;
+2. runs the extension scripts, which only apply patches to those copies:
+   [`toolchain/zyseal/setup.sh`](toolchain/zyseal/setup.sh) (Zyseal, LLVM and
+   QEMU) and [`toolchain/mmodemmu/setup.sh`](toolchain/mmodemmu/setup.sh)
+   (M-mode MMU, QEMU);
+3. builds the patched LLVM and QEMU.
+
+If it stops partway, run it again: steps that are already done are skipped.
+See [`toolchain/README.md`](toolchain/README.md) for details.
 
 Everything goes into `~/cheri` by default (set `CHERI_ROOT` to change that).
 SignetOS uses these two outputs:
@@ -70,7 +76,7 @@ system wrote on earlier boots; delete it to start fresh.
 ### Toolchain location
 
 The Makefile finds the toolchain through `CHERI_ROOT`, which defaults to
-`~/cheri`, the same default as `setup.sh`. If you ran `setup.sh` with a
+`~/cheri`, the same default as `toolchain/setup.sh`. If you ran it with a
 different `CHERI_ROOT`, use the same value here:
 
 ```bash
@@ -85,7 +91,7 @@ directory that contains `clang`) and `QEMU` (the full path to
 ## Troubleshooting
 
 - **`CHERI clang not found at ...`**: the toolchain isn't where the Makefile
-  is looking. Run `zyseal/setup.sh` (step 1) or set `CHERI_ROOT`.
+  is looking. Run `toolchain/setup.sh` (step 1) or set `CHERI_ROOT`.
 - **clang rejects `-march=rv64gc_zcheripurecap_zyseal`**: you're using an
   unpatched compiler. Use the one from `$CHERI_ROOT/zyseal/llvm-build/bin`.
 - **QEMU rejects `Zyseal=on`**: you're using an unpatched QEMU. Use
@@ -101,4 +107,6 @@ boot/        compartments embedded in the kernel: init, loader, fs, uart, blk
 external/    compartments loaded from disk.img: services/ (naming, sched,
              trap_mgr, shell) and apps/ (programs the shell can `run`)
 tools/       signetfs.py, which writes disk.img
+toolchain/   patches and scripts that build the CHERI LLVM and QEMU (Zyseal,
+             mmodemmu)
 ```

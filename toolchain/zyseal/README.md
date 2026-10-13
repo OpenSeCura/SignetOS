@@ -2,14 +2,14 @@
 
 Implementation of the CHERI RISC-V `Zyseal` sealing
 extension (spec Chapter 17) for QEMU and LLVM, plus a test suite. No QEMU or
-LLVM source is included; `setup.sh` fetches and patches it. Please note that
+LLVM source is included; `../setup.sh` fetches it and `setup.sh` patches it. Please note that
 Zyseal is not ratified and is subject to change. The way we have implemented
 it also allows the number of CT bits to increase should your usecase require
 more hardware otypes. NOTE: what CHERI folks normally refer to as the otype,
 CHERI RISC-V calls CT bits ie. capability type.
 
 ```
-setup.sh     fetch the upstream toolchain, patch it, build it
+setup.sh     apply the patches (run by ../setup.sh)
 patches/     01-qemu (10 files), 02-llvm (7 files), 03-llvm-sealed-get-fix (1 file)
 tests/       test suite
 ```
@@ -108,19 +108,12 @@ target; `rv32` accepts `Zyseal=on` but does nothing with it.
 
 ## Building
 
-```bash
-sudo apt install -y cmake ninja-build clang lld python3 pkg-config \
-                    libglib2.0-dev libpixman-1-dev flex bison
-
-./setup.sh                 # installs under $CHERI_ROOT, default $HOME/cheri
-```
-
-About an hour and ~30 GB of disk, nearly all of it LLVM. Re-running skips what
-is already done. It clones
-[cheribuild](https://github.com/CTSRD-CHERI/cheribuild), uses it to build
-upstream LLVM and the OpenSBI firmware and to fetch the QEMU source, then
-copies the LLVM and QEMU trees to `$CHERI_ROOT/zyseal/`, patches the copies and
-builds them.
+Build the toolchain with `../setup.sh` (see `../README.md`). That script
+fetches upstream LLVM and QEMU with
+[cheribuild](https://github.com/CTSRD-CHERI/cheribuild), copies them to
+`$CHERI_ROOT/zyseal/`, and builds them. In between, it runs `./setup.sh`
+here, which applies only the patches in `patches/`. A patch that is already
+applied is skipped.
 
 Upstream is `CHERI-Alliance/llvm-project` (`codasip-cheri-riscv-20`) and
 `CHERI-Alliance/qemu` (`main`).

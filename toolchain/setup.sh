@@ -16,19 +16,30 @@
 
 
 #!/bin/bash
-# Get the upstream CHERI toolchain with cheribuild, apply the zyseal patches,
-# and build the patched LLVM and QEMU. After this, `make run` in tests/ works.
+# Build the SignetOS toolchain: CHERI LLVM and QEMU with our extensions.
 #
-#   ./setup.sh                    installs under $HOME/cheri
-#   CHERI_ROOT=/opt/x ./setup.sh  installs somewhere else
+#   1. fetch the upstream CHERI toolchain with cheribuild
+#   2. copy the LLVM and QEMU trees to $CHERI_ROOT/zyseal/
+#   3. apply each extension's patches to the copies (zyseal/, mmodemmu/)
+#   4. build the patched LLVM and QEMU
 #
-# Expect an hour or so, almost all of it LLVM. Re-running is safe: steps that
-# are already done are skipped.
+#   ./toolchain/setup.sh                    installs under $HOME/cheri
+#   CHERI_ROOT=/opt/x ./toolchain/setup.sh  installs somewhere else
+#
+# Expect an hour or so the first time, almost all of it LLVM. Re-running is
+# safe: steps that are already done are skipped, and the builds are
+# incremental, so re-running after adding a patch rebuilds only what changed.
 set -e
 
-CHERI_ROOT=${CHERI_ROOT:-$HOME/cheri}
+export CHERI_ROOT=${CHERI_ROOT:-$HOME/cheri}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 JOBS=${JOBS:-$(nproc)}
+
+# The patched trees and their builds. The directory is called `zyseal` for
+# historical reasons: it holds the copies every extension patches.
+OUT=$CHERI_ROOT/zyseal
+export LLVM_SRC=$OUT/llvm
+export QEMU_SRC=$OUT/qemu
 
 BIOS=$CHERI_ROOT/build/cheri-std093-opensbi-baremetal-riscv64-purecap-std093-build/platform/generic/firmware/fw_jump.bin
 
@@ -54,8 +65,8 @@ $CB cheri-std093-llvm
 echo "### fetching the QEMU source"
 $CB cheri-std093-qemu --configure-only
 
-# The tests boot on fw_jump.bin. OpenSBI also builds fw_payload.elf, which we
-# never use and which fails to link against recent lld:
+# The Zyseal tests boot on fw_jump.bin. OpenSBI also builds fw_payload.elf,
+# which we never use and which fails to link against recent lld:
 #
 #   ld.lld: error: section: .got is not contiguous with other relro sections
 #
@@ -72,46 +83,44 @@ if [ ! -f "$BIOS" ]; then
 fi
 echo "    firmware ok: $BIOS"
 
-# ------------------------------------------------------------- copy + patch
+# ---------------------------------------------------------------------- copy
 # Patch copies, not the trees cheribuild manages, so cheribuild can still
 # update the originals and you keep a working toolchain to fall back on.
-mkdir -p "$CHERI_ROOT/zyseal"
-
-if [ -d "$CHERI_ROOT/zyseal/llvm" ]; then
-    echo "### $CHERI_ROOT/zyseal/llvm exists, not re-copying or re-patching"
+mkdir -p "$OUT"
+if [ -d "$LLVM_SRC" ]; then
+    echo "### $LLVM_SRC exists, not re-copying"
 else
-    echo "### copying and patching LLVM"
-    cp -a "$CHERI_ROOT/cheri-std093-llvm-project" "$CHERI_ROOT/zyseal/llvm"
-    ( cd "$CHERI_ROOT/zyseal/llvm"
-      patch -p1 < "$HERE/patches/02-llvm-zyseal.patch"
-      patch -p1 < "$HERE/patches/03-llvm-sealed-get-fix.patch" )
+    echo "### copying LLVM to $LLVM_SRC"
+    cp -a "$CHERI_ROOT/cheri-std093-llvm-project" "$LLVM_SRC"
+fi
+if [ -d "$QEMU_SRC" ]; then
+    echo "### $QEMU_SRC exists, not re-copying"
+else
+    echo "### copying QEMU to $QEMU_SRC"
+    cp -a "$CHERI_ROOT/cheri-std093-qemu" "$QEMU_SRC"
 fi
 
-if [ -d "$CHERI_ROOT/zyseal/qemu" ]; then
-    echo "### $CHERI_ROOT/zyseal/qemu exists, not re-copying or re-patching"
-else
-    echo "### copying and patching QEMU"
-    cp -a "$CHERI_ROOT/cheri-std093-qemu" "$CHERI_ROOT/zyseal/qemu"
-    ( cd "$CHERI_ROOT/zyseal/qemu"
-      patch -p1 < "$HERE/patches/01-qemu-zyseal.patch" )
-fi
+# --------------------------------------------------------------------- patch
+# Order matters: mmodemmu's QEMU patch applies on top of Zyseal's.
+"$HERE/zyseal/setup.sh"
+"$HERE/mmodemmu/setup.sh"
 
-# ------------------------------------------------------------- build patched
+# --------------------------------------------------------------------- build
 echo "### building patched LLVM"
-cmake -G Ninja -S "$CHERI_ROOT/zyseal/llvm/llvm" -B "$CHERI_ROOT/zyseal/llvm-build" \
+cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$OUT/llvm-build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="llvm;clang;lld" \
   -DLLVM_TARGETS_TO_BUILD="RISCV" \
   -DLLVM_ENABLE_ASSERTIONS=OFF \
-  -DCMAKE_INSTALL_PREFIX="$CHERI_ROOT/zyseal/llvm-sdk"
-ninja -C "$CHERI_ROOT/zyseal/llvm-build" -j"$JOBS"
+  -DCMAKE_INSTALL_PREFIX="$OUT/llvm-sdk"
+ninja -C "$OUT/llvm-build" -j"$JOBS"
 
 echo "### building patched QEMU"
-mkdir -p "$CHERI_ROOT/zyseal/qemu-build"
-if [ ! -f "$CHERI_ROOT/zyseal/qemu-build/build.ninja" ]; then
-    ( cd "$CHERI_ROOT/zyseal/qemu-build" && ../qemu/configure \
+mkdir -p "$OUT/qemu-build"
+if [ ! -f "$OUT/qemu-build/build.ninja" ]; then
+    ( cd "$OUT/qemu-build" && "$QEMU_SRC/configure" \
       --target-list=riscv64cheristd-softmmu \
-      --prefix="$CHERI_ROOT/zyseal/qemu-sdk" \
+      --prefix="$OUT/qemu-sdk" \
       --disable-sdl --disable-gtk --disable-opengl --disable-virglrenderer \
       --disable-stack-protector --disable-strip --enable-virtfs --disable-xen \
       --disable-docs --disable-rdma --disable-werror --disable-capstone \
@@ -119,8 +128,8 @@ if [ ! -f "$CHERI_ROOT/zyseal/qemu-build/build.ninja" ]; then
       --cc=/usr/bin/cc --cxx=/usr/bin/c++ --python=/usr/bin/python3 \
       --extra-cflags=-O1 )
 fi
-ninja -C "$CHERI_ROOT/zyseal/qemu-build" -j"$JOBS"
+ninja -C "$OUT/qemu-build" -j"$JOBS"
 
 echo
 echo "done. now:"
-echo "    cd $HERE/tests && CHERI_ROOT=$CHERI_ROOT make run"
+echo "    cd $HERE/zyseal/tests && CHERI_ROOT=$CHERI_ROOT make run"

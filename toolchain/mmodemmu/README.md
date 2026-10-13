@@ -7,14 +7,13 @@ CHERI ASR permission is the only privilege boundary, and paging still works.
 accessed by number.
 
 ```
-setup.sh     applies the patches to the Zyseal QEMU and rebuilds it
+setup.sh     applies the patches to the QEMU tree (run by ../setup.sh)
 patches/     01-qemu-mmodemmu (6 files)
 ```
 
-Run `../zyseal/setup.sh` first, then `./setup.sh` here. It patches the same
-QEMU copy (`$CHERI_ROOT/zyseal/qemu`) on top of Zyseal, and `ninja` rebuilds
-the six files the patch touches. Re-running it is safe: a patch that is
-already applied is skipped.
+`../setup.sh` runs `./setup.sh` after the Zyseal patches and before it builds
+QEMU, so the patch sits on top of Zyseal in the same QEMU copy
+(`$CHERI_ROOT/zyseal/qemu`). A patch that is already applied is skipped.
 
 ## The extension
 

@@ -16,24 +16,20 @@
 
 
 #!/bin/bash
-# Apply the mmodemmu patches to the patched QEMU that ../zyseal/setup.sh
-# built, and rebuild it. Run ../zyseal/setup.sh first.
+# Apply the mmodemmu patches to the QEMU tree, on top of Zyseal's. Fetching
+# and building are ../setup.sh's job, which runs this between the two.
 #
-#   ./setup.sh                    uses $HOME/cheri
-#   CHERI_ROOT=/opt/x ./setup.sh  uses somewhere else
+#   QEMU_SRC   QEMU tree to patch (default $CHERI_ROOT/zyseal/qemu)
 #
 # Re-running is safe: a patch that is already applied is skipped.
 set -e
 
 CHERI_ROOT=${CHERI_ROOT:-$HOME/cheri}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-JOBS=${JOBS:-$(nproc)}
-QEMU_SRC=$CHERI_ROOT/zyseal/qemu
-QEMU_BUILD=$CHERI_ROOT/zyseal/qemu-build
+QEMU_SRC=${QEMU_SRC:-$CHERI_ROOT/zyseal/qemu}
 
-if [ ! -d "$QEMU_SRC" ] || [ ! -f "$QEMU_BUILD/build.ninja" ]; then
-    echo "ERROR: no patched QEMU at $QEMU_SRC (or no build in $QEMU_BUILD)."
-    echo "       Run ../zyseal/setup.sh first."
+if [ ! -d "$QEMU_SRC" ]; then
+    echo "ERROR: no QEMU tree at $QEMU_SRC (run ../setup.sh)"
     exit 1
 fi
 
@@ -47,9 +43,3 @@ for p in "$HERE"/patches/*-qemu-*.patch; do
         ( cd "$QEMU_SRC" && patch -p1 < "$p" )
     fi
 done
-
-echo "### rebuilding QEMU"
-ninja -C "$QEMU_BUILD" -j"$JOBS"
-
-echo
-echo "done. enable it with -cpu rv64,...,mmodemmu=on"
