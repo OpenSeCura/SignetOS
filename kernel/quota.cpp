@@ -22,6 +22,9 @@
 
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
+#ifdef SIGNETOS_QUOTA_SELFTEST
+#include <signetos/revoke.hpp>  // the self-test forces a sweep
+#endif
 
 namespace signetos::quota {
 namespace {
@@ -594,6 +597,24 @@ void self_test(Capability root) {
   check(destroy(p) == Status::Ok, "destroy scratch parent");
   check(available_of(root) == root_before, "root restored");
   check(live_nodes() == nodes, "no nodes leaked");
+
+  // 9. The pages of every node freed above are quarantined. A revocation
+  //    sweep reclaims them, and the tree works as before afterwards. The
+  //    kernel only sweeps under memory pressure, so this is the one place
+  //    the sweep runs on every boot.
+  {
+    check(vm::quarantined_pages() > 0, "freed node pages await the sweep");
+    revoke::sweep();
+    check(vm::quarantined_pages() == 0, "sweep reclaims the freed pages");
+    check(available_of(root) == root_before, "root unaffected by the sweep");
+    Capability q = derive(root, 4 * PAGE, RW);
+    check(capability_is_valid(q), "derive after the sweep");
+    check(charge(q, PAGE) == Status::Ok, "charge after the sweep");
+    check(destroy(q) == Status::Ok, "destroy after the sweep");
+    check(refund(q, PAGE) == Status::Ok, "refund after the sweep");
+    check(available_of(root) == root_before, "root restored after the sweep");
+    check(live_nodes() == nodes, "no nodes leaked after the sweep");
+  }
   uart::print("[quota]    self-test passed\n");
 }
 #endif  // SIGNETOS_QUOTA_SELFTEST
