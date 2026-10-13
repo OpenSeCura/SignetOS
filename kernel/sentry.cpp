@@ -408,6 +408,13 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   inspect::assert_user_capability(entry.table, "switcher_prepare:callee_gp");
   inspect::assert_user_capability(narrowed, "switcher_prepare:callee_sp");
   if (!trusted) {
+    // Code never crosses a compartment boundary, only entry points do
+    // (DESIGN.md §2.5): a call carrying code, plain or a sentry, is refused.
+    for (size_t i = 0; i < 5; ++i) {
+      if (inspect::is_user_code(frame->args[i])) {
+        return refuse(Status::InvalidCapability);
+      }
+    }
     for (size_t i = 0; i < 5; ++i) {
       inspect::assert_user_capability(frame->args[i], "switcher_prepare:arg");
     }
@@ -442,6 +449,13 @@ extern "C" uint64_t __signetos_switcher_return(Capability ret) {
   // return sentry cannot underflow the kernel stack or confuse a `TrapFrame`
   // for a `ReturnFrame`. The assembly resumes whatever kind of frame this
   // stops at.
+  //
+  // Code never crosses a compartment boundary (DESIGN.md §2.5), so code
+  // returned by the callee reaches the caller as `InvalidCapability`.
+  if (inspect::is_user_code(ret)) {
+    ret = reinterpret_cast<Capability>(
+        static_cast<uintptr_t>(Status::InvalidCapability));
+  }
   return unwind::resume(unwind::KIND_RETURN_FRAME, ret);
 }
 

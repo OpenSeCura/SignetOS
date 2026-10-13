@@ -21,6 +21,7 @@
  */
 
 #include <signetos/compartment.hpp>
+#include <signetos/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
@@ -312,7 +313,9 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   // The table is filled through the same view the compartment itself gets
   // (no StoreLocal), so a local capability among the seeds -- a pointer into
   // the creator's thread stack -- arrives untagged, exactly as it would if the
-  // compartment had tried to store it there itself.
+  // compartment had tried to store it there itself. Code among the seeds
+  // arrives untagged too: it never crosses a compartment boundary (DESIGN.md
+  // §2.5).
   Capability* slot = reinterpret_cast<Capability*>(user_view(table));
   slot[SLOT_SELF] = handle;         // so code inside can name its own domain
   slot[SLOT_VM_QUOTA] = mem_quota;  // its allocation authority
@@ -320,7 +323,9 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   const Capability* seeds =
       reinterpret_cast<const Capability*>(initial_capabilities);
   for (size_t i = 0; i < seed_count; ++i) {
-    slot[RW_SLOT_SEED_BASE + i] = seeds[i];
+    const Capability seed = seeds[i];
+    slot[RW_SLOT_SEED_BASE + i] =
+        inspect::is_user_code(seed) ? capability_clear_tag(seed) : seed;
   }
 
   __atomic_fetch_add(&s_live_count, 1, __ATOMIC_RELAXED);

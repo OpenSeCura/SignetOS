@@ -159,10 +159,10 @@ void assert_user_capability(Capability cap, const char* site) {
   //    syscall gate bounded exactly to `[_kernel_start, _got_end)`; without
   //    ASR it is a compartment entry point in dynamic memory (or, for
   //    `sentry::create_kernel` test stubs, inside the kernel's code span).
-  //    A return sentry (CT = 2) passes the same test: a caller may hand on
-  //    its own `cra`, no more than a raw sentry over its own code, and the
-  //    ones the kernel hands out (a new thread's first link, the switcher's)
-  //    are in the kernel gate span.
+  //    A return sentry (CT = 2) passes the same test: the ones the kernel
+  //    hands out (a new thread's first link, the switcher's) are in the
+  //    kernel gate span. Compartment-made code never gets this far as an
+  //    argument or return value: the switcher refuses it (is_user_code).
   const bool hw_sentry = ct == static_cast<uint64_t>(OType::Sentry) ||
                          ct == static_cast<uint64_t>(OType::ReturnSentry);
   if (sealed && hw_sentry) {

@@ -293,6 +293,10 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
       (capability_get_perms(initial_arg) & perms::Global) == 0) {
     return fail_with(out_status, Status::InvalidCapability);
   }
+  // Nor may code: it never crosses a compartment boundary (DESIGN.md §2.5).
+  if (inspect::is_user_code(initial_arg)) {
+    return fail_with(out_status, Status::InvalidCapability);
+  }
 
   const size_t stack_pages = (stack_size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
   const uint64_t stack_bytes = stack_pages * vm::PAGE_SIZE;

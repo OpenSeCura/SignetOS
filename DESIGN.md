@@ -423,21 +423,25 @@ table, the owning compartment, flags, and the minimum stack.
 * `user/runtime.hpp::mint_entry` is the usual way to make one: it re-bases the
   compartment's PCC onto a function and calls `sys_sentry`.
 
-Records are what the *switcher* accepts. They are not the only way code can
-be shared. Nothing stops a compartment from making an ordinary CHERI hardware
-sentry over its own code and handing it to a peer; the outbound check
-(§3.4) explicitly allows such sentries as call arguments. Jumping to one is
-not a domain crossing, though:
+Records are the only way code crosses from one compartment to another.
+Handing a peer raw code would let it jump in without a domain crossing: the
+code would run on the peer's stack with the peer's capability table, with no
+scrubbing and no return frame, and could still reach whatever its own code
+capability covers, such as its GOT and through it its globals. So code -- a
+plain code capability, or a call or return sentry, anything with Execute and
+without AccessSystemRegs (`inspect::is_user_code`) -- never crosses through
+the kernel:
 
-* the code runs on the caller's stack, with the caller's capability table;
-* there is no scrubbing and no return frame;
-* the target can still reach whatever its own code capability covers, such as
-  its GOT and through it its globals.
+* the switcher refuses a call whose arguments include code
+  (`InvalidCapability`), and code a callee returns reaches its caller as
+  `InvalidCapability`;
+* `sys_thread_create` refuses code as `initial_arg`;
+* code among a new compartment's seeds arrives untagged, as a local
+  capability does.
 
-This makes a raw sentry a deliberate, unprotected form of sharing (shared
-library code, or trust between cooperating compartments), not an entry
-point. Whether to restrict it, for example by forbidding compartment-made
-sentries in arguments, is an open question.
+One gap remains: memory two compartments share. A compartment can still store
+its code there for the other to load. Closing that needs the hardware, for
+example by letting code capabilities be stored only where local ones can.
 
 Everything the switcher does *with* an entry is described in §3.4.
 
@@ -909,7 +913,7 @@ usual leak is physical memory held in quarantine until a sweep.
 | 1. No outbound data leaks | Registers are scrubbed except the arguments. |
 | 2. No return data leaks | All volatile registers *and the entire stack region the callee used* are scrubbed on return. |
 | 3. Stack frame protection | The callee's stack is narrowed to below the caller's stack pointer. Local capabilities keep stack pointers from escaping. |
-| 4. Control-flow integrity | Switcher-mediated entry happens only through `EntryPoint` records. Raw hardware sentries that compartments make over their own code bypass the switcher and carry none of these guarantees (§2.5). |
+| 4. Control-flow integrity | Switcher-mediated entry happens only through `EntryPoint` records. Code never crosses a compartment boundary through the kernel: the switcher, thread creation and compartment seeds refuse it; memory two compartments share is the remaining gap (§2.5). |
 | 5. Deterministic unwinding | Return frames live on the thread's trusted stack. The return path validates the frame chain and kills the thread on a mismatch. |
 
 

@@ -33,7 +33,10 @@ using Sentry = Capability;
 //                 can use it, and a return can use nothing else. It is local,
 //                 so only a stack can hold it; a return through it makes the
 //                 caller's PCC global again. That is exact because code never
-//                 runs from a local capability: entering one faults.
+//                 runs from a local capability: entering one faults. (Local
+//                 code would only matter for a sentry handed to another
+//                 compartment for one call, and code never crosses a
+//                 compartment boundary: entry points do, DESIGN.md §2.5.)
 //   CT = 3..7     reserved for more sentry types.
 //   CT = 8..31    object types, applied with yseal and removed with yunseal.
 //                 yseal/yunseal accept only these, so they cannot make or

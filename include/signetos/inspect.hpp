@@ -44,4 +44,15 @@ namespace signetos::inspect {
 // Panics and halts the machine immediately if any invariant is violated.
 void assert_user_capability(Capability cap, const char* site);
 
+// True if `cap` is code a compartment could hand to another: tagged, with
+// Execute and without AccessSystemRegs, sealed (a call or return sentry) or
+// not. Code never crosses a compartment boundary; entry points do (DESIGN.md
+// §2.5). The kernel's own gates carry AccessSystemRegs and are not code in
+// this sense.
+inline bool is_user_code(Capability cap) {
+  const uint64_t p = capability_get_perms(cap);
+  return capability_is_valid(cap) && (p & perms::Execute) != 0 &&
+         (p & perms::AccessSystemRegs) == 0;
+}
+
 }  // namespace signetos::inspect
