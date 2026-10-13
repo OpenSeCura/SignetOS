@@ -442,21 +442,18 @@ Capability sweep_locked() {
   if (capability_is_valid(g_pending_pages) || vm::quarantined_pages() > 0) {
     // 1. Scan kernel `.data`, `.bss.stack`, and `.bss` (`[_data_start,
     //    _kernel_end)`), which includes the boot stack and all static state.
+    //    The image is identity-mapped; `phys_view` is the one standing
+    //    capability that spans it.
     if (vm::is_initialized()) {
       const uint64_t data_start = KERNEL_SYM_ADDR(_data_start);
       const uint64_t kernel_end = KERNEL_SYM_ADDR(_kernel_end);
-      for (uint64_t pa = data_start; pa < kernel_end; pa += vm::PAGE_SIZE) {
-        Capability page = vm::phys_view(pa, vm::PAGE_SIZE);
-        if (!capability_is_valid(page)) {
-          continue;
-        }
-        Capability* slots = reinterpret_cast<Capability*>(page);
-        constexpr size_t kCapsPerPage = vm::PAGE_SIZE / sizeof(Capability);
-        for (size_t c = 0; c < kCapsPerPage; ++c) {
-          const Capability cap = slots[c];
-          if (capability_is_valid(cap) && should_revoke(cap)) {
-            slots[c] = capability_clear_tag(cap);
-          }
+      const Capability view = vm::phys_view(data_start, kernel_end - data_start);
+      Capability* slots = reinterpret_cast<Capability*>(view);
+      const size_t count =
+          capability_is_valid(view) ? (kernel_end - data_start) / sizeof(Capability) : 0;
+      for (size_t c = 0; c < count; ++c) {
+        if (capability_is_valid(slots[c]) && should_revoke(slots[c])) {
+          slots[c] = capability_clear_tag(slots[c]);
         }
       }
     }

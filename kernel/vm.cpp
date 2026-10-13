@@ -15,24 +15,10 @@
  */
 
 /*
- * vm.cpp - SignetOS Sv39 virtual memory
+ * vm.cpp - SignetOS virtual memory
  *
  * See vm.hpp for the address space layout and how the direct map reaches page
  * tables.
- *
- * SV39 IN ONE PARAGRAPH
- *
- * A virtual address is split into three 9-bit indexes and a 12-bit offset:
- *
- *   bits 38:30  index into the root table   (L2)  each entry covers 1GB
- *   bits 29:21  index into the next table   (L1)  each entry covers 2MB
- *   bits 20:12  index into the last table   (L0)  each entry covers 4KB
- *   bits 11:0   byte offset within the page
- *
- * Nine bits is 512 entries, and 512 entries of 8 bytes is exactly one 4KB page,
- * which is why a page table is one frame. Translation starts at the root table
- * named by satp and follows one entry per level until it reaches an entry that
- * carries permissions rather than pointing further down.
  */
 
 #include <signetos/frame.hpp>
@@ -302,17 +288,18 @@ struct Leaf {
 };
 
 // Read-only walk. Unlike leaf_slot this stops wherever the walk actually ends,
-// so it reports the 2MB and 1GB pages the boot mappings use.
+// so it reports the 2MB and 1GB pages the boot mappings use. For an unmapped
+// address `entry` is 0 and `page_size` is the size of the hole the walk fell
+// into (a missing table covers 1GB or 2MB), so a caller stepping through an
+// address range can skip the whole hole at once.
 Leaf find_leaf(uint64_t va) {
-  constexpr Leaf NONE = {0, PAGE_SIZE};
-
   if (!va_is_canonical(va)) {
-    return NONE;
+    return {0, PAGE_SIZE};
   }
 
   const uint64_t l2 = __atomic_load_n(&s_l2_root[l2_index(va)], __ATOMIC_ACQUIRE);
   if (!(l2 & pte::Valid)) {
-    return NONE;  // nothing mapped in this 1GB
+    return {0, GIGAPAGE_SIZE};  // nothing mapped in this 1GB
   }
   if (pte_is_leaf(l2)) {
     return {l2, GIGAPAGE_SIZE};  // the whole 1GB is one page
@@ -320,11 +307,11 @@ Leaf find_leaf(uint64_t va) {
 
   const uint64_t* l1_table = table_view(pte_addr(l2));
   if (l1_table == nullptr) {
-    return NONE;
+    return {0, GIGAPAGE_SIZE};
   }
   const uint64_t l1 = __atomic_load_n(&l1_table[l1_index(va)], __ATOMIC_ACQUIRE);
   if (!(l1 & pte::Valid)) {
-    return NONE;  // nothing mapped in this 2MB
+    return {0, MEGAPAGE_SIZE};  // nothing mapped in this 2MB
   }
   if (pte_is_leaf(l1)) {
     return {l1, MEGAPAGE_SIZE};  // the whole 2MB is one page
@@ -332,11 +319,16 @@ Leaf find_leaf(uint64_t va) {
 
   const uint64_t* l0_table = table_view(pte_addr(l1));
   if (l0_table == nullptr) {
-    return NONE;
+    return {0, MEGAPAGE_SIZE};
   }
   // Last level: either a 4KB page or nothing.
   const uint64_t l0 = __atomic_load_n(&l0_table[l0_index(va)], __ATOMIC_RELAXED);
-  return (l0 & pte::Valid) ? Leaf{l0, PAGE_SIZE} : NONE;
+  return {(l0 & pte::Valid) ? l0 : 0, PAGE_SIZE};
+}
+
+// The address just past the page or hole that `find_leaf(va)` reported.
+uint64_t next_after(uint64_t va, const Leaf& leaf) {
+  return (va & ~(leaf.page_size - 1)) + leaf.page_size;
 }
 
 }  // namespace
@@ -770,60 +762,17 @@ bool range_has_quarantined(uint64_t va, size_t len) {
   if (!is_initialized() || len == 0 || quarantined_pages() == 0) {
     return false;
   }
-  uint64_t end = va + len;
-  if (end < va) {
-    end = DYNAMIC_TOP;
-  }
-  if (end <= DYNAMIC_BASE || va >= DYNAMIC_TOP) {
-    return false;
-  }
-  uint64_t cur = (va < DYNAMIC_BASE) ? DYNAMIC_BASE : (va & ~(PAGE_SIZE - 1));
+  // Clip to the dynamic space: nothing outside it is ever quarantined.
+  uint64_t end = (va + len < va) ? DYNAMIC_TOP : va + len;
   if (end > DYNAMIC_TOP) {
     end = DYNAMIC_TOP;
   }
-  end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-  while (cur < end) {
-    const uint64_t l2 =
-        __atomic_load_n(&s_l2_root[l2_index(cur)], __ATOMIC_ACQUIRE);
-    if (!(l2 & pte::Valid) || pte_is_leaf(l2)) {
-      const uint64_t next_l2 = (cur & ~(GIGAPAGE_SIZE - 1)) + GIGAPAGE_SIZE;
-      if (next_l2 <= cur || next_l2 >= end) {
-        break;
-      }
-      cur = next_l2;
-      continue;
+  for (uint64_t cur = (va < DYNAMIC_BASE) ? DYNAMIC_BASE : va; cur < end;) {
+    const Leaf leaf = find_leaf(cur);
+    if ((leaf.entry & pte::Quarantined) != 0) {
+      return true;
     }
-    const uint64_t* l1_table = table_view(pte_addr(l2));
-    if (l1_table == nullptr) {
-      break;
-    }
-    const uint64_t l1 =
-        __atomic_load_n(&l1_table[l1_index(cur)], __ATOMIC_ACQUIRE);
-    if (!(l1 & pte::Valid) || pte_is_leaf(l1)) {
-      const uint64_t next_l1 = (cur & ~(MEGAPAGE_SIZE - 1)) + MEGAPAGE_SIZE;
-      if (next_l1 <= cur || next_l1 >= end) {
-        break;
-      }
-      cur = next_l1;
-      continue;
-    }
-    const uint64_t* l0_table = table_view(pte_addr(l1));
-    if (l0_table == nullptr) {
-      break;
-    }
-    const size_t start_i0 = l0_index(cur);
-    const uint64_t l1_end = (cur & ~(MEGAPAGE_SIZE - 1)) + MEGAPAGE_SIZE;
-    const uint64_t stop = (end < l1_end) ? end : l1_end;
-    const size_t count = static_cast<size_t>((stop - cur) / PAGE_SIZE);
-    for (size_t i = 0; i < count; ++i) {
-      const uint64_t l0 =
-          __atomic_load_n(&l0_table[start_i0 + i], __ATOMIC_RELAXED);
-      if ((l0 & (pte::Valid | pte::Quarantined)) ==
-          (pte::Valid | pte::Quarantined)) {
-        return true;
-      }
-    }
-    cur = stop;
+    cur = next_after(cur, leaf);  // the next page, or past the hole
   }
   return false;
 }
@@ -952,50 +901,29 @@ bool free_pages(Capability object) {
   return true;
 }
 
+// Both passes below walk the used part of the dynamic space, from its base to
+// the watermark, one page at a time. The page tables answer one question
+// only: is this page mapped, and if not, how far to the next place that might
+// be. Pages are read at their own addresses through `s_dynamic`.
+
 void sweep_live_pages() {
   if (!is_initialized()) {
     return;
   }
   Locked hold(s_lock);
-  const size_t start_i2 = l2_index(DYNAMIC_BASE);
-  const size_t end_i2 = l2_index(DYNAMIC_TOP);
-  for (size_t i2 = start_i2; i2 < end_i2; ++i2) {
-    const uint64_t l2 = s_l2_root[i2];
-    if (!(l2 & pte::Valid) || pte_is_leaf(l2)) {
-      continue;
-    }
-    const uint64_t* l1_table = table_view(pte_addr(l2));
-    if (l1_table == nullptr) {
-      continue;
-    }
-    for (size_t i1 = 0; i1 < ENTRIES; ++i1) {
-      const uint64_t l1 = l1_table[i1];
-      if (!(l1 & pte::Valid) || pte_is_leaf(l1)) {
-        continue;
-      }
-      const uint64_t* l0_table = table_view(pte_addr(l1));
-      if (l0_table == nullptr) {
-        continue;
-      }
-      for (size_t i0 = 0; i0 < ENTRIES; ++i0) {
-        const uint64_t l0 = l0_table[i0];
-        if ((l0 & (pte::Valid | pte::Quarantined)) != pte::Valid) {
-          continue;
-        }
-        Capability page = phys_view(pte_addr(l0), PAGE_SIZE);
-        if (!capability_is_valid(page)) {
-          continue;
-        }
-        Capability* slots = reinterpret_cast<Capability*>(page);
-        constexpr size_t kCapsPerPage = PAGE_SIZE / sizeof(Capability);
-        for (size_t c = 0; c < kCapsPerPage; ++c) {
-          const Capability cap = slots[c];
-          if (capability_is_valid(cap) && revoke::should_revoke(cap)) {
-            slots[c] = capability_clear_tag(cap);
-          }
+  for (uint64_t va = DYNAMIC_BASE; va < s_next_va;) {
+    const Leaf leaf = find_leaf(va);
+    if ((leaf.entry & (pte::Valid | pte::Quarantined)) == pte::Valid) {
+      Capability page = capability_set_address(s_dynamic, va);
+      Capability* slots =
+          reinterpret_cast<Capability*>(capability_set_bounds(page, PAGE_SIZE));
+      for (size_t c = 0; c < PAGE_SIZE / sizeof(Capability); ++c) {
+        if (capability_is_valid(slots[c]) && revoke::should_revoke(slots[c])) {
+          slots[c] = capability_clear_tag(slots[c]);
         }
       }
     }
+    va = next_after(va, leaf);
   }
 }
 
@@ -1007,85 +935,18 @@ void reclaim_quarantined() {
   if (s_quarantined_pages == 0) {
     return;
   }
-  const size_t start_i2 = l2_index(DYNAMIC_BASE);
-  const size_t end_i2 = l2_index(DYNAMIC_TOP);
-
-  uint64_t va_run_start = 0;
-  size_t va_run_pages = 0;
-  uint64_t pa_run_start = 0;
-  size_t pa_run_pages = 0;
-
-  auto flush_va_run = [&]() {
-    if (va_run_pages > 0) {
-      release_locked(va_run_start, va_run_pages);
-      va_run_pages = 0;
+  for (uint64_t va = DYNAMIC_BASE; va < s_next_va;) {
+    const Leaf leaf = find_leaf(va);
+    uint64_t* slot =
+        (leaf.entry & pte::Quarantined) ? leaf_slot(va, false) : nullptr;
+    if (slot != nullptr) {
+      *slot = 0;  // unmapped: nothing can reach it any more
+      frame::free(pte_addr(leaf.entry), 1);
+      release_locked(va, 1);  // merges with neighbouring free ranges
+      __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
     }
-  };
-  auto flush_pa_run = [&]() {
-    if (pa_run_pages > 0) {
-      frame::free(pa_run_start, pa_run_pages);
-      pa_run_pages = 0;
-    }
-  };
-
-  for (size_t i2 = start_i2; i2 < end_i2; ++i2) {
-    const uint64_t l2 = s_l2_root[i2];
-    if (!(l2 & pte::Valid) || pte_is_leaf(l2)) {
-      continue;
-    }
-    const uint64_t va2 = static_cast<uint64_t>(i2) << 30;
-    const uint64_t* l1_table = table_view(pte_addr(l2));
-    if (l1_table == nullptr) {
-      continue;
-    }
-    for (size_t i1 = 0; i1 < ENTRIES; ++i1) {
-      const uint64_t l1 = l1_table[i1];
-      if (!(l1 & pte::Valid) || pte_is_leaf(l1)) {
-        continue;
-      }
-      const uint64_t va1 = va2 | (static_cast<uint64_t>(i1) << 21);
-      uint64_t* l0_table = table_view(pte_addr(l1));
-      if (l0_table == nullptr) {
-        continue;
-      }
-      for (size_t i0 = 0; i0 < ENTRIES; ++i0) {
-        const uint64_t l0 = l0_table[i0];
-        if ((l0 & (pte::Valid | pte::Quarantined)) !=
-            (pte::Valid | pte::Quarantined)) {
-          continue;
-        }
-        const uint64_t page_va = va1 | (static_cast<uint64_t>(i0) << 12);
-        const uint64_t page_pa = pte_addr(l0);
-
-        l0_table[i0] = 0;
-        if (s_quarantined_pages > 0) {
-          __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
-        }
-
-        if (pa_run_pages > 0 &&
-            page_pa ==
-                pa_run_start + static_cast<uint64_t>(pa_run_pages) * PAGE_SIZE) {
-          pa_run_pages += 1;
-        } else {
-          flush_pa_run();
-          pa_run_start = page_pa;
-          pa_run_pages = 1;
-        }
-
-        if (va_run_pages > 0 &&
-            page_va ==
-                va_run_start + static_cast<uint64_t>(va_run_pages) * PAGE_SIZE) {
-          va_run_pages += 1;
-        } else {
-          flush_va_run();
-          va_run_start = page_va;
-          va_run_pages = 1;
-        }
-      }
-    }
+    va = next_after(va, leaf);
   }
-  flush_pa_run();
-  flush_va_run();
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
 

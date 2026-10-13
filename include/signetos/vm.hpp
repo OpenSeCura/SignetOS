@@ -58,6 +58,12 @@
 // frames and maps them at fresh addresses in the dynamic space; the direct map
 // aliases those frames but no compartment ever holds an address into it.
 //
+// The direct map is used only for things that have no virtual address of
+// their own: page tables, the frame bitmap, and the device tree at boot.
+// Anything mapped in the dynamic space is reached at its own address through
+// `s_dynamic`, the authority every allocation is derived from; the revocation
+// sweep reads pages that way.
+//
 // FREEING AND QUARANTINE
 //
 // A capability that is still tagged must always reach valid memory
