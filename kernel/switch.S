@@ -27,21 +27,21 @@
  *      `OType::EntryPoint` record (`syscall::gate`) passed to it in `ca0`.
  *
  *      Pushes a `ReturnFrame` (callee-saved registers, the five argument
- *      registers `ca1..ca5`) onto the thread's kernel stack (`sscratchc`),
+ *      registers `ca1..ca5`) onto the thread's kernel stack (`mscratchc`),
  *      calls `__signetos_switcher_prepare` to resolve the target record and
  *      narrow the caller's stack, then enters the callee with a `CT = 2`
  *      return sentry in `cra`:
  *
  *        compartment callee   csp = everything below the caller's csp,
  *                             cgp = its table, ca0..ca4 = args[0..4], every
- *                             other register scrubbed, caller's SIE restored.
+ *                             other register scrubbed, caller's MIE restored.
  *        kernel callee        csp = exactly `min_stack` bytes below the
  *             (ENTRY_FLAG_TRUSTED)  caller's csp, ca0..ca4 = args[0..4],
  *                             nothing scrubbed, interrupts stay masked.
  *
  *      On return, calls `__signetos_switcher_return` to pop the `ReturnFrame`
  *      and scrub the callee's stack region, restores the caller's state and
- *      `SIE`, and scrubs all volatile registers (`ct0..ct6`, `ca1..ca7`).
+ *      `MIE`, and scrubs all volatile registers (`ct0..ct6`, `ca1..ca7`).
  *      `ca0` carries the callee's checked return value, or the `Status` of a
  *      refused call.
  *
@@ -56,13 +56,13 @@
  *      there. The host (`init::launch`) calls it directly.
  *
  * INTERRUPT MASKING: see `asm_macros.h`. Every entry below masks first; the
- * caller's `SIE` is re-established only by the last few instructions before
+ * caller's `MIE` is re-established only by the last few instructions before
  * control returns to user code, after every kernel frame has been popped.
  *
  * NO MACROS: every register sequence in this file is written out in place so
  * each path reads top to bottom. Only constants come from `asm_macros.h`: the
  * frame offsets (`RET_FRAME_*`, `FRAME_SP`, `SWITCH_FRAME_SIZE`), which
- * `sentry.cpp` static_asserts against `ReturnFrame`, and the `sstatus`,
+ * `sentry.cpp` static_asserts against `ReturnFrame`, and the `mstatus`,
  * `ENTRY_TRUSTED` and `Status` values.
  */
 
@@ -87,14 +87,14 @@
     .type sys_compartment_invoke, @function
 sys_compartment_invoke:
     /*
-     * 1. Mask interrupts (keeping the caller's `sstatus` in `t2`, a volatile
+     * 1. Mask interrupts (keeping the caller's `mstatus` in `t2`, a volatile
      *    register that is scrubbed on every exit path), read the current
-     *    hart's kernel stack pointer from `sscratchc` (`ct0`) and verify that
+     *    hart's kernel stack pointer from `mscratchc` (`ct0`) and verify that
      *    there is a kernel stack with enough space for a `ReturnFrame` plus
      *    the headroom its callee may need on it.
      */
-    csrrci  t2, sstatus, SSTATUS_SIE
-    csrr    ct0, sscratchc
+    csrrci  t2, mstatus, MSTATUS_MIE
+    csrr    ct0, mscratchc
     gctag   t1, ct0
     beqz    t1, .Lno_kernel_stack
     gcbase  t1, ct0
@@ -129,7 +129,7 @@ sys_compartment_invoke:
     csc     ca3, RET_FRAME_ARG2(ct1)
     csc     ca4, RET_FRAME_ARG3(ct1)
     csc     ca5, RET_FRAME_ARG4(ct1)
-    sd      t2,  RET_FRAME_SSTATUS(ct1)
+    sd      t2,  RET_FRAME_MSTATUS(ct1)
     sd      zero, RET_FRAME_FLAGS(ct1)
     cmv     csp, ct1
 
@@ -162,15 +162,15 @@ sys_compartment_invoke:
     bnez    t1, .Lenter_kernel
 
     /*
-     * 4a. Compartment callee: give it the caller's `SIE`, scrub every other
+     * 4a. Compartment callee: give it the caller's `MIE`, scrub every other
      *     register, and jump (`cjalr` seals `.Lcomp_restore` into `cra` as a
      *     `CT = 2` return sentry).
      */
-    ld      t1,  RET_FRAME_SSTATUS(csp)
+    ld      t1,  RET_FRAME_MSTATUS(csp)
     clc     csp, RET_FRAME_CALLEE_SP(csp)
-    andi    t1, t1, SSTATUS_SIE
+    andi    t1, t1, MSTATUS_MIE
     beqz    t1, 1f
-    csrsi   sstatus, SSTATUS_SIE
+    csrsi   mstatus, MSTATUS_MIE
 1:
     /* Everything except ct0 (sentry), csp, cgp, ca0..ca4 and cra (set by cjalr). */
     cmv     ctp, cnull
@@ -205,10 +205,10 @@ sys_compartment_invoke:
      *    checks what the caller gets back in `ca0` and leaves it in
      *    `args[0]`. If the caller's compartment has been destroyed and swept
      *    it unwinds further; `a0` says what kind of frame it stopped at
-     *    (UNWIND_*), and that frame sits just below the new `sscratchc`.
+     *    (UNWIND_*), and that frame sits just below the new `mscratchc`.
      */
-    csrci   sstatus, SSTATUS_SIE
-    csrr    csp, sscratchc
+    csrci   mstatus, MSTATUS_MIE
+    csrr    csp, mscratchc
     cjal    cra, __signetos_switcher_return
     beqz    a0, .Lcomp_bad_return
     li      t0, UNWIND_TRAP_FRAME
@@ -221,7 +221,7 @@ sys_compartment_invoke:
      */
     .globl __signetos_resume_return_frame
 __signetos_resume_return_frame:
-    csrr    ct1, sscratchc
+    csrr    ct1, mscratchc
     caddi   ct1, ct1, -RET_FRAME_SIZE   /* ct1 = ReturnFrame* to resume */
 
 .Lcomp_pop_frame:
@@ -246,7 +246,7 @@ __signetos_resume_return_frame:
     clc     cs9, 208(ct1)
     clc     cs10, 224(ct1)
     clc     cs11, 240(ct1)
-    ld      t2,  RET_FRAME_SSTATUS(ct1)
+    ld      t2,  RET_FRAME_MSTATUS(ct1)
     clc     ca0, RET_FRAME_ARG0(ct1)
     /* Wipe all 25 slots of the popped frame. */
     csc     cnull,   0(ct1)             /* ra */
@@ -273,20 +273,20 @@ __signetos_resume_return_frame:
     csc     cnull, RET_FRAME_ARG4(ct1)
     csc     cnull, RET_FRAME_CALLEE_SP(ct1)
     csc     cnull, RET_FRAME_CALLEE_GP(ct1)
-    csc     cnull, RET_FRAME_SSTATUS(ct1) /* sstatus + flags */
+    csc     cnull, RET_FRAME_MSTATUS(ct1) /* mstatus + flags */
 
     /*
-     * Common exit to user code. `t2` holds the caller's `sstatus` as sampled
+     * Common exit to user code. `t2` holds the caller's `mstatus` as sampled
      * on entry (every path that reaches here has loaded it): re-enable
      * interrupts only if the caller had them enabled. Every kernel frame has
      * been popped and wiped by now, so a trap taken between `csrsi` and `ret`
-     * carves its `TrapFrame` from `sscratchc` over dead stack only.
+     * carves its `TrapFrame` from `mscratchc` over dead stack only.
      */
 .Lscrub_caller_and_ret:
     cmv     ct0, cnull
-    andi    t2, t2, SSTATUS_SIE
+    andi    t2, t2, MSTATUS_MIE
     beqz    t2, 1f
-    csrsi   sstatus, SSTATUS_SIE
+    csrsi   mstatus, MSTATUS_MIE
 1:
     cmv     ct1, cnull
     cmv     ct2, cnull
@@ -319,7 +319,7 @@ __signetos_resume_return_frame:
     /*
      * No kernel stack, or no room on it: nothing was pushed. Hand the caller
      * `Status::NoKernelStack` through the common exit, which also restores its
-     * `SIE` from `t2`.
+     * `MIE` from `t2`.
      */
     li      a0, STATUS_NO_KERNEL_STACK
     j       .Lscrub_caller_and_ret
@@ -340,7 +340,7 @@ __signetos_resume_return_frame:
     /*
      * The unwind stopped at a `TrapFrame` (the frames above it were in
      * destroyed compartments): leave through the trap vector's restore
-     * sequence, which derives the frame from `sscratchc` and `sret`s.
+     * sequence, which derives the frame from `mscratchc` and `mret`s.
      * Interrupts are masked, as that sequence requires.
      */
     j       __signetos_resume_trap_frame
@@ -362,21 +362,21 @@ sys_thread_switch:
      *    whatever the caller handed over and is never used: the frame and the
      *    C++ below both live on the kernel stack.
      */
-    csrci   sstatus, SSTATUS_SIE
+    csrci   mstatus, MSTATUS_MIE
     /*
-     * Carve the frame from `sscratchc` without losing any register: swap
-     * `ct0` with `sscratchc` (caller's `ct0` is now in the CSR, `ct0` is the
+     * Carve the frame from `mscratchc` without losing any register: swap
+     * `ct0` with `mscratchc` (caller's `ct0` is now in the CSR, `ct0` is the
      * kernel SP), save `ct1` so it can serve as scratch, swap the caller's
-     * `ct0` back out through `ct1` and leave `sscratchc` exactly as it was
+     * `ct0` back out through `ct1` and leave `mscratchc` exactly as it was
      * (= frame + SWITCH_FRAME_SIZE, the invariant `__thread_restore` relies
      * on). Same sequence as `_early_trap_entry` step 1 in `early_trap.S`.
      */
-    csrrw   ct0, sscratchc, ct0         /* ct0 = ksp, sscratchc = caller's ct0 */
+    csrrw   ct0, mscratchc, ct0         /* ct0 = ksp, mscratchc = caller's ct0 */
     caddi   ct0, ct0, -SWITCH_FRAME_SIZE /* ct0 = frame base */
     csc     ct1,  80(ct0)               /* frame->t[1]; ct1 is scratch below */
     caddi   ct1, ct0, SWITCH_FRAME_SIZE /* ct1 = original ksp */
     csc     ct1, FRAME_LINK(ct0)        /* frame->active_kernel_sp */
-    csrrw   ct1, sscratchc, ct1         /* ct1 = caller's ct0, sscratchc = ksp */
+    csrrw   ct1, mscratchc, ct1         /* ct1 = caller's ct0, mscratchc = ksp */
     csc     ct1,  64(ct0)               /* frame->t[0] = caller's ct0 */
     csc     cra,   0(ct0)
     csc     csp,  16(ct0)
@@ -422,7 +422,7 @@ sys_thread_switch:
     /*
      * 3. `__thread_restore(Capability next_ksp)`
      *    Restores all 31 capability registers from the `SwitchFrame` at `ca0`,
-     *    wipes the frame to `cnull`, re-installs `sscratchc = frame + 512`, and
+     *    wipes the frame to `cnull`, re-installs `mscratchc = frame + 512`, and
      *    jumps to `cra` -- always still masked. Every frame restored here
      *    resumes kernel code that unmasks on its own way out: the switcher's
      *    `.Lcomp_restore` (a thread parked by `sys_thread_switch`),
@@ -435,7 +435,7 @@ sys_thread_switch:
 __thread_restore:
     /*
      * `ct6` is the frame base for the whole sequence and the last register
-     * reloaded: its saved value is parked in `sscratchc` meanwhile and swapped
+     * reloaded: its saved value is parked in `mscratchc` meanwhile and swapped
      * back by the final `csrrw`, which at the same time re-installs the kernel
      * SP (`frame + SWITCH_FRAME_SIZE`). Each of the 32 slots is loaded and then
      * overwritten with `cnull`, so the popped frame leaves no capability on
@@ -444,7 +444,7 @@ __thread_restore:
      */
     cmv     ct6, ca0                    /* ct6 = frame base */
     clc     ct5, 160(ct6)               /* ct5 = saved ct6 */
-    csrw    sscratchc, ct5              /* park saved ct6 in sscratchc */
+    csrw    mscratchc, ct5              /* park saved ct6 in mscratchc */
     csc     cnull, 160(ct6)
     clc     cra,   0(ct6)
     csc     cnull, 0(ct6)
@@ -508,7 +508,7 @@ __thread_restore:
     clc     csp,  16(ct6)
     csc     cnull, 16(ct6)
     caddi   ct6, ct6, SWITCH_FRAME_SIZE /* ct6 = kernel SP above the frame */
-    csrrw   ct6, sscratchc, ct6         /* sscratchc = kernel SP, ct6 = saved ct6 */
+    csrrw   ct6, mscratchc, ct6         /* mscratchc = kernel SP, ct6 = saved ct6 */
     ret
     .size __thread_restore, . - __thread_restore
 
@@ -561,15 +561,15 @@ __thread_start_link:
 __thread_start:
     gctag   t1, ct0
     beqz    t1, 1f
-    csrsi   sstatus, SSTATUS_SIE
+    csrsi   mstatus, MSTATUS_MIE
     cjalr   cra, ct0
-    csrci   sstatus, SSTATUS_SIE
-    csrr    csp, sscratchc
+    csrci   mstatus, MSTATUS_MIE
+    csrr    csp, mscratchc
     li      a0, 0
     cjal    cra, sys_thread_exit
     unimp
 1:
-    csrr    csp, sscratchc
+    csrr    csp, mscratchc
     li      a0, -1
     cjal    cra, sys_thread_exit
     unimp

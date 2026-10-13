@@ -24,11 +24,11 @@
  * `kernel/early_trap.S`, and by `sentry.cpp`, which
  * static_asserts the offsets against the C++ structs they describe.
  *
- * PER-HART KERNEL STACK POINTER (`sscratchc`)
+ * PER-HART KERNEL STACK POINTER (`mscratchc`)
  * -------------------------------------------
- * Each hart stores its active thread's kernel stack pointer in its `sscratchc`
+ * Each hart stores its active thread's kernel stack pointer in its `mscratchc`
  * capability CSR (the boot kernel stack when running in host context with no
- * active user thread). Because `sscratchc` is a supervisor CSR, compartments
+ * active user thread). Because `mscratchc` is a machine CSR, compartments
  * (which lack `AccessSystemRegs`) cannot read or modify it, and each hart has
  * its own independent register with no global `.bss` state.
  *
@@ -61,14 +61,14 @@
  *
  *    `TrapFrame` appends three trap-specific capability slots, then four
  *    integers in two more 16-byte slots:
- *      512       sepcc              interrupted PC capability
+ *      512       mepcc              interrupted PC capability
  *      528       handler_sp         narrowed stack for bound trap handler
  *      544       handler_rw_table   handler compartment cap table (`cgp`)
- *      560       sstatus            integer `sstatus` at trap entry (only
- *                                   bit 5, `SPIE`, is consulted: it is the
- *                                   `SIE` the interrupted code had)
- *      568       handler_sie        `SSTATUS_SIE` or 0: what the trap vector
- *                                   sets in `sstatus` just before it enters
+ *      560       mstatus            integer `mstatus` at trap entry (only
+ *                                   bit 7, `MPIE`, is consulted: it is the
+ *                                   `MIE` the interrupted code had)
+ *      568       handler_mie        `MSTATUS_MIE` or 0: what the trap vector
+ *                                   sets in `mstatus` just before it enters
  *                                   the bound handler
  *      576       flags              ENTRY_FLAG_TRUSTED_TO_FINISH or 0: set
  *                                   for a bound handler whose compartment
@@ -91,8 +91,8 @@
  *                                   is reused for the caller's ca0 on return
  *      352       callee_sp          narrowed stack capability for callee
  *      368       callee_gp          capability table for callee
- *      384       sstatus            integer `sstatus` of the caller at entry
- *                                   (only bit 1, `SIE`, is consulted)
+ *      384       mstatus            integer `mstatus` of the caller at entry
+ *                                   (only bit 3, `MIE`, is consulted)
  *      392       flags              `EntryRecord::flags` of the callee
  *
  * FRAME LINK
@@ -103,33 +103,35 @@
  * `sys_thread_switch`, the trap vector, `thread::create`), and no compartment
  * can hold a capability with those bounds, so it is what identifies a frame
  * and its kind (`unwind::kind_at`): the address says how big the frame is.
- * Popping a frame is setting `sscratchc` to it.
+ * Popping a frame is setting `mscratchc` to it.
  *
  * INTERRUPT MASKING RULE
  * ----------------------
- * Kernel code (C++ and these transitions) always runs with `sstatus.SIE = 0`.
- * Every entry into the kernel from user code (`sys_compartment_invoke`, the
- * switcher's return path `.Lcomp_restore`, the trap vector) masks as its
- * first instruction; `SIE` is set again only on the way back out to user
- * code, and only to the value the interrupted or calling user context had:
- * `1` for ordinary thread code, `0` inside the dynamic extent of an interrupt
- * handler (which must stay masked until its own `sret`), never for the
- * boot/host context. The switcher saves that value in its `ReturnFrame` and
- * restores it when the call returns, whether the callee was a compartment or
- * the kernel and whether or not the thread was switched out in between. A
- * compartment callee runs with the caller's `SIE`; a kernel entry runs
- * masked. A brand-new thread is unmasked by `__thread_start`.
+ * Everything runs in M-mode and nothing is delegated, so `mstatus.MIE` masks
+ * every interrupt. Kernel code (C++ and these transitions) always runs with
+ * `mstatus.MIE = 0`. Every entry into the kernel from user code
+ * (`sys_compartment_invoke`, the switcher's return path `.Lcomp_restore`,
+ * the trap vector) masks as its first instruction; `MIE` is set again only
+ * on the way back out to user code, and only to the value the interrupted or
+ * calling user context had: `1` for ordinary thread code, `0` inside the
+ * dynamic extent of an interrupt handler (which must stay masked until its
+ * own `mret`), never for the boot/host context. The switcher saves that
+ * value in its `ReturnFrame` and restores it when the call returns, whether
+ * the callee was a compartment or the kernel and whether or not the thread
+ * was switched out in between. A compartment callee runs with the caller's
+ * `MIE`; a kernel entry runs masked. A brand-new thread is unmasked by
+ * `__thread_start`.
  *
  * Trap handlers. An interrupt handler always runs masked. An exception
- * handler runs with the `SIE` of the code that raised the exception, the way
+ * handler runs with the `MIE` of the code that raised the exception, the way
  * a callee runs with its caller's: over ordinary thread code it runs
  * unmasked, so an interrupt that arrives meanwhile is handled on top of it
  * and returns into it. Except: if the kernel stack has no room for that
  * interrupt (KERNEL-STACK ROOM, check 3), it runs masked. The dispatcher
- * records the interrupted `sstatus` in the `TrapFrame` and decides
- * `handler_sie`; the trap vector sets `SIE` from `handler_sie` just before
- * it enters the handler; and the trap's final `sret` gives the interrupted
- * code back the `SIE` it had (the recorded `SPIE`), whatever trapped or
+ * records the interrupted `mstatus` in the `TrapFrame` and decides
+ * `handler_mie`; the trap vector sets `MIE` from `handler_mie` just before
+ * it enters the handler; and the trap's final `mret` gives the interrupted
+ * code back the `MIE` it had (the recorded `MPIE`), whatever trapped or
  * switched threads in between.
  */
 
@@ -141,11 +143,11 @@
 
 #define SWITCH_FRAME_SIZE       512
 
-#define TRAP_FRAME_SEPCC        512
+#define TRAP_FRAME_MEPCC        512
 #define TRAP_FRAME_HANDLER_SP   528
 #define TRAP_FRAME_RW_TABLE     544
-#define TRAP_FRAME_SSTATUS      560
-#define TRAP_FRAME_HANDLER_SIE  568
+#define TRAP_FRAME_MSTATUS      560
+#define TRAP_FRAME_HANDLER_MIE  568
 #define TRAP_FRAME_FLAGS        576
 #define TRAP_FRAME_SIZE         592
 
@@ -156,7 +158,7 @@
 #define RET_FRAME_ARG4          336
 #define RET_FRAME_CALLEE_SP     352
 #define RET_FRAME_CALLEE_GP     368
-#define RET_FRAME_SSTATUS       384
+#define RET_FRAME_MSTATUS       384
 #define RET_FRAME_FLAGS         392
 #define RET_FRAME_SIZE          400
 
@@ -180,7 +182,7 @@
  *      the report comes out instead of a second overflow. 400 + 592 + 560 =
  *      1552, rounded up.
  *   2. `__signetos_switcher_prepare` enters a compartment callee that will
- *      run with interrupts enabled (its caller's `SIE` was set) only if,
+ *      run with interrupts enabled (its caller's `MIE` was set) only if,
  *      below the `ReturnFrame`, TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE bytes
  *      are free: such code can be ticked at any instruction, and the trap
  *      taken there must satisfy check 3. A callee that runs masked (called
@@ -236,12 +238,12 @@
 /* `unwind::Kind` (unwind.hpp): what `__signetos_switcher_return` and
  * `__signetos_trap_return` hand back in a0 -- the kind of the frame the
  * kernel has unwound to, which decides whether the exit is `ret` from a
- * `ReturnFrame` or `sret` from a `TrapFrame`. 0 means nothing to resume. */
+ * `ReturnFrame` or `mret` from a `TrapFrame`. 0 means nothing to resume. */
 #define UNWIND_NONE             0
 #define UNWIND_RETURN_FRAME     1
 #define UNWIND_TRAP_FRAME       2
 
-/* `sstatus` bits. */
-#define SSTATUS_SIE             2
-#define SSTATUS_SPIE            0x20
-#define SSTATUS_SPP             0x100
+/* `mstatus` bits. MPP is a two-bit field; both bits set is M-mode. */
+#define MSTATUS_MIE             0x8
+#define MSTATUS_MPIE            0x80
+#define MSTATUS_MPP             0x1800

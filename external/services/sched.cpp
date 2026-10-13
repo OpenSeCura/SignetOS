@@ -18,7 +18,7 @@
  * sched.cpp - SignetOS User-Space CPU Bandwidth Scheduler Compartment
  *
  * The kernel holds no scheduling state: it provides `sys_thread_switch`, a
- * periodic tick on `IRQ_S_TIMER`, and re-dispatches this compartment's
+ * periodic tick on `IRQ_M_TIMER`, and re-dispatches this compartment's
  * dispatcher thread whenever a thread exits.
  *
  * OBJECTS
@@ -40,7 +40,7 @@
  *   sched.self             ()                     the caller's tid
  *   sched.policy_register  (root, delegate)       Store on root
  *   sched.run              (kernel-created dispatcher thread; not published)
- *   (tick)                 bound to IRQ_S_TIMER; not published
+ *   (tick)                 bound to IRQ_M_TIMER; not published
  *
  * DISPATCH
  *   The dispatcher thread runs `pick(); sys_thread_switch(t)` forever. Every
@@ -51,12 +51,12 @@
  *   dispatcher exits when nothing is registered, which ends the system.
  *
  * PREEMPTION
- *   The scheduler binds `IRQ_S_TIMER` (the kernel's fixed 10 ms tick) to
+ *   The scheduler binds `IRQ_M_TIMER` (the kernel's fixed 10 ms tick) to
  *   `sched_tick_entry`. The handler runs on the interrupted thread's stack
  *   with interrupts masked: it charges the slice, picks, and if someone else
  *   should run it calls `sys_thread_switch` from inside the handler. The
  *   preempted thread stays parked in its handler until it is switched back to,
- *   when the handler returns and `sret` resumes it. The handler stands down
+ *   when the handler returns and `mret` resumes it. The handler stands down
  *   while an entry point is mid-update (`s_busy`), while a foreign policy
  *   delegate runs, and when the interrupted context is the dispatcher itself;
  *   those cases catch up at the next tick or on their own.
@@ -121,7 +121,7 @@ namespace {
 // publishes its own entry points as it mints them, rather than handing them
 // all back in the handshake; `naming.lookup` is spare.
 #define SCHED_MANIFEST(X)                                \
-  M_IRQ(X, IRQ_TIMER, 5)                                 \
+  M_IRQ(X, IRQ_TIMER, 7)                                 \
   M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched)   \
   M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
   M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
@@ -665,7 +665,7 @@ uint64_t switch_to(ThreadRec* t, uint64_t now) {
 // `s_running` clear the tick handler sees nothing to charge or preempt and
 // stands down (its `cur == nullptr` check); ticks and device interrupts are
 // still taken, which is how a wake gets in. `wfi` would do here instead of a
-// spin -- everything runs in S-mode -- but a spin keeps the time base simple.
+// spin -- everything runs in M-mode -- but a spin keeps the time base simple.
 // Callers hold `s_busy` on entry and get it back on return. The barriers pin
 // the store order: a tick landing anywhere in here sees either `s_running ==
 // nullptr` or `s_busy`, never a live `s_running` with a stale slice start.
@@ -1026,16 +1026,16 @@ extern "C" uint64_t sched_self_entry() {
   return s_running != nullptr ? s_running->tid : 0;
 }
 
-// IRQ_S_TIMER handler (kernel trap ABI: a0-a3 = scause/stval/sepc/stval2,
+// IRQ_M_TIMER handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
 // ca4 = this compartment's table slice). Runs masked on the interrupted
 // thread's stack; `cgp` is our table, so globals resolve as usual.
-extern "C" uint64_t sched_tick_entry(uint64_t scause, uint64_t stval,
-                                     uint64_t sepc, uint64_t stval2,
+extern "C" uint64_t sched_tick_entry(uint64_t mcause, uint64_t mtval,
+                                     uint64_t mepc, uint64_t mtval2,
                                      Capability cap_table_rw) {
-  (void)scause;
-  (void)stval;
-  (void)sepc;
-  (void)stval2;
+  (void)mcause;
+  (void)mtval;
+  (void)mepc;
+  (void)mtval2;
   (void)cap_table_rw;
   ThreadRec* cur = s_running;
   // Nothing to do if the dispatcher itself was interrupted (it has its own
@@ -1061,7 +1061,7 @@ extern "C" uint64_t sched_tick_entry(uint64_t scause, uint64_t stval,
     return 0;
   }
   // Switch from inside the handler. `cur` stays parked here, masked, until
-  // someone switches back to it; then this returns and `sret` resumes it.
+  // someone switches back to it; then this returns and `mret` resumes it.
   if (switch_to(next, now) != 0) {
     // `next` was dead and is reaped. Keep running `cur`; the next tick picks.
     if (cur->state == T_READY) {

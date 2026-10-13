@@ -49,7 +49,7 @@
 //
 // The direct map is reachable only through `s_direct`, a capability derived
 // from the boot root and never handed out; `phys_view` narrows it to one range
-// at a time. Isolation is CHERI's, not the MMU's (everything runs in S-mode,
+// at a time. Isolation is CHERI's, not the MMU's (everything runs in M-mode,
 // see pte::Permissive), so a standing mapping of RAM costs nothing in
 // protection as long as no capability to it escapes; `inspect` refuses any
 // outbound capability that is not inside the dynamic space.
@@ -157,8 +157,9 @@ namespace pte {
     // only provides physical backing, so a normal mapping grants everything and
     // the only reason to withhold a bit is to cause a fault we want.
     //
-    // User is never set. Everything runs in S-mode, and irrespective of SUM
-    // the supervisor may not fetch instructions from a U=1 page, so marking a
+    // User is never set. Everything runs in M-mode, which the MMU translates
+    // under the S-mode rules (toolchain/mmodemmu), and irrespective of SUM
+    // those never allow fetching instructions from a U=1 page, so marking a
     // page User would make it unexecutable.
     constexpr uint64_t Permissive = Valid | Read | Write | Execute | Accessed | Dirty;
 
@@ -169,7 +170,7 @@ namespace pte {
     // writes through `phys_view`, never code.
     constexpr uint64_t KernelData = Valid | Read | Write | Accessed | Dirty;
 
-    // CoW source. Write withheld so a store traps with scause 15 and the
+    // CoW source. Write withheld so a store traps with mcause 15 and the
     // handler can copy the page.
     constexpr uint64_t CowSource  = Valid | Read | Execute | Accessed;
 
@@ -180,9 +181,10 @@ namespace pte {
 }
 
 // Builds the boot mappings (devices, direct map), derives the two standing
-// authorities, and activates satp. Call after frame::discover and before
-// frame::init. On failure is_initialized() stays false; nothing can be mapped
-// and kernel_main must not continue.
+// authorities, and turns the MMU on for this hart (satp, then
+// mmodemmu.ENABLE). Call after frame::discover and before frame::init. On
+// failure is_initialized() stays false; nothing can be mapped and
+// kernel_main must not continue.
 void init(Capability root_data_cap);
 
 bool is_initialized();

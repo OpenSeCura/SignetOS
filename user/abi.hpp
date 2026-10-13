@@ -105,7 +105,7 @@ struct alignas(16) TrapMgrInterface {
   Capability irq_route;     // out: OType::EntryPoint -> trap_mgr_irq_route_entry
   uint32_t plic_ndev;       // in: max PLIC source number (from DTB; 0 = default)
   uint32_t pad_;
-  uint32_t plic_s_context[platform::MAX_HARTS];  // in: hart -> S-mode PLIC context
+  uint32_t plic_m_context[platform::MAX_HARTS];  // in: hart -> M-mode PLIC context
 };
 
 // ----------------------------------------------------------------------------

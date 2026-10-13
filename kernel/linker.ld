@@ -61,7 +61,7 @@ SECTIONS
      *   - [_got_start, _got_end) (~18 KiB < 2^15) requires 2^(15-9) = 64-byte
      *     alignment on _got_start and _got_end for exact cgp bounds.
      *   - [_kernel_start, _got_end) (~188 KiB < 2^18) requires 2^(18-9) =
-     *     512-byte alignment on _got_end for exact PCC and stvecc bounds,
+     *     512-byte alignment on _got_end for exact PCC and mtvecc bounds,
      *     guaranteeing zero rounding spillover into .data.
      */
     .got : ALIGN(64) {
@@ -80,7 +80,7 @@ SECTIONS
     } :kernel_seg
 
     /* Dedicated 64KB boot stack + 16KB initial per-hart kernel entry stack
-     * + per-hart M-mode CLINT scratch & S-mode boot handoff tables */
+     * + per-hart secondary boot handoff table */
     .bss.stack (NOLOAD) : ALIGN(65536) {
         _kernel_stack_base = .;
         . += 65536;
@@ -91,8 +91,6 @@ SECTIONS
         . = ALIGN(16);
         _boot_ksp_top = .;
         . = ALIGN(64);
-        _m_scratch = .;
-        . += 1024;
         _hart_boot_table = .;
         . += 1024;
         _boot_lottery = .;

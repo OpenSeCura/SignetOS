@@ -42,8 +42,9 @@ SpinLock s_lock;
 // they are carved from RAM just above the kernel image in init().
 //
 // The device gigabyte (root entry 0) is mapped as 512 MMIO megapage leaves:
-// the kernel does not know which devices the board has beyond its own console
-// and poweroff device (platform.hpp), and nothing is gained by mapping less.
+// the kernel does not know which devices the board has beyond its own console,
+// poweroff device and CLINT (platform.hpp), and nothing is gained by mapping
+// less.
 // What a compartment can reach is decided by capability bounds, not by the
 // page tables: `init` is handed one window over the gigabyte and carves the
 // per-device windows the drivers get from the DTB.
@@ -357,11 +358,12 @@ void init(Capability root_data_cap) {
   }
 
   // Root entry 0 covers VA 0x00000000..0x3FFFFFFF, where the devices are:
-  // every megapage of it is an MMIO leaf. The kernel's own console and
-  // poweroff device have to be inside it (they are the only devices the
+  // every megapage of it is an MMIO leaf. The kernel's own console, poweroff
+  // device and CLINT have to be inside it (they are the only devices the
   // kernel touches); the rest is reached by capability bounds alone.
   if (platform::test_device_base() >= GIGAPAGE_SIZE ||
-      platform::uart_base() >= GIGAPAGE_SIZE) {
+      platform::uart_base() >= GIGAPAGE_SIZE ||
+      platform::clint_base() >= GIGAPAGE_SIZE) {
     return;
   }
   s_l2_root[0] = pte_make(phys_of(&s_l1_mmio[0]), pte::Valid);
@@ -434,17 +436,22 @@ void init(Capability root_data_cap) {
   }
 
   // SUM lets this code read and write pages marked User; MXR lets it read
-  // pages marked execute-only.
-  constexpr uint64_t SSTATUS_SUM_MXR = (1ULL << 18) | (1ULL << 19);
-  __asm__ volatile("csrs sstatus, %0" ::"r"(SSTATUS_SUM_MXR) : "memory");
+  // pages marked execute-only. Both are `mstatus` bits, and the M-mode MMU
+  // applies them as the S-mode one would (toolchain/mmodemmu).
+  constexpr uint64_t MSTATUS_SUM_MXR = (1ULL << 18) | (1ULL << 19);
+  __asm__ volatile("csrs mstatus, %0" ::"r"(MSTATUS_SUM_MXR) : "memory");
 
-  // satp turns translation on. Mode 8 in the top four bits selects Sv39, and
-  // the low bits hold the root table's frame number, not its address.
+  // satp names the root table: mode 8 in the top four bits selects Sv39, and
+  // the low bits hold the root table's frame number, not its address. Setting
+  // mmodemmu.ENABLE (CSR 0x7c0, bit 0) then turns translation on for M-mode,
+  // from the next instruction. This code and its stack are in the kernel
+  // image, which is identity-mapped, so they stay where they are.
   const uint64_t satp = (8ULL << 60) | (phys_of(&s_l2_root[0]) >> PAGE_SHIFT);
   __asm__ volatile(
       "csrw satp, %0\n\t"
       // Everything cached from before translation was on is now meaningless.
-      "sfence.vma zero, zero\n\t" ::"r"(satp)
+      "sfence.vma zero, zero\n\t"
+      "csrsi 0x7c0, 1\n\t" ::"r"(satp)
       : "memory");
 
   s_direct = d;

@@ -15,32 +15,33 @@
  */
 
 /*
- * early_trap.S - Supervisor Trap and Interrupt Vector
+ * early_trap.S - Machine Trap and Interrupt Vector
  *
- * Installed in `stvecc` by `boot.S` step 8.
+ * Installed in `mtvecc` by `boot.S` step 8. Everything runs in M-mode and
+ * nothing is delegated, so every exception and interrupt arrives here.
  *
  * Saves the interrupted context (all 31 general-purpose capability registers
- * and `sepcc`) into a 592-byte `TrapFrame` on the current hart's kernel stack
- * (`sscratchc`, or `csp` if in boot/host context) without clobbering any
+ * and `mepcc`) into a 592-byte `TrapFrame` on the current hart's kernel stack
+ * (`mscratchc`, or `csp` if in boot/host context) without clobbering any
  * register, then calls `__signetos_trap_dispatch`.
  *
  * If a compartment has bound a handler sentry via `sys_trap_bind`, invokes the
- * handler on a narrowed stack capability with `(scause, stval, sepc, stval2,
+ * handler on a narrowed stack capability with `(mcause, mtval, mepc, mtval2,
  * cap_table_rw, cap_table_ro)` in `(a0, a1, a2, a3, ca4, ca5)` and all other
  * registers scrubbed, then restores the `TrapFrame` on return and executes
- * `sret`.
+ * `mret`.
  *
- * INTERRUPT MASKING (see `asm_macros.h`): the hardware clears `sstatus.SIE`
- * on entry. Just before entering the handler, step 3 sets `SIE` from the
- * frame's `handler_sie`, which the dispatcher chose: 0 for an interrupt
+ * INTERRUPT MASKING (see `asm_macros.h`): the hardware clears `mstatus.MIE`
+ * on entry. Just before entering the handler, step 3 sets `MIE` from the
+ * frame's `handler_mie`, which the dispatcher chose: 0 for an interrupt
  * handler (and every gate it calls restores the masked state on return),
- * the interrupted code's `SIE` for an exception handler, so an interrupt can
+ * the interrupted code's `MIE` for an exception handler, so an interrupt can
  * be taken on top of it and return into it. `__signetos_trap_return` sets
- * `sstatus.SPIE` from the `sstatus` the dispatcher recorded, so the final
- * `sret` gives the interrupted context back exactly the `SIE` it had.
+ * `mstatus.MPIE` from the `mstatus` the dispatcher recorded, so the final
+ * `mret` gives the interrupted context back exactly the `MIE` it had.
  *
  * NO MACROS: every register sequence is written out in place, as in
- * `switch.S`. Only the `TRAP_FRAME_*` offsets and `sstatus` bits come from
+ * `switch.S`. Only the `TRAP_FRAME_*` offsets and `mstatus` bits come from
  * `asm_macros.h`.
  */
 
@@ -54,22 +55,22 @@
 
 _early_trap_entry:
     /*
-     * 1. Push a `TrapFrame` onto the current hart's kernel stack (`sscratchc`
-     *    or `csp`), saving all 31 GPRs and `sepcc`.
+     * 1. Push a `TrapFrame` onto the current hart's kernel stack (`mscratchc`
+     *    or `csp`), saving all 31 GPRs and `mepcc`.
      *
      *    Nothing may be clobbered before it is saved, so the frame is carved
-     *    with two swaps: `ct0` <-> `sscratchc` (the interrupted `ct0` sits in
+     *    with two swaps: `ct0` <-> `mscratchc` (the interrupted `ct0` sits in
      *    the CSR while `ct0` is the kernel SP), then `ct1` is saved and used
      *    as scratch to swap the interrupted `ct0` back out, leaving
-     *    `sscratchc` exactly as it was (= frame + TRAP_FRAME_SIZE, which is
+     *    `mscratchc` exactly as it was (= frame + TRAP_FRAME_SIZE, which is
      *    what `.Ltrap_restore` re-derives).
      */
-    csrrw   ct0, sscratchc, ct0         /* ct0 = ksp, sscratchc = trapped ct0 */
+    csrrw   ct0, mscratchc, ct0         /* ct0 = ksp, mscratchc = trapped ct0 */
     caddi   ct0, ct0, -TRAP_FRAME_SIZE  /* ct0 = frame base */
     csc     ct1,  80(ct0)               /* frame->t[1]; ct1 is scratch below */
     caddi   ct1, ct0, TRAP_FRAME_SIZE   /* ct1 = original ksp */
     csc     ct1, FRAME_LINK(ct0)        /* frame->active_kernel_sp */
-    csrrw   ct1, sscratchc, ct1         /* ct1 = trapped ct0, sscratchc = ksp */
+    csrrw   ct1, mscratchc, ct1         /* ct1 = trapped ct0, mscratchc = ksp */
     csc     ct1,  64(ct0)               /* frame->t[0] = trapped ct0 */
     csc     cra,   0(ct0)
     csc     csp,  16(ct0)
@@ -100,34 +101,34 @@ _early_trap_entry:
     csc     ca5, 448(ct0)
     csc     ca6, 464(ct0)
     csc     ca7, 480(ct0)
-    csrr    ct1, sepcc
-    csc     ct1, TRAP_FRAME_SEPCC(ct0)
+    csrr    ct1, mepcc
+    csc     ct1, TRAP_FRAME_MEPCC(ct0)
     cmv     csp, ct0
 
     /*
-     * 2. Call `__signetos_trap_dispatch(scause, stval, stval2, frame)`.
+     * 2. Call `__signetos_trap_dispatch(mcause, mtval, mtval2, frame)`.
      *    Returns a `CT = 1` hardware sentry in `ca0` if a compartment handler
      *    is bound to this vector, or `nullptr` if handled in-kernel.
      */
-    csrr    a0, scause
-    csrr    a1, stval
-    csrr    a2, 0x14b                   /* 0x14b = stval2 (CHERI fault info) */
+    csrr    a0, mcause
+    csrr    a1, mtval
+    csrr    a2, 0x34b                   /* 0x34b = mtval2 (CHERI fault info) */
     cmv     ca3, csp                    /* ca3 = TrapFrame* */
     cjal    cra, __signetos_trap_dispatch
     beqz    a0, .Ltrap_restore
 
     /*
      * 3. Invoke the bound compartment trap handler (`ca0`) with:
-     *      a0  = scause        a1  = stval
-     *      a2  = sepc          a3  = stval2
+     *      a0  = mcause        a1  = mtval
+     *      a2  = mepc          a3  = mtval2
      *      ca4 = rw_table      cgp = rw_table
      *      csp = narrowed handler_sp
-     *    all other registers scrubbed to `cnull`, and `sstatus.SIE` set from
-     *    the frame's `handler_sie`.
+     *    all other registers scrubbed to `cnull`, and `mstatus.MIE` set from
+     *    the frame's `handler_mie`.
      *
-     *    `SIE` is set last, after the CSRs have been read: from then on an
+     *    `MIE` is set last, after the CSRs have been read: from then on an
      *    interrupt can be taken here, and it is an ordinary nested trap
-     *    (`sscratchc` points at this frame, so the nested frame goes below
+     *    (`mscratchc` points at this frame, so the nested frame goes below
      *    it, and every register set up here is saved and restored).
      */
     cmv     ct0, ca0                    /* ct0 = handler CT = 1 sentry */
@@ -159,31 +160,31 @@ _early_trap_entry:
     cmv     ca5, cnull
     cmv     ca6, cnull
     cmv     ca7, cnull
-    csrr    a0, scause
-    csrr    a1, stval
-    csrr    ca2, sepcc
-    scaddr  ca2, cnull, a2              /* a2 = integer address of sepcc */
-    csrr    a3, 0x14b                   /* a3 = stval2 */
+    csrr    a0, mcause
+    csrr    a1, mtval
+    csrr    ca2, mepcc
+    scaddr  ca2, cnull, a2              /* a2 = integer address of mepcc */
+    csrr    a3, 0x34b                   /* a3 = mtval2 */
     clc     ca4, TRAP_FRAME_RW_TABLE(csp)
-    ld      ra, TRAP_FRAME_HANDLER_SIE(csp) /* ra = handler_sie; cjalr overwrites it */
+    ld      ra, TRAP_FRAME_HANDLER_MIE(csp) /* ra = handler_mie; cjalr overwrites it */
     clc     csp, TRAP_FRAME_HANDLER_SP(csp)
     cmv     cgp, ca4
-    csrs    sstatus, ra
+    csrs    mstatus, ra
     cjalr   cra, ct0
 
     /*
      * 4. Handler returned: mask (an exception handler may come back with
      *    interrupts enabled; an interrupt taken before this instruction is
      *    an ordinary nested trap, as in step 3), scrub the handler's
-     *    narrowed stack and pop the `TrapFrame` from the hart's `sscratchc`
+     *    narrowed stack and pop the `TrapFrame` from the hart's `mscratchc`
      *    in C++ (`__signetos_trap_return` = `unwind::resume`). If the
      *    interrupted code's compartment has been destroyed and swept it
      *    unwinds further; `a0` says what kind of frame it stopped at
      *    (UNWIND_*; UNWIND_NONE does not come back), and that frame sits
-     *    just below the new `sscratchc`.
+     *    just below the new `mscratchc`.
      */
-    csrci   sstatus, SSTATUS_SIE
-    csrr    csp, sscratchc
+    csrci   mstatus, MSTATUS_MIE
+    csrr    csp, mscratchc
     cjal    cra, __signetos_trap_return
     li      t0, UNWIND_RETURN_FRAME
     beq     a0, t0, .Lresume_return_frame
@@ -195,40 +196,41 @@ _early_trap_entry:
      */
     .globl __signetos_resume_trap_frame
 __signetos_resume_trap_frame:
-    csrr    csp, sscratchc
+    csrr    csp, mscratchc
     caddi   csp, csp, -TRAP_FRAME_SIZE  /* csp = TrapFrame* to resume */
 
 .Ltrap_restore:
     /*
-     * 5. Restore `sepcc` and all 31 GPRs from the `TrapFrame` at `csp`, wiping
-     *    every slot of the frame, then `sret` (`SIE := SPIE`, mode := SPP).
+     * 5. Restore `mepcc` and all 31 GPRs from the `TrapFrame` at `csp`, wiping
+     *    every slot of the frame, then `mret` (`MIE := MPIE`, mode := MPP).
      *
-     *    `SPP` must be forced back to S: every `sret` clears it to U, so if
+     *    `MPP` must be forced back to M: every `mret` sets it to U, so if
      *    the handler switched threads and the thread that ran meanwhile took
-     *    and returned from a trap of its own, `SPP` is stale by the time this
-     *    context resumes. Everything in SignetOS runs in S-mode.
+     *    and returned from a trap of its own, `MPP` is stale by the time this
+     *    context resumes. Everything in SignetOS runs in M-mode, and no
+     *    `mret` may leave it.
      *
      *    The trap-only slots (512..576) are wiped first, while `csp` is
      *    still the frame. Then `ct6` becomes the base for the 32 shared slots:
      *    it is the last register reloaded, so its saved value is parked in
-     *    `sscratchc` meanwhile and swapped back by the final `csrrw`, which at
+     *    `mscratchc` meanwhile and swapped back by the final `csrrw`, which at
      *    the same time re-installs the kernel SP as `frame + TRAP_FRAME_SIZE`
-     *    (every frame is carved from `sscratchc`, so that is where it was).
+     *    (every frame is carved from `mscratchc`, so that is where it was).
      *    Interrupts are masked throughout; a trap in this window would push
      *    onto the parked value.
      */
-    li      t0, SSTATUS_SPP
-    csrs    sstatus, t0
-    clc     ct0, TRAP_FRAME_SEPCC(csp)
-    csrw    sepcc, ct0
-    csc     cnull, TRAP_FRAME_SEPCC(csp)
+    li      t0, MSTATUS_MPP
+    csrs    mstatus, t0
+    clc     ct0, TRAP_FRAME_MEPCC(csp)
+    csrw    mepcc, ct0
+    csc     cnull, TRAP_FRAME_MEPCC(csp)
     csc     cnull, TRAP_FRAME_HANDLER_SP(csp)
     csc     cnull, TRAP_FRAME_RW_TABLE(csp)
-    csc     cnull, TRAP_FRAME_SSTATUS(csp)  /* sstatus and handler_sie */
+    csc     cnull, TRAP_FRAME_MSTATUS(csp)  /* mstatus and handler_mie */
     csc     cnull, TRAP_FRAME_FLAGS(csp)    /* flags and reserved */
     cmv     ct6, csp                    /* ct6 = frame base; csp reloaded last */
     clc     ct5, 160(ct6)               /* ct5 = saved ct6 */
-    csrw    sscratchc, ct5              /* park saved ct6 in sscratchc */
+    csrw    mscratchc, ct5              /* park saved ct6 in mscratchc */
     csc     cnull, 160(ct6)
     clc     cra,   0(ct6)
     csc     cnull, 0(ct6)
@@ -292,14 +294,14 @@ __signetos_resume_trap_frame:
     clc     csp,  16(ct6)
     csc     cnull, 16(ct6)
     caddi   ct6, ct6, TRAP_FRAME_SIZE   /* ct6 = kernel SP above the frame */
-    csrrw   ct6, sscratchc, ct6         /* sscratchc = kernel SP, ct6 = saved ct6 */
-    sret
+    csrrw   ct6, mscratchc, ct6         /* mscratchc = kernel SP, ct6 = saved ct6 */
+    mret
 
 .Lresume_return_frame:
     /*
      * The unwind stopped at a `ReturnFrame` (the handler's `TrapFrame`, and
      * whatever was above it, belonged to destroyed compartments): leave
      * through the switcher's restore sequence, which derives the frame from
-     * `sscratchc`, gives the caller `args[0]` and `ret`s.
+     * `mscratchc`, gives the caller `args[0]` and `ret`s.
      */
     j       __signetos_resume_return_frame

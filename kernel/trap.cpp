@@ -18,9 +18,10 @@
  * trap.cpp - SignetOS trap dispatch, reporting and user trap binding
  *
  * Called from _early_trap_entry (early_trap.S) when a synchronous exception or
- * asynchronous interrupt reaches the supervisor trap vector.
+ * asynchronous interrupt reaches the machine trap vector. Everything runs in
+ * M-mode and nothing is delegated, so that is every trap there is.
  *
- * A synchronous fault raised by kernel code (`sepcc` carries AccessSystemRegs)
+ * A synchronous fault raised by kernel code (`mepcc` carries AccessSystemRegs)
  * is a kernel bug: `trap_report()` prints it and halts, whatever is bound.
  *
  * Otherwise, if a compartment has bound an `OType::EntryPoint` (CT = 18)
@@ -35,24 +36,24 @@
  * machine halts.
  *
  * An unbound asynchronous interrupt is silenced at its source on this hart
- * (the timer is disarmed, any other has its `sie` bit cleared) and returned
+ * (the timer is disarmed, any other has its `mie` bit cleared) and returned
  * from; an unbound synchronous exception is reported and halts the machine.
  *
- * Each hart keeps its `sie` and timer in line with the trap table, and the
+ * Each hart keeps its `mie` and timer in line with the trap table, and the
  * software interrupt is the kernel's own poke that tells a hart to do so
  * (see trap.hpp, SEVERAL HARTS and THE SOFTWARE INTERRUPT IS THE KERNEL'S).
  *
- * The kernel also owns the periodic tick behind `IRQ_S_TIMER` (see trap.hpp,
- * THE KERNEL TICK), and decides which `SIE` a handler runs with and which
+ * The kernel also owns the periodic tick behind `IRQ_M_TIMER` (see trap.hpp,
+ * THE KERNEL TICK), and decides which `MIE` a handler runs with and which
  * the interrupted context resumes with (see asm_macros.h, INTERRUPT MASKING
  * RULE).
  */
 
 #include <signetos/asm_macros.h>
+#include <signetos/clint.hpp>
 #include <signetos/compartment.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/lock.hpp>
-#include <signetos/sbi.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
@@ -68,13 +69,13 @@ using namespace signetos;
 namespace {
 
 // `_early_trap_entry` addresses the frame by these offsets.
-static_assert(offsetof(trap::TrapFrame, sepcc) == TRAP_FRAME_SEPCC);
+static_assert(offsetof(trap::TrapFrame, mepcc) == TRAP_FRAME_MEPCC);
 static_assert(offsetof(trap::TrapFrame, handler_sp) == TRAP_FRAME_HANDLER_SP);
 static_assert(offsetof(trap::TrapFrame, handler_rw_table) ==
               TRAP_FRAME_RW_TABLE);
-static_assert(offsetof(trap::TrapFrame, sstatus) == TRAP_FRAME_SSTATUS);
-static_assert(offsetof(trap::TrapFrame, handler_sie) ==
-              TRAP_FRAME_HANDLER_SIE);
+static_assert(offsetof(trap::TrapFrame, mstatus) == TRAP_FRAME_MSTATUS);
+static_assert(offsetof(trap::TrapFrame, handler_mie) ==
+              TRAP_FRAME_HANDLER_MIE);
 static_assert(offsetof(trap::TrapFrame, flags) == TRAP_FRAME_FLAGS);
 static_assert(sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE);
 
@@ -100,17 +101,17 @@ const char* const kStandardCause[16] = {
 
 // This CHERI implementation raises one unified exception code for every
 // capability check failure rather than a family of them, and reports which
-// check failed separately in stval2. Verified against the running machine and
+// check failed separately in mtval2. Verified against the running machine and
 // against target/riscv/cpu_bits.h in the QEMU tree:
 //     RISCV_EXCP_CHERI = 0x1c
 constexpr uint64_t kCheriFault = 28;
 
-// stval2 layout for scause 28, from cpu_helper.c:
+// mtval2 layout for mcause 28, from cpu_helper.c:
 //     cheri_exc_info = cheri093_cap_cause(cause) | (type << 16)
 // Values from Cheri093CapExcCause / Cheri093CapExcType in
 // target/riscv/cheri-archspecific-early.h.
-const char* cheri_violation(uint64_t stval2) {
-  switch (stval2 & 0xffff) {
+const char* cheri_violation(uint64_t mtval2) {
+  switch (mtval2 & 0xffff) {
     case 0:
       return "tag violation (the capability was not valid)";
     case 1:
@@ -126,8 +127,8 @@ const char* cheri_violation(uint64_t stval2) {
   }
 }
 
-const char* cheri_access(uint64_t stval2) {
-  switch ((stval2 >> 16) & 0xff) {
+const char* cheri_access(uint64_t mtval2) {
+  switch ((mtval2 >> 16) & 0xff) {
     case 0:
       return "instruction fetch";
     case 1:
@@ -166,14 +167,14 @@ bool s_in_trap_report = false;
 // Reports a synchronous exception and halts the machine.
 //
 // why    - one line on why nothing short of halting is possible
-// scause - supervisor cause register; the interrupt bit is known to be clear
-// sepc   - address of the faulting instruction, read out of sepcc
-// stval  - trap value register; its meaning depends on the cause
-// stval2 - for a CHERI fault, which capability check failed
+// mcause - machine cause register; the interrupt bit is known to be clear
+// mepc   - address of the faulting instruction, read out of mepcc
+// mtval  - trap value register; its meaning depends on the cause
+// mtval2 - for a CHERI fault, which capability check failed
 // ssp    - stack pointer at the point of the fault, for orientation
 //
-[[noreturn]] void trap_report(const char* why, uint64_t scause, uint64_t sepc,
-                              uint64_t stval, uint64_t stval2, uint64_t ssp) {
+[[noreturn]] void trap_report(const char* why, uint64_t mcause, uint64_t mepc,
+                              uint64_t mtval, uint64_t mtval2, uint64_t ssp) {
   if (s_in_trap_report) {
     for (;;) {
       __asm__ volatile("wfi");
@@ -197,9 +198,9 @@ bool s_in_trap_report = false;
       "########\n");
 
   // The cause first, since it decides what is worth looking at next.
-  uart::print("  scause : ");
-  uart::print_dec(scause);
-  const char* text = cause_text(scause);
+  uart::print("  mcause : ");
+  uart::print_dec(mcause);
+  const char* text = cause_text(mcause);
   if (text != nullptr) {
     uart::print("  (");
     uart::print(text);
@@ -211,22 +212,22 @@ bool s_in_trap_report = false;
 
   // For a CHERI fault the code above is the same for every kind of
   // violation, so this line is the one that says what actually went wrong.
-  if (scause == kCheriFault) {
+  if (mcause == kCheriFault) {
     uart::print("  detail : ");
-    uart::print(cheri_violation(stval2));
+    uart::print(cheri_violation(mtval2));
     uart::print(", on ");
-    uart::print(cheri_access(stval2));
+    uart::print(cheri_access(mtval2));
     uart::print("\n");
   }
 
-  // sepc is the instruction that faulted, not the one after it, so the
+  // mepc is the instruction that faulted, not the one after it, so the
   // address can be looked up directly in the disassembly:
   //   llvm-objdump -d --start-address=0x... signetos.elf
-  field("sepc  ", sepc);
+  field("mepc  ", mepc);
 
   // The address the instruction was trying to reach.
-  field("stval ", stval);
-  field("stval2", stval2);
+  field("mtval ", mtval);
+  field("mtval2", mtval2);
   field("sp    ", ssp);
 
   uart::print(
@@ -245,29 +246,28 @@ namespace {
 SpinLock s_lock;
 TrapSlot s_slots[MAX_TRAP_SLOTS];
 
-// `sie` and `sip` bits. `SSTATUS_SPIE` comes from asm_macros.h.
-constexpr uint64_t SIE_SSIE = 1ULL << 1;
-constexpr uint64_t SIE_STIE = 1ULL << 5;
-constexpr uint64_t SIP_SSIP = 1ULL << 1;
-constexpr uint64_t SOFT_CODE = IRQ_S_SOFT & ~INTERRUPT_BIT;
-constexpr uint64_t TIMER_CODE = IRQ_S_TIMER & ~INTERRUPT_BIT;
+// `mie` bits. `MSTATUS_MPIE` comes from asm_macros.h.
+constexpr uint64_t MIE_MSIE = 1ULL << 3;
+constexpr uint64_t MIE_MTIE = 1ULL << 7;
+constexpr uint64_t SOFT_CODE = IRQ_M_SOFT & ~INTERRUPT_BIT;
+constexpr uint64_t TIMER_CODE = IRQ_M_TIMER & ~INTERRUPT_BIT;
 
-uint64_t tick_ticks() { return sbi::us_to_ticks(TICK_US); }
+uint64_t tick_ticks() { return clint::us_to_ticks(TICK_US); }
 
 // The harts that have run `init_hart`, one bit per hart number: the harts a
 // poke is sent to.
 uint64_t s_harts_up = 0;
 
 void arm_tick() {
-  __asm__ volatile("csrs sie, %0" : : "r"(SIE_STIE));
-  sbi::set_timer(sbi::now() + tick_ticks());
+  __asm__ volatile("csrs mie, %0" : : "r"(MIE_MTIE));
+  clint::set_timer(clint::now() + tick_ticks());
 }
 
-// Clears STIE as well, so on each hart STIE is set exactly while that hart's
+// Clears MTIE as well, so on each hart MTIE is set exactly while that hart's
 // tick is armed (`sync_this_hart` reads it that way).
 void disarm_tick() {
-  sbi::set_timer(sbi::TIMER_OFF);
-  __asm__ volatile("csrc sie, %0" : : "r"(SIE_STIE));
+  clint::set_timer(clint::TIMER_OFF);
+  __asm__ volatile("csrc mie, %0" : : "r"(MIE_MTIE));
 }
 
 // Slot write/read protocol (trap.hpp, `TrapSlot`). Writers are system calls
@@ -313,13 +313,13 @@ bool irq_bound(uint64_t code) {
   return read_slot(&s_slots[MAX_EXCEPTION_VECTORS + code]).owner_comp_uid != 0;
 }
 
-// Brings this hart's `sie` and timer in line with the trap table: the poke
+// Brings this hart's `mie` and timer in line with the trap table: the poke
 // bit always set, every other interrupt's bit set exactly while its slot is
 // bound, and the tick armed exactly while the timer slot is bound. Nothing
-// here is device-specific: code 9 is one bit like the rest, and what sits
+// here is device-specific: code 11 is one bit like the rest, and what sits
 // behind it is `trap_mgr`'s business.
 void sync_this_hart() {
-  uint64_t on = SIE_SSIE;
+  uint64_t on = MIE_MSIE;
   uint64_t off = 0;
   for (uint64_t code = 0; code < MAX_INTERRUPT_VECTORS; ++code) {
     if (code == SOFT_CODE || code == TIMER_CODE) {
@@ -331,12 +331,12 @@ void sync_this_hart() {
       off |= 1ULL << code;
     }
   }
-  __asm__ volatile("csrs sie, %0" : : "r"(on));
-  __asm__ volatile("csrc sie, %0" : : "r"(off));
+  __asm__ volatile("csrs mie, %0" : : "r"(on));
+  __asm__ volatile("csrc mie, %0" : : "r"(off));
 
-  uint64_t sie = 0;
-  __asm__ volatile("csrr %0, sie" : "=r"(sie));
-  const bool armed = (sie & SIE_STIE) != 0;
+  uint64_t mie = 0;
+  __asm__ volatile("csrr %0, mie" : "=r"(mie));
+  const bool armed = (mie & MIE_MTIE) != 0;
   if (irq_bound(TIMER_CODE)) {
     if (!armed) {
       arm_tick();
@@ -354,13 +354,13 @@ void poke_other_harts() {
   const uint64_t others = __atomic_load_n(&s_harts_up, __ATOMIC_SEQ_CST) &
                           ~(1ULL << thread::this_hart());
   if (others != 0) {
-    sbi::send_ipi(others);
+    clint::send_ipi(others);
   }
 }
 
-bool slot_index(uint64_t scause, size_t* out_idx) {
-  const uint64_t code = scause & ~INTERRUPT_BIT;
-  if ((scause & INTERRUPT_BIT) != 0) {
+bool slot_index(uint64_t mcause, size_t* out_idx) {
+  const uint64_t code = mcause & ~INTERRUPT_BIT;
+  if ((mcause & INTERRUPT_BIT) != 0) {
     if (code >= MAX_INTERRUPT_VECTORS) {
       return false;
     }
@@ -429,44 +429,44 @@ Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
 // does not return in a thread. In host context there is no thread to end:
 // the machine halts.
 [[noreturn]] void end_interrupted_thread(const char* why, Status status,
-                                         uint64_t scause, uint64_t stval,
-                                         uint64_t stval2,
+                                         uint64_t mcause, uint64_t mtval,
+                                         uint64_t mtval2,
                                          const TrapFrame* frame) {
-  const uint64_t sepc = capability_get_address(frame->sepcc);
+  const uint64_t mepc = capability_get_address(frame->mepcc);
   uart::print("[trap] ending thread ");
   uart::print_dec(thread::current_tid());
   uart::print(": ");
   uart::print(why);
   uart::print(" (");
   uart::print(status_name(status));
-  uart::print("), scause 0x");
-  uart::print_hex64(scause);
+  uart::print("), mcause 0x");
+  uart::print_hex64(mcause);
   uart::print(" at 0x");
-  uart::print_hex64(sepc);
+  uart::print_hex64(mepc);
   uart::print("\n");
-  if (scause == IRQ_S_TIMER) {
-    sbi::set_timer(sbi::now() + tick_ticks());
+  if (mcause == IRQ_M_TIMER) {
+    clint::set_timer(clint::now() + tick_ticks());
   }
   thread::exit(-1);
-  trap_report("in host context, and the host cannot take this trap", scause,
-              sepc, stval, stval2, capability_get_address(frame->sp));
+  trap_report("in host context, and the host cannot take this trap", mcause,
+              mepc, mtval, mtval2, capability_get_address(frame->sp));
 }
 
-Capability advance_sync_sepcc(Capability sepcc) {
-  const uint64_t addr = capability_get_address(sepcc);
+Capability advance_sync_mepcc(Capability mepcc) {
+  const uint64_t addr = capability_get_address(mepcc);
   uint64_t step = 4;
-  if (capability_is_valid(sepcc) && !sealing::is_sealed(sepcc) &&
-      (capability_get_perms(sepcc) & perms::Load) != 0) {
-    const uint64_t base = capability_get_base(sepcc);
-    const uint64_t len = capability_get_length(sepcc);
+  if (capability_is_valid(mepcc) && !sealing::is_sealed(mepcc) &&
+      (capability_get_perms(mepcc) & perms::Load) != 0) {
+    const uint64_t base = capability_get_base(mepcc);
+    const uint64_t len = capability_get_length(mepcc);
     if (addr >= base && addr + 2 <= base + len) {
-      const uint16_t insn16 = *reinterpret_cast<const uint16_t*>(sepcc);
+      const uint16_t insn16 = *reinterpret_cast<const uint16_t*>(mepcc);
       if ((insn16 & 0x3u) != 0x3u) {
         step = 2;
       }
     }
   }
-  return capability_set_address(sepcc, addr + step);
+  return capability_set_address(mepcc, addr + step);
 }
 
 }  // namespace
@@ -479,10 +479,12 @@ void init() {
 }
 
 void init_hart() {
-  // A known start, so that STIE means "this hart's tick is armed" from here
-  // on: only the poke bit on, the timer off.
-  sbi::set_timer(sbi::TIMER_OFF);
-  __asm__ volatile("csrw sie, %0" : : "r"(SIE_SSIE));
+  // A known start, so that MTIE means "this hart's tick is armed" from here
+  // on: only the poke bit on, the timer off, and no poke pending (the one
+  // that started a secondary hart is still set, thread.cpp).
+  clint::set_timer(clint::TIMER_OFF);
+  clint::clear_ipi();
+  __asm__ volatile("csrw mie, %0" : : "r"(MIE_MSIE));
 
   // Publish this hart, then read the table. A binder does the opposite --
   // writes the table, then reads `s_harts_up` (`poke_other_harts`). Both
@@ -499,15 +501,15 @@ void sync_all_harts() {
   poke_other_harts();
 }
 
-Capability authority_for(uint64_t scause) {
+Capability authority_for(uint64_t mcause) {
   // The software interrupt is the kernel's poke (trap.hpp, THE SOFTWARE
   // INTERRUPT IS THE KERNEL'S). Nobody may bind it, so no authority for it
   // exists.
-  if (scause == IRQ_S_SOFT) {
+  if (mcause == IRQ_M_SOFT) {
     return nullptr;
   }
   size_t idx = 0;
-  if (!slot_index(scause, &idx)) {
+  if (!slot_index(mcause, &idx)) {
     return nullptr;
   }
   Capability slot_cap = reinterpret_cast<Capability>(&s_slots[idx]);
@@ -604,9 +606,9 @@ size_t purge_compartment(uint64_t comp_uid) {
   return purged;
 }
 
-bool is_bound(uint64_t scause, uint64_t* out_owner_uid) {
+bool is_bound(uint64_t mcause, uint64_t* out_owner_uid) {
   size_t idx = 0;
-  if (!slot_index(scause, &idx)) {
+  if (!slot_index(mcause, &idx)) {
     return false;
   }
   const TrapSlot slot = read_slot(&s_slots[idx]);
@@ -629,11 +631,11 @@ size_t bound_count() {
   return n;
 }
 
-extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
-                                               uint64_t stval2,
+extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
+                                               uint64_t mtval2,
                                                TrapFrame* frame) {
-  const bool async = (scause & INTERRUPT_BIT) != 0;
-  const uint64_t sepc = capability_get_address(frame->sepcc);
+  const bool async = (mcause & INTERRUPT_BIT) != 0;
+  const uint64_t mepc = capability_get_address(frame->mepcc);
   frame->flags = 0;
 
   // A synchronous fault raised by kernel code is a kernel bug, and no handler
@@ -646,19 +648,20 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
   // before it enters an exception handler and after it comes back -- and is
   // delivered like any other.
   if (!async &&
-      (capability_get_perms(frame->sepcc) & perms::AccessSystemRegs) != 0) {
-    trap_report("raised by kernel code (sepcc carries AccessSystemRegs)",
-                scause, sepc, stval, stval2,
+      (capability_get_perms(frame->mepcc) & perms::AccessSystemRegs) != 0) {
+    trap_report("raised by kernel code (mepcc carries AccessSystemRegs)",
+                mcause, mepc, mtval, mtval2,
                 capability_get_address(frame->sp));
   }
 
   // A software interrupt is a poke from the kernel (trap.hpp, THE SOFTWARE
   // INTERRUPT IS THE KERNEL'S): the trap table has changed, so this hart
-  // brings its `sie` and timer in line with it, and the interrupted context
-  // resumes. SSIP is cleared before the table is read, so a poke sent after
-  // that sets it again and brings this hart back here.
-  if (scause == IRQ_S_SOFT) {
-    __asm__ volatile("csrc sip, %0" : : "r"(SIP_SSIP));
+  // brings its `mie` and timer in line with it, and the interrupted context
+  // resumes. The poke is cleared (this hart's `msip`) before the table is
+  // read, so a poke sent after that sets it again and brings this hart back
+  // here.
+  if (mcause == IRQ_M_SOFT) {
+    clint::clear_ipi();
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     sync_this_hart();
     return nullptr;
@@ -668,7 +671,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
   // never writes the table: a binding whose owner is gone is treated as
   // unbound here and left for `purge_compartment`, which destroy runs.
   size_t idx = 0;
-  if (slot_index(scause, &idx)) {
+  if (slot_index(mcause, &idx)) {
     const TrapSlot slot = read_slot(&s_slots[idx]);
     compartment::Compartment comp_info{};
     sentry::Entry entry{};
@@ -686,7 +689,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
       if (thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
           RET_FRAME_MIN_FREE) {
         end_interrupted_thread("no room on its kernel stack for the handler",
-                               Status::NoKernelStack, scause, stval, stval2,
+                               Status::NoKernelStack, mcause, mtval, mtval2,
                                frame);
       }
       Status status = Status::Ok;
@@ -694,7 +697,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
           handler_stack(frame->sp, entry.min_stack, frame, &status);
       if (!capability_is_valid(h_sp)) {
         end_interrupted_thread("its stack cannot host the handler", status,
-                               scause, stval, stval2, frame);
+                               mcause, mtval, mtval2, frame);
       }
 
       // `frame->active_kernel_sp` was written by the trap vector at push
@@ -711,25 +714,25 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
         frame->flags = sentry::ENTRY_FLAG_TRUSTED_TO_FINISH;
       }
 
-      // The SIE the handler runs with (asm_macros.h, INTERRUPT MASKING
+      // The MIE the handler runs with (asm_macros.h, INTERRUPT MASKING
       // RULE): an interrupt handler, masked; an exception handler, the
       // interrupted code's. Unmasked, it can be interrupted at its first
       // instruction, so, like an unmasked callee (KERNEL-STACK ROOM, check
       // 2), it also needs room for one more `TrapFrame` that still passes
       // check 3; with less it runs masked.
       //
-      // `sstatus` is as the trap left it: its SPIE is the SIE the
+      // `mstatus` is as the trap left it: its MPIE is the MIE the
       // interrupted code had (the dispatcher runs masked, so nothing has
       // changed it since). The copy recorded here is what
       // `__signetos_trap_return` resumes the interrupted code with.
-      uint64_t sstatus = 0;
-      __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+      uint64_t mstatus = 0;
+      __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
       const bool unmasked =
-          !async && (sstatus & SSTATUS_SPIE) != 0 &&
+          !async && (mstatus & MSTATUS_MPIE) != 0 &&
           thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
               TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
-      frame->sstatus = sstatus;
-      frame->handler_sie = unmasked ? SSTATUS_SIE : 0;
+      frame->mstatus = mstatus;
+      frame->handler_mie = unmasked ? MSTATUS_MIE : 0;
 
       // User-space trap delivery: verify that the bound handler's hardware sentry (`ct0`), narrowed
       // stack capability (`csp`), and capability table (`ca4`/`cgp`) are
@@ -743,43 +746,43 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
                                       "trap_dispatch:rw_table");
 
       if (async) {
-        if (scause == IRQ_S_TIMER) {
-          // Re-arm before the handler runs: this clears STIP, so a handler
+        if (mcause == IRQ_M_TIMER) {
+          // Re-arm before the handler runs: this clears MTIP, so a handler
           // that simply returns is safe, and the period does not drift
           // with the handler's running time.
-          sbi::set_timer(sbi::now() + tick_ticks());
+          clint::set_timer(clint::now() + tick_ticks());
         }
-      } else if (scause != EXC_INST_PAGE_FAULT &&
-                 scause != EXC_LOAD_PAGE_FAULT &&
-                 scause != EXC_STORE_PAGE_FAULT) {
-        frame->sepcc = advance_sync_sepcc(frame->sepcc);
+      } else if (mcause != EXC_INST_PAGE_FAULT &&
+                 mcause != EXC_LOAD_PAGE_FAULT &&
+                 mcause != EXC_STORE_PAGE_FAULT) {
+        frame->mepcc = advance_sync_mepcc(frame->mepcc);
       }
       return entry.sentry;
     }
   }
 
   // Unbound asynchronous interrupt: silence that source on this hart only
-  // and return to the interrupted PC. With `sie` following the table this is
+  // and return to the interrupted PC. With `mie` following the table this is
   // a hart whose poke has not arrived yet, or a binding whose owner has just
-  // been destroyed. The timer is disarmed (STIP can only be cleared by
-  // reprogramming it); any other source has its `sie` bit cleared.
+  // been destroyed. The timer is disarmed (MTIP can only be cleared by
+  // reprogramming it); any other source has its `mie` bit cleared.
   if (async) {
-    if (scause == IRQ_S_TIMER) {
+    if (mcause == IRQ_M_TIMER) {
       disarm_tick();
     } else {
-      __asm__ volatile("csrc sie, %0" : : "r"(1ULL << (scause & ~INTERRUPT_BIT)));
+      __asm__ volatile("csrc mie, %0" : : "r"(1ULL << (mcause & ~INTERRUPT_BIT)));
     }
     return nullptr;
   }
 
   // Unbound synchronous exception: report and halt.
-  trap_report("no handler is bound to this exception", scause, sepc, stval,
-              stval2, capability_get_address(frame->sp));
+  trap_report("no handler is bound to this exception", mcause, mepc, mtval,
+              mtval2, capability_get_address(frame->sp));
 }
 
 extern "C" uint64_t __signetos_trap_return() {
   // Pop the handler's `TrapFrame`, scrub the stack loaned to the handler and
-  // resume the interrupted code with the SIE it had -- or, if its
+  // resume the interrupted code with the MIE it had -- or, if its
   // compartment has been destroyed and swept while the handler ran, the
   // nearest live frame beneath (unwind.hpp). The top frame must be a
   // `TrapFrame` the dispatcher pushed for a handler, not something else

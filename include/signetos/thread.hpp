@@ -143,7 +143,7 @@ void init_hart(uint64_t hartid);
 
 // Brings up every secondary hart present in the DTB (`platform::hart_present`),
 // carving each hart's 64 KiB host stack (`csp`) and 16 KiB kernel entry stack
-// (`sscratchc`) from the identity-mapped kernel region above `_kernel_end` and
+// (`mscratchc`) from the identity-mapped kernel region above `_kernel_end` and
 // waiting until each hart has completed `init_hart` and `trap::init_hart`.
 void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart);
 
@@ -207,20 +207,20 @@ uint64_t tid_of(Capability thread_handle);
 // The id of the thread running on this hart, or 0 in host context.
 uint64_t current_tid();
 
-// Reads the current hart's active kernel stack capability from `sscratchc`
+// Reads the current hart's active kernel stack capability from `mscratchc`
 // (the boot kernel stack when executing in host context).
 inline Capability current_kernel_sp() {
   Capability ksp;
-  __asm__ volatile("csrr %0, sscratchc" : "=C"(ksp));
+  __asm__ volatile("csrr %0, mscratchc" : "=C"(ksp));
   return ksp;
 }
 
-// Updates the current hart's active kernel stack capability in `sscratchc`.
+// Updates the current hart's active kernel stack capability in `mscratchc`.
 inline void set_kernel_sp(Capability ksp) {
-  __asm__ volatile("csrw sscratchc, %0" : : "C"(ksp));
+  __asm__ volatile("csrw mscratchc, %0" : : "C"(ksp));
 }
 
-// Bytes free on a kernel stack below `ksp` -- `sscratchc` itself or a frame
+// Bytes free on a kernel stack below `ksp` -- `mscratchc` itself or a frame
 // carved from it, both carry the stack's bounds. The switcher and the trap
 // dispatcher compare this against the budget in asm_macros.h.
 inline uint64_t kernel_stack_free(Capability ksp) {

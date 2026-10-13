@@ -71,9 +71,9 @@ struct SpinLock {
   uint32_t held = 0;
 
   void acquire() {
-    uint64_t sstatus;
-    __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
-    if ((sstatus & SSTATUS_SIE) != 0) {
+    uint64_t mstatus;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
+    if ((mstatus & MSTATUS_MIE) != 0) {
       uart::panic("lock: taken with interrupts unmasked");
     }
     for (;;) {

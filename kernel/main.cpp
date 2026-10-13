@@ -20,6 +20,7 @@
  * Brings up the kernel subsystems and launches the `init` compartment.
  */
 
+#include <signetos/clint.hpp>
 #include <signetos/compartment.hpp>
 #include <signetos/frame.hpp>
 #include <signetos/init.hpp>
@@ -27,7 +28,6 @@
 #include <signetos/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
-#include <signetos/sbi.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
@@ -44,7 +44,7 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   // the DTB while physical addressing is still on, then build the boot
   // mappings and switch the MMU on.
   platform::discover(root_data_cap, dtb_cap);
-  sbi::init(root_data_cap);
+  clint::init(root_data_cap);
   frame::discover(root_data_cap, dtb_cap);
   vm::init(root_data_cap);
 

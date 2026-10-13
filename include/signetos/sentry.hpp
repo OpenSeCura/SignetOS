@@ -189,7 +189,7 @@ struct alignas(16) ReturnFrame {
                          //      or the Status of a refused call.
   Capability callee_sp;  // 352: narrowed stack capability for callee
   Capability callee_gp;  // 368: capability table for callee
-  uint64_t sstatus;      // 384: caller's `sstatus` at entry (SIE restored on
+  uint64_t mstatus;      // 384: caller's `mstatus` at entry (MIE restored on
                          //      return and propagated to a compartment callee)
   uint64_t flags;        // 392: EntryRecord::flags of the callee
 };
@@ -202,7 +202,7 @@ static_assert(sizeof(ReturnFrame) == 25 * sizeof(Capability),
 //     narrows the stack for the callee (everything below `csp` for a
 //     compartment, exactly `min_stack` bytes for a kernel entry), populates
 //     `frame->callee_sp`, `frame->callee_gp` and `frame->flags`, advances the
-//     hart's `sscratchc` kernel SP to `frame`, and returns the callee's
+//     hart's `mscratchc` kernel SP to `frame`, and returns the callee's
 //     `CT = 1` hardware sentry. On refusal it returns null and leaves the
 //     `Status` (as an integer) in `frame->args[0]` for the caller.
 //   - `__signetos_switcher_return` is `unwind::resume(KIND_RETURN_FRAME, ret)`

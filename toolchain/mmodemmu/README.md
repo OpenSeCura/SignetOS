@@ -71,8 +71,7 @@ and data accesses are translated through `satp`:
 
 ## Status in SignetOS
 
-Nothing uses it yet. The kernel still runs in S-mode behind the
-`_m_trap_entry` stub. Two things are needed to move it to M-mode:
-
-- port the trap and switch paths to the M-mode CSRs;
-- add `mmodemmu=on` to `QEMU_CPU` in the top-level `Makefile`.
+SignetOS runs entirely in M-mode on it: kernel and compartments, with no
+S-mode and no firmware. `QEMU_CPU` in the top-level `Makefile` sets
+`mmodemmu=on`; every hart sets `ENABLE` once `satp` is programmed
+(`vm::init`, and `.Lsecondary_start` in `kernel/boot.S`).

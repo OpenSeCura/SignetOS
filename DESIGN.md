@@ -40,9 +40,12 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
     return can use one, a return can use nothing else, and it is local, so
     only a stack can hold it. Code never runs from a local capability
     (`toolchain/sentries`).
+  * `mmodemmu`: lets M-mode use the MMU (`toolchain/mmodemmu`). Everything
+    runs in M-mode, and this is what keeps paging.
 * **Machine:** multi-hart QEMU `virt` with one virtio-blk disk (`disk.img`).
-  There is no OpenSBI: the kernel ships a tiny M-mode stub that services the
-  timer and IPI "SBI" calls.
+  There is no firmware (`-bios none`). The kernel starts in M-mode and stays
+  there, takes every trap itself (nothing is delegated), and drives the CLINT
+  timer and IPIs directly.
 
 ### 0.2 Source layout
 
@@ -78,7 +81,7 @@ count.
 | Design goal | Today |
 | --- | --- |
 | **Single virtual address space**: kernel, services, drivers and applications share one 64-bit space; no page-table switches | One root page table; nothing is remapped on a context switch. |
-| **Single privilege level**: everything runs at one CPU privilege level; only the kernel holds ASR | Everything runs in S-mode with permissive page-table entries; the only thing separating compartments is CHERI. Only kernel entry points run with ASR (§2.5). |
+| **Single privilege level**: everything runs at one CPU privilege level; only the kernel holds ASR | Everything runs in M-mode with permissive page-table entries; the only thing separating compartments is CHERI. Only kernel entry points run with ASR (§2.5). |
 | **CHERI-enforced isolation** | Bounds, permissions, sealing and tags are the only isolation mechanism. |
 | **Thread migration model**: threads are not owned by compartments and migrate through a domain switcher | `sys_compartment_invoke` is the switcher (§3.4). A thread's kernel stack records the calls and traps it is inside; nothing records which compartments (§2.2, Lifecycle). |
 | **Capability system call interface**: syscalls are cross-compartment invocations into the kernel | Kernel syscalls are entry points (§2.5) invoked through the *same* switcher gate as any other compartment call. That gate is the only hardware sentry the kernel gives a compartment. |
@@ -87,7 +90,7 @@ count.
 ### 1.2 The system as it runs today
 
 ```
- hardware  ──►  kernel (S-mode, ASR)  ──►  init (embedded)
+ hardware  ──►  kernel (M-mode, ASR)  ──►  init (embedded)
                                              │  creates the core services
                                              │  (drivers, loader, fs, naming,
                                              │   sched, trap_mgr, shell)

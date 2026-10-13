@@ -18,10 +18,10 @@
  * thread.cpp - SignetOS Thread Memory Quotas and Thread Execution State
  */
 
+#include <signetos/clint.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
-#include <signetos/sbi.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
@@ -54,7 +54,8 @@ struct alignas(64) HartBootSlot {
   Capability ksp;     // +16: 16 KiB kernel entry stack (cursor at top)
   uint64_t satp;      // +32: Sv39 satp value
   uint64_t state;     // +40: 0 = waiting, 1 = go, 2 = online
-  uint64_t pad[2];    // +48..63
+  Capability msip;    // +48: this hart's CLINT `msip`, which the parked hart
+                      //      writes to clear each poke (clint.hpp)
 };
 static_assert(sizeof(HartBootSlot) == 64);
 
@@ -206,9 +207,10 @@ void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart) {
     table[h].sp = sp;
     table[h].ksp = ksp;
     table[h].satp = satp_val;
+    table[h].msip = clint::msip_register(h);
     __atomic_store_n(&table[h].state, 1ULL, __ATOMIC_RELEASE);
 
-    sbi::send_ipi(1ULL << h);
+    clint::send_ipi(1ULL << h);
 
     while (__atomic_load_n(&table[h].state, __ATOMIC_ACQUIRE) != 2ULL) {
     }
@@ -218,7 +220,7 @@ void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart) {
   uart::print_dec(online_harts());
   uart::print("/");
   uart::print_dec(platform::hart_count());
-  uart::print(" hart(s) online in S-mode (boot hart ");
+  uart::print(" hart(s) online in M-mode (boot hart ");
   uart::print_dec(boot_hart);
   uart::print(")\n");
 }
@@ -479,7 +481,7 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
   // `__thread_restore` wipes the incoming frame and re-derives the hart's
   // kernel SP as `frame + sizeof(SwitchFrame)`. Refuse to switch if the
   // frame's recorded `active_kernel_sp` disagrees: that would mean the frame
-  // was not carved from `sscratchc` by `sys_thread_switch` / `thread::create`.
+  // was not carved from `mscratchc` by `sys_thread_switch` / `thread::create`.
   if (!capability_is_valid(next_frame->active_kernel_sp) ||
       capability_get_address(next_frame->active_kernel_sp) !=
           capability_get_address(t->kernel_sp) + sizeof(SwitchFrame)) {

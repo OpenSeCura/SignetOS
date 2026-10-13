@@ -45,7 +45,7 @@ static_assert(offsetof(ReturnFrame, args) + 4 * sizeof(Capability) ==
               RET_FRAME_ARG4);
 static_assert(offsetof(ReturnFrame, callee_sp) == RET_FRAME_CALLEE_SP);
 static_assert(offsetof(ReturnFrame, callee_gp) == RET_FRAME_CALLEE_GP);
-static_assert(offsetof(ReturnFrame, sstatus) == RET_FRAME_SSTATUS);
+static_assert(offsetof(ReturnFrame, mstatus) == RET_FRAME_MSTATUS);
 static_assert(offsetof(ReturnFrame, flags) == RET_FRAME_FLAGS);
 static_assert(sizeof(ReturnFrame) == RET_FRAME_SIZE);
 static_assert(ENTRY_FLAG_TRUSTED == ENTRY_TRUSTED);
@@ -376,7 +376,7 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   // user compartment. Unmasked compartments can be interrupted at any time,
   // so ensure enough kernel stack remains for a trap frame and handler.
   const bool trusted = (entry.flags & ENTRY_FLAG_TRUSTED) != 0;
-  if (!trusted && (frame->sstatus & SSTATUS_SIE) != 0 &&
+  if (!trusted && (frame->mstatus & MSTATUS_MIE) != 0 &&
       thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
           TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE) {
     return refuse(Status::NoKernelStack);

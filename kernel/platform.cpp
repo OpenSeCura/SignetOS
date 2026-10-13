@@ -18,9 +18,10 @@
  * platform.cpp - The kernel's own view of the board, from the DTB
  *
  * Walks the DTB once at boot (while physical addressing is still active) for
- * the five things the kernel needs to run itself: RAM bounds, usable harts,
- * timer frequency, the console UART's registers, and the poweroff device.
- * Device policy (PLIC, interrupt numbers, virtio) is `init`'s business.
+ * the six things the kernel needs to run itself: RAM bounds, usable harts,
+ * timer frequency, the CLINT (timer and IPIs), the console UART's registers,
+ * and the poweroff device. Device policy (PLIC, interrupt numbers, virtio)
+ * is `init`'s business.
  */
 
 #include <signetos/fdt.hpp>
@@ -35,6 +36,7 @@ uint64_t s_ram_base         = DEFAULT_RAM_BASE;
 uint64_t s_ram_bytes        = DEFAULT_RAM_BYTES;
 uint64_t s_timebase_hz      = DEFAULT_TIMEBASE_HZ;
 uint64_t s_clint_base       = DEFAULT_CLINT_BASE;
+uint64_t s_clint_size       = DEFAULT_CLINT_SIZE;
 uint64_t s_test_device_base = DEFAULT_TEST_DEVICE_BASE;
 uint64_t s_test_device_size = DEFAULT_TEST_DEVICE_SIZE;
 uint64_t s_uart_base        = DEFAULT_UART_BASE;
@@ -192,6 +194,7 @@ void discover(Capability root_data_cap, Capability dtb_cap) {
       uint64_t size = 0;
       if (n.reg(&base, &size) && size > 0) {
         s_clint_base = base;
+        s_clint_size = size;
         found_clint = true;
       }
     }
@@ -242,6 +245,7 @@ uint64_t ram_bytes()        { return s_ram_bytes; }
 size_t   hart_count()       { return s_hart_count; }
 uint64_t timebase_hz()      { return s_timebase_hz; }
 uint64_t clint_base()       { return s_clint_base; }
+uint64_t clint_size()       { return s_clint_size; }
 uint64_t test_device_base() { return s_test_device_base; }
 uint64_t test_device_size() { return s_test_device_size; }
 uint64_t uart_base()        { return s_uart_base; }

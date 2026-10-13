@@ -17,6 +17,10 @@
 /*
  * boot.S - SignetOS CHERI RISC-V Pure-Capability Kernel Bootloader
  *
+ * Every hart starts here in M-mode and never leaves it: the kernel and all
+ * compartments run in M-mode, the CHERI ASR permission is the only privilege
+ * boundary, and `mmodemmu` (toolchain/mmodemmu) lets M-mode use the MMU.
+ *
  * Boot sequence:
  * 1. Switch CPU hardware to Pure Capability Pointer Mode (modesw.cap, PCC.P = 0).
  * 2. Derive master root data capability (cs11) and code capability (cs10) from PCC.
@@ -25,7 +29,7 @@
  * 5. Set up Capability Global Pointer (cgp) to .got.
  * 6. Process __cap_relocs table to dynamically seal/relocate all capability pointers in GOT/data.
  * 7. Zero-initialize the .bss section using the root data capability.
- * 8. Set up the supervisor trap vector capability (stvecc).
+ * 8. Set up the machine trap vector capability (mtvecc).
  * 9. Jump to the C++ kernel entry: kernel_main(root_data_cap, hartid, dtb_cap).
  */
 
@@ -95,167 +99,51 @@
     .globl _start
 _start:
     /*
-     * Step 0: Per-hart M-mode setup and CLINT timer/IPI trap vector (-bios none).
+     * Step 0: Per-hart M-mode setup (-bios none).
      *
      * At reset, QEMU starts every hart in M-mode at 0x80000000 in integer
      * pointer mode with `mseccfg.CRE = 0` and:
      *   a0 = hart ID
      *   a1 = physical address of the Flattened Device Tree (DTB)
      *
-     * Every hart (< MAX_HARTS = 16) configures its M-mode CSRs, sets its
-     * `mscratchc` to its 64-byte `MScratch` slot in `_m_scratch` (populated
-     * from the DTB by `sbi::init`), installs `_m_trap_entry` in `mtvecc`, and
-     * drops to S-mode at `.Ls_mode_entry`.
+     * Every hart (< MAX_HARTS = 16) configures its M-mode CSRs and carries on
+     * to step 2, still in M-mode. Nothing runs below M-mode, so nothing is set
+     * up for lower modes: no counter enables (`mcounteren`), no CHERI enable
+     * in `menvcfg`, and no PMP entries (with none, PMP does not constrain
+     * M-mode).
      */
     csrsi   0x747, 8            /* mseccfg.CRE = 1 (enable CHERI in M-mode) */
     .word   0x12001033          /* modesw.cap */
     li      t0, 16              /* platform::MAX_HARTS */
     bgeu    a0, t0, _hang
 
-    /* Delegate S-mode interrupts (SSIP=1, STIP=5, SEIP=9) and synchronous
-     * exceptions (misaligned fetch=0, breakpoint=3, U-ecall=8,
-     * page faults=12/13/15, CHERI fault=28) straight to S-mode (`stvecc`). */
-    li      t0, (1 << 1) | (1 << 5) | (1 << 9)
-    csrw    mideleg, t0
-    li      t0, (1 << 0) | (1 << 3) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15) | (1 << 28)
-    csrw    medeleg, t0
+    /* Delegate nothing: every exception and interrupt is taken in M-mode, at
+     * `mtvecc`. */
+    csrw    mideleg, zero
+    csrw    medeleg, zero
 
-    /* Allow S-mode to read time/cycle/instret counters, and enable CHERI CRE
-     * (bit 28) in `menvcfg`. */
-    li      t0, -1
-    csrw    mcounteren, t0
-    li      t0, (1 << 28)
-    csrs    menvcfg, t0
-
-    /* Open Physical Memory Protection (PMP) across the entire address space
-     * (NAPOT all-ones address, R|W|X = 0x1f) so S-mode can access MMIO & RAM. */
-    li      t0, -1
-    csrw    pmpaddr0, t0
-    li      t0, 0x1f
-    csrw    pmpcfg0, t0
-
-    /* Clear interrupt/paging state and enable M-mode software interrupts
-     * (mie.MSIE, bit 3) so cross-hart CLINT `msip` IPIs wake/interrupt harts. */
+    /* Clear interrupt/paging state and enable only the machine software
+     * interrupt (mie.MSIE, bit 3), so a CLINT `msip` poke wakes a hart from
+     * `wfi`. Addresses stay physical until the MMU is turned on (`vm::init`,
+     * `.Lsecondary_start`): `satp` is Bare and `mmodemmu` (CSR 0x7c0) resets
+     * to 0. */
     csrw    mip, zero
     li      t0, (1 << 3)
     csrw    mie, t0
-    csrw    sie, zero
     csrw    satp, zero
 
-    /* Point `mscratchc` at this hart's 64-byte `MScratch` entry in `_m_scratch`
-     * (bounded to the 1024-byte `_m_scratch` table with `KERNEL_DATA_PERMS`). */
-    auipcc  ct0, 0
-    scaddr  ct2, ct0, zero
-    llc     ct1, _m_scratch
-    scaddr  ct1, ct2, t1
-    li      t3, 1024
-    scbndsr ct1, ct1, t3
-    li      t3, KERNEL_DATA_PERMS
-    acperm  ct1, ct1, t3
-    slli    t3, a0, 6           /* a0 * 64 */
-    cadd    ct1, ct1, t3
-    csrw    mscratchc, ct1
-
-    /* Install `_m_trap_entry` in `mtvecc`. */
-    llc     ct1, _m_trap_entry
-    scaddr  ct1, ct0, t1
-    csrw    mtvecc, ct1
-
-    /* Point mepcc (and initial stvecc) at .Ls_mode_entry with infinite bounds
-     * derived from M-mode PCC, then set mstatus.MPP = S-mode and drop via mret. */
-    llc     ct1, .Ls_mode_entry
-    scaddr  ct0, ct0, t1
-    csrw    mepcc, ct0
-    csrw    stvecc, ct0
-
-    li      t0, (1 << 7) | (1 << 11) | (1 << 13)
+    /* mstatus: MIE = 0 (interrupts masked), MPP = M (bits 11-12, the mode an
+     * `mret` returns to), FS = Initial (bit 13, FPU on). */
+    li      t0, (3 << 11) | (1 << 13)
     csrw    mstatus, t0
-    mret
 
-    /*
-     * _m_trap_entry: Per-hart M-mode trap handler for CLINT timer & IPIs.
-     *
-     * `mscratchc` holds `&_m_scratch[this_hart]` (`sbi::MScratch`, sbi.hpp):
-     *   +0:  saved_ct1
-     *   +16: msip_cap      (4-byte DataRw cap to CLINT msip[this_hart])
-     *   +32: mtimecmp_cap  (8-byte DataRw cap to CLINT mtimecmp[this_hart])
-     *
-     * `csrrw ct0, mscratchc, ct0` swaps the interrupted `ct0` into `mscratchc`
-     * without ever writing integer `t0`, so `ct0` retains its capability tag
-     * throughout and all caller registers are preserved.
-     */
-    .align 4
-_m_trap_entry:
-    csrrw   ct0, mscratchc, ct0     /* ct0 = &_m_scratch[this_hart] */
-    csc     ct1, 0(ct0)             /* save caller ct1 */
-    csrr    t1, mcause
-    bltz    t1, .Lm_irq
+    /* Until step 8 installs the trap vector, a trap parks the hart in
+     * `_hang`. */
+    auipcc  ct0, 0
+    llc     ct1, _hang
+    scaddr  ct0, ct0, t1
+    csrw    mtvecc, ct0
 
-    /* S-mode ecall:
-     *   a7 == 0: sbi::set_timer(a0 = deadline)
-     *   a7 != 0: sbi::send_ipi(a0 = target_hart)
-     */
-    bnez    a7, .Lm_ecall_ipi
-    clc     ct1, 32(ct0)            /* ct1 = this hart's mtimecmp_cap */
-    sd      a0, 0(ct1)              /* mtimecmp[this_hart] = a0 */
-    li      t1, (1 << 5)
-    csrc    mip, t1                 /* clear mip.STIP */
-    li      t1, (1 << 7)
-    csrs    mie, t1                 /* enable mie.MTIE */
-    j       .Lm_ecall_done
-
-.Lm_ecall_ipi:
-    csrr    t1, mhartid
-    beq     a0, t1, .Lm_self_ipi
-    sub     t1, a0, t1
-    slli    t1, t1, 6               /* (target_hart - this_hart) * 64 */
-    cadd    ct1, ct0, t1            /* ct1 = &_m_scratch[target_hart] */
-    clc     ct1, 16(ct1)            /* ct1 = target hart's msip_cap */
-    li      a0, 1
-    sw      a0, 0(ct1)              /* msip[target_hart] = 1 */
-    j       .Lm_ecall_done
-
-.Lm_self_ipi:
-    li      t1, (1 << 1)
-    csrs    mip, t1                 /* pend mip.SSIP on this hart */
-
-.Lm_ecall_done:
-    csrr    ct1, mepcc
-    caddi   ct1, ct1, 4
-    csrw    mepcc, ct1
-    li      a0, 0
-    clc     ct1, 0(ct0)             /* restore caller ct1 */
-    csrrw   ct0, mscratchc, ct0     /* restore caller ct0 and mscratchc */
-    mret
-
-.Lm_irq:
-    andi    t1, t1, 0xff
-    addi    t1, t1, -3
-    bnez    t1, .Lm_timer_irq
-
-    /* Machine software interrupt (cause 3): clear CLINT msip[this_hart]
-     * and raise S-mode software interrupt (mip.SSIP, bit 1). */
-    clc     ct1, 16(ct0)            /* ct1 = this hart's msip_cap */
-    sw      zero, 0(ct1)            /* msip[this_hart] = 0 */
-    li      t1, (1 << 1)
-    csrs    mip, t1                 /* pend mip.SSIP for S-mode */
-    clc     ct1, 0(ct0)             /* restore interrupted context's ct1 */
-    csrrw   ct0, mscratchc, ct0     /* restore interrupted context's ct0 */
-    mret
-
-.Lm_timer_irq:
-    /* Machine timer interrupt (cause 7): mask mie.MTIE until next set_timer
-     * and raise S-mode timer interrupt (mip.STIP, bit 5). */
-    li      t1, (1 << 7)
-    csrc    mie, t1                 /* mask mie.MTIE */
-    li      t1, (1 << 5)
-    csrs    mip, t1                 /* pend mip.STIP for S-mode */
-    clc     ct1, 0(ct0)             /* restore interrupted context's ct1 */
-    csrrw   ct0, mscratchc, ct0     /* restore interrupted context's ct0 */
-    mret
-
-    .align 4
-.Ls_mode_entry:
     /*
      * Step 2: Derive master root data capability (cs11) and bounded kernel
      * code capability (cs10) from initial PCC.
@@ -263,7 +151,7 @@ _m_trap_entry:
      * cs10 is restricted strictly to [_kernel_start, _got_end) (covering only
      * .text, .rodata, __cap_relocs, and .got — excluding writable
      * .data/.bss.stack/.bss) with KERNEL_CODE_PERMS (stripping Store, Seal,
-     * and Unseal). All kernel function pointers, stvecc, and kernel_main's PCC
+     * and Unseal). All kernel function pointers, mtvecc, and kernel_main's PCC
      * are derived from cs10 so the kernel never executes with an unbounded PCC.
      */
     auipcc  cs11, 0
@@ -298,7 +186,7 @@ _m_trap_entry:
     bnez    t1, .Lsecondary_wait_loop
 
     /*
-     * Step 4: Set up tightly-bounded, non-executable stacks (csp and sscratchc)
+     * Step 4: Set up tightly-bounded, non-executable stacks (csp and mscratchc)
      * derived from cs11, masked to KERNEL_DATA_PERMS (stripping Execute, Seal,
      * Unseal, and AccessSystemRegs).
      */
@@ -316,7 +204,7 @@ _m_trap_entry:
     scbndsr ct0, ct0, t1
     acperm  ct0, ct0, t2        /* Strip Execute, Seal, Unseal, AccessSystemRegs */
     cadd    ct0, ct0, t1
-    csrw    sscratchc, ct0      /* Initialize per-hart kernel SP in sscratchc */
+    csrw    mscratchc, ct0      /* Initialize per-hart kernel SP in mscratchc */
 
     /*
      * Step 5: Set up Capability Global Pointer (cgp), tightly bounded to
@@ -420,12 +308,12 @@ _m_trap_entry:
     fence.i
 
     /*
-     * Step 8: Set up early trap vector derived from bounded cs10 so trap
+     * Step 8: Set up the trap vector (mtvecc) derived from bounded cs10 so trap
      * handlers execute with PCC bounded to [_kernel_start, _got_end).
      */
     llc     ct0, _early_trap_entry
     scaddr  ct0, cs10, t0
-    csrw    stvecc, ct0
+    csrw    mtvecc, ct0
 
     /*
      * Step 9: Call kernel_main(root_data_cap in ca0, hartid in ca1, dtb_cap in ca2).
@@ -467,25 +355,30 @@ _m_trap_entry:
     j       .Lsecondary_spin
 
 .Lsecondary_start:
+    /* The poke that ended the wait above stays pending (`msip` is still set)
+     * until `trap::init_hart` clears it, inside `secondary_hart_init`. */
     fence   r, r
-    csrci   sip, 2              /* clear wakeup software interrupt (sip.SSIP) */
 
     /* Load bounded 64 KiB host stack (csp) and scrub handoff slot */
     clc     csp, 0(cs1)
     csc     cnull, 0(cs1)
 
-    /* Load bounded 16 KiB kernel entry stack (sscratchc) and scrub handoff slot */
+    /* Load bounded 16 KiB kernel entry stack (mscratchc) and scrub handoff slot */
     clc     ct0, 16(cs1)
     csc     cnull, 16(cs1)
-    csrw    sscratchc, ct0
+    csrw    mscratchc, ct0
 
-    /* Enable sstatus.SUM | sstatus.MXR and turn on Sv39 MMU (satp) */
+    /* Enable mstatus.SUM | mstatus.MXR, load the boot hart's Sv39 satp, and
+     * set mmodemmu.ENABLE (CSR 0x7c0, bit 0): from the next instruction this
+     * hart's M-mode accesses go through the MMU. This code, the boot table and
+     * the stacks are all in the identity-mapped kernel region. */
     li      t0, (1 << 18) | (1 << 19)
-    csrs    sstatus, t0
+    csrs    mstatus, t0
     ld      t0, 32(cs1)
     sd      zero, 32(cs1)
     csrw    satp, t0
     sfence.vma zero, zero
+    csrsi   0x7c0, 1
 
     /* Set up bounded cgp ([_got_start, _got_end), KERNEL_RO_TABLE_PERMS) */
     llc     ct0, _got_start
@@ -496,10 +389,10 @@ _m_trap_entry:
     li      t1, KERNEL_RO_TABLE_PERMS
     acperm  cgp, cgp, t1
 
-    /* Set up bounded stvecc (_early_trap_entry derived from cs10) */
+    /* Set up bounded mtvecc (_early_trap_entry derived from cs10) */
     llc     ct0, _early_trap_entry
     scaddr  ct0, cs10, t0
-    csrw    stvecc, ct0
+    csrw    mtvecc, ct0
 
     /* Call secondary_hart_init(hartid in ca0) with bounded PCC (cs10),
      * scrubbing all temporary capability registers except callee-saved cs1. */
@@ -513,8 +406,11 @@ _m_trap_entry:
     cmv     ct1, cnull
     cjalr   cra, ct0
 
-    /* Signal boot hart that this hart is online (state = 2), scrub cs1/cra/ct0,
-     * and enter the S-mode idle loop. */
+    /* Keep this hart's CLINT `msip` in cs2 for the idle loop and scrub its
+     * slot, signal boot hart that this hart is online (state = 2), scrub
+     * cs1/cra/ct0, and park. */
+    clc     cs2, 48(cs1)
+    csc     cnull, 48(cs1)
     fence   rw, w
     li      t0, 2
     sd      t0, 40(cs1)
@@ -522,10 +418,13 @@ _m_trap_entry:
     cmv     cra, cnull
     cmv     ct0, cnull
 .Lsecondary_idle:
+    /* Parked with interrupts masked (DESIGN.md §4.4). A poke ends the `wfi`;
+     * clearing it is all this hart does with it, so the next `wfi` sleeps. */
     wfi
-    csrci   sip, 2
+    sw      zero, 0(cs2)        /* msip[this hart] = 0 */
     j       .Lsecondary_idle
 
+    .align 2                    /* `mtvecc` until step 8: 4-byte aligned */
 _hang:
     wfi
     j       _hang

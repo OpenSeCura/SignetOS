@@ -37,6 +37,10 @@
 # local, so only a stack can hold it. Code never runs from a local capability.
 # It needs Zylevels1.
 #
+# mmodemmu=on (toolchain/mmodemmu) lets M-mode use the MMU. The kernel and
+# every compartment run in M-mode, so this is what keeps paging; without it
+# the kernel's first access to the mmodemmu CSR is an illegal instruction.
+#
 # CHERI_ROOT is the install root toolchain/setup.sh used (its default is
 # ~/cheri); the patched tools are under $(CHERI_ROOT)/zyseal. Override it (or
 # CHERI_SDK_BIN / QEMU individually) on the command line or in the environment
@@ -46,7 +50,7 @@ CHERI_ROOT    ?= $(HOME)/cheri
 CHERI_SDK_BIN ?= $(CHERI_ROOT)/zyseal/llvm-build/bin
 QEMU          ?= $(CHERI_ROOT)/zyseal/qemu-build/qemu-system-riscv64cheristd
 MARCH         = rv64gc_zcheripurecap_zyseal
-QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on,sentries=on
+QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on,sentries=on,mmodemmu=on
 EXTRA_LDFLAGS =
 
 CXX     = $(CHERI_SDK_BIN)/clang++
@@ -153,6 +157,7 @@ ASM_SRCS = kernel/boot.S \
 
 CXX_SRCS = kernel/kstring.cpp \
            kernel/platform.cpp \
+           kernel/clint.cpp \
            kernel/vm.cpp \
            kernel/uart.cpp \
            kernel/trap.cpp \

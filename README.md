@@ -8,10 +8,11 @@ A capability-based microkernel for pure-capability CHERI RISC-V (RV64,
 `-mabi=l64pc128d`), run under QEMU.
 
 SignetOS depends on **Zyseal**, a CHERI RISC-V sealing extension that isn't
-ratified (the `YSEAL`/`YUNSEAL` instructions), and on **sentries**, a QEMU
-extension that makes return addresses local return sentries. No released
-CHERI toolchain has them, so you first build a patched LLVM and QEMU with
-[`toolchain/setup.sh`](toolchain/setup.sh).
+ratified (the `YSEAL`/`YUNSEAL` instructions), on **sentries**, a QEMU
+extension that makes return addresses local return sentries, and on
+**mmodemmu**, a QEMU extension that lets machine mode use the MMU (SignetOS
+runs entirely in M-mode). No released CHERI toolchain has them, so you first
+build a patched LLVM and QEMU with [`toolchain/setup.sh`](toolchain/setup.sh).
 
 SignetOS design and vision can be found [here](DESIGN.md).
 
@@ -96,8 +97,8 @@ directory that contains `clang`) and `QEMU` (the full path to
   is looking. Run `toolchain/setup.sh` (step 1) or set `CHERI_ROOT`.
 - **clang rejects `-march=rv64gc_zcheripurecap_zyseal`**: you're using an
   unpatched compiler. Use the one from `$CHERI_ROOT/zyseal/llvm-build/bin`.
-- **QEMU rejects `Zyseal=on`**: you're using an unpatched QEMU. Use
-  `$CHERI_ROOT/zyseal/qemu-build/qemu-system-riscv64cheristd`.
+- **QEMU rejects `Zyseal=on` or `mmodemmu=on`**: you're using an unpatched
+  QEMU. Use `$CHERI_ROOT/zyseal/qemu-build/qemu-system-riscv64cheristd`.
 
 ## Layout
 

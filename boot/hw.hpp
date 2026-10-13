@@ -34,7 +34,7 @@
 
 namespace signetos::user::hw {
 
-constexpr uint32_t IRQ_S_EXT = 9;
+constexpr uint32_t IRQ_M_EXT = 11;
 constexpr uint64_t PAGE = 0x1000ULL;
 
 inline uint64_t page_down(uint64_t v) { return v & ~(PAGE - 1); }
@@ -49,12 +49,12 @@ struct Board {
   uint32_t uart_irq;
 
   // PLIC ("riscv,plic0" / "sifive,plic-1.0.0"): window large enough to reach
-  // every context the board declares, max source number, and the S-mode
+  // every context the board declares, max source number, and the M-mode
   // context of each hart (PLIC_NO_CONTEXT where a hart has none).
   uint64_t plic_base;
   uint64_t plic_size;
   uint32_t plic_ndev;
-  uint32_t plic_s_context[platform::MAX_HARTS];
+  uint32_t plic_m_context[platform::MAX_HARTS];
 
   // virtio-mmio transports ("virtio,mmio"), sorted by address. One window
   // covers all of them; `virtio_slot_bytes` is the stride between slots.
@@ -74,7 +74,7 @@ struct Board {
     plic_base = plic_size = 0;
     plic_ndev = 0;
     for (size_t h = 0; h < platform::MAX_HARTS; ++h) {
-      plic_s_context[h] = platform::PLIC_NO_CONTEXT;
+      plic_m_context[h] = platform::PLIC_NO_CONTEXT;
     }
     virtio_count = 0;
     for (size_t s = 0; s < platform::MAX_VIRTIO_SLOTS; ++s) {
@@ -179,21 +179,22 @@ inline bool discover(const uint8_t* dtb, size_t avail, Board* out) {
   });
 
   // PLIC contexts: `interrupts-extended` is (phandle, code) per context, in
-  // context order. The S-mode external context of a hart is the entry whose
-  // phandle is that hart's cpu-intc and whose code is IRQ_S_EXT.
+  // context order. The M-mode external context of a hart is the entry whose
+  // phandle is that hart's cpu-intc and whose code is IRQ_M_EXT; everything
+  // runs in M-mode, so the S-mode one (code 9) is never used.
   uint32_t max_ctx = 0;
   if (out->plic_base != 0) {
     const uint32_t pairs = plic_ext.ok() ? plic_ext.len / 8 : 0;
     for (uint32_t ctx = 0; ctx < pairs; ++ctx) {
       const uint32_t ph = plic_ext.u32(ctx * 2);
       const uint32_t code = plic_ext.u32(ctx * 2 + 1);
-      if (code != IRQ_S_EXT || ph == 0) {
+      if (code != IRQ_M_EXT || ph == 0) {
         continue;
       }
       for (size_t h = 0; h < platform::MAX_HARTS; ++h) {
         if (intc_phandle[h] == ph &&
-            out->plic_s_context[h] == platform::PLIC_NO_CONTEXT) {
-          out->plic_s_context[h] = ctx;
+            out->plic_m_context[h] == platform::PLIC_NO_CONTEXT) {
+          out->plic_m_context[h] = ctx;
           if (ctx > max_ctx) {
             max_ctx = ctx;
           }
@@ -201,11 +202,11 @@ inline bool discover(const uint8_t* dtb, size_t avail, Board* out) {
       }
     }
     if (pairs == 0) {
-      // No map: assume the usual M/S interleave (context 2*hart+1 for S).
+      // No map: assume the usual M/S interleave (context 2*hart for M).
       for (size_t h = 0; h < platform::MAX_HARTS && h < platform::DEFAULT_HARTS;
            ++h) {
-        out->plic_s_context[h] = static_cast<uint32_t>(2 * h + 1);
-        max_ctx = static_cast<uint32_t>(2 * h + 1);
+        out->plic_m_context[h] = static_cast<uint32_t>(2 * h);
+        max_ctx = static_cast<uint32_t>(2 * h);
       }
     }
     uint64_t want = platform::plic_window_for_context(max_ctx);

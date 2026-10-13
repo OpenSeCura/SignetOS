@@ -24,19 +24,21 @@
  *
  * THE PLIC
  *   Every device interrupt on the board is a PLIC source, and the PLIC
- *   presents all of them to the hart as one interrupt, `IRQ_S_EXT` (scause
- *   code 9). The kernel does not touch the PLIC: `init` delegates its register
- *   window (BootManifest, platform.hpp) to this compartment alone, together
- *   with the code 9 authority. So the PLIC is a driver like any other -- in
- *   user space, behind a capability -- and the kernel's whole part in an
- *   external interrupt is one `sie` bit and the ordinary trap delivery.
+ *   presents all of them to the hart as one interrupt, `IRQ_M_EXT` (mcause
+ *   code 11; everything runs in M-mode, so devices interrupt through each
+ *   hart's M-mode context). The kernel does not touch the PLIC: `init`
+ *   delegates its register window (BootManifest, platform.hpp) to this
+ *   compartment alone, together with the code 11 authority. So the PLIC is a
+ *   driver like any other -- in user space, behind a capability -- and the
+ *   kernel's whole part in an external interrupt is one `mie` bit and the
+ *   ordinary trap delivery.
  *
  * WHICH HART
  *   The PLIC interrupts a hart only for sources enabled in that hart's
  *   context, and each source is enabled for exactly one hart: the one this
  *   compartment was set up on, which is the hart the system booted on. That
- *   is the hart that runs SignetOS, and it need not be hart 0: OpenSBI picks
- *   it, and QEMU with `-smp 4` boots on hart 1. A hart's number is in its
+ *   is the hart that runs SignetOS, and it need not be hart 0: it is
+ *   whichever hart wins the boot lottery in boot.S. A hart's number is in its
  *   `utidc`, where the kernel puts it (thread.cpp, `init_hart`). The claim is
  *   made in the same context, so it is always the right one for the hart
  *   taking the interrupt.
@@ -44,7 +46,7 @@
  * ROUTING
  *   `trap_mgr.irq_route(handler, source)` appends `handler`, an
  *   `OType::EntryPoint`, to the source's handler list and enables the source
- *   at the PLIC the first time. The code 9 handler claims sources until the
+ *   at the PLIC the first time. The code 11 handler claims sources until the
  *   PLIC has none pending and, for each, invokes its handlers in order with
  *   `source` in `a0`, then completes the claim -- which is what lets a
  *   level-triggered source fire again. A claimed source nobody routed is
@@ -79,7 +81,7 @@ namespace {
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
-  M_IRQ(X, IRQ_EXT, 9)                                   \
+  M_IRQ(X, IRQ_EXT, 11)                                  \
   M_EXC(X, EXC_INST_PF, trap::EXC_INST_PAGE_FAULT)       \
   M_EXC(X, EXC_LOAD_PF, trap::EXC_LOAD_PAGE_FAULT)       \
   M_EXC(X, EXC_STORE_PF, trap::EXC_STORE_PAGE_FAULT)     \
@@ -212,16 +214,16 @@ extern "C" int64_t trap_mgr_irq_route_entry(Capability handler,
   return init::IRQ_OK;
 }
 
-// IRQ_S_EXT handler (kernel trap ABI: a0-a3 = scause/stval/sepc/stval2,
+// IRQ_M_EXT handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
 // ca4 = this compartment's capability table). Runs masked on the interrupted
 // thread's stack; `cgp` is our table, so globals resolve as usual.
-extern "C" uint64_t trap_mgr_irq_entry(uint64_t scause, uint64_t stval,
-                                       uint64_t sepc, uint64_t stval2,
+extern "C" uint64_t trap_mgr_irq_entry(uint64_t mcause, uint64_t mtval,
+                                       uint64_t mepc, uint64_t mtval2,
                                        Capability cap_table_rw) {
-  (void)scause;
-  (void)stval;
-  (void)sepc;
-  (void)stval2;
+  (void)mcause;
+  (void)mtval;
+  (void)mepc;
+  (void)mtval2;
   (void)cap_table_rw;
   if (!capability_is_valid(s_plic)) {
     return 0;
@@ -290,16 +292,16 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // Devices interrupt the hart this runs on, the one the system booted on
-  // (WHICH HART). `init` passes the DTB-discovered S-mode PLIC context map
+  // (WHICH HART). `init` passes the DTB-discovered M-mode PLIC context map
   // and `riscv,ndev` in `TrapMgrInterface`.
   const uint64_t hart = this_hart();
   if (hart >= platform::MAX_HARTS) {
     return -1;
   }
-  uint32_t ctx = static_cast<uint32_t>(2 * hart + 1);
+  uint32_t ctx = static_cast<uint32_t>(2 * hart);
   uint32_t ndev = platform::DEFAULT_PLIC_NDEV;
   if (iface != nullptr && iface->plic_ndev != 0) {
-    ctx = iface->plic_s_context[hart];
+    ctx = iface->plic_m_context[hart];
     ndev = (iface->plic_ndev > platform::PLIC_MAX_SOURCE)
                ? platform::PLIC_MAX_SOURCE
                : iface->plic_ndev;
@@ -318,9 +320,9 @@ extern "C" int64_t compartment_main(Capability arg) {
     r.count = 0;
   }
 
-  // This hart's S-mode context: let every priority through. Firmware leaves
-  // the threshold at its maximum, which blocks everything; sources stay off
-  // until something is routed to them.
+  // This hart's M-mode context: let every priority through, whatever
+  // threshold it was left with; sources stay off until something is routed
+  // to them.
   plic_set_threshold(0);
 
   Capability e_route =
@@ -336,7 +338,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[SLOT_IRQ_ROUTE_ENTRY] = e_route;
   rw[SLOT_IRQ_ENTRY] = e_irq;
 
-  // Bind code 9. The kernel sets `sie.SEIE` on every hart; from now on any
+  // Bind code 11. The kernel sets `mie.MEIE` on every hart; from now on any
   // source we enable at the PLIC lands in `trap_mgr_irq_entry`.
   using FnTrapBind = decltype(&sys_trap_bind);
   syscall::call<FnTrapBind>(gate_invoke, gate_trap_bind, self_comp, irq_ext,
@@ -347,7 +349,7 @@ extern "C" int64_t compartment_main(Capability arg) {
     iface->irq_route = e_route;
   }
   print_dec(gate_invoke, uart_sentry, "[trap_mgr] PLIC online (hart ", hart,
-            " S-mode context, threshold 0); IRQ_S_EXT bound; routes via "
+            " M-mode context, threshold 0); IRQ_M_EXT bound; routes via "
             "irq_route\n");
   return 0;
 }

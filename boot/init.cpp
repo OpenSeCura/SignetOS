@@ -854,7 +854,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 7. `trap_mgr`
   // =========================================================================
-  // Its manifest is the only one that asks for the PLIC or `IRQ_S_EXT`: it
+  // Its manifest is the only one that asks for the PLIC or `IRQ_M_EXT`: it
   // decides which handler each device interrupt reaches.
   const Started trap_mgr = L.start_file("trap_mgr.bin");
   // Like `uart`, `trap_mgr` hands its routing entry to whoever brings it up
@@ -862,7 +862,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   init::TrapMgrInterface tm_if{};
   tm_if.plic_ndev = board.plic_ndev;
   for (size_t h = 0; h < platform::MAX_HARTS; ++h) {
-    tm_if.plic_s_context[h] = board.plic_s_context[h];
+    tm_if.plic_m_context[h] = board.plic_m_context[h];
   }
   if (capability_is_valid(trap_mgr.sentry)) {
     comp_invoke(trap_mgr.sentry, bounded(&tm_if));

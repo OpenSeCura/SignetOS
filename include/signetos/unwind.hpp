@@ -66,7 +66,7 @@ using Status = signetos::Status;
 enum Kind : uint64_t {
   KIND_NONE = 0,          // nothing recognisable: empty stack, or not a frame
   KIND_RETURN_FRAME = 1,  // sentry::ReturnFrame, resumed with `ret`
-  KIND_TRAP_FRAME = 2,    // trap::TrapFrame, resumed with `sret`
+  KIND_TRAP_FRAME = 2,    // trap::TrapFrame, resumed with `mret`
 };
 
 // Identifies the frame at `ksp` by its FRAME LINK (asm_macros.h): the
@@ -77,17 +77,17 @@ enum Kind : uint64_t {
 // reading anything.
 Kind kind_at(Capability ksp);
 
-// Pops frames from the current hart's kernel stack (`sscratchc`) until one
+// Pops frames from the current hart's kernel stack (`mscratchc`) until one
 // can be resumed, and returns its kind; KIND_NONE if the top frame is not an
 // `expected_top` (a replayed return sentry -- the caller ends the thread) or
-// if every frame was dead. On return `sscratchc` sits just above the frame
-// to resume: the assembly finds it at `sscratchc - RET_FRAME_SIZE` or
-// `sscratchc - TRAP_FRAME_SIZE`.
+// if every frame was dead. On return `mscratchc` sits just above the frame
+// to resume: the assembly finds it at `mscratchc - RET_FRAME_SIZE` or
+// `mscratchc - TRAP_FRAME_SIZE`.
 //
 // `value` is what the first `ReturnFrame` resumed gets in `args[0]` if no
 // frame was skipped (the callee's return value); after a skipped frame it is
 // Status::CompartmentDestroyed, or Status::Killed if the frame was cut for a
-// kill. A `TrapFrame` resumed has its `sstatus.SPIE`
+// kill. A `TrapFrame` resumed has its `mstatus.MPIE`
 // restored from the frame. Each popped frame's loaned stack slice
 // (`callee_sp` / `handler_sp`) is scrubbed whether it is resumed or skipped;
 // a skipped frame is wiped.

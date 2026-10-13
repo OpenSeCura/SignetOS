@@ -182,17 +182,18 @@ Kind resume(Kind expected_top, Capability value) {
       auto* f = reinterpret_cast<trap::TrapFrame*>(ksp);
       thread::set_kernel_sp(f->active_kernel_sp);  // pop
       sentry::zero_stack(f->handler_sp);  // nor what a handler left
-      // The interrupted code is live if `sepcc` still has its tag; it is
-      // resumed as if its handler had returned. `sret` sets SIE := SPIE, and
-      // the SPIE the hardware holds now is stale if anything trapped or
+      // The interrupted code is live if `mepcc` still has its tag; it is
+      // resumed as if its handler had returned. `mret` sets MIE := MPIE, and
+      // the MPIE the hardware holds now is stale if anything trapped or
       // switched threads since the trap was taken, so set it from the
-      // `sstatus` recorded then: the interrupted code resumes with exactly
-      // the SIE it had.
-      if (fate == Fate::Run && capability_is_valid(f->sepcc)) {
-        if ((f->sstatus & SSTATUS_SPIE) != 0) {
-          __asm__ volatile("csrs sstatus, %0" : : "r"(SSTATUS_SPIE));
+      // `mstatus` recorded then: the interrupted code resumes with exactly
+      // the MIE it had. Only MPIE is touched here; the trap vector forces
+      // MPP back to M just before its `mret` (early_trap.S, step 5).
+      if (fate == Fate::Run && capability_is_valid(f->mepcc)) {
+        if ((f->mstatus & MSTATUS_MPIE) != 0) {
+          __asm__ volatile("csrs mstatus, %0" : : "r"(MSTATUS_MPIE));
         } else {
-          __asm__ volatile("csrc sstatus, %0" : : "r"(SSTATUS_SPIE));
+          __asm__ volatile("csrc mstatus, %0" : : "r"(MSTATUS_MPIE));
         }
         return KIND_TRAP_FRAME;
       }

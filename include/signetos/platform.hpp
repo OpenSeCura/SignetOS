@@ -19,13 +19,15 @@
 //
 // platform.hpp - What the kernel needs to know about the board
 //
-// `discover()` walks the DTB passed by OpenSBI at boot (while physical
-// addressing is still on, through `fdt.hpp`) and records only the facts the
-// kernel itself depends on:
+// `discover()` walks the DTB QEMU passes at boot (while physical addressing
+// is still on, through `fdt.hpp`) and records only the facts the kernel
+// itself depends on:
 //
 //   - Physical RAM (`/memory*`: `reg`)             frame allocator, direct map
 //   - Usable harts (`/cpus/cpu@*`: `reg`, `status`) per-hart state, IPIs
 //   - Timer frequency (`/cpus`: `timebase-frequency`)  the kernel tick
+//   - CLINT (`"riscv,clint0"` / `"sifive,clint0"`: `reg`)  the timer and
+//                                                  IPIs (clint.hpp)
 //   - Console UART (`"ns16550a"`, preferring `/chosen` `stdout-path`: `reg`)
 //                                                  boot banner, panic
 //   - Finisher / poweroff device (`"sifive,test*"`: `reg`)  `qemu_poweroff`
@@ -46,7 +48,7 @@
 namespace signetos::platform {
 
 // Ceiling on hart IDs tracked in fixed-size arrays (`thread::s_cpus`,
-// `TrapMgrInterface::plic_s_context`). Harts present in the DTB are recorded
+// `TrapMgrInterface::plic_m_context`). Harts present in the DTB are recorded
 // up to this limit; `thread::init_hart` refuses any hart ID that was not
 // enabled in the DTB or lies at or above `MAX_HARTS`.
 constexpr size_t MAX_HARTS = 16;
@@ -54,7 +56,7 @@ constexpr size_t MAX_HARTS = 16;
 // Ceiling on VirtIO MMIO transport slots user space tracks (`BlkInterface`).
 constexpr size_t MAX_VIRTIO_SLOTS = 8;
 
-// Sentinel for "this hart has no S-mode PLIC context".
+// Sentinel for "this hart has no M-mode PLIC context".
 constexpr uint32_t PLIC_NO_CONTEXT = ~0u;
 
 // Standard RISC-V / SiFive PLIC architectural register offsets within the
@@ -80,6 +82,7 @@ constexpr uint64_t DEFAULT_RAM_BASE         = 0x80000000ULL;
 constexpr uint64_t DEFAULT_RAM_BYTES        = 2ULL * 1024 * 1024 * 1024;
 constexpr uint64_t DEFAULT_TIMEBASE_HZ      = 10'000'000ULL;
 constexpr uint64_t DEFAULT_CLINT_BASE       = 0x02000000ULL;
+constexpr uint64_t DEFAULT_CLINT_SIZE       = 0x10000ULL;
 constexpr uint64_t DEFAULT_TEST_DEVICE_BASE = 0x00100000ULL;
 constexpr uint64_t DEFAULT_TEST_DEVICE_SIZE = 0x1000ULL;
 constexpr uint64_t DEFAULT_UART_BASE        = 0x10000000ULL;
@@ -98,11 +101,12 @@ uint64_t ram_base();
 uint64_t ram_bytes();
 
 // Harts (`/cpus/cpu@*`), timer frequency (`/cpus` `timebase-frequency`), and
-// CLINT base (`"riscv,clint0"` / `"sifive,clint0"`).
+// CLINT window (`"riscv,clint0"` / `"sifive,clint0"`).
 size_t   hart_count();
 bool     hart_present(uint64_t hart);
 uint64_t timebase_hz();
 uint64_t clint_base();
+uint64_t clint_size();
 
 // Finisher / poweroff device (`"sifive,test1"` / `"sifive,test0"`).
 uint64_t test_device_base();
