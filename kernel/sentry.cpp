@@ -67,6 +67,7 @@ Capability create_impl(Capability comp, Capability code_cap,
   }
   // Accept either an already-executable capability or a writable allocation
   // (e.g. from sys_vm_allocate) being transitioned into a W^X entry point.
+  // TODO: let's revisit this at a later time
   if ((in_perms & (perms::Execute | perms::Store)) == 0) {
     return fail_with(out_status, Status::NotExecutable);
   }
@@ -87,7 +88,9 @@ Capability create_impl(Capability comp, Capability code_cap,
     return fail_with(out_status, Status::BadAlignment);
   }
 
-  // No compartment can own memory outside `[vm::DYNAMIC_BASE, vm::DYNAMIC_TOP)`.
+  // No compartment can own memory outside `[vm::DYNAMIC_BASE,
+  // vm::DYNAMIC_TOP)`. That range is the one we currently give to user
+  // compartments
   if (require_owned &&
       (base < vm::DYNAMIC_BASE || len > (vm::DYNAMIC_TOP - base))) {
     return fail_with(out_status, Status::NotOwned);
@@ -219,6 +222,18 @@ Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
     return nullptr;
   }
   return capability_set_address(narrowed, narrowed_top);
+}
+
+void zero_stack(Capability stack) {
+  if (!capability_is_valid(stack)) {
+    return;
+  }
+  Capability* slot = reinterpret_cast<Capability*>(
+      capability_set_address(stack, capability_get_base(stack)));
+  for (size_t i = 0; i < capability_get_length(stack) / sizeof(Capability);
+       ++i) {
+    slot[i] = nullptr;
+  }
 }
 
 void init(Capability root_data_cap) {
@@ -399,6 +414,10 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   }
 
   frame->callee_sp = narrowed;
+  // the kernel is already privileged...
+  if (!trusted) {
+    zero_stack(narrowed);  // what the caller's own calls left below its csp
+  }
   frame->callee_gp = entry.table;
   if (trusted) {
     entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;  // the kernel always finishes

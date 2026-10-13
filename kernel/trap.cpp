@@ -701,6 +701,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t scause, uint64_t stval,
       // (asm_macros.h, FRAME LINK).
       thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
       frame->handler_sp = h_sp;
+      sentry::zero_stack(h_sp);  // what the interrupted code left below its csp
       frame->handler_rw_table = compartment::table_writable(slot.owner_comp);
       // What a kill does to the handler (unwind.hpp, KILLED THREADS).
       const auto* owner =

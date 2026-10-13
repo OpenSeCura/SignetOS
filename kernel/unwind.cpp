@@ -60,20 +60,6 @@ void wipe(Capability* slot, size_t count) {
   }
 }
 
-// Scrubs the whole of `region`'s bounds: the stack slice loaned to a callee
-// (`ReturnFrame::callee_sp`) or a handler (`TrapFrame::handler_sp`), so
-// nothing it left behind, data or capability, reaches whoever resumes. For a
-// compartment callee that is everything below the caller's `csp`; for a
-// kernel entry it is the `min_stack` slice.
-void scrub(Capability region) {
-  if (!capability_is_valid(region)) {
-    return;
-  }
-  const uint64_t base = capability_get_base(region);
-  wipe(reinterpret_cast<Capability*>(capability_set_address(region, base)),
-       capability_get_length(region) / sizeof(Capability));
-}
-
 // The kernel SP kept in the frame at `ksp` (FRAME LINK): where the frame
 // beneath it starts.
 Capability link_of(Capability ksp) {
@@ -178,7 +164,7 @@ Kind resume(Kind expected_top, Capability value) {
     if (kind == KIND_RETURN_FRAME) {
       auto* f = reinterpret_cast<sentry::ReturnFrame*>(ksp);
       thread::set_kernel_sp(f->prev_ksp);  // pop
-      scrub(f->callee_sp);
+      sentry::zero_stack(f->callee_sp);  // nothing the callee left reaches the caller
       // The caller is live if its return address still has its tag. Only
       // `ra` is judged: a host-context caller has no `cgp`, and a
       // compartment's code and table die together anyway. The saved caller
@@ -195,7 +181,7 @@ Kind resume(Kind expected_top, Capability value) {
     } else {
       auto* f = reinterpret_cast<trap::TrapFrame*>(ksp);
       thread::set_kernel_sp(f->active_kernel_sp);  // pop
-      scrub(f->handler_sp);
+      sentry::zero_stack(f->handler_sp);  // nor what a handler left
       // The interrupted code is live if `sepcc` still has its tag; it is
       // resumed as if its handler had returned. `sret` sets SIE := SPIE, and
       // the SPIE the hardware holds now is stale if anything trapped or

@@ -232,6 +232,13 @@ extern "C" uint64_t __signetos_switcher_return(Capability ret);
 Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
                         uint64_t want, Status* out_status);
 
+// Zeroes the whole of `stack`'s bounds. A slice lent to a compartment (a
+// callee's or a trap handler's) is zeroed when it is lent, so the borrower
+// cannot read what the lender's own earlier calls left below its `csp`, and
+// again when it comes back (`unwind::resume`), so the lender cannot read what
+// the borrower left there.
+void zero_stack(Capability stack);
+
 
 // Validates `entry_point` via `unseal()` and transfers control to its entry point
 // directly (kernel-internal; no domain switch).
