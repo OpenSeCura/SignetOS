@@ -778,6 +778,12 @@ Caller                       Switcher (switch.S + sentry.cpp)                 Ca
    * The return value (`ca0`) is checked by `inspect` (§4.5) before the caller
      sees it.
 
+TODO: a compartment callee is lent everything below the caller's `csp`, and
+that whole region is zeroed on entry and again on return (trap handlers too).
+So the cost depends on how much stack the caller has free, not on how much
+the callee uses. Kernel entries always zero their full 4 KiB slice. We need a
+faster way to do this zeroing.
+
 **Outbound capability policy (`kernel/inspect.cpp`):** every capability
 leaving the kernel, as an argument on the way in or a return value on the way
 out, must:
@@ -1105,6 +1111,10 @@ their parent; there are no directory-entry blocks.
 | `trap_mgr` | External-interrupt routing | §3.6. |
 | `loader` | Compartment construction | §2.8. |
 | `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
+
+TODO: isolate DMA access. `blk` writes physical addresses into the device's
+registers and descriptors, and nothing checks them, so it can point the
+device at any memory. Today it is effectively part of the TCB.
 
 The shell's `run` policy decides what a `/bin` program can get from its
 manifest:
