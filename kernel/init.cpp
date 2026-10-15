@@ -111,6 +111,10 @@ Status launch(Capability system_quota, Capability thread_quota,
 
   alignas(sizeof(Capability)) static Capability init_seeds[INIT_SEED_COUNT];
   size_t idx = 0;
+  // `RW_SLOT_VM_QUOTA`: `init` allocates from, and derives every service's
+  // VM quota out of, the quota that funds it. `compartment::create` does not
+  // put it in the table, so it is a seed like the rest.
+  init_seeds[idx++] = system_quota;
   for (size_t i = 0; i < syscall::kSyscallCount; ++i) {
     init_seeds[idx++] = syscall::gate(static_cast<syscall::Id>(i));
     uart::print_cap("syscall", syscall::gate(static_cast<syscall::Id>(i)));

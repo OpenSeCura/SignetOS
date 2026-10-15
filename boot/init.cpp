@@ -54,9 +54,10 @@
  *      then).
  *   7. `trap_mgr`: routes the UART's and the block device's PLIC sources to
  *      their drivers' interrupt entries.
- *   8. `shell`: its manifest asks for thread memory, `/home` and `/bin`, and
- *      the system's root quotas, which it holds from then on; its thread is
- *      made and registered with the scheduler.
+ *   8. `shell`: its manifest asks for its own quotas (VM, thread memory, a
+ *      `quota_sched` node), `/home` and `/bin`, and the system's root quotas,
+ *      which it holds from then on; its thread is made from those quotas and
+ *      registered with the scheduler.
  *   9. Records every handle in its own table for the kernel's tests, then
  *  10. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
@@ -144,6 +145,7 @@ struct Launcher {
   Capability mem_quota;    // the root QuotaVm: every VM quota is a slice of it
   Capability thread_quota; // the root QuotaThreadMem
   Capability gate_q_derive;
+  Capability gate_q_destroy;
   Capability gate_tq_derive;
   Capability gate_vm_alloc;
   Capability gate_vm_dealloc;
@@ -182,13 +184,18 @@ struct Launcher {
   Capability fs_query;
   Capability fs_node_funding;  // the QuotaVm that pays for the nodes
 
-  // The scheduler's root quota, for ROOT_SCHED.
+  // The scheduler (step 6), for ROOT_SCHED and QUOTA_SCHED entries: its root
+  // quota, `sched.quota_derive`, and the QuotaVm that pays for the nodes.
   Capability root_sched;
+  Capability sched_derive;
+  Capability sched_node_funding;
 
   // Recorded for step 9 (the kernel's exec tests tear the system down through
-  // `init`'s table): the thread-memory quota and the ADMIN disk node the
-  // shell asked for.
+  // `init`'s table): the thread-memory quota, the `quota_sched` node and the
+  // ADMIN disk node the shell asked for. The first two are also what the
+  // shell's thread is paid from and registered under (step 8).
   Capability shell_t_quota;
+  Capability shell_sched_quota;
   Capability shell_disk_quota;
 
   void say(const char* msg) const { print(invoke, uart, msg); }
@@ -226,6 +233,14 @@ struct Launcher {
     using Fn = decltype(&sys_quota_vm_derive);
     return syscall::call<Fn>(invoke, gate_q_derive, mem_quota, bytes,
                              kAdminPerms);
+  }
+
+  // Gives back a VM quota of `vm_quota`'s that nothing came to use.
+  void drop_vm_quota(Capability q) const {
+    using Fn = decltype(&sys_quota_vm_destroy);
+    if (capability_is_valid(q)) {
+      syscall::call<Fn>(invoke, gate_q_destroy, q);
+    }
   }
 
   Capability tmem_quota(size_t bytes) const {
@@ -374,8 +389,39 @@ struct Launcher {
     return node;
   }
 
+  // QUOTA_SCHED: a node under the scheduler's root with the bandwidth and
+  // class asked for -- so not before the scheduler is up (step 6). The node
+  // page is paid from `sched_node_funding`.
+  Capability sched_node(const init::ManifestEntry& e) {
+    if (!capability_is_valid(root_sched) || !capability_is_valid(sched_derive) ||
+        !capability_is_valid(sched_node_funding) || e.amount > UINT32_MAX ||
+        e.param > init::PRIORITY_BATCH) {
+      return nullptr;
+    }
+    init::SchedDeriveRequest req{};
+    req.parent = root_sched;
+    req.node_funding = sched_node_funding;
+    req.budget_us = static_cast<uint32_t>(e.amount);
+    req.period_us = e.count;
+    // Permanent: `init` is gone once the system is up, so nobody would be
+    // left to take it back.
+    req.term_us = init::SCHED_PERMANENT;
+    req.priority_class = static_cast<uint8_t>(e.param);
+    req.status = init::SCHED_BAD_REQUEST;
+    reinterpret_cast<FnInvoke>(invoke)(sched_derive, bounded(&req));
+    if (req.status != init::SCHED_OK) {
+      say_dec("[init]     WARNING: sched.quota_derive failed, status -",
+              static_cast<uint64_t>(-req.status), "\n");
+      return nullptr;
+    }
+    shell_sched_quota = req.out_quota;
+    return req.out_quota;
+  }
+
   // The policy: one manifest entry, met from what `init` holds, or null.
-  Capability grant_one(const char* who, const init::ManifestEntry& e) {
+  // `funding` is the VM quota the image is being started on.
+  Capability grant_one(const char* who, const init::ManifestEntry& e,
+                       Capability funding) {
     switch (e.kind) {
       case init::MANIFEST_SYSCALL:
         return e.count < syscall::kSyscallCount
@@ -396,6 +442,8 @@ struct Launcher {
         return dma_arena(e.amount);
       case init::MANIFEST_SERVICE:
         return service(e.name);
+      case init::MANIFEST_QUOTA_VM:
+        return funding;
       case init::MANIFEST_QUOTA_THREAD: {
         Capability q = tmem_quota(static_cast<size_t>(e.amount));
         if (capability_is_valid(q)) {
@@ -403,6 +451,8 @@ struct Launcher {
         }
         return q;
       }
+      case init::MANIFEST_QUOTA_SCHED:
+        return sched_node(e);
       case init::MANIFEST_ROOT:
         switch (e.count) {
           case init::ROOT_VM: return mem_quota;
@@ -429,11 +479,11 @@ struct Launcher {
 
   // The manifest, entry by entry, into `s_seeds`. True if every REQUIRED
   // entry was met; each that was not is named on the console.
-  bool grant(const char* who, const init::Manifest& m) {
+  bool grant(const char* who, const init::Manifest& m, Capability funding) {
     bool ok = true;
     for (uint32_t i = 0; i < m.count; ++i) {
       const init::ManifestEntry& e = m.entries[i];
-      s_seeds[i] = grant_one(who, e);
+      s_seeds[i] = grant_one(who, e, funding);
       if (!capability_is_valid(s_seeds[i]) &&
           (e.flags & init::MANIFEST_REQUIRED) != 0) {
         ok = false;
@@ -448,7 +498,7 @@ struct Launcher {
   }
 
   // Starts the compartment image `image` (`who` for the console): reads its
-  // manifest, grants it, funds it with the VM it asks for plus `extra_vm`,
+  // manifest, funds it with the VM it asks for plus `extra_vm`, grants it,
   // creates and loads it -- through `loader`, or directly while there is none
   // (`direct`). An image that is not one, whose manifest is malformed, or
   // that requires what `init` cannot give is not started.
@@ -461,16 +511,19 @@ struct Launcher {
       warn(who, "not a compartment image, or its manifest is malformed");
       return r;
     }
-    if (!grant(who, m)) {
-      warn(who, "not started");
-      return r;
-    }
+    // The VM quota comes first: it is what a QUOTA_VM entry is given.
     const size_t vm_bytes =
         (m.vm_bytes != 0 ? static_cast<size_t>(m.vm_bytes) : 64 * 1024) +
         extra_vm;
     r.quota = vm_quota(vm_bytes);
     if (!capability_is_valid(r.quota)) {
       warn(who, "no VM quota for it");
+      return r;
+    }
+    if (!grant(who, m, r.quota)) {
+      warn(who, "not started");
+      drop_vm_quota(r.quota);
+      r.quota = nullptr;
       return r;
     }
     const Capability seeds =
@@ -569,11 +622,12 @@ extern "C" int64_t compartment_main(Capability arg) {
   Launcher& L = s_launcher;
 
   L.rw = rw;
-  L.mem_quota = rw[compartment::SLOT_VM_QUOTA];
+  L.mem_quota = rw[init::RW_SLOT_VM_QUOTA];
   L.self_comp = rw[compartment::SLOT_SELF];
   L.thread_quota = rw[init::RW_SLOT_THREAD_QUOTA];
   L.invoke = rw[init::syscall_slot(syscall::Id::compartment_invoke)];
   L.gate_q_derive = rw[init::syscall_slot(syscall::Id::quota_vm_derive)];
+  L.gate_q_destroy = rw[init::syscall_slot(syscall::Id::quota_vm_destroy)];
   L.gate_tq_derive = rw[init::syscall_slot(syscall::Id::quota_thread_mem_derive)];
   L.gate_vm_alloc = rw[init::syscall_slot(syscall::Id::vm_allocate)];
   L.gate_vm_dealloc = rw[init::syscall_slot(syscall::Id::vm_deallocate)];
@@ -817,37 +871,49 @@ extern "C" int64_t compartment_main(Capability arg) {
   L.root_sched = sched_if.root_quota;
   L.offer("sched", sched.sentry);
   Capability sched_run = sched_if.run;
-  const Capability sched_quota_derive = lookup("sched.quota_derive");
+  L.sched_derive = lookup("sched.quota_derive");
   const Capability sched_thread_register = lookup("sched.thread_register");
   if (!capability_is_valid(L.root_sched) || !capability_is_valid(sched_run)) {
     say("[init]     WARNING: sched handshake returned no root quota / run "
         "entry\n");
   }
-  if (!capability_is_valid(sched_quota_derive) ||
+  if (!capability_is_valid(L.sched_derive) ||
       !capability_is_valid(sched_thread_register)) {
     say("[init]     WARNING: sched.* entry points not found in naming\n");
   }
 
-  // Scheduler nodes are paid for by their creator: this quota funds the node
-  // `init` derives for the shell below.
-  const Capability sched_node_funding = L.vm_quota(64 * 1024);
+  // Scheduler nodes are paid for by their creator: this quota funds the
+  // nodes `init` derives for QUOTA_SCHED entries (the shell's, step 8).
+  L.sched_node_funding = L.vm_quota(64 * 1024);
 
   // Now that there is a scheduler, `blk` can sleep in it instead of polling.
   // Without it the disk still works, polled.
   if (blk_if.status == init::BLK_OK) {
     const Capability s_block = lookup("sched.block");
     const Capability s_wake = lookup("sched.wake");
-    const Capability s_self = lookup("sched.self");
     int64_t st = init::BLK_BAD_REQUEST;
     if (sealing::is_sealed_as(OType::EntryPoint, s_block) &&
-        sealing::is_sealed_as(OType::EntryPoint, s_wake) &&
-        sealing::is_sealed_as(OType::EntryPoint, s_self)) {
+        sealing::is_sealed_as(OType::EntryPoint, s_wake)) {
       st = ::signetos::user::invoke<int64_t>(invoke, blk.sentry, s_block,
-                                             s_wake, s_self);
+                                             s_wake);
     }
     if (st != init::BLK_OK) {
       say("[init]     WARNING: blk has no scheduler entries; the block device "
           "will poll\n");
+    }
+  }
+
+  // `fs` waits for its lock in the scheduler from now on (fs.cpp, ONE CALLER
+  // AT A TIME); until now `init` was its only caller. This is the one call
+  // `fs` takes the lock's entries from, so it is made even if they are
+  // missing: nobody else can make it later.
+  if (capability_is_valid(fs.sentry)) {
+    const int64_t st = ::signetos::user::invoke<int64_t>(
+        invoke, fs.sentry, lookup("sched.lock_wait"),
+        lookup("sched.lock_wake"));
+    if (st != init::FS_OK) {
+      say("[init]     WARNING: fs has no scheduler lock entries; a second "
+          "caller will get FS_BUSY\n");
     }
   }
 
@@ -899,13 +965,16 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 8. `shell`
   // =========================================================================
-  // The shell's manifest asks for the thread memory its workers run on, its
-  // place on the disk -- `/home` as an ADMIN node with everything the
-  // system's images leave free, `/bin` as a budget-less read-only view of the
-  // programs (abi.hpp, "File system") -- and the system's root quotas: `init`
-  // exits in a moment and scrubs its own table (step 10), so the shell is
-  // their long-lived holder. All of it is granted by `Launcher::grant` as the
-  // image starts; what is left here is its thread.
+  // The shell's manifest asks for its own quotas -- the VM it lives on, the
+  // thread memory it and its workers run on, and its CPU bandwidth (half the
+  // machine, 50 ms per 100 ms, interactive, as an ADMIN node so it can
+  // sub-divide it for its own threads) -- its place on the disk -- `/home` as
+  // an ADMIN node with everything the system's images leave free, `/bin` as a
+  // budget-less read-only view of the programs (abi.hpp, "File system") --
+  // and the system's root quotas: `init` exits in a moment and scrubs its own
+  // table (step 10), so the shell is their long-lived holder. All of it is
+  // granted by `Launcher::grant` as the image starts; what is left here is
+  // its one-time setup and its thread.
   const Started shell = L.start_file("shell.bin");
   const uint64_t timebase_hz = board.timebase_hz;
   Capability hz_cap = capability_and_perms(
@@ -917,46 +986,22 @@ extern "C" int64_t compartment_main(Capability arg) {
     comp_invoke(shell.sentry, hz_cap);
   }
 
-  // The shell's CPU bandwidth: half the machine (50 ms per 100 ms period),
-  // interactive class, administrative handle so it can sub-divide it for its
-  // own threads.
-  Capability shell_sched_quota = nullptr;
-  if (capability_is_valid(sched_quota_derive) &&
-      capability_is_valid(L.root_sched)) {
-    init::SchedDeriveRequest dreq{};
-    dreq.parent = L.root_sched;
-    dreq.node_funding = sched_node_funding;
-    dreq.budget_us = 50'000;
-    dreq.period_us = 100'000;
-    dreq.deadline_us = 0;
-    dreq.policy_id = init::POLICY_SCHED_DEFAULT;
-    dreq.perms = kAdminPerms;
-    dreq.priority_class = init::PRIORITY_INTERACTIVE;
-    dreq.status = init::SCHED_BAD_REQUEST;
-    comp_invoke(sched_quota_derive, bounded(&dreq));
-    if (dreq.status == init::SCHED_OK) {
-      shell_sched_quota = dreq.out_quota;
-    } else {
-      L.say_dec(
-          "[init]     WARNING: sched.quota_derive(shell) failed, status -",
-          static_cast<uint64_t>(-dreq.status), "\n");
-    }
-  }
-
-  // The shell's initial thread starts with its `quota_sched` handle as the
-  // argument, and is handed to the scheduler, which runs it once `init` has
-  // exited and the kernel starts driving the dispatcher.
+  // The shell's initial thread: paid from the shell's own thread memory and
+  // registered under its own `quota_sched` node, both of them its grants
+  // above. It starts with no argument -- the call with the timebase was the
+  // one-time setup -- and the scheduler runs it once `init` has exited and
+  // the kernel starts driving the dispatcher.
   Capability shell_thread = nullptr;
   if (capability_is_valid(shell.sentry) &&
       capability_is_valid(L.shell_t_quota)) {
     shell_thread = thread_create(L.shell_t_quota, 16 * 1024, shell.sentry,
-                                 shell_sched_quota);
+                                 nullptr);
   }
   if (capability_is_valid(shell_thread) &&
       capability_is_valid(sched_thread_register) &&
-      capability_is_valid(shell_sched_quota)) {
+      capability_is_valid(L.shell_sched_quota)) {
     const int64_t tid = ::signetos::user::invoke<int64_t>(
-        invoke, sched_thread_register, shell_thread, shell_sched_quota);
+        invoke, sched_thread_register, shell_thread, L.shell_sched_quota);
     if (tid <= 0) {
       say("[init]     WARNING: sched.thread_register(shell) failed\n");
     }
@@ -1013,8 +1058,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[init::RW_SLOT_NAMING_PUBLISH] = naming_publish;
   rw[init::RW_SLOT_NAMING_LOOKUP] = naming_lookup;
   rw[init::RW_SLOT_NAMING_PROOF] = lookup("uart");
-  rw[init::RW_SLOT_SCHED_NODE_FUNDING] = sched_node_funding;
-  rw[init::RW_SLOT_SHELL_SCHED_QUOTA] = shell_sched_quota;
+  rw[init::RW_SLOT_SCHED_NODE_FUNDING] = L.sched_node_funding;
+  rw[init::RW_SLOT_SHELL_SCHED_QUOTA] = L.shell_sched_quota;
   rw[init::RW_SLOT_BLK_QUOTA] = blk.quota;
   rw[init::RW_SLOT_BLK_COMP] = blk.comp;
   rw[init::RW_SLOT_BLK_SENTRY] = blk.sentry;
@@ -1027,18 +1072,18 @@ extern "C" int64_t compartment_main(Capability arg) {
 
   // =========================================================================
   // 10. Scrub: nothing runs in `init` after this thread exits, so nothing
-  //     here may still be able to act. Every kernel gate, every IRQ and
-  //     exception authority and both root quotas are cleared from the table,
-  //     and the launcher's copies of everything it granted with them. What
-  //     stays is inert without a gate: the handles recorded in step 9 and
-  //     `RW_SLOT_SCHED_RUN`, which the kernel reads next. The locals this
-  //     thread still holds die with its stack.
+  //     here may still be able to act. Every seed the kernel gave it -- the
+  //     root VM quota, every kernel gate, every IRQ and exception authority,
+  //     the root thread-memory quota and the two sealing authorities -- is
+  //     cleared from the table, and the launcher's copies of everything it
+  //     granted with them. What stays is inert without a gate: the handles
+  //     recorded in step 9 and `RW_SLOT_SCHED_RUN`, which the kernel reads
+  //     next. The locals this thread still holds die with its stack.
   // =========================================================================
-  for (size_t s = init::RW_SLOT_SYSCALL_BASE; s < init::RW_SLOT_SCHED_RUN;
+  for (size_t s = compartment::RW_SLOT_SEED_BASE; s < init::RW_SLOT_SCHED_RUN;
        ++s) {
     rw[s] = nullptr;
   }
-  rw[compartment::SLOT_VM_QUOTA] = nullptr;
   zero_bytes(&s_launcher, sizeof(s_launcher));
   zero_bytes(&s_seeds[0], sizeof(s_seeds));
 

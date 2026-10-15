@@ -177,10 +177,13 @@ int sys_quota_thread_mem_destroy(
 // --- Compartments, entry points and types ----------------------------------
 
 // Creates a protection domain funded from `mem_quota` and seeds its capability
-// table from `initial_capabilities`. The array's bounds set both the count and
-// the table's size: up to 238 seeds fit the one-page minimum, a longer array
-// (pad it with nulls to reserve room) buys a table of as many pages as it
-// needs, up to `compartment::MAX_COMPARTMENT_PAGES`, from the same quota.
+// table from `initial_capabilities`: slot 0 is the new compartment's own
+// handle, and seed i lands in slot 1 + i, copied as it is (what each seed is
+// is between the creator and the image; `mem_quota` itself is not put in the
+// table unless it is passed as a seed). The array's bounds set both the count
+// and the table's size: up to 239 seeds fit the one-page minimum, a longer
+// array (pad it with nulls to reserve room) buys a table of as many pages as
+// it needs, up to `compartment::MAX_COMPARTMENT_PAGES`, from the same quota.
 capability_compartment_t sys_compartment_create(
     capability_quota_vm_t mem_quota,
     capability_data_t     initial_capabilities

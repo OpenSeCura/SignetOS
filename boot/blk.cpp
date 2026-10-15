@@ -62,15 +62,16 @@
  *   a sign that some caller is running deeper than the system allows for.
  *   Until the
  *   first interrupt has been seen -- or when the caller is not a scheduled
- *   thread, such as `init` mounting the disk -- the loop polls instead, so a
- *   missing interrupt route degrades to polling rather than a hang.
+ *   thread, such as `init` mounting the disk, which `block` turns away with
+ *   SCHED_INVALID_THREAD -- the loop polls instead, so a missing interrupt
+ *   route degrades to polling rather than a hang.
  *
  * BEFORE THERE IS A SCHEDULER
  *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
  *   serves, so at its handshake there is nothing to look up and no interrupt
  *   route. Every request polls until `init` has loaded the scheduler and
- *   hands over its entries (`block`, `wake`, `self`) in a second call, and
- *   until `trap_mgr` is up and the device's interrupt is routed here.
+ *   hands over its entries (`block`, `wake`) in a second call, and until
+ *   `trap_mgr` is up and the device's interrupt is routed here.
  */
 
 #include "runtime.hpp"
@@ -191,7 +192,6 @@ Capability s_gate_invoke = nullptr;
 Capability s_uart = nullptr;
 Capability s_sched_block = nullptr;
 Capability s_sched_wake = nullptr;
-Capability s_sched_self = nullptr;
 
 volatile uint32_t* s_regs = nullptr;  // the chosen slot's registers
 uint8_t* s_dma = nullptr;             // the arena, as the driver sees it
@@ -203,8 +203,8 @@ bool s_busy = false;
 bool s_first_call_done = false;
 uint16_t s_last_used = 0;             // used-ring entries consumed so far
 
-// The thread waiting for the in-flight request (0: nobody, or not a
-// scheduled thread), and how many interrupts have ever reached us.
+// The thread waiting for the in-flight request (0: nobody), and how many
+// interrupts have ever reached us.
 volatile uint64_t s_waiter_tid = 0;
 volatile uint32_t s_irq_count = 0;
 
@@ -350,17 +350,12 @@ bool init_device() {
   return true;
 }
 
-// The calling thread's tid, or 0 if it is not running under the scheduler.
-uint64_t self_tid() {
-  if (!capability_is_valid(s_sched_self)) {
-    return 0;
-  }
-  return invoke<uint64_t>(s_gate_invoke, s_sched_self);
-}
-
-// Sleeps until woken or WAIT_TIMEOUT_US, whichever is first.
-void block() {
-  invoke<int64_t>(s_gate_invoke, s_sched_block, WAIT_TIMEOUT_US);
+// Sleeps until woken or WAIT_TIMEOUT_US, whichever is first. False if the
+// scheduler does not run the calling thread (`init`, before the dispatcher
+// starts), which cannot sleep and polls instead.
+bool block() {
+  return invoke<int64_t>(s_gate_invoke, s_sched_block, WAIT_TIMEOUT_US) !=
+         init::SCHED_INVALID_THREAD;
 }
 
 // Submits one request and waits for it. `type` is BLK_T_IN or BLK_T_OUT; the
@@ -389,8 +384,7 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
   d[2].next = 0;
 
   // Whom to wake, recorded before the device can possibly complete.
-  const uint64_t tid = self_tid();
-  s_waiter_tid = tid;
+  s_waiter_tid = self_tid();
 
   volatile VirtqAvail* av = avail();
   const uint16_t idx = av->idx;
@@ -407,13 +401,14 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
   // device owns the request until then, and `s_busy`, `s_waiter_tid` and
   // `s_last_used` are only right again after it.
   volatile VirtqUsed* us = used();
+  bool scheduled = capability_is_valid(s_sched_block);
   for (;;) {
     fence();
     if (us->idx != s_last_used) {
       break;
     }
-    if (tid != 0 && s_irq_count > 0 && capability_is_valid(s_sched_block)) {
-      block();
+    if (scheduled && s_irq_count > 0) {
+      scheduled = block();
     } else {
       __asm__ volatile("" ::: "memory");
     }
@@ -497,7 +492,9 @@ extern "C" uint64_t blk_irq_entry(uint64_t source) {
   const uint64_t tid = s_waiter_tid;
   if (tid != 0 && capability_is_valid(s_sched_wake)) {
     const int64_t st = invoke<int64_t>(s_gate_invoke, s_sched_wake, tid);
-    if (st != init::SCHED_OK) {
+    // SCHED_INVALID_THREAD: a waiter the scheduler does not run (`init`),
+    // which polls. Anything else that is not SCHED_OK was lost.
+    if (st != init::SCHED_OK && st != init::SCHED_INVALID_THREAD) {
       s_wakes_lost = s_wakes_lost + 1;
     }
   }
@@ -517,25 +514,21 @@ extern "C" int64_t blk_write_entry(Capability buf, uint64_t sector,
 namespace {
 
 // A later call from `init` (abi.hpp): the scheduler's entries (`block`,
-// `wake`, `self`), now that there is a scheduler. Nothing else reaches our
-// sentry, so the entries are taken on the strength of their shape alone.
-int64_t bind_sched(Capability block_ep, Capability wake_ep,
-                   Capability self_ep) {
+// `wake`), now that there is a scheduler. Nothing else reaches our sentry, so
+// the entries are taken on the strength of their shape alone.
+int64_t bind_sched(Capability block_ep, Capability wake_ep) {
   if (!sealing::is_sealed_as(OType::EntryPoint, block_ep) ||
-      !sealing::is_sealed_as(OType::EntryPoint, wake_ep) ||
-      !sealing::is_sealed_as(OType::EntryPoint, self_ep)) {
+      !sealing::is_sealed_as(OType::EntryPoint, wake_ep)) {
     return init::BLK_BAD_REQUEST;
   }
   s_sched_block = block_ep;
   s_sched_wake = wake_ep;
-  s_sched_self = self_ep;
   return init::BLK_OK;
 }
 
 }  // namespace
 
-extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
-                                    Capability arg2) {
+extern "C" int64_t compartment_main(Capability arg0, Capability arg1) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
@@ -544,7 +537,7 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   // argument of `BlkInterface`'s size is `init` bringing us up. Any later
   // call can only be `init` handing over the scheduler's entries.
   if (s_first_call_done) {
-    return bind_sched(arg0, arg1, arg2);
+    return bind_sched(arg0, arg1);
   }
   s_first_call_done = true;
   if (!capability_is_valid(arg0) || sealing::is_sealed(arg0) ||

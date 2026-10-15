@@ -136,9 +136,14 @@
  *   but clearly such a limited number of files makes no sense.
  *
  * ONE CALLER AT A TIME
- *   A disk request parks the calling thread in `sched.block` (inside `blk`);
- *   a second thread arriving meanwhile gets FS_BUSY rather than a view of a
- *   half-updated table.
+ *   Every entry point holds `s_lock` (runtime.hpp, `lock`) while it uses the
+ *   tables. Its caller can be preempted, or parked in `sched.block` inside
+ *   `blk` while a disk request is in flight, half way through an update; a
+ *   second caller waits for the lock rather than see the half-updated tables,
+ *   and lends the holder its time meanwhile. `fs` is trusted to finish, so a
+ *   thread does not end while it holds the lock. `init` hands over the
+ *   scheduler's lock entries once there is a scheduler; until then it is the
+ *   only thread there is.
  */
 
 #include "runtime.hpp"
@@ -155,8 +160,10 @@ namespace {
 // of a `quota_disk` handle. They are optional because a machine without a
 // block device still boots -- the file system then reports itself unmounted.
 // No `naming` entry: `fs` hands its entry points back in the `FsInterface`
-// handshake and `init` publishes them.
+// handshake and `init` publishes them. Its VM quota is what its in-memory
+// tables and the root quota node are allocated from.
 #define FS_MANIFEST(X)                                \
+  M_QUOTA_VM(X, VM_QUOTA)                             \
   M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaDisk) \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)             \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)         \
@@ -303,8 +310,13 @@ uint32_t s_max_inodes = 0;
 uint64_t s_data_start = 0;
 
 bool s_mounted = false;
-bool s_busy = false;
 bool s_first_call_done = false;
+bool s_second_call_done = false;
+
+// ONE CALLER AT A TIME, above.
+uint64_t s_lock = 0;
+Capability s_lock_wait = nullptr;  // sched.lock_wait
+Capability s_lock_wake = nullptr;  // sched.lock_wake
 
 // --- Small helpers -------------------------------------------------------------------
 
@@ -359,18 +371,22 @@ bool buffer_ok(Capability buf, uint64_t need, uint64_t bytes) {
          capability_has_perms(buf, need) && room(buf) >= bytes;
 }
 
-// Marks the tables as mid-update on the current thread. `taken` is false if
-// another thread already holds them (it is parked in `blk`).
-struct BusyScope {
+// Holds `s_lock` while in scope (ONE CALLER AT A TIME). `taken` is false if
+// the scheduler would not let the caller wait, which only a misuse of the
+// lock causes.
+struct LockScope {
   bool taken;
-  BusyScope() : taken(!s_busy) {
-    if (taken) {
-      s_busy = true;
+  LockScope() {
+    const int64_t st = lock(s_gate_invoke, s_lock_wait, &s_lock);
+    if (st == init::SCHED_OWNER_DEAD) {
+      out("[fs]       WARNING: a thread ended holding the fs lock; the tables "
+          "may be half-updated\n");
     }
+    taken = st == init::SCHED_OK || st == init::SCHED_OWNER_DEAD;
   }
-  ~BusyScope() {
+  ~LockScope() {
     if (taken) {
-      s_busy = false;
+      unlock(s_gate_invoke, s_lock_wake, &s_lock);
     }
   }
 };
@@ -1215,8 +1231,8 @@ extern "C" int64_t fs_quota_derive_entry(Capability arg) {
     req->status = init::FS_NOT_MOUNTED;
     return req->status;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     req->status = init::FS_BUSY;
     return req->status;
   }
@@ -1322,8 +1338,8 @@ extern "C" int64_t fs_quota_destroy_entry(Capability quota) {
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::FS_BUSY;
   }
   const QuotaRef q = open_quota(quota);
@@ -1389,6 +1405,11 @@ extern "C" int64_t fs_quota_query_entry(Capability arg) {
     req->status = init::FS_NOT_MOUNTED;
     return req->status;
   }
+  LockScope locked;
+  if (!locked.taken) {
+    req->status = init::FS_BUSY;
+    return req->status;
+  }
   const QuotaRef q = open_quota(req->quota);
   if (q.node == nullptr) {
     req->status = init::FS_INVALID_QUOTA;
@@ -1409,8 +1430,8 @@ extern "C" Capability fs_create_entry(Capability quota, Capability path_cap,
   if (!s_mounted) {
     return init::status_cap(init::FS_NOT_MOUNTED);
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::status_cap(init::FS_BUSY);
   }
   const QuotaRef q = open_quota(quota);
@@ -1464,8 +1485,8 @@ extern "C" int64_t fs_mkdir_entry(Capability quota, Capability path_cap) {
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::FS_BUSY;
   }
   const QuotaRef q = open_quota(quota);
@@ -1505,8 +1526,8 @@ extern "C" Capability fs_open_entry(Capability quota, Capability path_cap,
   if (!s_mounted) {
     return init::status_cap(init::FS_NOT_MOUNTED);
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::status_cap(init::FS_BUSY);
   }
   const QuotaRef q = open_quota(quota);
@@ -1560,6 +1581,10 @@ extern "C" int64_t fs_close_entry(Capability file) {
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
+  LockScope locked;
+  if (!locked.taken) {
+    return init::FS_BUSY;
+  }
   OpenFile* f = open_file(file);
   if (f == nullptr) {
     return init::FS_INVALID_FILE;
@@ -1573,8 +1598,8 @@ extern "C" int64_t fs_read_entry(Capability file, Capability buf,
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::FS_BUSY;
   }
   OpenFile* f = open_file(file);
@@ -1623,8 +1648,8 @@ extern "C" int64_t fs_write_entry(Capability file, Capability buf,
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::FS_BUSY;
   }
   OpenFile* f = open_file(file);
@@ -1792,8 +1817,8 @@ extern "C" int64_t fs_unlink_entry(Capability quota, Capability path_cap) {
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
   }
-  BusyScope busy;
-  if (!busy.taken) {
+  LockScope locked;
+  if (!locked.taken) {
     return init::FS_BUSY;
   }
   const QuotaRef q = open_quota(quota);
@@ -1842,6 +1867,10 @@ extern "C" int64_t fs_list_entry(Capability quota, Capability path_cap,
   }
   if (!s_mounted) {
     return init::FS_NOT_MOUNTED;
+  }
+  LockScope locked;
+  if (!locked.taken) {
+    return init::FS_BUSY;
   }
   const QuotaRef q = open_quota(quota);
   if (q.node == nullptr) {
@@ -1901,14 +1930,25 @@ extern "C" int64_t fs_list_entry(Capability quota, Capability path_cap,
   return static_cast<int64_t>(count);
 }
 
-extern "C" int64_t compartment_main(Capability arg) {
+extern "C" int64_t compartment_main(Capability arg, Capability arg1) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
 
   // One-shot handshake: the first call with a writable argument of
-  // `FsInterface`'s size is `init` bringing us up. Anything later is a
-  // status enquiry.
+  // `FsInterface`'s size is `init` bringing us up. The second, also from
+  // `init`, hands over `sched.lock_wait` and `sched.lock_wake` once there is a
+  // scheduler (ONE CALLER AT A TIME). Anything later is a status enquiry.
+  if (s_first_call_done && !s_second_call_done) {
+    s_second_call_done = true;
+    if (!sealing::is_sealed_as(OType::EntryPoint, arg) ||
+        !sealing::is_sealed_as(OType::EntryPoint, arg1)) {
+      return init::FS_BAD_REQUEST;
+    }
+    s_lock_wait = arg;
+    s_lock_wake = arg1;
+    return init::FS_OK;
+  }
   if (s_first_call_done) {
     if (!s_mounted) {
       out("[fs]       not mounted\n");
@@ -1922,7 +1962,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_first_call_done = true;
 
   s_self_comp = rw[compartment::SLOT_SELF];
-  s_vm_quota = rw[compartment::SLOT_VM_QUOTA];
+  s_vm_quota = rw[SLOT_VM_QUOTA];
   s_seal_auth = rw[SLOT_SEAL_AUTH];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];

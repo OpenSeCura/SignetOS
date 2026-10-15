@@ -69,11 +69,13 @@ size_t s_online_harts = 0;
 
 // Per-hart state. "Which thread is running" and "where is the host frame" are
 // facts about a hart, not about the kernel, so each hart has its own block.
-// A hart finds its block by its number, which `init_hart` leaves in `utidc`
-// (CSR 0x480) as an untagged integer. `utidc` is readable without ASR, so a
-// compartment can learn its hart number too (`trap_mgr` does); nothing with
-// authority goes in it. Writing it takes ASR, which compartment code (CodeRx)
-// does not have, so no compartment can change the number this lookup uses.
+// A hart finds its block by its number, which the kernel keeps in `utidc`
+// (CSR 0x480) as an untagged integer, together with the id of the thread the
+// hart is running (platform.hpp, UTIDC_*). `utidc` is readable without ASR, so
+// a compartment can learn both too (`trap_mgr` reads the hart number, a lock
+// the thread id); nothing with authority goes in it. Writing it takes ASR,
+// which compartment code (CodeRx) does not have, so no compartment can change
+// the number this lookup uses, or pass itself off as another thread.
 // (`stdc`, 0x163, would carry a capability and is
 // S-mode only, but this QEMU traps on it.)
 struct alignas(16) Cpu {
@@ -87,7 +89,15 @@ Cpu s_cpus[MAX_HARTS];
 Cpu* cpu() {
   Capability id;
   __asm__ volatile("csrr %0, 0x480" : "=C"(id));  // 0x480 = utidc
-  return &s_cpus[capability_get_address(id)];
+  return &s_cpus[capability_get_address(id) & platform::UTIDC_HART_MASK];
+}
+
+// Records in `utidc` which hart this is and which thread it is running (0 for
+// none). An untagged value: numbers only, no authority.
+void set_utidc(uint64_t hart, uint64_t tid) {
+  const Capability id = reinterpret_cast<Capability>(
+      static_cast<uintptr_t>(hart | (tid << platform::UTIDC_TID_SHIFT)));
+  __asm__ volatile("csrw 0x480, %0" : : "C"(id));  // 0x480 = utidc
 }
 
 ThreadState* unseal_thread(Capability handle) {
@@ -145,10 +155,7 @@ void init_hart(uint64_t hartid) {
   Cpu* c = &s_cpus[hartid];
   *c = Cpu{};
   c->hart_id = hartid;
-  // An untagged value: the number only, no authority.
-  const Capability id =
-      reinterpret_cast<Capability>(static_cast<uintptr_t>(hartid));
-  __asm__ volatile("csrw 0x480, %0" : : "C"(id));  // 0x480 = utidc
+  set_utidc(hartid, 0);
   __atomic_fetch_add(&s_online_harts, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -512,6 +519,7 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
   }
 
   c->current = t;
+  set_utidc(c->hart_id, t->tid);
 
 #ifdef SIGNETOS_TRACE_SWITCH
   // Emitted only once the switch is committed, so a refused handle never
@@ -551,6 +559,7 @@ void exit(int exit_status) {
   t->exit_status = exit_status;
   t->flags = (t->flags & ~FLAG_RUNNING) | FLAG_EXITED;
   c->current = nullptr;
+  set_utidc(c->hart_id, 0);
 
   Capability host_sp = c->host_kernel_sp;
   c->host_kernel_sp = nullptr;

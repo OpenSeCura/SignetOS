@@ -247,10 +247,10 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
     }
   }
 
-  // Slots 0-1 hold `SLOT_SELF` and `SLOT_VM_QUOTA`; the seeds follow. The
-  // table is as many pages as that takes (one for up to `CAP_SLOTS` slots),
-  // and a seed array that would need more than `MAX_COMPARTMENT_PAGES` is
-  // refused, which also bounds how much a creator can ask the kernel to copy.
+  // Slot 0 holds `SLOT_SELF`; the seeds follow. The table is as many pages
+  // as that takes (one for up to `CAP_SLOTS` slots), and a seed array that
+  // would need more than `MAX_COMPARTMENT_PAGES` is refused, which also
+  // bounds how much a creator can ask the kernel to copy.
   const size_t pages = pages_for_slots(RW_SLOT_SEED_BASE + seed_count);
   if (pages > MAX_COMPARTMENT_PAGES) {
     return fail_with(out_status, Status::TooManyCapabilities);
@@ -315,10 +315,11 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   // the creator's thread stack -- arrives untagged, exactly as it would if the
   // compartment had tried to store it there itself. Code among the seeds
   // arrives untagged too: it never crosses a compartment boundary (DESIGN.md
-  // §2.5).
+  // §2.5). Beyond that the seeds are copied as they are: what each one is,
+  // and where it goes, is between the creator and the image, so `mem_quota`
+  // is in the table only if the creator passed it as a seed.
   Capability* slot = reinterpret_cast<Capability*>(user_view(table));
-  slot[SLOT_SELF] = handle;         // so code inside can name its own domain
-  slot[SLOT_VM_QUOTA] = mem_quota;  // its allocation authority
+  slot[SLOT_SELF] = handle;  // so code inside can name its own domain
 
   const Capability* seeds =
       reinterpret_cast<const Capability*>(initial_capabilities);

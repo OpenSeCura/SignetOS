@@ -53,6 +53,13 @@ namespace signetos::platform {
 // enabled in the DTB or lies at or above `MAX_HARTS`.
 constexpr size_t MAX_HARTS = 16;
 
+// `utidc` (CSR 0x480) holds the number of the hart reading it in its low bits
+// and the id of the thread that hart is running above them (0 when it is
+// running none). Only the kernel writes it; any code may read it.
+constexpr uint64_t UTIDC_HART_MASK = 0xff;
+constexpr uint64_t UTIDC_TID_SHIFT = 8;
+static_assert(MAX_HARTS <= UTIDC_HART_MASK + 1);
+
 // Ceiling on VirtIO MMIO transport slots user space tracks (`BlkInterface`).
 constexpr size_t MAX_VIRTIO_SLOTS = 8;
 

@@ -60,7 +60,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
-  Capability vm_quota = rw[compartment::SLOT_VM_QUOTA];
 
   Capability gate_create = rw[SLOT_SYS_COMP_CREATE];
   Capability gate_alloc = rw[SLOT_SYS_VM_ALLOC];
@@ -68,15 +67,16 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
 
-  if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
-      !sealing::is_sealed_as(OType::QuotaVm, vm_quota)) {
+  // No VM quota of its own: everything it creates is paid for by the quota in
+  // the request, never by the loader.
+  if (!sealing::is_sealed_as(OType::Compartment, self_comp)) {
     return -1;
   }
 
   // Bootstrap ping (`arg == nullptr`): verify capability table and log banner.
   if (!capability_is_valid(arg)) {
     print(gate_invoke, uart_sentry,
-          "[loader]   Compartment loader ready (quota_vm + create/alloc/sentry gates)\n");
+          "[loader]   Compartment loader ready (create/alloc/sentry gates)\n");
     return 0;
   }
 

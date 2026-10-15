@@ -91,13 +91,14 @@ constexpr size_t pages_for_slots(size_t slots) {
 constexpr size_t CAP_SLOTS     = slots_in_pages(COMPARTMENT_PAGES);
 constexpr size_t MAX_CAP_SLOTS = slots_in_pages(MAX_COMPARTMENT_PAGES);
 
-// Slots 0-1 are the compartment's identity and funding VM quota; slots 2 and
-// up receive the `initial_capabilities` array passed to
-// `sys_compartment_create` and serve as the compartment's own capability table
-// (`cgp` on entry).
+// Slot 0 is the compartment's identity, the one slot the kernel fills. Slots 1
+// and up receive the `initial_capabilities` array passed to
+// `sys_compartment_create`, copied in order and uninterpreted: what each seed
+// is -- which of its quotas a compartment holds, and where -- is agreed
+// between the creator and the image (user/manifest.hpp), not by the kernel.
+// The whole table is the compartment's own capability table (`cgp` on entry).
 constexpr size_t SLOT_SELF         = 0;  // this compartment's sealed handle
-constexpr size_t SLOT_VM_QUOTA     = 1;  // capability_quota_vm_t that funded it
-constexpr size_t RW_SLOT_SEED_BASE = 2;  // first seed slot in the table
+constexpr size_t RW_SLOT_SEED_BASE = 1;  // first seed slot in the table
 
 // Set while the compartment is in use, cleared by destroy. This is what refuses
 // a stale handle: a destroyed compartment's page is quarantined, not unmapped
@@ -215,15 +216,17 @@ static_assert(RANGE_PAGE_HEADER + RANGES_PER_PAGE * sizeof(Range) ==
 // Prepares the subsystem. Needs the sealing authority and vm up already.
 void init();
 
-// Charges one page to `mem_quota`, builds the struct and the table, and returns
-// the sealed handle.
+// Charges the pages to `mem_quota`, builds the struct and the table, and
+// returns the sealed handle.
 //
 // `initial_capabilities` is copied into the capability table starting at
-// `RW_SLOT_SEED_BASE` (slot 2, directly after `SLOT_SELF` and `SLOT_VM_QUOTA`).
-// Its length is taken from its own bounds, so there is no count argument. Pass
-// null for none.
+// `RW_SLOT_SEED_BASE` (slot 1, directly after `SLOT_SELF`), in order and
+// uninterpreted. Its length is taken from its own bounds, so there is no count
+// argument. Pass null for none.
 //
-// `mem_quota` needs Permit_Load. It is stored in slot 1 unchanged.
+// `mem_quota` needs Permit_Load. It pays for the pages and is kept for their
+// refund, but it is not put in the table: a creator that wants the
+// compartment to hold it passes it as a seed.
 Capability create(Capability mem_quota, Capability initial_capabilities,
                   Status* out_status = nullptr);
 

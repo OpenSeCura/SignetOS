@@ -112,30 +112,51 @@ struct alignas(16) TrapMgrInterface {
 // Scheduler service (`external/services/sched.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  sched.quota_derive(SchedDeriveRequest* req) -> SCHED_*
-//   int64_t  sched.quota_destroy(Capability quota) -> SCHED_*
+//   int64_t  sched.quota_destroy(Capability parent, Capability child) -> SCHED_*
+//   int64_t  sched.quota_query(Capability quota, SchedQueryRequest* req) -> SCHED_*
 //   int64_t  sched.thread_register(Capability thread, Capability quota) -> tid (>0) or SCHED_* (<0)
-//   int64_t  sched.policy_register(Capability root, Capability delegate) -> policy_id (>0) or SCHED_* (<0)
 //   int64_t  sched.yield() -> 0
 //   int64_t  sched.block(uint64_t timeout_us) -> SCHED_OK, SCHED_TIMED_OUT or SCHED_KILLED
 //   int64_t  sched.wake(uint64_t tid) -> SCHED_OK or SCHED_INVALID_THREAD
 //   int64_t  sched.thread_kill(Capability thread) -> SCHED_OK, SCHED_PERMISSION or SCHED_INVALID_THREAD
-//   uint64_t sched.self() -> tid (0 if unregistered)
+//   int64_t  sched.lock_wait(uint64_t* word, uint64_t seen) -> SCHED_OK, SCHED_OWNER_DEAD or SCHED_DEADLOCK
+//   int64_t  sched.lock_wake(uint64_t* word) -> SCHED_OK or SCHED_PERMISSION
+//
+// `block`, `lock_wait` and `lock_wake` return SCHED_INVALID_THREAD to a thread
+// the scheduler does not run (`init`, before the dispatcher starts). A thread
+// reads its own tid, which is what `wake` takes, from `utidc` (runtime.hpp,
+// `self_tid`).
 //
 // A killed thread never sleeps: every `block` it makes returns SCHED_KILLED
 // at once. A caller waiting for something certain to happen (a device
 // finishing a request it was given) keeps waiting, and so polls; one waiting
 // for something that may never happen (input, another thread) gives up.
+//
+// There is one kind of handle to a node, and whoever holds it has full use of
+// the node's time: registering threads on it, deriving from it, querying it.
+// A child may not be of a more urgent class than its parent, nor guaranteed
+// for longer. Taking a node's time back is not something its own handle can
+// do: `quota_destroy` needs the handle of the node it was derived from, and is
+// refused until the term it was derived with has ended (`term_us`). It removes
+// the node and everything derived under it, and every thread on them stops at
+// once. A stopped thread keeps its state and its registration; it carries on
+// when `thread_register` puts it on another node, and `thread_kill` puts it
+// on the killer's node so that it can run to its end.
+//
+// A lock is a 64-bit word in the memory of the compartment whose state it
+// protects: 0 when free, otherwise the owner's tid, with LOCK_WAITERS set once
+// someone waits for it (runtime.hpp, `lock` and `unlock`). A thread that finds
+// it taken sets LOCK_WAITERS and calls `lock_wait` with the value it saw; while
+// it waits, its node's turns run the owner instead. The owner, seeing
+// LOCK_WAITERS as it releases the lock, calls `lock_wake`, which writes the
+// next waiter's tid into the word and wakes it. If the owner ended holding the
+// lock, the next waiter gets it with SCHED_OWNER_DEAD. `word` is an unsealed
+// Load|Store capability to the 8-byte word.
 
 constexpr uint8_t PRIORITY_RT          = 0;
 constexpr uint8_t PRIORITY_INTERACTIVE = 1;
 constexpr uint8_t PRIORITY_NORMAL      = PRIORITY_INTERACTIVE;
 constexpr uint8_t PRIORITY_BATCH       = 2;
-
-constexpr uint32_t POLICY_SCHED_DEFAULT      = 0;   // resolves to ROUND_ROBIN
-constexpr uint32_t POLICY_SCHED_ROUND_ROBIN  = 1;
-constexpr uint32_t POLICY_SCHED_FIFO         = 2;
-constexpr uint32_t POLICY_SCHED_EDF          = 3;
-constexpr uint32_t POLICY_SCHED_FIRST_CUSTOM = 16;  // issued by sched.policy_register
 
 // The root node: the whole machine, C = T.
 constexpr uint32_t SCHED_ROOT_PERIOD_US = 1'000'000;
@@ -143,62 +164,58 @@ constexpr uint32_t SCHED_ROOT_PERIOD_US = 1'000'000;
 constexpr int64_t SCHED_OK             = 0;
 constexpr int64_t SCHED_BAD_REQUEST    = -1;
 constexpr int64_t SCHED_INVALID_QUOTA  = -2;
-constexpr int64_t SCHED_PERMISSION     = -3;  // handle lacks Store permission
+constexpr int64_t SCHED_PERMISSION     = -3;  // not allowed through these handles (above)
 constexpr int64_t SCHED_BANDWIDTH      = -4;  // temporal conservation violated
 constexpr int64_t SCHED_NO_MEMORY      = -5;  // node_funding could not pay
-constexpr int64_t SCHED_BUSY           = -6;  // node still has children/threads
+constexpr int64_t SCHED_BUSY           = -6;  // destroy: the node's term has not ended
 constexpr int64_t SCHED_FULL           = -7;
 constexpr int64_t SCHED_INVALID_THREAD = -8;
-constexpr int64_t SCHED_UNKNOWN_POLICY = -9;
 constexpr int64_t SCHED_TIMED_OUT      = -10;  // block: the timeout ran out first
 constexpr int64_t SCHED_KILLED         = -11;  // block: the caller was killed; it did not sleep
+constexpr int64_t SCHED_OWNER_DEAD     = -12;  // lock_wait: taken over from an owner that ended
+constexpr int64_t SCHED_DEADLOCK       = -13;  // lock_wait: the owner is waiting for the caller
 
-// sched.quota_derive: needs the ADMIN handle of `parent`.
+// SchedDeriveRequest::term_us: the deriver may take the node back at any
+// time; never; or, for any other value, once that many microseconds have
+// passed.
+constexpr uint64_t SCHED_REVOCABLE = 0;
+constexpr uint64_t SCHED_PERMANENT = ~0ULL;
+
+// A lock word: the owner's tid, and this bit once anyone waits for it.
+constexpr uint64_t LOCK_WAITERS = 1ULL << 63;
+
+// sched.quota_derive: `parent` is the handle of the node to derive from.
 struct alignas(16) SchedDeriveRequest {
   Capability parent;        // in
   Capability node_funding;  // in: QuotaVm that pays for the node's page
   Capability out_quota;     // out: handle of the new node
+  uint64_t term_us;         // in: SCHED_REVOCABLE, SCHED_PERMANENT or a term
   uint32_t budget_us;       // in: C
   uint32_t period_us;       // in: T (>= C)
-  uint32_t deadline_us;     // in: relative deadline D (0 = T)
-  uint32_t policy_id;       // in: POLICY_SCHED_*
-  uint32_t perms;           // in: perms::Store -> ADMIN handle, else OP handle
-  uint8_t priority_class;   // in: PRIORITY_*
-  uint8_t pad_[3];
+  uint8_t priority_class;   // in: PRIORITY_*, no more urgent than the parent's
+  uint8_t pad_[7];
+  int64_t status;           // out: SCHED_*
+};
+
+// sched.quota_query. `guaranteed_until_us` is when the node's term ends: 0
+// for a revocable node, SCHED_PERMANENT for a permanent one.
+struct alignas(16) SchedQueryRequest {
+  uint64_t guaranteed_until_us;  // out
+  uint32_t budget_us;       // out
+  uint32_t period_us;       // out
+  uint32_t threads;         // out: registered on it and on the nodes under it
+  uint32_t children;        // out: nodes derived directly from it
+  uint8_t priority_class;   // out
+  uint8_t pad_[7];
   int64_t status;           // out: SCHED_*
 };
 
 // Filled by `sched`'s `compartment_main` when invoked with a writable
 // capability to one of these (owned by `init`).
 struct alignas(16) SchedInterface {
-  Capability root_quota;    // out: ADMIN handle of the root node
+  Capability root_quota;    // out: handle of the root node
   Capability run;           // out: OType::EntryPoint -> dispatcher (RW_SLOT_SCHED_RUN)
   uint64_t timebase_hz;     // in: `time` CSR frequency in Hz (from DTB; 0 = default)
-  uint64_t pad_;
-};
-
-// Policy delegate contract.
-constexpr uint32_t POLICY_PICK           = 1;
-constexpr uint32_t POLICY_THREAD_ADDED   = 2;
-constexpr uint32_t POLICY_THREAD_REMOVED = 3;
-constexpr uint32_t POLICY_PERIOD_RESET   = 4;
-
-struct alignas(16) PolicyView {
-  uint64_t tid;
-  uint64_t runtime_us;      // total CPU time charged so far
-  uint64_t last_run_us;     // when it was last switched to
-  uint32_t deadline_us;     // the node's relative deadline
-  uint32_t runnable;
-};
-
-struct alignas(16) PolicyRequest {
-  uint32_t op;              // POLICY_*
-  uint32_t count;           // entries in `threads`
-  uint64_t now_us;
-  Capability threads;       // PICK: Load-only PolicyView[count]
-  uint64_t tid;             // THREAD_ADDED / THREAD_REMOVED
-  uint64_t pick;            // out (PICK)
-  uint64_t node_id;         // stable per node
   uint64_t pad_;
 };
 
@@ -208,7 +225,7 @@ struct alignas(16) PolicyRequest {
 //   int64_t  blk.read(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   int64_t  blk.write(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   uint64_t blk.irq(uint64_t source)
-//   int64_t  blk(Capability block, Capability wake, Capability self) [2nd call]
+//   int64_t  blk(Capability block, Capability wake) [2nd call]
 constexpr uint64_t BLK_SECTOR_BYTES   = 512;
 constexpr uint64_t BLK_MAX_XFER_BYTES = 4096;  // per request: the bounce buffer
 

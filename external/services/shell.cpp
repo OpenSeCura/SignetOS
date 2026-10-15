@@ -106,16 +106,21 @@ constexpr uint64_t FOREVER_US = ~0ULL;
 // kind of test some things for now
 
 // --- What the shell asks `init` for (user/manifest.hpp) -----------------------
-// Thread memory for its workers; the kernel entries a console that starts
-// threads and runs programs is made of; the services it talks to; its place
-// on the disk: `/home` as an ADMIN node with all the space and inodes the
-// system's own images leave free (DISK entries are met in order, so this one
-// takes everything before `/bin` asks for nothing), and `/bin` as a 0-byte
-// read-only view of the programs. The system's four root quotas come last,
-// optional: `init` exits and scrubs its own table, so the shell is their
-// long-lived holder, not their user.
+// Its own quotas: the VM it lives on, thread memory for its workers, and its
+// CPU bandwidth -- half the machine, as an ADMIN `quota_sched` node it
+// sub-divides for its workers and programs; the kernel entries a console that
+// starts threads and runs programs is made of; the services it talks to; its
+// place on the disk: `/home` as an ADMIN node with all the space and inodes
+// the system's own images leave free (DISK entries are met in order, so this
+// one takes everything before `/bin` asks for nothing), and `/bin` as a
+// 0-byte read-only view of the programs. The system's four root quotas come
+// last, optional: `init` exits and scrubs its own table, so the shell is
+// their long-lived holder, not their user.
 #define SHELL_MANIFEST(X)                                                      \
+  M_QUOTA_VM(X, VM_QUOTA)                                                      \
   M_QUOTA_THREAD(X, THREAD_QUOTA, 160 * 1024)                                  \
+  M_QUOTA_SCHED(X, SCHED_QUOTA, 50'000, 100'000,                               \
+                ::signetos::init::PRIORITY_INTERACTIVE)                        \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                                      \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)                                  \
   M_SYSCALL(X, SYS_QUOTA_VM_DERIVE, quota_vm_derive)                           \
@@ -211,10 +216,11 @@ Capability s_uart = nullptr;
 Capability s_uart_read = nullptr;
 Capability s_vm_quota = nullptr;
 Capability s_thread_quota = nullptr;
-Capability s_my_quota = nullptr;      // ADMIN quota_sched handle from `init`
+Capability s_my_quota = nullptr;      // SLOT_SCHED_QUOTA: this compartment's node
 Capability s_worker_entry = nullptr;  // OType::EntryPoint -> shell_worker_entry
 Capability s_sched_derive = nullptr;
 Capability s_sched_destroy = nullptr;
+Capability s_sched_query = nullptr;
 Capability s_sched_register = nullptr;
 Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
@@ -255,6 +261,22 @@ void yield() { invoke<int64_t>(s_gate_invoke, s_sched_yield); }
 // Sleeps until `shell_notify_entry` has run (or had already run since the
 // last time: the scheduler remembers a wake that arrives early).
 void block() { invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL); }
+
+// How many threads are registered on the scheduler node `node` and the nodes
+// under it, or a negative SCHED_* status.
+int64_t node_threads(Capability node) {
+  init::SchedQueryRequest req{};
+  req.status = init::SCHED_BAD_REQUEST;
+  invoke<int64_t>(s_gate_invoke, s_sched_query, node, bounded(&req));
+  return req.status == init::SCHED_OK ? static_cast<int64_t>(req.threads)
+                                      : req.status;
+}
+
+// Takes back `node`, a scheduler node derived from the shell's own. A thread
+// still on it stops.
+int64_t destroy_sched_node(Capability node) {
+  return invoke<int64_t>(s_gate_invoke, s_sched_destroy, s_my_quota, node);
+}
 
 // --- Files: clients of fs.* ----------------------------------------------------
 
@@ -527,8 +549,7 @@ size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
     dreq.node_funding = s_vm_quota;
     dreq.budget_us = cfg.budget_us[i];
     dreq.period_us = cfg.period_us;
-    dreq.policy_id = init::POLICY_SCHED_DEFAULT;
-    dreq.perms = perms::Load | perms::Store;
+    dreq.term_us = init::SCHED_REVOCABLE;
     dreq.priority_class = cfg.priority[i];
     dreq.status = init::SCHED_BAD_REQUEST;
     invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&dreq));
@@ -575,7 +596,7 @@ void stop_workers(WorkerSet& set) {
 }
 
 // Tears the nodes down. A worker that has bumped `done` may not have exited
-// yet, in which case destroy answers BUSY: yield and retry.
+// yet: yield until nothing is registered on its node, then destroy it.
 size_t destroy_workers(WorkerSet& set) {
   size_t destroyed = 0;
   for (size_t i = 0; i < set.count; ++i) {
@@ -583,17 +604,16 @@ size_t destroy_workers(WorkerSet& set) {
       continue;
     }
     for (int attempt = 0; attempt < DESTROY_RETRIES; ++attempt) {
-      const int64_t st =
-          invoke<int64_t>(s_gate_invoke, s_sched_destroy, set.quota[i]);
-      if (st == init::SCHED_OK) {
+      const int64_t threads = node_threads(set.quota[i]);
+      if (threads > 0) {
+        yield();
+        continue;
+      }
+      if (threads == 0 && destroy_sched_node(set.quota[i]) == init::SCHED_OK) {
         destroyed += 1;
         set.quota[i] = nullptr;
-        break;
       }
-      if (st != init::SCHED_BUSY) {
-        break;
-      }
-      yield();
+      break;
     }
   }
   set.started = 0;
@@ -840,20 +860,21 @@ void cmd_df() {
 //      handle on `/bin` -- into a page-granular, zeroed allocation of the
 //      shell's: the same shape as a packaged image, so `loader` can take it
 //      as one (see `DiskImages` in init.cpp, which does the same);
-//   2. read its manifest (user/manifest.hpp) and grant it, entry by entry,
-//      by the policy below -- this is the shell acting as a launcher, and
-//      the whole of what the program will be able to reach is decided here;
-//   3. a VM sub-quota of the shell's for the program to live on, as large as
-//      the manifest asks within APP_VM_MAX;
+//   2. read its manifest (user/manifest.hpp) and make the program its own
+//      quotas: a VM sub-quota of the shell's for it to live on, as large as
+//      the manifest asks within APP_VM_MAX, and a `quota_sched` node of the
+//      shell's for its thread (THE PROGRAM'S THREAD, below);
+//   3. grant the manifest, entry by entry, by the policy below -- this is the
+//      shell acting as a launcher, and the whole of what the program will be
+//      able to reach is decided here;
 //   4. `loader`: compartment, code, entry sentry -- seeded with `s_app_seeds`,
 //      entry i in slot RW_SLOT_SEED_BASE + i. There is no directory to ask: a
 //      program holds what its creator put in its table and nothing else;
 //   5. start its thread -- entry: the program's entry point, argument: an
-//      `AppRequest` carrying the arguments -- on a `quota_sched` node of its
-//      own, and sleep until the thread has ended; its status comes back in
-//      the block;
+//      `AppRequest` carrying the arguments -- on its node, and sleep until
+//      the thread has ended; its status comes back in the block;
 //   6. destroy the compartment, destroy the quota, release the buffer, and
-//      take back what step 2 granted: destroy the nodes (which removes the
+//      take back what step 3 granted: destroy the nodes (which removes the
 //      directories and everything the program put in them) and close the
 //      files.
 // Everything a program had is gone when `run` returns, and INIT.2 (the
@@ -884,6 +905,15 @@ void cmd_df() {
 //            handle with the permissions asked for -- read-only is what a
 //            program is usually handed -- and closed when it returns. A file
 //            the shell could not open is simply not granted.
+//   vm quota the VM sub-quota of step 2, the one it lives on (the ADMIN
+//            handle; the shell destroys it when the program returns).
+//   cpu      its `quota_sched` node of step 2, with the bandwidth its first
+//            QUOTA_SCHED entry asks for, up to APP_BUDGET_US per
+//            APP_PERIOD_US and never above the interactive class. The node
+//            is revocable: the shell takes it back through its own node
+//            whenever it likes, and anything derived under it goes too. The
+//            program cannot reach `sched.*` (above), so it can neither
+//            derive under the node nor register threads on it yet.
 //   anything else (devices, interrupts, exceptions, thread memory, root
 //            quotas, kinds this shell does not know) is refused.
 // A REQUIRED entry refused means the program is not started, and `run` says
@@ -903,15 +933,18 @@ constexpr uint32_t APP_DISK_MAX_INODES = 32;
 //   When the entry returns the thread ends, and
 //   so does a fault in the program: it ends the program's thread, never the
 //   shell's. The thread is paid from the shell's thread memory and scheduled
-//   under a `quota_sched` node of its own, APP_BUDGET_US per APP_PERIOD_US
-//   carved out of the shell's bandwidth: a program is preempted like any
+//   under a `quota_sched` node of its own, carved out of the shell's
+//   bandwidth -- what its manifest asks for, at most APP_BUDGET_US per
+//   APP_PERIOD_US (`derive_app_node`): a program is preempted like any
 //   other thread and cannot take more of the CPU than that. The shell sleeps
-//   meanwhile and knows the program is done when the node can be destroyed --
-//   `sched.quota_destroy` answers BUSY while a thread is still registered on
-//   it, and the scheduler unregisters a thread when it ends.
+//   meanwhile and knows the program is done when nothing is registered on
+//   the node any more (`sched.quota_query`): the scheduler unregisters a
+//   thread when it ends. Then it destroys the node.
 constexpr size_t APP_STACK = 16 * 1024;
 constexpr uint32_t APP_BUDGET_US = 20'000;
 constexpr uint32_t APP_PERIOD_US = 100'000;
+constexpr uint32_t APP_PERIOD_MIN_US = 1'000;      // the periods a manifest
+constexpr uint32_t APP_PERIOD_MAX_US = 1'000'000;  // may ask for
 constexpr uint64_t APP_POLL_US = 5'000;  // how often the shell looks again
 
 // In `.bss`, not on the stack: `sys_compartment_create` refuses a seed array
@@ -937,25 +970,46 @@ void sleep_us(uint64_t us) {
   invoke<int64_t>(s_gate_invoke, s_sched_block, us);
 }
 
-// A `quota_sched` node of the shell's for one program, or null.
-Capability derive_app_node() {
+// A `quota_sched` node of the shell's for one program, or null: what the
+// first QUOTA_SCHED entry of its manifest asks for, held to at most
+// APP_BUDGET_US per APP_PERIOD_US -- the same share of the CPU over any
+// period from APP_PERIOD_MIN_US to APP_PERIOD_MAX_US -- and never above the
+// interactive class; exactly that share, interactive, if it asks for none
+// (or for 0).
+Capability derive_app_node(const init::Manifest& m) {
+  uint32_t period = APP_PERIOD_US;
+  uint64_t budget = APP_BUDGET_US;
+  uint8_t priority = init::PRIORITY_INTERACTIVE;
+  for (uint32_t i = 0; i < m.count; ++i) {
+    const init::ManifestEntry& e = m.entries[i];
+    if (e.kind != init::MANIFEST_QUOTA_SCHED) {
+      continue;
+    }
+    if (e.count != 0) {
+      period = e.count < APP_PERIOD_MIN_US   ? APP_PERIOD_MIN_US
+               : e.count > APP_PERIOD_MAX_US ? APP_PERIOD_MAX_US
+                                             : e.count;
+    }
+    const uint64_t most =
+        static_cast<uint64_t>(APP_BUDGET_US) * period / APP_PERIOD_US;
+    budget = (e.amount == 0 || e.amount > most) ? most : e.amount;
+    if (e.param > priority) {  // a lower class; anything else stays interactive
+      priority = e.param > init::PRIORITY_BATCH
+                     ? init::PRIORITY_BATCH
+                     : static_cast<uint8_t>(e.param);
+    }
+    break;
+  }
   init::SchedDeriveRequest req{};
   req.parent = s_my_quota;
   req.node_funding = s_vm_quota;
-  req.budget_us = APP_BUDGET_US;
-  req.period_us = APP_PERIOD_US;
-  req.policy_id = init::POLICY_SCHED_DEFAULT;
-  req.perms = perms::Load | perms::Store;
-  req.priority_class = init::PRIORITY_INTERACTIVE;
+  req.budget_us = static_cast<uint32_t>(budget);
+  req.period_us = period;
+  req.term_us = init::SCHED_REVOCABLE;
+  req.priority_class = priority;
   req.status = init::SCHED_BAD_REQUEST;
   invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&req));
   return req.status == init::SCHED_OK ? req.out_quota : nullptr;
-}
-
-// sched.quota_destroy of `node`: SCHED_OK, or SCHED_BUSY while a thread is
-// still registered on it.
-int64_t destroy_sched_node(Capability node) {
-  return invoke<int64_t>(s_gate_invoke, s_sched_destroy, node);
 }
 
 // Starts the program's thread at `entry` with `s_app_req`, registered on
@@ -983,21 +1037,21 @@ bool start_app_thread(Capability entry, Capability node) {
   return true;
 }
 
-// Sleeps until the program's thread has ended -- its node destroys -- and
-// says whether it did. Anything but BUSY from destroy ends the wait.
+// Sleeps until the program's thread has ended -- nothing is registered on its
+// node any more -- then destroys the node, and says whether that all worked.
 bool wait_app_thread(Capability node) {
-  for (;;) {
+  int64_t threads = 0;
+  do {
     sleep_us(APP_POLL_US);
-    const int64_t st = destroy_sched_node(node);
-    if (st == init::SCHED_OK) {
-      return true;
-    }
-    if (st != init::SCHED_BUSY) {
-      out_dec("[shell]    run: WARNING: the program's scheduler node would "
-              "not go, status -", static_cast<uint64_t>(-st), "\n");
-      return false;
-    }
+    threads = node_threads(node);
+  } while (threads > 0);
+  const int64_t st = threads == 0 ? destroy_sched_node(node) : threads;
+  if (st != init::SCHED_OK) {
+    out_dec("[shell]    run: WARNING: the program's scheduler node would "
+            "not go, status -", static_cast<uint64_t>(-st), "\n");
+    return false;
   }
+  return true;
 }
 
 // Step 1: `name`, in `/bin`, read whole into a fresh page-granular, zeroed
@@ -1113,7 +1167,7 @@ bool mkdir_path(const char* path) {
   }
 }
 
-// Step 2, one DISK entry: the directory, and a node of the shell's rooted
+// Step 3, one DISK entry: the directory, and a node of the shell's rooted
 // there. The handle asked for goes to the seed, the ADMIN handle to
 // `s_app_nodes` for the way out.
 Capability grant_disk(const char* prog, const init::ManifestEntry& e,
@@ -1143,10 +1197,12 @@ Capability grant_disk(const char* prog, const init::ManifestEntry& e,
   return handle;
 }
 
-// Step 2: the manifest, entry by entry, into `s_app_seeds` by the policy
-// above. True if every REQUIRED entry was met; the first that was not is
-// named on the console. Prints the grants on one line either way.
-bool grant_manifest(const char* prog, const init::Manifest& m) {
+// Step 3: the manifest, entry by entry, into `s_app_seeds` by the policy
+// above, `quota` and `node` being the program's own quotas of step 2. True if
+// every REQUIRED entry was met; the first that was not is named on the
+// console. Prints the grants on one line either way.
+bool grant_manifest(const char* prog, const init::Manifest& m,
+                    Capability quota, Capability node) {
   bool ok = true;
   out("[shell]    ");
   out(prog);
@@ -1176,6 +1232,12 @@ bool grant_manifest(const char* prog, const init::Manifest& m) {
         } else {
           cap = nullptr;
         }
+        break;
+      case init::MANIFEST_QUOTA_VM:
+        cap = quota;
+        break;
+      case init::MANIFEST_QUOTA_SCHED:
+        cap = node;
         break;
       default:
         break;
@@ -1256,7 +1318,8 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
   Capability image = read_image("run", name);
   bool ok = capability_is_valid(image);
 
-  // 2. What it asks for, and what it gets.
+  // 2. What it asks for, and its own quotas: the VM it lives on and the node
+  //    its thread runs under (THE PROGRAM'S THREAD, above).
   init::Manifest manifest{};
   if (ok) {
     const init::CompartmentImageHeader* hdr = init::image_header(image);
@@ -1266,16 +1329,6 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
           "manifest)\n");
     }
   }
-  if (ok) {
-    ok = grant_manifest(name, manifest);
-    if (!ok) {
-      out("[shell]    run: ");
-      out(name);
-      out(" needs what this shell will not give; not started\n");
-    }
-  }
-
-  // 3. A quota of its own.
   Capability quota = nullptr;
   if (ok) {
     size_t vm_bytes = manifest.vm_bytes == 0
@@ -1288,6 +1341,24 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
     ok = sealing::is_sealed_as(OType::QuotaVm, quota);
     if (!ok) {
       out("[shell]    run: no VM quota left for a program\n");
+    }
+  }
+  Capability node = nullptr;
+  if (ok) {
+    node = derive_app_node(manifest);
+    ok = capability_is_valid(node);
+    if (!ok) {
+      out("[shell]    run: no CPU bandwidth left for a program\n");
+    }
+  }
+
+  // 3. What it gets.
+  if (ok) {
+    ok = grant_manifest(name, manifest, quota, node);
+    if (!ok) {
+      out("[shell]    run: ");
+      out(name);
+      out(" needs what this shell will not give; not started\n");
     }
   }
 
@@ -1303,14 +1374,6 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
 
   // 5. Run it, on a thread of its own (THE PROGRAM'S THREAD, above), and
   //    sleep until that thread has ended.
-  Capability node = nullptr;
-  if (ok) {
-    node = derive_app_node();
-    ok = capability_is_valid(node);
-    if (!ok) {
-      out("[shell]    run: no CPU bandwidth left for a program\n");
-    }
-  }
   if (ok) {
     size_t i = 0;
     for (; i + 1 < init::APP_ARGS_MAX && args[i] != '\0'; ++i) {
@@ -1915,7 +1978,7 @@ void cmd_killtest(const char* mode) {
   const Capability entry = mint(reinterpret_cast<const void*>(&killtest_thread));
   const Capability kill =
       lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
-  const Capability node = derive_app_node();
+  const Capability node = derive_app_node(init::Manifest{});  // the default share
   using FnThreadCreate = decltype(&sys_thread_create);
   const Capability t = syscall::call<FnThreadCreate>(
       s_gate_invoke, s_gate_thread_create, s_thread_quota, APP_STACK, entry,
@@ -1931,15 +1994,177 @@ void cmd_killtest(const char* mode) {
   const int64_t st = invoke<int64_t>(s_gate_invoke, kill, t);
   out_dec("[killtest] sched.thread_kill: status -", static_cast<uint64_t>(-st),
           "\n");
-  while (destroy_sched_node(node) == init::SCHED_BUSY) {
+  while (node_threads(node) > 0) {
     if (now_us() - t0 > 2'000'000) {
       out("[killtest] the thread is still there 2 s after the kill\n");
       return;
     }
     sleep_us(1'000);
   }
+  destroy_sched_node(node);
   out_dec("[killtest] the thread was gone ", (now_us() - t0) / 1000,
           " ms after the kill\n");
+}
+
+// revoketest: a check of the three kinds of `quota_sched` node, not part of
+// the shell. It derives three nodes from the shell's own -- revocable, fixed
+// term (REVOKE_TERM_US) and permanent -- and starts one thread on each, which
+// prints a line every REVOKE_PRINT_US. Then it tries to take each node back
+// with `sched.quota_destroy` every REVOKE_RETRY_US for REVOKE_TRY_US, and
+// says when it managed it. A node that is taken back stops its thread, so
+// that thread prints no more. The permanent node is never taken back, so its
+// thread keeps printing. Last, it kills all three threads with
+// `sched.thread_kill`. The permanent node outlives the test: nobody can take
+// it back, so every run keeps REVOKE_BUDGET_US per REVOKE_PERIOD_US of the
+// shell's bandwidth for good.
+constexpr uint32_t REVOKE_BUDGET_US = 2'000;
+constexpr uint32_t REVOKE_PERIOD_US = 100'000;
+constexpr uint64_t REVOKE_TERM_US = 400'000;
+constexpr uint64_t REVOKE_PRINT_US = 100'000;
+constexpr uint64_t REVOKE_RETRY_US = 50'000;
+constexpr uint64_t REVOKE_TRY_US = 1'000'000;
+
+struct alignas(16) RevokeThread {
+  const char* line;    // what the thread prints
+  uint64_t printed;    // how many times it has
+  uint64_t pad_;
+};
+
+alignas(16) RevokeThread s_revoke[3];
+
+uint64_t revoketest_thread(Capability arg) {
+  auto* r = reinterpret_cast<RevokeThread*>(arg);
+  for (;;) {
+    out(r->line);
+    __atomic_fetch_add(&r->printed, 1, __ATOMIC_SEQ_CST);
+    sleep_us(REVOKE_PRINT_US);
+  }
+}
+
+void cmd_revoketest() {
+  const char* names[3] = {"revocable", "fixed term", "permanent"};
+  const uint64_t terms[3] = {init::SCHED_REVOCABLE, REVOKE_TERM_US,
+                             init::SCHED_PERMANENT};
+  s_revoke[0].line = "[revoketest] this is thread 1 (revocable)\n";
+  s_revoke[1].line = "[revoketest] this is thread 2 (fixed term)\n";
+  s_revoke[2].line = "[revoketest] this is thread 3 (permanent)\n";
+
+  Capability* rw = rw_table();
+  const Capability kill =
+      lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
+  const Capability entry =
+      mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp,
+                 reinterpret_cast<const void*>(&revoketest_thread));
+  if (!capability_is_valid(kill) || !capability_is_valid(entry)) {
+    out("[revoketest] sched.thread_kill or the thread entry is missing\n");
+    return;
+  }
+  const int64_t threads_before = node_threads(s_my_quota);
+  const uint64_t t0 = now_us();
+
+  // One node and one thread of each kind.
+  Capability node[3] = {};
+  Capability thread[3] = {};
+  for (int i = 0; i < 3; ++i) {
+    init::SchedDeriveRequest req{};
+    req.parent = s_my_quota;
+    req.node_funding = s_vm_quota;
+    req.term_us = terms[i];
+    req.budget_us = REVOKE_BUDGET_US;
+    req.period_us = REVOKE_PERIOD_US;
+    req.priority_class = init::PRIORITY_INTERACTIVE;
+    req.status = init::SCHED_BAD_REQUEST;
+    invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&req));
+    if (req.status != init::SCHED_OK) {
+      out("[revoketest] could not derive the ");
+      out(names[i]);
+      out_dec(" node, status -", static_cast<uint64_t>(-req.status), "\n");
+      return;
+    }
+    node[i] = req.out_quota;
+    s_revoke[i].printed = 0;
+    using FnThreadCreate = decltype(&sys_thread_create);
+    thread[i] = syscall::call<FnThreadCreate>(
+        s_gate_invoke, s_gate_thread_create, s_thread_quota, WORKER_STACK,
+        entry, bounded(&s_revoke[i]));
+    if (!sealing::is_sealed_as(OType::Thread, thread[i]) ||
+        invoke<int64_t>(s_gate_invoke, s_sched_register, thread[i], node[i]) <=
+            0) {
+      out("[revoketest] could not start thread for the ");
+      out(names[i]);
+      out(" node\n");
+      return;
+    }
+  }
+  out_dec("[revoketest] started 3 threads; the fixed term is ",
+          REVOKE_TERM_US / 1000, " ms\n");
+
+  // Let them run, then try to take each node back until it goes or time is
+  // up.
+  sleep_us(2 * REVOKE_PRINT_US);
+  bool revoked[3] = {false, false, false};
+  uint64_t printed_then[3] = {0, 0, 0};
+  while (now_us() - t0 < REVOKE_TRY_US) {
+    for (int i = 0; i < 3; ++i) {
+      if (revoked[i]) {
+        continue;
+      }
+      const int64_t st = destroy_sched_node(node[i]);
+      if (st == init::SCHED_OK) {
+        revoked[i] = true;
+        printed_then[i] = s_revoke[i].printed;
+        out("[revoketest] took back the ");
+        out(names[i]);
+        out_dec(" node after ", (now_us() - t0) / 1000, " ms\n");
+      } else if (st != init::SCHED_BUSY) {
+        out("[revoketest] destroying the ");
+        out(names[i]);
+        out_dec(" node failed, status -", static_cast<uint64_t>(-st), "\n");
+        revoked[i] = true;  // do not try again
+      }
+    }
+    sleep_us(REVOKE_RETRY_US);
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (!revoked[i]) {
+      out("[revoketest] the ");
+      out(names[i]);
+      out_dec(" node was still refused after ", REVOKE_TRY_US / 1000,
+              " ms\n");
+    }
+  }
+
+  // A thread whose node was taken back has stopped: it prints no more.
+  const uint64_t printed_before_wait = s_revoke[2].printed;
+  sleep_us(3 * REVOKE_PRINT_US);
+  for (int i = 0; i < 2; ++i) {
+    if (revoked[i]) {
+      out_dec("[revoketest] thread ", i + 1, "");
+      out_dec(" printed ", s_revoke[i].printed - printed_then[i],
+              " times after its node was taken back\n");
+    }
+  }
+  out_dec("[revoketest] thread 3 printed ",
+          s_revoke[2].printed - printed_before_wait, " times meanwhile\n");
+
+  // Kill all three. A stopped thread is put on the shell's node to end.
+  const uint64_t t_kill = now_us();
+  for (int i = 0; i < 3; ++i) {
+    const int64_t st = invoke<int64_t>(s_gate_invoke, kill, thread[i]);
+    if (st != init::SCHED_OK) {
+      out_dec("[revoketest] sched.thread_kill of thread ", i + 1, "");
+      out_dec(" failed, status -", static_cast<uint64_t>(-st), "\n");
+    }
+  }
+  while (node_threads(s_my_quota) != threads_before) {
+    if (now_us() - t_kill > 2'000'000) {
+      out("[revoketest] the threads are still there 2 s after the kill\n");
+      return;
+    }
+    sleep_us(1'000);
+  }
+  out_dec("[revoketest] all three threads were gone ",
+          (now_us() - t_kill) / 1000, " ms after the kill\n");
 }
 
 // Runs one command line (edited in place to split off arguments). False means
@@ -1976,6 +2201,8 @@ bool execute(char* line) {
     cmd_run(name, args, &status);
   } else if (str_eq(cmd, "killtest")) {
     cmd_killtest(rest);
+  } else if (str_eq(cmd, "revoketest")) {
+    cmd_revoketest();
   } else if (str_eq(cmd, "shutdown")) {
     return false;
   } else {
@@ -2079,13 +2306,13 @@ extern "C" int64_t shell_notify_entry() {
 }
 
 // TODO: This is hacky (multiplexing one-time init/banner vs scheduled thread
-// entry by checking if `arg` is sealed as QuotaSched). Let's make this be
-// nicer.
+// entry: `init` calls it once with the timebase, and starts the thread with
+// no argument). Let's make this be nicer.
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
-  Capability vm_quota = rw[compartment::SLOT_VM_QUOTA];
+  Capability vm_quota = rw[SLOT_VM_QUOTA];
 
   // The manifest's slots (SHELL_MANIFEST above): entry i is slot SEED_BASE + i.
   Capability thread_quota = rw[SLOT_THREAD_QUOTA];
@@ -2103,18 +2330,24 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_q_derive = rw[SLOT_SYS_QUOTA_VM_DERIVE];
   Capability gate_q_destroy = rw[SLOT_SYS_QUOTA_VM_DESTROY];
   Capability gate_comp_destroy = rw[SLOT_SYS_COMP_DESTROY];
+  // CPU bandwidth: the compartment's own node, which every worker's and
+  // program's node is derived under.
+  Capability sched_quota = rw[SLOT_SCHED_QUOTA];
 
   if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
       !sealing::is_sealed_as(OType::QuotaThreadMem, thread_quota) ||
+      !sealing::is_sealed_as(OType::QuotaSched, sched_quota) ||
       !sealing::is_sealed_as(OType::EntryPoint, uart_sentry) ||
       !sealing::is_sealed_as(OType::EntryPoint, naming_lookup) ||
       !sealing::is_sealed_as(OType::EntryPoint, loader_sentry)) {
     return -1;
   }
 
-  if (!sealing::is_sealed_as(OType::QuotaSched, arg)) {
-    if (capability_is_valid(arg)) {
+  // One-time setup: `init` calls in with the timebase before the shell's
+  // thread first runs.
+  if (capability_is_valid(arg)) {
+    if (capability_get_length(arg) >= sizeof(uint64_t)) {
       const uint64_t hz = *reinterpret_cast<const uint64_t*>(arg);
       if (hz >= 1'000'000) {
         s_ticks_per_us = hz / 1'000'000;
@@ -2131,24 +2364,25 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_uart_read = uart_read;
   s_vm_quota = vm_quota;
   s_thread_quota = thread_quota;
-  s_my_quota = arg;
+  s_my_quota = sched_quota;
 
   s_sched_derive =
       lookup_name(gate_invoke, naming_lookup, "sched.quota_derive");
   s_sched_destroy =
       lookup_name(gate_invoke, naming_lookup, "sched.quota_destroy");
+  s_sched_query = lookup_name(gate_invoke, naming_lookup, "sched.quota_query");
   s_sched_register =
       lookup_name(gate_invoke, naming_lookup, "sched.thread_register");
   s_sched_yield = lookup_name(gate_invoke, naming_lookup, "sched.yield");
   s_sched_block = lookup_name(gate_invoke, naming_lookup, "sched.block");
   s_sched_wake = lookup_name(gate_invoke, naming_lookup, "sched.wake");
-  Capability sched_self = lookup_name(gate_invoke, naming_lookup, "sched.self");
   if (!capability_is_valid(s_sched_derive) ||
       !capability_is_valid(s_sched_destroy) ||
+      !capability_is_valid(s_sched_query) ||
       !capability_is_valid(s_sched_register) ||
       !capability_is_valid(s_sched_yield) ||
       !capability_is_valid(s_sched_block) ||
-      !capability_is_valid(s_sched_wake) || !capability_is_valid(sched_self)) {
+      !capability_is_valid(s_sched_wake)) {
     out("[shell]    sched.* lookup FAILED\n");
     return -1;
   }
@@ -2200,6 +2434,7 @@ extern "C" int64_t compartment_main(Capability arg) {
                 capability_is_valid(s_sched_derive) &&
                 capability_is_valid(s_sched_register) &&
                 capability_is_valid(s_sched_destroy) &&
+                capability_is_valid(s_sched_query) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_vm_alloc) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_vm_dealloc) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_q_derive) &&
@@ -2232,18 +2467,18 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // The two halves of going to sleep on the keyboard: what `uart` invokes when
-  // a key is pressed, and which thread that should wake. Without either the
-  // console would sleep for good, so it polls instead (`read_input` passes
-  // whatever `s_notify_entry` is, and `uart` ignores a non-entry).
-  const uint64_t my_tid = invoke<uint64_t>(gate_invoke, sched_self);
+  // a key is pressed, and which thread that should wake (this one, by the tid
+  // the kernel keeps in `utidc`). Without the entry the console would sleep
+  // for good, so it polls instead (`read_input` passes whatever
+  // `s_notify_entry` is, and `uart` ignores a non-entry).
   Capability notify = mint_entry(gate_invoke, gate_sentry, self_comp,
                                  reinterpret_cast<const void*>(&shell_notify_entry));
-  if (my_tid != 0 && sealing::is_sealed_as(OType::EntryPoint, notify)) {
-    s_my_tid = my_tid;
+  if (sealing::is_sealed_as(OType::EntryPoint, notify)) {
+    s_my_tid = self_tid();
     s_notify_entry = notify;
   } else {
-    out("[shell]    WARNING: sched.self / notify entry FAILED; console input "
-        "will be polled\n");
+    out("[shell]    WARNING: notify entry FAILED; console input will be "
+        "polled\n");
     s_sched_block = s_sched_yield;
   }
 

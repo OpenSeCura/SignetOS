@@ -106,9 +106,8 @@ The present build makes these simplifications, each expanded below:
 
 * **One hart does all the work.** Secondary harts are brought up and then
   park (§4.4).
-* **The scheduler is strict-priority round-robin** with per-node budgets and
-  lazy replenishment. It has no policy delegates, locks or bandwidth
-  inheritance (§2.6).
+* **The scheduler is currently round-robin** with per-node budgets,
+  lazy replenishment and budgets enforced at the kernel's 10 ms tick (§2.6).
 * **Revocation sweeps run only under memory pressure.** Freed memory is
   quarantined and stays mapped until a sweep (§4.2).
 * **An unbound synchronous fault halts the whole machine** (§3.6).
@@ -232,9 +231,16 @@ same memory. The UID conveys no authority.
 | Slot | Contents |
 | --- | --- |
 | 0 | The compartment's own handle. |
-| 1 | The funding `QuotaVm` handle. |
-| seeds | The `initial_capabilities` array, in order, exactly as the creator supplied it. By convention seed *i* is manifest entry *i* (§2.8). |
+| seeds (from 1) | The `initial_capabilities` array, in order, exactly as the creator supplied it. By convention seed *i* is manifest entry *i* (§2.8). |
 | after the seeds | Free for the compartment's own use. |
+
+Slot 0 is the only slot the kernel fills. It copies the seeds without giving
+them any meaning: which quotas a compartment holds, and where, is agreed
+between its creator and its image (§2.8). The funding quota pays for the
+table but is not put in it. A compartment that allocates asks for its VM
+quota in its manifest (`QUOTA_VM`), as it asks for thread memory
+(`QUOTA_THREAD`) and CPU bandwidth (`QUOTA_SCHED`), and its creator derives
+each one from its own.
 
 The whole table is one writable region reached through `cgp`. Slot 0 is not
 write-protected yet.
@@ -248,7 +254,7 @@ chains only grow while the compartment lives.
 
 #### Lifecycle
 
-* `sys_compartment_create(quota, seeds)` fills slot 0, slot 1 and the seeds,
+* `sys_compartment_create(quota, seeds)` fills slot 0 and the seeds,
   assigns the UID and bills the pages to `quota`.
 * `sys_compartment_destroy(comp)` marks the compartment as no longer live
   (its handle stops working at once), then:
@@ -276,7 +282,9 @@ records (§2.7).
 A thread is an execution context: registers, PC and stack. Threads do not
 belong to compartments. They are funded from a `QuotaThreadMem`, scheduled by
 the user-space scheduler under a `quota_sched` node, and migrate freely
-between compartments.
+between compartments. The quotas themselves belong to compartments, held in
+their capability tables (§2.2): a thread is paid from, and registered under,
+the quotas its creator passes when it makes and registers it.
 
 | Element | Description |
 | --- | --- |
@@ -284,10 +292,10 @@ between compartments.
 | Thread stack | Allocated from the same quota and made local (§2.1). When the thread migrates, the switcher narrows the stack so the callee sees only the unused part below the current stack pointer. |
 | TLS | Not implemented yet.|
 | Billing | State and stack are debited from the `QuotaThreadMem` and refunded at teardown. |
-| Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. |
-| Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the child quota is destroyed, its bandwidth returns to the parent node. |
+| Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. A thread can read its own tid from `utidc` (CSR 0x480) without a call: the kernel writes the hart number and the running thread's tid there on every switch, and only the kernel can write it (`runtime.hpp`, `self_tid`). |
+| Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the parent destroys the child quota, its bandwidth returns to the parent node and the threads on it stop until they are registered elsewhere (§2.4, §2.6). |
 | Exit | `sys_thread_exit` quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
-| Kill | `sys_thread_kill`. A thread that never ran is torn down at once. Otherwise it is marked, and the kernel acts on the mark each time it resumes compartment code on it (return from a call, end of a trap) (`unwind.hpp`, KILLED THREADS). See the table below. `sched.thread_kill` wakes the thread and keeps it from sleeping again, so a kill takes effect within a tick of its CPU time. |
+| Kill | `sys_thread_kill`. A thread that never ran is torn down at once. Otherwise it is marked, and the kernel acts on the mark each time it resumes compartment code on it (return from a call, end of a trap) (`unwind.hpp`, KILLED THREADS). See the table below. `sched.thread_kill` wakes the thread and keeps it from sleeping again, so a kill takes effect within a tick of its CPU time. A stopped thread (§2.6) is put on the killer's node first, so the killer pays for it to run to its end. |
 
 Code about to resume on a killed thread (trap handlers included):
 
@@ -316,7 +324,9 @@ or disk space etc.
    manager can open it.
 3. **Load / Store.** `Permit_Load` grants operational authority (allocate,
    consume, schedule against it); `Permit_Store` grants administrative
-   authority (derive children, destroy).
+   authority (derive children, destroy). `quota_sched` is the exception: it
+   has one kind of handle, and destroying a node takes its parent's
+   (`quota_sched` node, below).
 4. **Immutable partitions.** Budgets are fixed at derivation. There is no
    resize and no renegotiation (§3.5).
 5. **No reparenting.** Destroying a node never moves its children to another
@@ -326,11 +336,10 @@ or disk space etc.
    parent at once, a closed node keeps only what is outstanding and passes
    every later refund straight to its first live ancestor, and it is freed
    when nothing is outstanding, because memory can only come back through
-   the revoker. `sched` is to
-   **cascade**: destroying a node kills the threads registered under it and
-   its subtree, because bandwidth is a promise the parent needs back at once
-   and stopping a thread is free. (Not yet implemented: today `sched` refuses
-   while threads or children remain.)
+   the revoker. `sched` **cascades**: destroying a node frees it and its
+   subtree at once and their bandwidth goes back to the parent, because
+   bandwidth is a promise the parent needs back at once. The threads on them
+   stop, which is free (§2.6).
 
 #### The kernel's quota tree
 
@@ -383,9 +392,26 @@ away: the quota closes and is freed once the manager releases its pages.
 ##### `quota_sched` node
 
 A node holds a budget and period (C/T), the bandwidth delegated to its
-children, a priority class, an optional deadline, a policy, the remaining
-budget for the current period, and the count of registered threads. The root
-covers 100 % of CPU bandwidth and is funded from the scheduler's own quota.
+children, a priority class, the budget left for the current period (or the
+overrun it still owes, §2.6), and until when its parent may not take it back.
+The root covers 100 % of CPU bandwidth, is in the `RT` class and is
+permanent. It is funded from the scheduler's own quota.
+
+There is one kind of handle to a node, and whoever holds it can register
+threads on it, derive children from it and query it. A child is never in a
+more urgent class than its parent. Taking a node's time back needs its
+parent's handle (`sched.quota_destroy(parent, child)`), so a holder can never
+revoke its own node or anything above it. When it derives a child, the deriver
+chooses how long the child is guaranteed:
+
+| Kind | Can be destroyed | Use it when |
+| --- | --- | --- |
+| Revocable | at any time | The deriver needs control and the work can wait: untrusted programs, background work, its own workers. |
+| Fixed term | once the term has ended | Both sides need protection for a while: a bounded job that must not be starved. |
+| Permanent | never | Nobody should take it back, or nobody would be left to: `init`'s grants. |
+
+A child's guarantee never outlasts its parent's. Destroying a node removes it
+and everything derived under it, and the threads on them stop (§2.6).
 
 ##### `quota_disk` node
 
@@ -452,53 +478,83 @@ Everything the switcher does *with* an entry is described in §3.4.
 
 Scheduling lives entirely in user space (`external/services/sched.cpp`). The
 kernel keeps **no** scheduling state and never picks a thread. It provides
-exactly two things: `sys_thread_switch`, and a timer trap that the scheduler
-binds.
+`sys_thread_switch`, a timer trap that the scheduler binds, and a host loop
+that re-dispatches the scheduler's thread whenever a thread exits; the
+scheduler also uses `sys_thread_tid` and `sys_thread_kill`, and reads which
+thread is running from `utidc`.
 
 1. **Sealing authority.** The scheduler seals and opens `quota_sched`
    handles.
 2. **Hardware preemption.** The scheduler binds the timer interrupt with
-   `sys_trap_bind`. The kernel owns the tick period and re-arms the timer.
-3. **Run queues and bandwidth tracking in user memory**, debited with no
+   `sys_trap_bind`. The kernel owns the tick period (10 ms) and re-arms the
+   timer.
+3. **Thread tables and bandwidth tracking in user memory**, debited with no
    syscalls.
-4. **Verified policy delegates.** A sub-quota selects a vetted policy engine
-   (`EDF`, `FIFO`, `ROUND_ROBIN`) that orders threads within
-   its subtree.
-5. **Exhaustion and replenishment.** A thread that runs out of budget waits
-   for the next period without affecting its siblings.
+4. **Ordering.** Priority classes are strict. Within a class the node served
+   longest ago goes first, and within a node the thread chosen longest ago.
+5. **Exhaustion and replenishment.** A node gets its budget back every
+   period. It is charged at every tick and every switch, and a node with no
+   budget left is not picked, so it can overrun by up to a tick. The overrun
+   is carried into the next periods as a debt of at most a tick, so over time
+   a node gets its share even when its budget is small next to the tick.
+   A thread whose node is out of budget waits for the next period when it
+   yields, blocks or waits for a lock: when nothing else can run, the CPU
+   idles rather than hand out time nobody was promised. A thread that never
+   yields keeps the CPU while nothing else can run (the tick handler cannot
+   idle); that spare time, like idle time, is billed to nobody.
 6. **Dispatch** via `sys_thread_switch`, including from inside the tick
    handler. A preempted thread then parks in its trap handler until it is
-   picked again.
-7. **Allowance reclaim.** Destroying a sub-quota returns its bandwidth to the
-   parent.
-8. **Bandwidth inheritance.** A thread blocked on a lock held by a depleted
-   thread lends that thread its budget.
-9. **Contended synchronisation.** Uncontended locks are local atomics;
-   contention calls `sched_lock_wait`; waiters on a dead owner's lock wake
-   with `ERR_LOCK_OWNER_DEAD`.
+   picked again. The tick handler stands down while an entry point is
+   updating scheduler state on the interrupted thread, and when the
+   interrupted thread is not the one the scheduler last switched to.
+7. **Allowance reclaim.** Destroying a sub-quota returns its bandwidth, and
+   that of everything derived under it, to the parent at once. Its threads
+   **stop**: they keep their state and their registration but are never picked
+   for themselves, until their creator registers them on another node or
+   kills them. They are not moved to the parent's node, which would make the
+   whole subtree share the parent's own time.
+8. **Bandwidth inheritance.** A thread waiting for a lock is still offered to
+   `pick`, and when it is chosen the lock's owner runs in its place, charged
+   to the waiter's node and in the waiter's class, following owners that are
+   waiting in turn. That is how a stopped or depleted owner gets out of the
+   way.
+9. **Contended synchronisation.** A lock is a word in the memory of the
+   compartment whose state it protects, holding the owner's tid, which a
+   thread reads from `utidc` (the kernel keeps it up to date on every switch).
+   Taking and releasing a lock nobody waits for is one compare-and-swap each
+   (`runtime.hpp`, `lock` and `unlock`). Contention calls `sched.lock_wait`,
+   and releasing with waiters calls `sched.lock_wake`, which hands the lock
+   straight to the next waiter. If the owner ended holding the lock, the next
+   waiter gets it with `SCHED_OWNER_DEAD`. A wait that would close a loop is
+   refused with `SCHED_DEADLOCK`.
 
-**Current policy:** strict priority classes (`RT`, then `INTERACTIVE`, then
-`BATCH`), round-robin across nodes within a class, and a node is skipped once
-its budget for the current period is spent. Admission is checked at derive
-time. When nothing is runnable the scheduler spins instead of waiting for an
+**What this asks of compartments:** a thread can be stopped in the middle of a
+call into any compartment. A compartment that shares state between callers has
+to protect it with a scheduler lock, as `fs` does. One that protects it some
+other way can get stuck when a caller's node is destroyed.
+
+**Admission** is checked at derive time: what a node hands out to its
+children, each share normalised to its own period, never exceeds its own
+budget. When nothing can run the scheduler spins instead of waiting for an
 interrupt.
 
 **Not built yet:**
 
 * run queues: tables are static and every pick is a linear scan;
 * a replenishment queue: replenishment is computed lazily at pick time;
-* RR, FIFO and EDF exist as built-in intra-node orderings,
-  and custom policy registration cannot be reached yet;
-* bandwidth inheritance;
-* locks of any kind: blocking is `block` plus `wake(tid)`, and **anyone may
-  wake any tid**.
+* budget enforcement finer than the kernel's tick (item 5);
+* `wake(tid)` is unprotected: **anyone may wake any tid**;
+* a lock's waiters lend their time to whichever thread the lock word names,
+  and a compartment can write any tid there. It can only give its own time
+  away by it.
 
 **Run loop:** `init` hands the scheduler's `run` entry point back to the
 kernel. After `init` exits, the kernel creates a thread on that entry and
 **re-dispatches it every time the running thread exits**. That is how the
-scheduler learns about exits: it is resumed, scans its tables, and notices
-the dead thread. When no registered threads remain, the run loop returns and
-the kernel powers the machine off.
+scheduler learns about exits: it is resumed, asks the kernel which of its
+threads have ended (`sys_thread_tid` returns 0), and forgets them. When no
+registered threads remain, the run loop returns and the kernel powers the
+machine off.
 
 ### 2.7 Compartment-minted sealing types
 
@@ -593,11 +649,15 @@ header points to.
   * `MMIO`: a device window.
   * `DMA`: physically contiguous memory.
   * `IRQ` / `EXC`: trap authorities.
+  * `QUOTA_VM`: the VM quota the compartment is funded from.
   * `QUOTA_THREAD`: a thread-memory quota.
+  * `QUOTA_SCHED`: a `quota_sched` node (budget, period, class).
   * `ROOT`: one of the system's root quotas.
   * `OTYPE`: a hardware sealing authority (`OType::QuotaSched`, `OType::QuotaDisk`).
 
-  Only `init` can meet the hardware and root kinds.
+  Only `init` can meet the hardware and root kinds. The `QUOTA_*` kinds are
+  how a compartment comes to hold its own quotas: its launcher derives each
+  from its own.
 * `MANIFEST_REQUIRED` tells the launcher not to start the image without that
   entry. Any other unmet entry becomes a null slot, and by design the program
   cannot tell "refused" from "unavailable".
@@ -663,7 +723,7 @@ filesystem; which is which is a build detail.
 | 6 | `naming` | Once it is up, init publishes `uart`, `loader` and the `fs.*` entries. |
 | 7 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
 | 8 | `trap_mgr` | The PLIC window, the external-interrupt authority and the exception authorities it asks for. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
-| 9 | `shell` | Per its manifest: a thread-memory quota, `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, with the shell's ADMIN `quota_sched` (`INTERACTIVE`) as its argument, registered with the scheduler. |
+| 9 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
 | 10 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
 ### 3.2 Creating and loading a new compartment
@@ -709,17 +769,20 @@ Once loaded, a compartment is passive; a thread has to enter it.
 
 #### A. Starting an independent program (the shell's `run`)
 
-1. Derive a `quota_sched` for the program under the shell's own node.
+1. Derive a `quota_sched` for the program under the shell's own node, with
+   the bandwidth its manifest asks for (`QUOTA_SCHED`) within the shell's
+   cap.
 2. `sys_thread_create` on the program's entry, from the shell's thread-memory
    quota, which returns a suspended thread.
 3. Register the thread with the scheduler under the new quota.
 4. The scheduler dispatches the thread with `sys_thread_switch` when its
    class and budget allow.
 
-It does not get its own `quota_sched` right now: the shell keeps the
-ADMIN handle so it can tear the node down. A program therefore cannot yet
-sub-delegate bandwidth to threads of its own. Once TLS exists (§2.3), a thread
-would keep its quota there for that purpose.
+The node is revocable. If its manifest asks, the program holds the node in its
+own table too; the shell destroys it through its own node, which the program
+does not hold. The program cannot reach `sched.*` or create threads yet, so it
+cannot use the node to sub-delegate bandwidth to threads of its own. If it
+could, destroying the node would take those nodes with it.
 
 #### B. Using a compartment as a shared library
 
@@ -894,7 +957,7 @@ parent. The shell does this after a program's thread has exited:
 // shell `run`, after the program thread is gone
 sys_compartment_destroy(prog_comp);      // the program's thread has already exited
 fs.close / fs.unlink / fs.quota_destroy  // program's files and /home/<prog> node
-sched.quota_destroy(prog_sched);         // refused while threads are registered
+sched.quota_destroy(shell_sched, prog_sched);  // through the shell's own node
 sys_vm_deallocate(image & buffers);
 sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded remains
 ```
@@ -902,9 +965,9 @@ sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded
 | Step | Behaviour |
 | --- | --- |
 | Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
-| Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_destroy` until it succeeds, because the scheduler quota cannot go while the thread is registered. There is no join or timeout. A running program can be killed (§2.3). |
+| Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_query` until no thread is registered on the program's node: destroying the node earlier would stop the thread, not end it. There is no join or timeout. A running program can be killed (§2.3). |
 | `sys_quota_vm_destroy` | Closes the quota and its whole subtree and refunds every unused byte in it at once. Each node is freed, and the rest refunded, when everything it funded has been released. Fails only for a bad or already-closed handle or missing `Permit_Store`. |
-| `sched.quota_destroy` | Returns the bandwidth to the parent and releases the node page to its funding grant. Today refused while threads or child nodes remain; the intended policy is to cascade instead (§2.6). |
+| `sched.quota_destroy` | Called through the parent's handle. Frees the node and everything derived under it, returns their bandwidth to the parent and their pages to their funding grants. Threads still on them stop (§2.6). Refused only while a fixed term runs. |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
 | Funding order | None required. A VM quota that funds another manager's nodes may be destroyed before them: it closes, and is freed once the manager releases the node pages. Destroying a compartment never takes manager-held nodes with it. |
 
@@ -1000,7 +1063,7 @@ status.
 
 | Syscall | Behaviour |
 | --- | --- |
-| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. The bounds of the seed array set the seed count. |
+| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 1, uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. |
 | `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry). |
 | `Sentry sys_sentry(comp, code)` | §2.5. |
@@ -1060,15 +1123,16 @@ from page-granular `sys_vm_allocate` and static arrays.
 
 | Entry | Purpose |
 | --- | --- |
-| `sched.quota_derive` | Derive a child node (budget, period, class, policy, optional deadline) from a parent ADMIN handle. Admission-checked. Returns an ADMIN or an OP handle depending on the requested rights. |
-| `sched.quota_destroy` | Destroy a node through its ADMIN handle. Refused while it has children or registered threads; the intended policy is to cascade instead (§2.6). The shell uses this as a stand-in for join. |
-| `sched.thread_register` | Register a thread under a node. The thread is unregistered automatically when it exits. |
+| `sched.quota_derive` | Derive a child node (budget, period, class, term) from its parent's handle. Admission-checked. The class may not be more urgent than the parent's, nor the guarantee longer (§2.4). |
+| `sched.quota_destroy` | Destroy a child node through its parent's handle, with everything derived under it. Threads on them stop. Refused while a fixed term runs (§2.4, §2.6). |
+| `sched.quota_query` | Report a node's budget, period, class, guarantee and children, and the threads registered on it and below. The shell polls it to know a program's thread has gone. |
+| `sched.thread_register` | Register a thread under a node, or move a stopped thread onto one. The thread is unregistered automatically when it exits. |
 | `sched.yield` | Charge the running node and pick again. |
-| `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. It may return spuriously, so callers loop. |
+| `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. A woken thread runs when it is next picked, so not before its node has budget. It may return spuriously, so callers loop. The caller's tid, which `wake` takes, is in `utidc` (`runtime.hpp`, `self_tid`). |
 | `sched.wake` | Wake a tid. Safe to call from interrupt context. **Unprotected**: anyone holding the entry and a tid can wake that thread. |
-| `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping. Safe to call from interrupt context. |
-| `sched.self` | Return the caller's tid, for use with `wake`. |
-| `sched.policy_register` | Register a custom policy engine. Not reachable yet (§2.6). |
+| `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping. A stopped thread is put on the caller's node first, so this is called from thread context. |
+| `sched.lock_wait` | Wait for a lock whose word showed it taken, lending the owner this thread's time meanwhile (§2.6). |
+| `sched.lock_wake` | Release a lock that has waiters, handing it to the next of them. |
 | `run` | The scheduler's main loop. Not published; `init` hands it to the kernel (§2.6). |
 
 #### 5.7.3 Filesystem (`fs`)
@@ -1089,8 +1153,8 @@ The entries are handed to `init` in the handshake, because `fs` is up before
 
 Properties and gaps:
 
-* Only one operation runs at a time; concurrent callers get `FS_BUSY`, and a
-  few read-only entries are not yet guarded.
+* Only one operation runs at a time: every entry holds a scheduler lock
+  (§2.6), so a concurrent caller waits for it, lending the holder its time.
 * Paths are confined, with no `..`.
 * There is no rename, truncate, timestamps or permissions.
 * **An unrecognised disk is auto-formatted.**
@@ -1123,7 +1187,8 @@ manifest:
 * `SERVICE`: `uart` and the `fs.*` entries.
 * `DISK`: a capped sub-node under `/home/<prog>`.
 * `FILE`: files opened under `/home`.
-* A capped amount of memory.
+* A capped amount of memory, which `QUOTA_VM` hands to the program.
+* A capped `quota_sched` node for its thread, which `QUOTA_SCHED` hands to the program.
 * Everything else is refused.
 
 Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
@@ -1133,7 +1198,8 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 
 | Slots (`include/signetos/init.hpp`) | Contents |
 | --- | --- |
-| 0, 1 | `init`'s own handle; the root `QuotaVm` |
+| 0 | `init`'s own handle |
+| `RW_SLOT_VM_QUOTA` | The root `QuotaVm` |
 | `RW_SLOT_SYSCALL_BASE` … | One `EntryPoint` per syscall |
 | `RW_SLOT_IRQ_BASE` … | The interrupt `Trap` authorities |
 | `RW_SLOT_EXC_BASE` … | The exception `Trap` authorities |
@@ -1141,7 +1207,9 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
 
-`init`'s entry argument is the boot manifest.
+These are ordinary seeds: the layout is the kernel's choice as `init`'s
+creator, not something `sys_compartment_create` imposes. `init`'s entry
+argument is the boot manifest.
 
 ---
 
@@ -1220,5 +1288,7 @@ Properties under investigation:
   ("read `/etc/config`", "connect to `example.com:443`"), the launcher's
   policy (§6.1) would decide, and an auditor could read back exactly what
   was granted.
+* **Scheduler Hierarchy** Each scheduler node can choose a policy to manage 
+  its pool of threads.
 
 ---

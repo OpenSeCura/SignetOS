@@ -136,7 +136,9 @@ void init();
 
 // Per-hart initialisation: installs this hart's state block (which thread it
 // is running, where its host frame is), found through the hart number kept
-// in `utidc`. Every hart calls it once, on itself, before it runs any thread.
+// in `utidc`, which also holds the id of the thread the hart is running
+// (platform.hpp, UTIDC_*). Every hart calls it once, on itself, before it
+// runs any thread.
 // Harts are numbered from 0 and discovered from `/cpus/cpu@*` in the DTB.
 constexpr size_t MAX_HARTS = platform::MAX_HARTS;
 void init_hart(uint64_t hartid);

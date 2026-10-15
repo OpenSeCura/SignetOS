@@ -202,8 +202,12 @@ struct alignas(16) BootManifest {
 };
 
 // `init` compartment capability table layout: the seeds the kernel installs,
-// starting at `RW_SLOT_SEED_BASE`.
-constexpr size_t RW_SLOT_SYSCALL_BASE = compartment::RW_SLOT_SEED_BASE;
+// starting at `RW_SLOT_SEED_BASE`. `compartment::create` gives seeds no
+// meaning; this layout is the kernel's choice as `init`'s creator, the way a
+// manifest is an image's (user/manifest.hpp).
+constexpr size_t RW_SLOT_VM_QUOTA =
+    compartment::RW_SLOT_SEED_BASE;                  // root QuotaVm (funds init)
+constexpr size_t RW_SLOT_SYSCALL_BASE = RW_SLOT_VM_QUOTA + 1;
 constexpr size_t RW_SLOT_IRQ_BASE =
     RW_SLOT_SYSCALL_BASE + syscall::kSyscallCount;   // 16 IRQ authorities
 constexpr size_t RW_SLOT_EXC_BASE =

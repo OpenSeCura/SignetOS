@@ -86,6 +86,13 @@ constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
 //                 perms::Load [| perms::Store] (OP or ADMIN handle), name = the
 //                 directory, relative to wherever the launcher roots programs
 //   FILE          an open-file handle: name = path, perms = Load [| Store]
+//   QUOTA_VM      the QuotaVm the compartment is funded from (`vm_bytes`,
+//                 derived by the launcher from its own), as an ADMIN handle.
+//                 The kernel does not put it in the table: an image that
+//                 allocates asks for it here, like for any other quota
+//   QUOTA_SCHED   a `quota_sched` node derived under the launcher's own, for
+//                 as long as the launcher chooses: amount = budget C (us),
+//                 count = period T (us), param = priority class (PRIORITY_*)
 //   MMIO          name = a device window: "uart", "plic", "virtio"
 //   DMA           amount = bytes of physically contiguous memory
 //   IRQ, EXC      count = the interrupt number / exception code
@@ -104,6 +111,8 @@ constexpr uint32_t MANIFEST_EXC          = 8;
 constexpr uint32_t MANIFEST_QUOTA_THREAD = 9;
 constexpr uint32_t MANIFEST_ROOT         = 10;
 constexpr uint32_t MANIFEST_OTYPE        = 11;
+constexpr uint32_t MANIFEST_QUOTA_VM     = 12;
+constexpr uint32_t MANIFEST_QUOTA_SCHED  = 13;
 
 constexpr uint32_t MANIFEST_REQUIRED = 1;  // flags: do not start me without it
 
@@ -128,9 +137,11 @@ struct alignas(16) ManifestEntry {
   uint32_t kind;            // MANIFEST_*
   uint32_t flags;           // MANIFEST_REQUIRED, or 0
   uint32_t perms;           // DISK, FILE
-  uint32_t count;           // DISK: inodes; SYSCALL: id; IRQ/EXC: number; ROOT; OTYPE
-  uint64_t amount;          // DISK, DMA, QUOTA_THREAD: bytes
-  uint64_t reserved_;
+  uint32_t count;           // DISK: inodes; SYSCALL: id; IRQ/EXC: number; ROOT;
+                            // OTYPE; QUOTA_SCHED: period (us)
+  uint64_t amount;          // DISK, DMA, QUOTA_THREAD: bytes; QUOTA_SCHED:
+                            // budget (us)
+  uint64_t param;           // QUOTA_SCHED: priority class (PRIORITY_*)
   char name[FS_PATH_MAX];   // SERVICE, DISK, FILE, MMIO; NUL-terminated
 };
 static_assert(sizeof(ManifestEntry) == 128, "ManifestEntry is 128 bytes");
@@ -207,6 +218,8 @@ inline const char* manifest_kind_name(uint32_t kind) {
     case MANIFEST_IRQ: return "irq";
     case MANIFEST_EXC: return "exception";
     case MANIFEST_QUOTA_THREAD: return "thread memory";
+    case MANIFEST_QUOTA_VM: return "vm quota";
+    case MANIFEST_QUOTA_SCHED: return "cpu bandwidth";
     case MANIFEST_ROOT: return "root quota";
     case MANIFEST_OTYPE: return "otype";
     default: return "unknown";
@@ -234,45 +247,55 @@ inline const char* manifest_syscall_name(uint32_t id) {
 // or `flags` is given explicitly (DISK, FILE).
 #define M_SYSCALL(X, slot, id)                                               \
   X(slot, ::signetos::init::MANIFEST_SYSCALL, ::signetos::init::MANIFEST_REQUIRED, \
-    0, static_cast<uint32_t>(::signetos::syscall::Id::id), 0, "")
+    0, static_cast<uint32_t>(::signetos::syscall::Id::id), 0, 0, "")
 #define M_SERVICE(X, slot, name)                                             \
   X(slot, ::signetos::init::MANIFEST_SERVICE, ::signetos::init::MANIFEST_REQUIRED, \
-    0, 0, 0, name)
+    0, 0, 0, 0, name)
 #define M_SERVICE_OPT(X, slot, name)                                         \
-  X(slot, ::signetos::init::MANIFEST_SERVICE, 0, 0, 0, 0, name)
+  X(slot, ::signetos::init::MANIFEST_SERVICE, 0, 0, 0, 0, 0, name)
 #define M_DISK(X, slot, flags, perms, bytes, inodes, path)                   \
-  X(slot, ::signetos::init::MANIFEST_DISK, flags, perms, inodes, bytes, path)
+  X(slot, ::signetos::init::MANIFEST_DISK, flags, perms, inodes, bytes, 0, path)
 #define M_FILE(X, slot, flags, perms, path)                                  \
-  X(slot, ::signetos::init::MANIFEST_FILE, flags, perms, 0, 0, path)
+  X(slot, ::signetos::init::MANIFEST_FILE, flags, perms, 0, 0, 0, path)
 #define M_MMIO(X, slot, device)                                              \
   X(slot, ::signetos::init::MANIFEST_MMIO, ::signetos::init::MANIFEST_REQUIRED, \
-    0, 0, 0, device)
+    0, 0, 0, 0, device)
 #define M_MMIO_OPT(X, slot, device)                                          \
-  X(slot, ::signetos::init::MANIFEST_MMIO, 0, 0, 0, 0, device)
+  X(slot, ::signetos::init::MANIFEST_MMIO, 0, 0, 0, 0, 0, device)
 #define M_DMA_OPT(X, slot, bytes)                                            \
-  X(slot, ::signetos::init::MANIFEST_DMA, 0, 0, 0, bytes, "")
+  X(slot, ::signetos::init::MANIFEST_DMA, 0, 0, 0, bytes, 0, "")
 #define M_IRQ(X, slot, number)                                               \
   X(slot, ::signetos::init::MANIFEST_IRQ, ::signetos::init::MANIFEST_REQUIRED, \
-    0, number, 0, "")
+    0, number, 0, 0, "")
 #define M_EXC(X, slot, code)                                                 \
   X(slot, ::signetos::init::MANIFEST_EXC, ::signetos::init::MANIFEST_REQUIRED, \
-    0, code, 0, "")
+    0, code, 0, 0, "")
+#define M_QUOTA_VM(X, slot)                                                  \
+  X(slot, ::signetos::init::MANIFEST_QUOTA_VM,                               \
+    ::signetos::init::MANIFEST_REQUIRED, 0, 0, 0, 0, "")
 #define M_QUOTA_THREAD(X, slot, bytes)                                       \
   X(slot, ::signetos::init::MANIFEST_QUOTA_THREAD,                           \
-    ::signetos::init::MANIFEST_REQUIRED, 0, 0, bytes, "")
+    ::signetos::init::MANIFEST_REQUIRED, 0, 0, bytes, 0, "")
+#define M_QUOTA_SCHED(X, slot, budget_us, period_us, priority_class)         \
+  X(slot, ::signetos::init::MANIFEST_QUOTA_SCHED,                            \
+    ::signetos::init::MANIFEST_REQUIRED, 0, period_us, budget_us,            \
+    priority_class, "")
 #define M_ROOT_OPT(X, slot, which)                                           \
-  X(slot, ::signetos::init::MANIFEST_ROOT, 0, 0, which, 0, "")
+  X(slot, ::signetos::init::MANIFEST_ROOT, 0, 0, which, 0, 0, "")
 #define M_OTYPE(X, slot, otype)                                              \
   X(slot, ::signetos::init::MANIFEST_OTYPE, ::signetos::init::MANIFEST_REQUIRED, \
-    0, static_cast<uint32_t>(otype), 0, "")
+    0, static_cast<uint32_t>(otype), 0, 0, "")
 
-#define SIGNETOS_MANIFEST_INDEX_(slot, kind, flags, perms, count, amount, name) \
+#define SIGNETOS_MANIFEST_INDEX_(slot, kind, flags, perms, count, amount,    \
+                                 param, name)                                \
   MANIFEST_INDEX_##slot,
-#define SIGNETOS_MANIFEST_SLOT_(slot, kind, flags, perms, count, amount, name) \
+#define SIGNETOS_MANIFEST_SLOT_(slot, kind, flags, perms, count, amount,     \
+                                param, name)                                 \
   [[maybe_unused]] constexpr size_t SLOT_##slot =                             \
       ::signetos::compartment::RW_SLOT_SEED_BASE + MANIFEST_INDEX_##slot;
-#define SIGNETOS_MANIFEST_ENTRY_(slot, kind, flags, perms, count, amount, name) \
-  {kind, flags, perms, count, amount, 0, name},
+#define SIGNETOS_MANIFEST_ENTRY_(slot, kind, flags, perms, count, amount,    \
+                                 param, name)                                \
+  {kind, flags, perms, count, amount, param, name},
 
 // Emits, in the enclosing namespace: `MANIFEST_INDEX_<slot>` and
 // `SLOT_<slot>` for every entry, `MANIFEST_COUNT`, and the table itself in

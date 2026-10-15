@@ -73,8 +73,9 @@ namespace {
 // --- What `trap_mgr` asks `init` for (user/manifest.hpp) ----------------------
 // The external-interrupt line and the PLIC window are what routing is made
 // of; the four exception bindings are the fault reporter; `vm_allocate` funds
-// the per-source route pages.
+// the per-source route pages, out of its VM quota.
 #define TRAP_MGR_MANIFEST(X)                             \
+  M_QUOTA_VM(X, VM_QUOTA)                                \
   M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
   M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
@@ -108,14 +109,6 @@ Capability s_gate_invoke = nullptr;
 uint64_t s_context = 0;  // the PLIC context devices interrupt (WHICH HART)
 uint32_t s_ndev = platform::DEFAULT_PLIC_NDEV;
 bool s_online = false;
-
-// The number of the hart this is running on. The kernel leaves it in `utidc`
-// as a plain integer, no authority in it, and reading it needs none.
-uint64_t this_hart() {
-  Capability id;
-  __asm__ volatile("csrr %0, 0x480" : "=C"(id));  // 0x480 = utidc
-  return capability_get_address(id);
-}
 
 // --- PLIC --------------------------------------------------------------------
 // 32-bit registers; offsets from platform.hpp, context = `s_context`.
@@ -252,7 +245,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   Capability self_comp = rw[compartment::SLOT_SELF];
-  Capability vm_quota = rw[compartment::SLOT_VM_QUOTA];
+  Capability vm_quota = rw[SLOT_VM_QUOTA];
 
   Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];

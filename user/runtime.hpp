@@ -33,6 +33,7 @@
 #include <signetos/compartment.hpp>
 #include "abi.hpp"
 #include "manifest.hpp"
+#include <signetos/platform.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/types.hpp>
@@ -144,6 +145,16 @@ inline void print_manifest_entry(Capability invoke_gate, Capability uart_sentry,
       out(" ");
       dec(e.amount);
       break;
+    case init::MANIFEST_QUOTA_VM:
+      break;
+    case init::MANIFEST_QUOTA_SCHED:
+      out(" ");
+      dec(e.amount);
+      out("/");
+      dec(e.count);
+      out(" us class ");
+      dec(e.param);
+      break;
     case init::MANIFEST_IRQ:
     case init::MANIFEST_EXC:
     case init::MANIFEST_ROOT:
@@ -200,6 +211,83 @@ inline Capability lookup_name(Capability invoke_gate, Capability lookup_entry,
     *out_status = init::cap_error(res, init::NAMING_BAD_REQUEST);
   }
   return nullptr;
+}
+
+// The number of the hart this is running on, from `utidc` (platform.hpp).
+inline uint64_t this_hart() {
+  Capability id;
+  __asm__ volatile("csrr %0, 0x480" : "=C"(id));  // 0x480 = utidc
+  return capability_get_address(id) & platform::UTIDC_HART_MASK;
+}
+
+// The kernel's id for the thread this is running on, from `utidc`: the same
+// number `sys_thread_tid` and the scheduler use.
+inline uint64_t self_tid() {
+  Capability id;
+  __asm__ volatile("csrr %0, 0x480" : "=C"(id));  // 0x480 = utidc
+  return capability_get_address(id) >> platform::UTIDC_TID_SHIFT;
+}
+
+// Locks. A lock is a `uint64_t` in the memory of the compartment whose state
+// it protects, 0 when free (abi.hpp, scheduler). `lock_wait` and `lock_wake`
+// are the scheduler's `sched.lock_wait` and `sched.lock_wake`.
+
+// `word` as the scheduler takes it: its eight bytes, Load|Store.
+inline Capability lock_word_cap(uint64_t* word) {
+  Capability cap = capability_set_bounds(reinterpret_cast<Capability>(word),
+                                         sizeof(uint64_t));
+  return capability_and_perms(cap, perms::Load | perms::Store);
+}
+
+// Takes the lock at `word`, sleeping in the scheduler while another thread
+// holds it. SCHED_OK once it is held. SCHED_OWNER_DEAD once it is held, but
+// the previous owner ended without releasing it, so what it protects may be
+// half-updated. Anything else means it was not taken: SCHED_DEADLOCK if the
+// caller holds it already, or the owner is waiting for the caller.
+inline int64_t lock(Capability invoke_gate, Capability lock_wait,
+                    uint64_t* word) {
+  const uint64_t me = self_tid();
+  for (;;) {
+    uint64_t seen = 0;
+    if (__atomic_compare_exchange_n(word, &seen, me, false, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_SEQ_CST)) {
+      return init::SCHED_OK;
+    }
+    if ((seen & ~init::LOCK_WAITERS) == me) {
+      return init::SCHED_DEADLOCK;
+    }
+    if (!capability_is_valid(lock_wait)) {
+      return init::SCHED_BAD_REQUEST;  // nowhere to wait: leave the word alone
+    }
+    // The flag tells the owner to call `lock_wake` when it releases the lock.
+    if ((seen & init::LOCK_WAITERS) == 0) {
+      const uint64_t flagged = seen | init::LOCK_WAITERS;
+      if (!__atomic_compare_exchange_n(word, &seen, flagged, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        continue;  // it changed meanwhile: look again
+      }
+      seen = flagged;
+    }
+    const int64_t st =
+        invoke<int64_t>(invoke_gate, lock_wait, lock_word_cap(word), seen);
+    if ((__atomic_load_n(word, __ATOMIC_SEQ_CST) & ~init::LOCK_WAITERS) == me) {
+      return st == init::SCHED_OWNER_DEAD ? st : init::SCHED_OK;
+    }
+    if (st != init::SCHED_OK) {
+      return st;
+    }
+  }
+}
+
+// Releases the lock at `word`, which the caller holds. If anyone is waiting
+// for it, the scheduler hands it to the next of them.
+inline void unlock(Capability invoke_gate, Capability lock_wake,
+                   uint64_t* word) {
+  uint64_t expected = self_tid();
+  if (!__atomic_compare_exchange_n(word, &expected, 0, false, __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST)) {
+    invoke<int64_t>(invoke_gate, lock_wake, lock_word_cap(word));
+  }
 }
 
 // Copies a standalone compartment binary image (`img_cap`) into a fresh

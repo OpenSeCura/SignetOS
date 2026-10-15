@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// THIS IS STILL A DUMB AND EARLY PROTOTYPE
+
 /*
  * sched.cpp - SignetOS User-Space CPU Bandwidth Scheduler Compartment
  *
@@ -23,56 +25,80 @@
  *
  * OBJECTS
  *   quota_sched   One page per node, paid for by the caller's `node_funding`
- *                 VM quota. Handles are hardware-sealed with `OType::QuotaSched`:
- *                 `Load|Store` for the administrative (derive/destroy/register)
- *                 handle and `Load` for the operational (register only) handle.
- *   ThreadRec     Registered thread: its `OType::Thread` handle (the right
- *                 to `sys_thread_switch` to it), its node and accounting.
+ *                 VM quota. Handles are hardware-sealed with
+ * `OType::QuotaSched`. There is one kind: whoever holds it can derive from the
+ * node, register threads on it and query it. Destroying a node takes its
+ * parent's handle (DESTROYING). ThreadRec     Registered thread: its
+ * `OType::Thread` handle (the right to `sys_thread_switch` to it), its node and
+ * its state.
  *
  * ENTRY POINTS (each a separate `OType::EntryPoint`, published by name)
- *   sched.quota_derive     SchedDeriveRequest     Store on parent
- *   sched.quota_destroy    (quota)                Store on quota
- *   sched.thread_register  (thread, quota)        Load on quota
+ *   sched.quota_derive     SchedDeriveRequest     the parent's handle
+ *   sched.quota_destroy    (parent, child)        the parent's handle
+ *   sched.quota_query      (quota, SchedQueryRequest)
+ *   sched.thread_register  (thread, quota)        put a thread on a node
  *   sched.yield            ()                     give up the rest of the slice
- *   sched.block            (timeout_us)           sleep until woken (or timeout)
- *   sched.wake             (tid)                  wake a blocked thread by tid
- *   sched.thread_kill      (thread)               Store on thread: end it
- *   sched.self             ()                     the caller's tid
- *   sched.policy_register  (root, delegate)       Store on root
+ *   sched.block            (timeout_us)           sleep until woken (or
+ * timeout) sched.wake             (tid)                  wake a blocked thread
+ * by tid sched.thread_kill      (thread)               Store on thread: end it
+ *   sched.lock_wait        (word, seen)           wait for a lock (LOCKS)
+ *   sched.lock_wake        (word)                 hand a lock to its next owner
  *   sched.run              (kernel-created dispatcher thread; not published)
  *   (tick)                 bound to IRQ_M_TIMER; not published
+ *
+ * ORDERING
+ *   `pick` chooses among the threads that can run: those on a node with
+ *   budget left that are READY, or that wait for a lock whose owner can run
+ *   in their place (LOCKS). Priority classes are strict (RT before
+ *   Interactive before Batch). Within a class the node served longest ago
+ *   goes first, and within a node the thread chosen longest ago. A child's
+ *   class is never more urgent than its parent's.
+ *
+ * BUDGETS
+ *   A node gets its budget C back every period T. The running thread's node
+ *   is charged at every tick and every switch, and `pick` passes over a node
+ *   with nothing left, so a node can overrun by up to a tick (the kernel's
+ *   fixed 10 ms). The overrun is carried into the next periods as a debt of
+ *   at most a tick, so over time a node gets its share even when its budget
+ *   is small next to the tick. Time a thread gets only because nothing else
+ *   can run (the tick handler lets it run on, IDLE) is spare, and like idle
+ *   time it is billed to nobody. Admission (`quota_derive`) keeps what a
+ *   parent hands out within what it has not handed out already.
  *
  * DISPATCH
  *   The dispatcher thread runs `pick(); sys_thread_switch(t)` forever. Every
  *   thread exit unwinds to the kernel's host context, which re-dispatches
- *   the dispatcher: its `sys_thread_switch` returns and `s_running` is the
- *   thread that has just exited. `yield` and the tick handler switch
- *   thread-to-thread directly and only ever update `s_running`. The
- *   dispatcher exits when nothing is registered, which ends the system.
+ *   the dispatcher: its `sys_thread_switch` returns, and it forgets every
+ *   registered thread the kernel no longer knows (`sys_thread_tid` is 0).
+ *   `yield`, `block`, `lock_wait` and the tick handler switch thread-to-thread
+ *   directly (`reschedule`). The dispatcher exits when nothing is registered,
+ *   which ends the system.
  *
  * PREEMPTION
- *   The scheduler binds `IRQ_M_TIMER` (the kernel's fixed 10 ms tick) to
- *   `sched_tick_entry`. The handler runs on the interrupted thread's stack
- *   with interrupts masked: it charges the slice, picks, and if someone else
- *   should run it calls `sys_thread_switch` from inside the handler. The
- *   preempted thread stays parked in its handler until it is switched back to,
- *   when the handler returns and `mret` resumes it. The handler stands down
- *   while an entry point is mid-update (`s_busy`), while a foreign policy
- *   delegate runs, and when the interrupted context is the dispatcher itself;
- *   those cases catch up at the next tick or on their own.
+ *   The scheduler binds `IRQ_M_TIMER` to `sched_tick_entry`. The handler runs
+ *   on the interrupted thread's stack with interrupts masked: it charges the
+ *   slice, picks, and if someone else should run it calls `sys_thread_switch`
+ *   from inside the handler. The preempted thread stays parked in its handler
+ *   until it is switched back to, when the handler returns and `mret`
+ *   resumes it. The handler stands down while an entry point is mid-update
+ *   (`s_busy`), and when the interrupted thread is not `s_running` (`caller`;
+ *   `utidc` says which thread is really running): the dispatcher, or a
+ *   thread in `switch_to` that has named the next thread but not yet
+ *   switched to it. Those cases catch up at the next tick or on their own.
  *
  * BLOCKING
  *   `block` marks the caller BLOCKED and picks someone else; a BLOCKED thread
- *   is invisible to `pick` until `wake` makes it READY again. `wake` is built
- *   to be called from interrupt context (a device driver, via whoever it
- *   notifies): it only flips one record, never picks or switches, and so
- *   needs no `s_busy` protection. The classic lost-wakeup race -- the event
- *   lands after the caller looked and before it blocked -- is closed by
- *   `wake_pending`: a wake that finds its target not BLOCKED is remembered,
- *   and `block` consumes it and returns at once. `block` writes BLOCKED
- *   before it reads `wake_pending`, and `wake` tests BLOCKED before it sets
- *   `wake_pending`, so whichever instruction the interrupt lands on, one of
- *   the two sides sees the other.
+ *   is invisible to `pick` until `wake` makes it READY again, and then runs
+ *   when `pick` next chooses it, like any other. `wake` is built to be called
+ *   from interrupt context (a device driver, via whoever it notifies): it
+ *   only flips one record, never picks or switches, and so needs no `s_busy`
+ *   protection. The classic lost-wakeup race -- the event lands after the
+ *   caller looked and before it blocked -- is closed by `wake_pending`: a
+ *   wake that finds its target not BLOCKED is remembered, and `block`
+ *   consumes it and stays READY. `block` writes BLOCKED before it reads
+ *   `wake_pending`, and `wake` tests BLOCKED before it sets `wake_pending`,
+ *   so whichever instruction the interrupt lands on, one of the two sides
+ *   sees the other.
  *
  *   A `block` with a timeout also records `wake_at_us`; `expire` (run at the
  *   top of every `pick`) makes a BLOCKED thread whose time has come READY by
@@ -85,27 +111,47 @@
  *   `thread_kill` asks the kernel to end a thread (`sys_thread_kill`, see
  *   unwind.hpp). The thread only ends once it runs, so a killed thread never
  *   sleeps: `thread_kill` wakes it as `wake` does, and every later `block`
- *   returns SCHED_KILLED at once. Its record is reaped like any exited
- *   thread's, or, if the kernel tore it down before it ever ran, on the next
- *   refused switch to it.
+ *   returns SCHED_KILLED at once. Its record is forgotten like any exited
+ *   thread's (DISPATCH), or, if the kernel tore it down before it ever ran,
+ *   on the next refused switch to it. A stopped thread (DESTROYING) is put on
+ *   the killer's node first, which pays for it to run to its end. A thread
+ *   that is stopped after it was killed, before it has ended, stays stopped
+ *   like any other until it is moved or killed again.
+ *
+ * DESTROYING
+ *   `quota_destroy(parent, child)` frees the child and every node under it,
+ *   and their bandwidth goes back to `parent`. Their threads stop at once: a
+ *   stopped thread keeps its record (with no node), its state and its
+ *   registration, and is never picked for itself. `thread_register` puts it
+ *   on another node, where it carries on. A node derived with a term
+ *   (`guaranteed_until_us`) cannot be destroyed before the term ends, and a
+ *   child's guarantee never outlasts its parent's.
+ *
+ * LOCKS
+ *   A lock is a word in the memory of the compartment that uses it (abi.hpp);
+ *   taking and releasing one nobody waits for never reaches the scheduler.
+ *   `lock_wait` puts the caller to sleep (LOCK_WAIT), recorded as waiting for
+ *   the owner. It is still offered to `pick`, and when it is chosen the owner
+ *   runs in its place (`runs_for`), following owners that are waiting in
+ *   turn: the waiter's node is charged (`paying`), and the owner runs in the
+ *   waiter's class. That is how a stopped owner gets out of the way.
+ *   `lock_wake` writes the next owner into the word and wakes it: waiters on
+ *   a node before stopped ones, then the most urgent class, then the one
+ *   waiting longest. A thread that ends holding a lock wakes its waiters,
+ *   and the first to try again gets the lock with SCHED_OWNER_DEAD. A wait
+ *   that would close a loop of owners is refused with SCHED_DEADLOCK. A
+ *   killed thread still waits for a lock: it is inside the scheduler, which
+ *   is trusted to finish, and its node lends the owner its time meanwhile.
  *
  * IDLE
- *   When nothing is runnable the CPU idles in the scheduler (`idle_until`):
- *   a spin with `s_running` clear, so the tick has nothing to charge or
- *   preempt and nobody is billed for idle time, ended by the earliest period
- *   reset or by a wake. A thread that yields with its budget spent and
- *   nothing else to run idles there too, rather than running on borrowed
- *   time: spare bandwidth is not handed out, it is idled. The tick handler
- *   is the one exception -- it cannot spin masked -- so a thread that never
- *   yields keeps the CPU when nothing else is runnable.
- *
- * ORDERING
- *   Priority classes are strict (RT before Interactive before Batch). Within
- *   a class, nodes with a runnable thread take turns; within a node the
- *   node's policy picks the thread through the `PolicyRequest` contract
- *   (`abi.hpp`), which third-party delegates registered with
- *   `sched.policy_register` implement behind a sentry. A node whose budget
- *   for the current period is spent is skipped until the period resets.
+ *   When nothing can run the CPU idles in the scheduler (`idle_until`): a
+ *   spin holding `s_busy`, so the tick stands down and nobody is billed for
+ *   idle time, ended by the earliest period reset or timeout, or by a wake.
+ *   A thread whose node has spent its budget idles there too when it yields,
+ *   blocks or waits, rather than running on borrowed time: spare bandwidth
+ *   is not handed out, it is idled. The tick handler is the one exception --
+ *   it cannot spin masked -- so a thread that never yields keeps the CPU
+ *   when nothing else can run.
  */
 
 #include "runtime.hpp"
@@ -113,100 +159,82 @@
 namespace signetos::user {
 namespace {
 
-// --- What `sched` asks `init` for (user/manifest.hpp) -------------------------
-// The timer interrupt is the scheduler's clock; `trap_bind` is how it attaches
-// to it; `thread_switch`/`thread_tid` are what dispatching is made of;
-// `OType::QuotaSched` makes `quota_sched` handles; the VM entries fund
-// the per-node pages. `naming.publish` is asked for because the scheduler
-// publishes its own entry points as it mints them, rather than handing them
-// all back in the handshake; `naming.lookup` is spare.
-#define SCHED_MANIFEST(X)                                \
-  M_IRQ(X, IRQ_TIMER, 7)                                 \
-  M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched)   \
-  M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
-  M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
-  M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)         \
-  M_SYSCALL(X, SYS_THREAD_TID, thread_tid)               \
-  M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)             \
-  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
-  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
-  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
-  M_SYSCALL(X, SYS_SENTRY, sentry)                       \
-  M_SERVICE(X, UART_SENTRY, "uart")                      \
-  M_SERVICE_OPT(X, NAMING_LOOKUP, "naming.lookup")       \
+// --- What `sched` asks `init` for (user/manifest.hpp)
+// ------------------------- The timer interrupt is the scheduler's clock;
+// `trap_bind` is how it attaches to it; `thread_switch`, `thread_tid` and
+// `thread_kill` are what dispatching and killing are made of;
+// `OType::QuotaSched` makes `quota_sched` handles; the VM entries fund the
+// per-node pages. `naming.publish` is asked for because the scheduler publishes
+// its own entry points as it mints them, rather than handing them all back in
+// the handshake. Its VM quota pays for the root node's page.
+#define SCHED_MANIFEST(X)                              \
+  M_QUOTA_VM(X, VM_QUOTA)                              \
+  M_IRQ(X, IRQ_TIMER, 7)                               \
+  M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched) \
+  M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)               \
+  M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)       \
+  M_SYSCALL(X, SYS_THREAD_TID, thread_tid)             \
+  M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)           \
+  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)              \
+  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)          \
+  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)    \
+  M_SYSCALL(X, SYS_SENTRY, sentry)                     \
+  M_SERVICE(X, UART_SENTRY, "uart")                    \
   M_SERVICE(X, NAMING_PUBLISH, "naming.publish")
 SIGNETOS_MANIFEST(SCHED_MANIFEST, 256 * 1024)
 
-using init::PolicyRequest;
-using init::PolicyView;
-
 constexpr size_t MAX_THREADS = 128;
 constexpr size_t MAX_NODES = 64;
-constexpr size_t MAX_POLICIES = 16;
-constexpr size_t MAX_VIEW = 32;  // threads one node offers a policy per pick
+
+// The most a node may owe into its next periods (BUDGETS): a tick, which is
+// as far as one pick can overrun.
+constexpr int64_t MAX_DEBT_US = static_cast<int64_t>(trap::TICK_US);
 
 // `time` ticks per microsecond; populated from `SchedInterface::timebase_hz`
 // (`/cpus` `timebase-frequency` in the DTB, fallback 10 MHz).
 uint64_t s_ticks_per_us = 10;
 
 constexpr uint32_t T_FREE = 0;
-constexpr uint32_t T_READY = 1;
-constexpr uint32_t T_RUNNING = 2;
+constexpr uint32_t T_READY = 1;  // running, or able to run
 constexpr uint32_t T_BLOCKED =
-    3;  // in `block`; invisible to `pick` until woken
+    2;  // in `block`; invisible to `pick` until woken
+constexpr uint32_t T_LOCK_WAIT = 3;  // in `lock_wait` (LOCKS in the header)
 
 struct QuotaSched;
 
 struct ThreadRec {
-  Capability thread;        // sealed OType::Thread with Permit_Load
-  QuotaSched* node;
-  ThreadRec* next;          // node's thread list
-  uint64_t tid;             // the kernel's id for it (sys_thread_tid)
-  uint64_t runtime_us;
-  uint64_t last_run_us;
+  Capability thread;       // sealed OType::Thread with Permit_Load
+  QuotaSched* node;        // nullptr once stopped (DESTROYING in the header)
+  QuotaSched* paying;      // charged for the current slice (BUDGETS, LOCKS);
+                           // nullptr: nobody, as for spare time
+  uint64_t tid;            // the kernel's id for it (sys_thread_tid)
+  uint64_t last_run_us;    // when `pick` last chose it (ORDERING)
+  uint64_t wake_at_us;     // BLOCKED with a timeout: READY again at this time
+  uint64_t lock_word;      // LOCK_WAIT: the address of the lock's word
+  uint64_t lock_owner;     // LOCK_WAIT: the tid of the thread holding it
+  uint64_t lock_since_us;  // LOCK_WAIT: when the wait began
   uint32_t state;
-  uint32_t wake_pending;  // a wake arrived while not BLOCKED (file comment)
-  uint64_t wake_at_us;    // BLOCKED with a timeout: READY again at this time
+  uint32_t wake_pending;  // a wake arrived while not BLOCKED (BLOCKING)
   bool timed_out;         // the last `block` ended by `expire`
   bool killed;            // `thread_kill` was called: `block` never sleeps it
 };
 
 // One node per page.
 struct alignas(16) QuotaSched {
-  struct {
-    QuotaSched* parent;
-    QuotaSched* first_child;
-    QuotaSched* next_sibling;
-    QuotaSched* prev_sibling;
-    uint64_t child_count;
-  } tree;
-
-  // Bandwidth definition: budget C per period T (microseconds).
-  uint32_t budget_us;
-  uint32_t period_us;
+  QuotaSched* parent;            // nullptr for the root
+  uint32_t budget_us;            // C, per period T
+  uint32_t period_us;            // T
   uint32_t delegated_budget_us;  // children's C, normalised to our T
   uint8_t priority_class;
-  uint8_t pad0_[3];
-  uint32_t deadline_us;
-  uint32_t policy_id;
-  Capability policy_delegate;    // nullptr for built-in policies
-
-  // Runtime state.
-  uint32_t remaining_budget_us;
-  uint32_t active_thread_count;
-  uint64_t last_replenish_tick;  // microseconds
-
-  // Private bookkeeping.
-  Capability node_page;          // this page, as returned by sys_vm_allocate
-  Capability node_funding;       // the QuotaVm that paid for it
-  ThreadRec* threads;
+  bool dying;                    // `destroy_subtree` is freeing it
+  uint64_t guaranteed_until_us;  // not destroyed before this (DESTROYING)
+  int64_t remaining_us;          // left this period; below 0, owed (BUDGETS)
+  uint64_t period_start_us;
+  uint64_t last_run_us;  // when `pick` last chose one of its threads
+  Capability page;       // this page, as returned by sys_vm_allocate
+  Capability funding;    // the QuotaVm that paid for it
 };
 static_assert(sizeof(QuotaSched) <= vm::PAGE_SIZE);
-
-struct Policy {
-  Capability delegate;      // nullptr for the built-ins
-  bool used;
-};
 
 // Scheduler state: funded from the compartment's own image (`.bss`).
 Capability s_self_comp = nullptr;
@@ -219,29 +247,23 @@ Capability s_gate_thread_kill = nullptr;
 Capability s_gate_invoke = nullptr;
 Capability s_uart = nullptr;
 
-QuotaSched* s_root = nullptr;
 QuotaSched* s_nodes[MAX_NODES];
 size_t s_node_count = 0;
-size_t s_node_cursor = 0;
 
 ThreadRec s_threads[MAX_THREADS];
 size_t s_registered = 0;
 
-Policy s_policies[MAX_POLICIES];
-bool s_in_delegate = false;
 // An entry point is updating scheduler state on the current thread: the tick
-// handler must not pick (it would see half-updated lists). Cleared across
+// handler must not pick (it would see half-updated state). Cleared across
 // `sys_thread_switch`, since the thread that comes back may be anything.
 bool s_busy = false;
 
-ThreadRec* s_running = nullptr;
+ThreadRec* s_running = nullptr;  // the thread the scheduler last switched to
 uint64_t s_slice_start_us = 0;
 
 // Bumped by every `wake`, from interrupt context; `idle_until` polls it so an
 // idle CPU notices a thread becoming runnable before the next period reset.
 volatile uint64_t s_wakeups = 0;
-
-alignas(16) PolicyView s_view[MAX_VIEW];
 
 inline uint64_t now_us() {
   uint64_t t;
@@ -249,54 +271,77 @@ inline uint64_t now_us() {
   return t / s_ticks_per_us;
 }
 
-// Orders plain stores to scheduler globals against the handlers (tick, wake)
-// that can land between any two instructions. Single hart: a compiler
-// barrier is all that is needed.
+// The tick handler can land between any two instructions of an entry point
+// and decides what it may touch by `s_busy` (PREEMPTION in the header). The
+// barriers keep the compiler from moving the stores the flag guards to the
+// other side of it. Single hart: a compiler barrier is all that is needed.
 inline void compiler_barrier() { __asm__ volatile("" ::: "memory"); }
+inline void busy_begin() {
+  s_busy = true;
+  compiler_barrier();
+}
+inline void busy_end() {
+  compiler_barrier();
+  s_busy = false;
+}
+
+// Holds `s_busy` for a scope that never switches threads.
+struct BusyScope {
+  BusyScope() { busy_begin(); }
+  ~BusyScope() { busy_end(); }
+};
 
 inline uint32_t sat_sub(uint32_t a, uint64_t b) {
   return (b >= a) ? 0 : static_cast<uint32_t>(a - b);
 }
 
+// Bytes addressable from `cap`'s current address to the end of its bounds.
+uint64_t room(Capability cap) {
+  const uint64_t base = capability_get_base(cap);
+  const uint64_t end = base + capability_get_length(cap);
+  const uint64_t addr = capability_get_address(cap);
+  return (addr < base || addr > end) ? 0 : end - addr;
+}
+
+// A request must be writable (we report status through it) and whole.
 template <typename T>
 T* open_request(Capability arg) {
   if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      capability_get_length(arg) < sizeof(T)) {
+      !capability_has_perms(arg, perms::Load | perms::Store) ||
+      room(arg) < sizeof(T)) {
     return nullptr;
   }
   return reinterpret_cast<T*>(arg);
 }
 
+// The kernel's id for the thread behind `thread`; 0 once it has ended.
+uint64_t thread_tid(Capability thread) {
+  using FnThreadTid = decltype(&sys_thread_tid);
+  return syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, thread);
+}
+
 // --- Nodes -------------------------------------------------------------------
 
-QuotaSched* node_for_page(uint64_t page_addr) {
+// Unseals a quota handle. Returns the node, or nullptr if it is not a live one.
+QuotaSched* open_quota(Capability handle) {
+  Capability payload = sealing::unseal_with(s_seal_auth, handle);
+  if (!capability_is_valid(payload) ||
+      capability_get_length(payload) != vm::PAGE_SIZE) {
+    return nullptr;
+  }
+  const uint64_t base = capability_get_base(payload);
   for (size_t i = 0; i < s_node_count; ++i) {
-    if (capability_get_base(s_nodes[i]->node_page) == page_addr) {
+    if (capability_get_base(s_nodes[i]->page) == base) {
       return s_nodes[i];
     }
   }
   return nullptr;
 }
 
-// Unseals a quota handle. `need_store`: the handle must be the
-// administrative one. Returns the node or nullptr.
-QuotaSched* open_quota(Capability handle, bool need_store) {
-  Capability payload = sealing::unseal_with(s_seal_auth, handle);
-  if (!capability_is_valid(payload) ||
-      capability_get_length(payload) != vm::PAGE_SIZE ||
-      (capability_get_perms(payload) & perms::Load) == 0) {
-    return nullptr;
-  }
-  if (need_store && (capability_get_perms(payload) & perms::Store) == 0) {
-    return nullptr;
-  }
-  return node_for_page(capability_get_base(payload));
-}
-
-Capability seal_node(QuotaSched* node, bool admin) {
-  const uint64_t p = admin ? (perms::Load | perms::Store) : perms::Load;
-  Capability obj = capability_and_perms(node->node_page, p);
-  return sealing::seal_with(s_seal_auth, obj);
+// The node's handle: its page, sealed.
+Capability seal_node(QuotaSched* n) {
+  return sealing::seal_with(s_seal_auth,
+                            capability_and_perms(n->page, perms::Load));
 }
 
 // Budget available to the node's own threads: what it has not delegated.
@@ -310,18 +355,47 @@ inline uint64_t normalised_share(uint64_t c_child, uint64_t t_child,
   return (c_child * t_parent + t_child - 1) / t_child;
 }
 
-void replenish(QuotaSched* n, uint64_t now) {
-  if (n->period_us == 0) {
-    return;
+// Whether `n` is `top` or a node under it.
+bool within(const QuotaSched* n, const QuotaSched* top) {
+  for (; n != nullptr; n = n->parent) {
+    if (n == top) {
+      return true;
+    }
   }
-  const uint64_t elapsed = now - n->last_replenish_tick;
-  if (elapsed >= n->period_us) {
-    n->last_replenish_tick = now - (elapsed % n->period_us);
-    n->remaining_budget_us = own_budget(n);
-  }
+  return false;
 }
 
-QuotaSched* alloc_node(Capability funding, QuotaSched* parent) {
+// Starts the periods that have ended since the node's current one began
+// (BUDGETS): each gives the budget back, less what is owed, and budget left
+// unused does not pile up.
+void replenish(QuotaSched* n, uint64_t now) {
+  const uint64_t periods = (now - n->period_start_us) / n->period_us;
+  if (periods == 0) {
+    return;
+  }
+  n->period_start_us += periods * n->period_us;
+  const int64_t budget = own_budget(n);
+  const int64_t refilled =
+      n->remaining_us + static_cast<int64_t>(periods) * budget;
+  n->remaining_us = refilled < budget ? refilled : budget;
+}
+
+// Until when a node derived at `now` with `term_us` (SchedDeriveRequest) may
+// not be taken back.
+uint64_t guaranteed_until(uint64_t now, uint64_t term_us) {
+  if (term_us == init::SCHED_REVOCABLE || term_us == init::SCHED_PERMANENT) {
+    return term_us;
+  }
+  return term_us < init::SCHED_PERMANENT - now ? now + term_us
+                                               : init::SCHED_PERMANENT - 1;
+}
+
+// A new node under `parent` (nullptr for the root), its page paid for by
+// `funding`, with its whole budget for a first period starting now. nullptr
+// if the table is full or `funding` cannot pay.
+QuotaSched* alloc_node(Capability funding, QuotaSched* parent,
+                       uint32_t budget_us, uint32_t period_us,
+                       uint8_t priority_class, uint64_t guaranteed_until_us) {
   if (s_node_count >= MAX_NODES) {
     return nullptr;
   }
@@ -333,123 +407,66 @@ QuotaSched* alloc_node(Capability funding, QuotaSched* parent) {
     return nullptr;
   }
   QuotaSched* n = reinterpret_cast<QuotaSched*>(page);
-  n->node_page = page;
-  n->node_funding = funding;
-  n->threads = nullptr;
-  n->tree.parent = parent;
-  n->tree.first_child = nullptr;
-  n->tree.prev_sibling = nullptr;
-  n->tree.next_sibling = nullptr;
-  n->tree.child_count = 0;
-  if (parent != nullptr) {
-    n->tree.next_sibling = parent->tree.first_child;
-    if (parent->tree.first_child != nullptr) {
-      parent->tree.first_child->tree.prev_sibling = n;
-    }
-    parent->tree.first_child = n;
-    parent->tree.child_count += 1;
-  }
+  n->parent = parent;
+  n->budget_us = budget_us;
+  n->period_us = period_us;
+  n->priority_class = priority_class;
+  n->guaranteed_until_us = guaranteed_until_us;
+  n->remaining_us = budget_us;
+  n->period_start_us = now_us();
+  n->page = page;
+  n->funding = funding;
   s_nodes[s_node_count++] = n;
   return n;
 }
 
+// Takes `n` out of the table and gives its page back. Nothing may point at it
+// any more.
 void free_node(QuotaSched* n) {
-  QuotaSched* parent = n->tree.parent;
-  if (parent != nullptr) {
-    if (n->tree.prev_sibling != nullptr) {
-      n->tree.prev_sibling->tree.next_sibling = n->tree.next_sibling;
-    } else {
-      parent->tree.first_child = n->tree.next_sibling;
-    }
-    if (n->tree.next_sibling != nullptr) {
-      n->tree.next_sibling->tree.prev_sibling = n->tree.prev_sibling;
-    }
-    parent->tree.child_count -= 1;
-    parent->delegated_budget_us = sat_sub(
-        parent->delegated_budget_us,
-        normalised_share(n->budget_us, n->period_us, parent->period_us));
-  }
   for (size_t i = 0; i < s_node_count; ++i) {
     if (s_nodes[i] == n) {
-      s_nodes[i] = s_nodes[s_node_count - 1];
-      s_nodes[s_node_count - 1] = nullptr;
       s_node_count -= 1;
+      s_nodes[i] = s_nodes[s_node_count];
+      s_nodes[s_node_count] = nullptr;
       break;
     }
   }
-  Capability page = n->node_page;
-  Capability funding = n->node_funding;
+  Capability page = n->page;
+  Capability funding = n->funding;
   // The page is quarantined by the kernel, not reused; scrub what we can.
-  n->node_page = nullptr;
-  n->node_funding = nullptr;
+  n->page = nullptr;
+  n->funding = nullptr;
   using FnDealloc = decltype(&sys_vm_deallocate);
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_dealloc, s_self_comp, funding,
                            page);
 }
 
-// --- Policies ----------------------------------------------------------------
-
-bool policy_known(uint32_t id) {
-  return id < MAX_POLICIES && s_policies[id].used;
-}
-
-// Built-ins. They see exactly what a foreign delegate would.
-void policy_round_robin(PolicyRequest* req) {
-  // Least recently run first.
-  const PolicyView* v = reinterpret_cast<const PolicyView*>(req->threads);
-  uint64_t best = ~0ULL;
-  for (uint32_t i = 0; i < req->count; ++i) {
-    if (v[i].runnable && v[i].last_run_us < best) {
-      best = v[i].last_run_us;
-      req->pick = v[i].tid;
+// Frees `top` and every node under it. `top`'s bandwidth goes back to its
+// parent; theirs was part of it. Their threads stop (DESTROYING).
+void destroy_subtree(QuotaSched* top) {
+  QuotaSched* parent = top->parent;
+  parent->delegated_budget_us = sat_sub(
+      parent->delegated_budget_us,
+      normalised_share(top->budget_us, top->period_us, parent->period_us));
+  // Marked first: `within` walks up through parents, which must still be
+  // there when it does.
+  for (size_t i = 0; i < s_node_count; ++i) {
+    s_nodes[i]->dying = within(s_nodes[i], top);
+  }
+  for (ThreadRec& t : s_threads) {
+    if (t.node != nullptr && t.node->dying) {
+      t.node = nullptr;
+    }
+    if (t.paying != nullptr && t.paying->dying) {
+      t.paying = nullptr;
     }
   }
-}
-
-void policy_fifo(PolicyRequest* req) {
-  // Oldest registration first (tids are issued in order).
-  const PolicyView* v = reinterpret_cast<const PolicyView*>(req->threads);
-  uint64_t best = ~0ULL;
-  for (uint32_t i = 0; i < req->count; ++i) {
-    if (v[i].runnable && v[i].tid < best) {
-      best = v[i].tid;
-      req->pick = v[i].tid;
+  for (size_t i = 0; i < s_node_count;) {
+    if (s_nodes[i]->dying) {
+      free_node(s_nodes[i]);  // moves the last node into slot `i`
+    } else {
+      ++i;
     }
-  }
-}
-
-void policy_edf(PolicyRequest* req) {
-  // Earliest (last run + relative deadline) first; equal deadlines degrade
-  // to least-recently-run.
-  const PolicyView* v = reinterpret_cast<const PolicyView*>(req->threads);
-  uint64_t best = ~0ULL;
-  for (uint32_t i = 0; i < req->count; ++i) {
-    const uint64_t due = v[i].last_run_us + v[i].deadline_us;
-    if (v[i].runnable && due < best) {
-      best = due;
-      req->pick = v[i].tid;
-    }
-  }
-}
-
-void run_policy(QuotaSched* n, PolicyRequest* req) {
-  req->pick = 0;
-  const uint32_t id = n->policy_id;
-  if (id == init::POLICY_SCHED_FIFO) {
-    policy_fifo(req);
-  } else if (id == init::POLICY_SCHED_EDF) {
-    policy_edf(req);
-  } else if (id < init::POLICY_SCHED_FIRST_CUSTOM) {
-    policy_round_robin(req);
-  } else if (policy_known(id) && capability_is_valid(n->policy_delegate)) {
-    // Foreign delegate: a Load-only view, and the tick handler stands down
-    // while it runs (it may not switch threads from under us).
-    Capability req_cap = reinterpret_cast<Capability>(req);
-    req_cap = capability_set_bounds(req_cap, sizeof(PolicyRequest));
-    using FnInvoke = decltype(&sys_compartment_invoke);
-    s_in_delegate = true;
-    reinterpret_cast<FnInvoke>(s_gate_invoke)(n->policy_delegate, req_cap);
-    s_in_delegate = false;
   }
 }
 
@@ -457,269 +474,283 @@ void run_policy(QuotaSched* n, PolicyRequest* req) {
 
 // A thread's `tid` is the kernel's id for it (`sys_thread_tid`), fetched at
 // registration; the scheduler has no numbering of its own.
+ThreadRec* find_registered(uint64_t tid) {
+  for (ThreadRec& t : s_threads) {
+    if (t.state != T_FREE && t.tid == tid) {
+      return &t;
+    }
+  }
+  return nullptr;
+}
 
-ThreadRec* find_tid(QuotaSched* n, uint64_t tid) {
-  for (ThreadRec* t = n->threads; t != nullptr; t = t->next) {
-    if (t->tid == tid) {
+// The calling thread's record: `s_running`, if that is the thread running
+// (`utidc`, which only the kernel writes). nullptr from anything the
+// scheduler does not run -- `init`, the dispatcher -- and from a thread in
+// `switch_to` that has named the next thread but not yet switched to it.
+ThreadRec* caller() {
+  ThreadRec* t = s_running;
+  return t != nullptr && t->tid == self_tid() ? t : nullptr;
+}
+
+// Bills the slice that ends now to whoever pays for the running thread
+// (BUDGETS, LOCKS), and starts the next.
+void charge_running(uint64_t now) {
+  const int64_t used = static_cast<int64_t>(now - s_slice_start_us);
+  s_slice_start_us = now;
+  QuotaSched* n = s_running != nullptr ? s_running->paying : nullptr;
+  if (n != nullptr) {
+    const int64_t left = n->remaining_us - used;
+    n->remaining_us = left > -MAX_DEBT_US ? left : -MAX_DEBT_US;
+  }
+}
+
+// What runs when `t` is chosen: `t` itself if it is ready; if it is waiting
+// for a lock, the lock's owner, following owners that are waiting in turn
+// (LOCKS in the header). nullptr if that ends at a thread that cannot run.
+ThreadRec* runs_for(ThreadRec* t) {
+  for (size_t hops = 0; t != nullptr && hops < MAX_THREADS; ++hops) {
+    if (t->state == T_READY) {
       return t;
     }
+    if (t->state != T_LOCK_WAIT) {
+      return nullptr;
+    }
+    t = find_registered(t->lock_owner);
   }
   return nullptr;
 }
 
-// Same, across every node.
-ThreadRec* find_registered(uint64_t tid) {
-  for (size_t i = 0; i < MAX_THREADS; ++i) {
-    if (s_threads[i].state != T_FREE && s_threads[i].tid == tid) {
-      return &s_threads[i];
-    }
+// Whether `pick` prefers `a` to `b` (ORDERING): the more urgent class, then
+// the node served longer ago, then the thread chosen longer ago.
+bool chosen_before(const ThreadRec* a, const ThreadRec* b) {
+  const QuotaSched* na = a->node;
+  const QuotaSched* nb = b->node;
+  if (na->priority_class != nb->priority_class) {
+    return na->priority_class < nb->priority_class;
   }
-  return nullptr;
-}
-
-void charge_running(uint64_t now) {
-  if (s_running == nullptr) {
-    return;
+  if (na->last_run_us != nb->last_run_us) {
+    return na->last_run_us < nb->last_run_us;
   }
-  const uint64_t used = now - s_slice_start_us;
-  s_running->runtime_us += used;
-  s_running->node->remaining_budget_us =
-      sat_sub(s_running->node->remaining_budget_us, used);
-  s_slice_start_us = now;
-}
-
-// The node's choice among its own ready threads, or nullptr.
-ThreadRec* node_pick(QuotaSched* n, uint64_t now) {
-  replenish(n, now);
-  if (n->remaining_budget_us == 0 || n->threads == nullptr) {
-    return nullptr;
-  }
-  uint32_t count = 0;
-  ThreadRec* only = nullptr;
-  for (ThreadRec* t = n->threads; t != nullptr && count < MAX_VIEW;
-       t = t->next) {
-    if (t->state != T_READY) {
-      continue;
-    }
-    s_view[count].tid = t->tid;
-    s_view[count].runtime_us = t->runtime_us;
-    s_view[count].last_run_us = t->last_run_us;
-    s_view[count].deadline_us = n->deadline_us;
-    s_view[count].runnable = 1;
-    only = t;
-    count += 1;
-  }
-  if (count == 0) {
-    return nullptr;
-  }
-  if (count == 1) {
-    return only;
-  }
-  PolicyRequest req{};
-  req.op = init::POLICY_PICK;
-  req.count = count;
-  req.now_us = now;
-  req.node_id = capability_get_base(n->node_page);
-  Capability view = reinterpret_cast<Capability>(&s_view[0]);
-  view = capability_set_bounds(view, count * sizeof(PolicyView));
-  req.threads = capability_and_perms(view, perms::Load);
-  run_policy(n, &req);
-  ThreadRec* chosen = find_tid(n, req.pick);
-  if (chosen == nullptr || chosen->state != T_READY) {
-    // Invalid answer from the policy: round-robin fallback.
-    req.pick = 0;
-    policy_round_robin(&req);
-    chosen = find_tid(n, req.pick);
-  }
-  return chosen;
+  return a->last_run_us < b->last_run_us;
 }
 
 // Makes every BLOCKED thread whose timeout has passed READY again (BLOCKING
 // in the header). The compare-and-swap is the one `wake` uses: whichever of
 // the two gets there first, the other finds the thread no longer BLOCKED.
 void expire(uint64_t now) {
-  for (size_t i = 0; i < MAX_THREADS; ++i) {
-    ThreadRec* t = &s_threads[i];
-    if (t->wake_at_us == 0 || t->wake_at_us > now) {
+  for (ThreadRec& t : s_threads) {
+    if (t.wake_at_us == 0 || t.wake_at_us > now) {
       continue;
     }
     uint32_t expected = T_BLOCKED;
-    if (__atomic_compare_exchange_n(&t->state, &expected, T_READY, false,
+    if (__atomic_compare_exchange_n(&t.state, &expected, T_READY, false,
                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-      t->timed_out = true;
+      t.timed_out = true;
     }
-    t->wake_at_us = 0;
+    t.wake_at_us = 0;
   }
 }
 
-// The earliest timeout still pending, or `~0`.
-uint64_t next_timeout() {
-  uint64_t earliest = ~0ULL;
-  for (size_t i = 0; i < MAX_THREADS; ++i) {
-    const uint64_t at = s_threads[i].wake_at_us;
-    if (at != 0 && s_threads[i].state == T_BLOCKED && at < earliest) {
-      earliest = at;
-    }
-  }
-  return earliest;
-}
-
-// Strict priority classes; round robin across nodes within a class.
+// Chooses what runs next (ORDERING), or nullptr if nothing can. Whatever runs
+// is charged to the chosen thread's node: its own, or, for a lock's owner
+// running in a waiter's place, the waiter's (LOCKS).
 ThreadRec* pick(uint64_t now) {
   expire(now);
-  if (s_node_count == 0) {
-    return nullptr;
-  }
-  for (uint8_t cls = init::PRIORITY_RT; cls <= init::PRIORITY_BATCH; ++cls) {
-    for (size_t i = 0; i < s_node_count; ++i) {
-      const size_t idx = (s_node_cursor + i) % s_node_count;
-      QuotaSched* n = s_nodes[idx];
-      if (n->priority_class != cls) {
-        continue;
-      }
-      ThreadRec* t = node_pick(n, now);
-      if (t != nullptr) {
-        s_node_cursor = idx + 1;
-        return t;
-      }
-    }
-  }
-  return nullptr;
-}
-
-// Earliest time any node with a ready thread gets budget back (or `now` if
-// something is runnable; `~0` if nothing is registered).
-uint64_t next_replenish(uint64_t now) {
-  uint64_t earliest = ~0ULL;
-  for (size_t i = 0; i < s_node_count; ++i) {
-    QuotaSched* n = s_nodes[i];
-    bool ready = false;
-    for (ThreadRec* t = n->threads; t != nullptr; t = t->next) {
-      if (t->state == T_READY) {
-        ready = true;
-        break;
-      }
-    }
-    if (!ready || n->period_us == 0) {
+  ThreadRec* chosen = nullptr;
+  ThreadRec* run = nullptr;
+  for (ThreadRec& t : s_threads) {
+    if (t.state == T_FREE || t.node == nullptr) {
       continue;
     }
-    const uint64_t at = n->last_replenish_tick + n->period_us;
-    if (at < earliest) {
-      earliest = at;
+    replenish(t.node, now);
+    if (t.node->remaining_us <= 0) {
+      continue;
+    }
+    ThreadRec* r = runs_for(&t);
+    if (r != nullptr && (chosen == nullptr || chosen_before(&t, chosen))) {
+      chosen = &t;
+      run = r;
     }
   }
-  return earliest < now ? now : earliest;
+  if (chosen == nullptr) {
+    return nullptr;
+  }
+  chosen->last_run_us = now;
+  chosen->node->last_run_us = now;
+  run->paying = chosen->node;
+  return run;
 }
 
-// When an idle CPU has something to look at again: the earliest period reset
-// of a node with a ready thread, or the earliest timeout of a blocked one.
+// When an idle CPU next has something to look at (IDLE): the earliest
+// timeout of a blocked thread, or the earliest period reset of a node one of
+// whose threads could run but for its budget. `~0` if neither.
 uint64_t next_event(uint64_t now) {
-  const uint64_t replenish = next_replenish(now);
-  const uint64_t timeout = next_timeout();
-  const uint64_t at = timeout < replenish ? timeout : replenish;
+  uint64_t at = ~0ULL;
+  for (ThreadRec& t : s_threads) {
+    uint64_t when = ~0ULL;
+    if (t.state == T_BLOCKED && t.wake_at_us != 0) {
+      when = t.wake_at_us;
+    } else if (t.state != T_FREE && t.node != nullptr &&
+               runs_for(&t) != nullptr) {
+      when = t.node->period_start_us + t.node->period_us;
+    }
+    at = when < at ? when : at;
+  }
   return at < now ? now : at;
 }
 
-void reap(ThreadRec* t, uint64_t now);
-
-// Hands the CPU to `t`. Returns 0 when something switches back to the caller.
-//
-// A refused switch means one of two things. Either `t` is gone (it exited or
-// was killed, and the kernel no longer knows its handle as a live thread):
-// then nothing ran, `t` is reaped here, and the caller gets back the state it
-// had, `s_busy` held, to pick again; the kernel's `Status` is returned. Or `t`
-// is the thread running right now, i.e. the caller itself under a stale
-// `s_running`: a tick can land between the stores below and the kernel
-// masking interrupts, see `s_running == t` and act on it before it is true,
-// and if it picks the interrupted thread the kernel refuses, as it is running.
-// The kernel reports both as InvalidCapability; `sys_thread_tid` tells them
-// apart, 0 only for a dead thread. For a live one `s_running = t` and
-// `t->state = T_RUNNING` are already right, so that case reports success.
-uint64_t switch_to(ThreadRec* t, uint64_t now) {
-  ThreadRec* const prev = s_running;
-  t->state = T_RUNNING;
-  t->last_run_us = now;
-  s_running = t;
-  s_slice_start_us = now;
-  s_busy = false;
-  using FnSwitch = decltype(&sys_thread_switch);
-  const uint64_t status =
-      syscall::call<FnSwitch>(s_gate_invoke, s_gate_switch, t->thread);
-  if (status != 0) {
-    using FnThreadTid = decltype(&sys_thread_tid);
-    if (syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid,
-                                   t->thread) != 0) {
-      return 0;  // alive, so it is us: nothing to undo
+// Forgets `t`, which has ended. Threads waiting for a lock it held try again;
+// the first gets the lock, with SCHED_OWNER_DEAD (LOCKS).
+void reap(ThreadRec* t) {
+  for (ThreadRec& w : s_threads) {
+    if (w.state == T_LOCK_WAIT && w.lock_owner == t->tid) {
+      w.state = T_READY;
     }
-    s_busy = true;
-    reap(t, now);  // clears `s_running`, which was `t`
-    s_running = prev;
-    s_slice_start_us = now;
-  }
-  // Back on this thread: whoever switched to us left `s_busy` clear.
-  return status;
-}
-
-// Idles on the current thread (`cur`, or nullptr for the dispatcher) until
-// `at` or a wake, whichever is first, and returns the time afterwards. With
-// `s_running` clear the tick handler sees nothing to charge or preempt and
-// stands down (its `cur == nullptr` check); ticks and device interrupts are
-// still taken, which is how a wake gets in. `wfi` would do here instead of a
-// spin -- everything runs in M-mode -- but a spin keeps the time base simple.
-// Callers hold `s_busy` on entry and get it back on return. The barriers pin
-// the store order: a tick landing anywhere in here sees either `s_running ==
-// nullptr` or `s_busy`, never a live `s_running` with a stale slice start.
-uint64_t idle_until(ThreadRec* cur, uint64_t at) {
-  const uint64_t seen = s_wakeups;
-  s_running = nullptr;
-  compiler_barrier();
-  s_busy = false;
-  compiler_barrier();
-  while (now_us() < at && s_wakeups == seen) {
-    compiler_barrier();
-  }
-  s_busy = true;
-  compiler_barrier();
-  const uint64_t now = now_us();
-  s_slice_start_us = now;  // the idle time is nobody's
-  s_running = cur;
-  compiler_barrier();
-  return now;
-}
-
-void reap(ThreadRec* t, uint64_t now) {
-  charge_running(now);
-  QuotaSched* n = t->node;
-  ThreadRec** link = &n->threads;
-  while (*link != nullptr && *link != t) {
-    link = &(*link)->next;
-  }
-  if (*link == t) {
-    *link = t->next;
-  }
-  if (n->active_thread_count > 0) {
-    n->active_thread_count -= 1;
-  }
-  t->thread = nullptr;
-  t->node = nullptr;
-  t->next = nullptr;
-  t->state = T_FREE;
-  t->wake_at_us = 0;
-  t->killed = false;
-  if (s_registered > 0) {
-    s_registered -= 1;
   }
   if (s_running == t) {
     s_running = nullptr;
   }
+  t->thread = nullptr;
+  t->node = nullptr;
+  t->paying = nullptr;
+  __atomic_store_n(&t->state, T_FREE, __ATOMIC_SEQ_CST);
+  s_registered -= 1;
 }
 
-// Marks scheduler state as mid-update for the current thread. Not held
-// across `switch_to` (which clears the flag itself before switching).
-struct BusyScope {
-  BusyScope() { s_busy = true; }
-  ~BusyScope() { s_busy = false; }
-};
+// Forgets every registered thread the kernel no longer knows: the one that
+// has just exited, and any that was killed before it ever ran (DISPATCH).
+void reap_ended() {
+  for (ThreadRec& t : s_threads) {
+    if (t.state != T_FREE && thread_tid(t.thread) == 0) {
+      reap(&t);
+    }
+  }
+}
+
+// Hands the CPU to `t`. True once something switches back to the caller,
+// which then runs on with `s_busy` clear: whoever switched to it cleared it.
+// False if the kernel refused, which it does only for a thread that has
+// ended (nothing here switches to the running one): `t` is reaped, nothing
+// ran, and the caller still holds `s_busy`, `s_running` and its slice as
+// before. `s_running` names `t` before the switch, so a tick landing in
+// between finds that the interrupted thread is not `s_running` and stands
+// down (PREEMPTION in the header).
+bool switch_to(ThreadRec* t, uint64_t now) {
+  ThreadRec* const prev = s_running;
+  s_running = t;
+  s_slice_start_us = now;
+  busy_end();
+  using FnSwitch = decltype(&sys_thread_switch);
+  if (syscall::call<FnSwitch>(s_gate_invoke, s_gate_switch, t->thread) == 0) {
+    return true;
+  }
+  busy_begin();
+  s_running = prev;
+  reap(t);
+  return false;
+}
+
+// Spins until `at` or a wake, whichever is first, and returns the time
+// afterwards (IDLE in the header). Called holding `s_busy`, which keeps the
+// tick handler out; ticks and device interrupts are still taken, which is
+// how a wake gets in. The idle time is billed to nobody. `wfi` would do here
+// instead of a spin -- everything runs in M-mode -- but a spin keeps the
+// time base simple.
+uint64_t idle_until(uint64_t at) {
+  const uint64_t seen = s_wakeups;
+  while (now_us() < at && s_wakeups == seen) {
+  }
+  const uint64_t now = now_us();
+  s_slice_start_us = now;
+  return now;
+}
+
+// Runs whatever `pick` chooses until it chooses `cur`, the calling thread,
+// again. Called holding `s_busy`, with `cur`'s slice charged and its state
+// set: READY to stay in the running, BLOCKED or LOCK_WAIT to sleep. Returns
+// with `s_busy` clear and `cur` running. When nothing can run it idles (IDLE
+// in the header) -- except from the tick handler (`can_idle` false), which
+// cannot spin masked and lets `cur` run on instead. That time is spare, and
+// like idle time it is billed to nobody (BUDGETS).
+void reschedule(ThreadRec* cur, uint64_t now, bool can_idle) {
+  for (;;) {
+    ThreadRec* next = pick(now);
+    if (next == cur || (next == nullptr && !can_idle)) {
+      if (next == nullptr) {
+        cur->paying = nullptr;  // spare time: nobody pays for it
+      }
+      busy_end();
+      return;
+    }
+    if (next == nullptr) {
+      now = idle_until(next_event(now));
+    } else if (switch_to(next, now)) {
+      return;
+    }
+    // Otherwise `next` had ended and is reaped: pick again.
+  }
+}
+
+// The lock word `word` points at, or nullptr: it must be an unsealed
+// Load|Store capability to eight aligned bytes.
+uint64_t* open_lock_word(Capability word) {
+  if (!capability_is_valid(word) || sealing::is_sealed(word) ||
+      !capability_has_perms(word, perms::Load | perms::Store)) {
+    return nullptr;
+  }
+  const uint64_t addr = capability_get_address(word);
+  const uint64_t base = capability_get_base(word);
+  if (addr % sizeof(uint64_t) != 0 || addr < base ||
+      addr + sizeof(uint64_t) > base + capability_get_length(word)) {
+    return nullptr;
+  }
+  return reinterpret_cast<uint64_t*>(word);
+}
+
+// Whether `t` is `target`, or is waiting for it through a chain of lock
+// owners.
+bool waits_on(ThreadRec* t, const ThreadRec* target) {
+  for (size_t hops = 0; t != nullptr && hops < MAX_THREADS; ++hops) {
+    if (t == target) {
+      return true;
+    }
+    if (t->state != T_LOCK_WAIT) {
+      return false;
+    }
+    t = find_registered(t->lock_owner);
+  }
+  return false;
+}
+
+// Which of two waiters gets a lock first: one on a node before a stopped one,
+// then the more urgent class, then the one that has waited longer.
+bool goes_first(const ThreadRec* a, const ThreadRec* b) {
+  if ((a->node != nullptr) != (b->node != nullptr)) {
+    return a->node != nullptr;
+  }
+  if (a->node != nullptr &&
+      a->node->priority_class != b->node->priority_class) {
+    return a->node->priority_class < b->node->priority_class;
+  }
+  return a->lock_since_us < b->lock_since_us;
+}
+
+// Makes `to` the owner of the lock at `word`: writes its tid there, with
+// LOCK_WAITERS if anyone else is still waiting, and points those waiters at
+// it.
+void set_owner(uint64_t* word, const ThreadRec* to) {
+  const uint64_t addr =
+      capability_get_address(reinterpret_cast<Capability>(word));
+  bool others = false;
+  for (ThreadRec& w : s_threads) {
+    if (&w != to && w.state == T_LOCK_WAIT && w.lock_word == addr) {
+      w.lock_owner = to->tid;
+      others = true;
+    }
+  }
+  __atomic_store_n(word, to->tid | (others ? init::LOCK_WAITERS : 0),
+                   __ATOMIC_SEQ_CST);
+}
 
 }  // namespace
 
@@ -732,86 +763,117 @@ extern "C" int64_t sched_quota_derive_entry(Capability arg) {
   }
   BusyScope busy;
   req->out_quota = nullptr;
-  QuotaSched* parent = open_quota(req->parent, true);
+  auto done = [&](int64_t status) {
+    req->status = status;
+    return status;
+  };
+  QuotaSched* parent = open_quota(req->parent);
   if (parent == nullptr) {
-    req->status = init::SCHED_PERMISSION;
-    return req->status;
+    return done(init::SCHED_INVALID_QUOTA);
   }
   if (req->budget_us == 0 || req->period_us == 0 ||
       req->budget_us > req->period_us ||
       req->priority_class > init::PRIORITY_BATCH ||
       !sealing::is_sealed_as(OType::QuotaVm, req->node_funding)) {
-    req->status = init::SCHED_BAD_REQUEST;
-    return req->status;
+    return done(init::SCHED_BAD_REQUEST);
   }
-  const uint32_t policy = (req->policy_id == init::POLICY_SCHED_DEFAULT)
-                              ? init::POLICY_SCHED_ROUND_ROBIN
-                              : req->policy_id;
-  if (!policy_known(policy)) {
-    req->status = init::SCHED_UNKNOWN_POLICY;
-    return req->status;
+  // No more urgent than the parent, and guaranteed for no longer.
+  const uint64_t until = guaranteed_until(now_us(), req->term_us);
+  if (req->priority_class < parent->priority_class ||
+      until > parent->guaranteed_until_us) {
+    return done(init::SCHED_PERMISSION);
   }
   // Temporal conservation: C_c / T_c <= (C_p - D_p) / T_p.
-  const uint64_t lhs = static_cast<uint64_t>(req->budget_us) * parent->period_us;
-  const uint64_t rhs =
-      static_cast<uint64_t>(own_budget(parent)) * req->period_us;
-  if (lhs > rhs) {
-    req->status = init::SCHED_BANDWIDTH;
-    return req->status;
+  if (static_cast<uint64_t>(req->budget_us) * parent->period_us >
+      static_cast<uint64_t>(own_budget(parent)) * req->period_us) {
+    return done(init::SCHED_BANDWIDTH);
   }
-  QuotaSched* n = alloc_node(req->node_funding, parent);
-  if (n == nullptr) {
-    req->status = init::SCHED_NO_MEMORY;
-    return req->status;
+  QuotaSched* n = alloc_node(req->node_funding, parent, req->budget_us,
+                             req->period_us, req->priority_class, until);
+  Capability handle = n != nullptr ? seal_node(n) : nullptr;
+  if (!capability_is_valid(handle)) {
+    if (n != nullptr) {
+      free_node(n);
+    }
+    return done(init::SCHED_NO_MEMORY);
   }
-  n->budget_us = req->budget_us;
-  n->period_us = req->period_us;
-  n->delegated_budget_us = 0;
-  n->priority_class = req->priority_class;
-  n->deadline_us = (req->deadline_us != 0) ? req->deadline_us : req->period_us;
-  n->policy_id = policy;
-  n->policy_delegate = s_policies[policy].delegate;
-  n->remaining_budget_us = req->budget_us;
-  n->last_replenish_tick = now_us();
-  n->active_thread_count = 0;
   parent->delegated_budget_us += static_cast<uint32_t>(
       normalised_share(req->budget_us, req->period_us, parent->period_us));
   // The parent's own threads just lost bandwidth; cap what is left.
-  if (parent->remaining_budget_us > own_budget(parent)) {
-    parent->remaining_budget_us = own_budget(parent);
-  }
-  const bool admin = (req->perms & perms::Store) != 0;
-  Capability handle = seal_node(n, admin);
-  if (!capability_is_valid(handle)) {
-    free_node(n);
-    req->status = init::SCHED_NO_MEMORY;
-    return req->status;
+  if (parent->remaining_us > own_budget(parent)) {
+    parent->remaining_us = own_budget(parent);
   }
   req->out_quota = handle;
-  req->status = init::SCHED_OK;
-  return req->status;
+  return done(init::SCHED_OK);
 }
 
-extern "C" int64_t sched_quota_destroy_entry(Capability quota) {
-  BusyScope busy;
-  QuotaSched* n = open_quota(quota, true);
-  if (n == nullptr || n == s_root) {
-    return init::SCHED_PERMISSION;
+extern "C" int64_t sched_yield_entry();
+
+// Takes back the time `parent` gave `child` (DESTROYING in the header).
+extern "C" int64_t sched_quota_destroy_entry(Capability parent,
+                                             Capability child) {
+  {
+    BusyScope busy;
+    QuotaSched* p = open_quota(parent);
+    QuotaSched* c = open_quota(child);
+    if (p == nullptr || c == nullptr) {
+      return init::SCHED_INVALID_QUOTA;
+    }
+    if (c->parent != p) {
+      return init::SCHED_PERMISSION;
+    }
+    if (c->guaranteed_until_us > now_us()) {
+      return init::SCHED_BUSY;
+    }
+    destroy_subtree(c);
   }
-  if (n->tree.child_count != 0 || n->active_thread_count != 0 ||
-      n->threads != nullptr) {
-    return init::SCHED_BUSY;
+  // The caller was on one of those nodes: it stops here.
+  const ThreadRec* me = caller();
+  if (me != nullptr && me->node == nullptr) {
+    sched_yield_entry();
   }
-  free_node(n);
   return init::SCHED_OK;
+}
+
+extern "C" int64_t sched_quota_query_entry(Capability quota, Capability arg) {
+  auto* req = open_request<init::SchedQueryRequest>(arg);
+  if (req == nullptr) {
+    return init::SCHED_BAD_REQUEST;
+  }
+  BusyScope busy;
+  QuotaSched* n = open_quota(quota);
+  if (n == nullptr) {
+    req->status = init::SCHED_INVALID_QUOTA;
+    return req->status;
+  }
+  uint32_t threads = 0;
+  for (const ThreadRec& t : s_threads) {
+    if (t.state != T_FREE && within(t.node, n)) {
+      threads += 1;
+    }
+  }
+  uint32_t children = 0;
+  for (size_t i = 0; i < s_node_count; ++i) {
+    if (s_nodes[i]->parent == n) {
+      children += 1;
+    }
+  }
+  req->guaranteed_until_us = n->guaranteed_until_us;
+  req->budget_us = n->budget_us;
+  req->period_us = n->period_us;
+  req->threads = threads;
+  req->children = children;
+  req->priority_class = n->priority_class;
+  req->status = init::SCHED_OK;
+  return req->status;
 }
 
 extern "C" int64_t sched_thread_register_entry(Capability thread,
                                                Capability quota) {
   BusyScope busy;
-  QuotaSched* n = open_quota(quota, false);
+  QuotaSched* n = open_quota(quota);
   if (n == nullptr) {
-    return init::SCHED_PERMISSION;
+    return init::SCHED_INVALID_QUOTA;
   }
   if (!sealing::is_sealed_as(OType::Thread, thread) ||
       (capability_get_perms(thread) & perms::Load) == 0) {
@@ -821,138 +883,65 @@ extern "C" int64_t sched_thread_register_entry(Capability thread,
   // we were handed rather than supplied by the caller, so nobody can file a
   // thread under another's number. 0: the kernel does not know this handle
   // as a live thread (stale, or forged).
-  using FnThreadTid = decltype(&sys_thread_tid);
-  const uint64_t tid =
-      syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, thread);
-  if (tid == 0 || find_registered(tid) != nullptr) {
+  const uint64_t tid = thread_tid(thread);
+  if (tid == 0) {
     return init::SCHED_INVALID_THREAD;
   }
-  ThreadRec* rec = nullptr;
-  for (size_t i = 0; i < MAX_THREADS; ++i) {
-    if (s_threads[i].state == T_FREE) {
-      rec = &s_threads[i];
+  // A stopped thread goes onto `n` and carries on from where it stopped.
+  ThreadRec* rec = find_registered(tid);
+  if (rec != nullptr) {
+    if (rec->node != nullptr) {
+      return init::SCHED_INVALID_THREAD;  // it is on a node already
+    }
+    rec->node = n;
+    return static_cast<int64_t>(tid);
+  }
+  for (ThreadRec& t : s_threads) {
+    if (t.state == T_FREE) {
+      rec = &t;
       break;
     }
   }
   if (rec == nullptr) {
     return init::SCHED_FULL;
   }
+  *rec = ThreadRec{};
   rec->thread = thread;
   rec->node = n;
   rec->tid = tid;
-  rec->runtime_us = 0;
-  rec->last_run_us = 0;
-  rec->wake_pending = 0;
-  rec->wake_at_us = 0;
-  rec->timed_out = false;
-  rec->killed = false;
-  rec->state = T_READY;
-  rec->next = n->threads;
-  n->threads = rec;
-  n->active_thread_count += 1;
+  // Filled in before `wake`, from interrupt context, can find it.
+  compiler_barrier();
+  __atomic_store_n(&rec->state, T_READY, __ATOMIC_SEQ_CST);
   s_registered += 1;
-  return static_cast<int64_t>(rec->tid);
-}
-
-extern "C" int64_t sched_policy_register_entry(Capability root,
-                                               Capability delegate) {
-  BusyScope busy;
-  if (open_quota(root, true) != s_root) {
-    return init::SCHED_PERMISSION;
-  }
-  if (!sealing::is_sealed_as(OType::EntryPoint, delegate)) {
-    return init::SCHED_BAD_REQUEST;
-  }
-  for (uint32_t id = init::POLICY_SCHED_FIRST_CUSTOM; id < MAX_POLICIES; ++id) {
-    if (!s_policies[id].used) {
-      s_policies[id].used = true;
-      s_policies[id].delegate = delegate;
-      return static_cast<int64_t>(id);
-    }
-  }
-  return init::SCHED_FULL;
+  return static_cast<int64_t>(tid);
 }
 
 // Called in the yielding thread's own context (through the domain switcher).
 extern "C" int64_t sched_yield_entry() {
-  ThreadRec* cur = s_running;
-  if (cur == nullptr || s_in_delegate) {
+  ThreadRec* cur = caller();
+  if (cur == nullptr) {
     return 0;
   }
-  s_busy = true;
-  uint64_t now = now_us();
+  busy_begin();
+  const uint64_t now = now_us();
   charge_running(now);
-  cur->state = T_READY;
-  for (;;) {
-    ThreadRec* next = pick(now);
-    if (next == cur) {
-      cur->state = T_RUNNING;  // still the best choice: keep going
-      s_busy = false;
-      return 0;
-    }
-    if (next != nullptr) {
-      // `switch_to` clears s_busy before switching.
-      if (switch_to(next, now) == 0) {
-        // Resumed by a later switch back to `cur`; `s_running` is already `cur`.
-        return 0;
-      }
-      continue;  // `next` was dead and is reaped: pick again
-    }
-    // Every ready node -- ours included -- is out of budget for this period:
-    // idle until the earliest reset instead of running on borrowed time.
-    now = idle_until(cur, next_event(now));
-  }
+  reschedule(cur, now, true);
+  return 0;
 }
 
-// The body of `block`: called holding `s_busy`, returns with it clear, once
-// `cur` has been woken (or timed out, by `expire`).
-void block_until_woken(ThreadRec* cur, uint64_t now) {
-  // BLOCKED must be visible before we look at `wake_pending`: a wake landing
-  // after this store flips us back to READY, one landing before it left the
-  // pending flag, and the test below catches either.
-  __atomic_store_n(&cur->state, T_BLOCKED, __ATOMIC_SEQ_CST);
-  for (;;) {
-    if (__atomic_exchange_n(&cur->wake_pending, 0u, __ATOMIC_SEQ_CST) != 0 ||
-        __atomic_load_n(&cur->state, __ATOMIC_SEQ_CST) != T_BLOCKED) {
-      cur->state = T_RUNNING;  // woken already: nothing to wait for
-      s_busy = false;
-      return;
-    }
-    ThreadRec* next = pick(now);
-    if (next == cur) {
-      // A wake got in between the test above and the pick.
-      cur->state = T_RUNNING;
-      s_busy = false;
-      return;
-    }
-    if (next != nullptr) {
-      if (switch_to(next, now) == 0) {
-        // Back here because a `wake` made us READY and someone picked us;
-        // `switch_to` on their side already made us RUNNING.
-        return;
-      }
-      continue;  // `next` was dead and is reaped: look again
-    }
-    // Nothing runnable: idle until the earliest period reset, timeout or
-    // wake (`~0`, i.e. a wake only, if every thread is blocked for good).
-    now = idle_until(cur, next_event(now));
-  }
-}
-
-// Called in the blocking thread's own context. Returns when a `wake` for
-// this thread has been seen: either one that was already pending, or one
-// that made us READY again and got us picked -- or when `timeout_us` ran out
-// first. See BLOCKING in the header. `timeout_us == 0` blocks without a
-// timeout.
+// Called in the blocking thread's own context. Returns once the thread has
+// been woken, by a `wake` that was already pending or one that made it
+// READY again, or `timeout_us` ran out first, and `pick` has chosen it. See
+// BLOCKING in the header. `timeout_us == 0` blocks without a timeout.
 extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
-  ThreadRec* cur = s_running;
-  if (cur == nullptr || s_in_delegate) {
+  ThreadRec* cur = caller();
+  if (cur == nullptr) {
     return init::SCHED_INVALID_THREAD;
   }
   if (__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST)) {
     return init::SCHED_KILLED;  // a killed thread never sleeps
   }
-  s_busy = true;
+  busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
   cur->timed_out = false;
@@ -961,7 +950,14 @@ extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
     const uint64_t at = now + timeout_us;
     cur->wake_at_us = at < now ? ~0ULL : at;
   }
-  block_until_woken(cur, now);
+  // BLOCKED must be visible before we look at `wake_pending`: a wake landing
+  // after this store makes us READY itself, and one that landed before it
+  // left the pending flag.
+  __atomic_store_n(&cur->state, T_BLOCKED, __ATOMIC_SEQ_CST);
+  if (__atomic_exchange_n(&cur->wake_pending, 0u, __ATOMIC_SEQ_CST) != 0) {
+    __atomic_store_n(&cur->state, T_READY, __ATOMIC_SEQ_CST);
+  }
+  reschedule(cur, now, true);
   cur->wake_at_us = 0;
   if (__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST)) {
     return init::SCHED_KILLED;  // woken by `thread_kill`
@@ -980,8 +976,8 @@ extern "C" int64_t sched_wake_entry(uint64_t tid) {
   uint32_t expected = T_BLOCKED;
   if (!__atomic_compare_exchange_n(&t->state, &expected, T_READY, false,
                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-    // Not blocked (READY, RUNNING, or about to block): remember the wake so
-    // the next `block` returns at once instead of sleeping through it.
+    // Not blocked (READY, or about to block): remember the wake so the next
+    // `block` returns instead of sleeping through it.
     __atomic_store_n(&t->wake_pending, 1u, __ATOMIC_SEQ_CST);
   }
   s_wakeups = s_wakeups + 1;  // ends any `idle_until` in progress
@@ -989,17 +985,15 @@ extern "C" int64_t sched_wake_entry(uint64_t tid) {
 }
 
 // Ends the thread behind `thread` (needs Store) through `sys_thread_kill`,
-// then wakes it so it runs to where the kernel ends it (KILLING above). Like
-// `wake`, this only touches one record and the wake counter, so it is safe
-// from interrupt context.
+// then wakes it so it runs to where the kernel ends it (KILLING above). A
+// stopped thread is put on the caller's node first, so unlike `wake` this is
+// for thread context only.
 extern "C" int64_t sched_thread_kill_entry(Capability thread) {
   if (!sealing::is_sealed_as(OType::Thread, thread)) {
     return init::SCHED_INVALID_THREAD;
   }
   // The id first: a thread that never ran is torn down by the kill.
-  using FnThreadTid = decltype(&sys_thread_tid);
-  const uint64_t tid =
-      syscall::call<FnThreadTid>(s_gate_invoke, s_gate_thread_tid, thread);
+  const uint64_t tid = thread_tid(thread);
   using FnThreadKill = decltype(&sys_thread_kill);
   const uint64_t st =
       syscall::call<FnThreadKill>(s_gate_invoke, s_gate_thread_kill, thread);
@@ -1008,22 +1002,94 @@ extern "C" int64_t sched_thread_kill_entry(Capability thread) {
                ? init::SCHED_PERMISSION
                : init::SCHED_INVALID_THREAD;
   }
+  BusyScope busy;
   ThreadRec* t = tid != 0 ? find_registered(tid) : nullptr;
   if (t == nullptr) {
     return init::SCHED_OK;  // not registered with us
   }
+  const ThreadRec* me = caller();
+  if (t->node == nullptr && me != nullptr) {
+    t->node = me->node;
+  }
   // `killed` is set before the wake. A full `wake` is needed, not just the
-  // BLOCKED -> READY flip: a kill from interrupt context can land between
-  // `block`'s test of `killed` and the thread going to sleep, and only
-  // `wake_pending` makes that sleep return at once.
+  // BLOCKED -> READY flip: a kill can land between `block`'s test of
+  // `killed` and the thread going to sleep (it may be preempted there), and
+  // only `wake_pending` makes that sleep return at once.
   __atomic_store_n(&t->killed, true, __ATOMIC_SEQ_CST);
   sched_wake_entry(tid);
   return init::SCHED_OK;
 }
 
-// The caller's own tid: what it hands to whoever is going to `wake` it.
-extern "C" uint64_t sched_self_entry() {
-  return s_running != nullptr ? s_running->tid : 0;
+// Called by a thread that found the lock at `word` taken, with the value it
+// saw there, LOCK_WAITERS set. Sleeps until the lock is handed to it (LOCKS
+// in the header). Returns SCHED_OK at once if the word holds something else
+// by now: the caller looks again.
+extern "C" int64_t sched_lock_wait_entry(Capability word_cap, uint64_t seen) {
+  ThreadRec* cur = caller();
+  if (cur == nullptr) {
+    return init::SCHED_INVALID_THREAD;
+  }
+  uint64_t* word = open_lock_word(word_cap);
+  if (word == nullptr) {
+    return init::SCHED_BAD_REQUEST;
+  }
+  busy_begin();
+  int64_t status = init::SCHED_OK;
+  ThreadRec* owner = nullptr;
+  if ((seen & init::LOCK_WAITERS) == 0 ||
+      __atomic_load_n(word, __ATOMIC_SEQ_CST) != seen) {
+    // It changed meanwhile: the caller looks again.
+  } else if ((owner = find_registered(seen & ~init::LOCK_WAITERS)) == nullptr) {
+    set_owner(word, cur);  // it ended holding the lock
+    status = init::SCHED_OWNER_DEAD;
+  } else if (waits_on(owner, cur)) {
+    status = init::SCHED_DEADLOCK;
+  } else {
+    const uint64_t now = now_us();
+    charge_running(now);
+    cur->lock_word = capability_get_address(word_cap);
+    cur->lock_owner = owner->tid;
+    cur->lock_since_us = now;
+    cur->state = T_LOCK_WAIT;
+    reschedule(cur, now, true);  // until the lock is handed to us
+    return init::SCHED_OK;
+  }
+  busy_end();
+  return status;
+}
+
+// Called by the owner of the lock at `word` as it releases it, having seen
+// LOCK_WAITERS: hands the lock to the waiter that goes first and wakes it, or
+// frees it if nobody is waiting any more.
+extern "C" int64_t sched_lock_wake_entry(Capability word_cap) {
+  ThreadRec* cur = caller();
+  if (cur == nullptr) {
+    return init::SCHED_INVALID_THREAD;
+  }
+  uint64_t* word = open_lock_word(word_cap);
+  if (word == nullptr) {
+    return init::SCHED_BAD_REQUEST;
+  }
+  BusyScope busy;
+  if ((__atomic_load_n(word, __ATOMIC_SEQ_CST) & ~init::LOCK_WAITERS) !=
+      cur->tid) {
+    return init::SCHED_PERMISSION;  // not the owner
+  }
+  const uint64_t addr = capability_get_address(word_cap);
+  ThreadRec* next = nullptr;
+  for (ThreadRec& w : s_threads) {
+    if (w.state == T_LOCK_WAIT && w.lock_word == addr &&
+        (next == nullptr || goes_first(&w, next))) {
+      next = &w;
+    }
+  }
+  if (next == nullptr) {
+    __atomic_store_n(word, 0ULL, __ATOMIC_SEQ_CST);
+    return init::SCHED_OK;
+  }
+  set_owner(word, next);
+  next->state = T_READY;
+  return init::SCHED_OK;
 }
 
 // IRQ_M_TIMER handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
@@ -1037,38 +1103,19 @@ extern "C" uint64_t sched_tick_entry(uint64_t mcause, uint64_t mtval,
   (void)mepc;
   (void)mtval2;
   (void)cap_table_rw;
-  ThreadRec* cur = s_running;
-  // Nothing to do if the dispatcher itself was interrupted (it has its own
-  // loop), or if scheduler state is mid-update on the interrupted thread.
-  if (cur == nullptr || s_busy || s_in_delegate) {
+  // Nothing to do while scheduler state is mid-update on the interrupted
+  // thread, or if that thread is not `s_running` (`caller`).
+  ThreadRec* cur = caller();
+  if (s_busy || cur == nullptr) {
     return 0;
   }
-  s_busy = true;
+  busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
-  // Only a RUNNING thread is demoted and only a READY one restored: the
-  // interrupted thread is always RUNNING here (`block` holds `s_busy`), but
-  // a BLOCKED record must never be turned back into a runnable one by us.
-  if (cur->state == T_RUNNING) {
-    cur->state = T_READY;
-  }
-  ThreadRec* next = pick(now);
-  if (next == nullptr || next == cur) {
-    if (cur->state == T_READY) {
-      cur->state = T_RUNNING;  // work-conserving: a handler cannot idle
-    }
-    s_busy = false;
-    return 0;
-  }
-  // Switch from inside the handler. `cur` stays parked here, masked, until
-  // someone switches back to it; then this returns and `mret` resumes it.
-  if (switch_to(next, now) != 0) {
-    // `next` was dead and is reaped. Keep running `cur`; the next tick picks.
-    if (cur->state == T_READY) {
-      cur->state = T_RUNNING;
-    }
-    s_busy = false;
-  }
+  // If someone else should run, this switches from inside the handler: `cur`
+  // stays parked here, masked, until someone switches back to it; then this
+  // returns and `mret` resumes it.
+  reschedule(cur, now, false);
   return 0;
 }
 
@@ -1077,31 +1124,26 @@ extern "C" uint64_t sched_run_entry(Capability arg) {
   (void)arg;
   print(s_gate_invoke, s_uart, "[sched]    Dispatcher running\n");
   for (;;) {
-    s_busy = true;
-    uint64_t now = now_us();
-    if (s_running != nullptr) {
-      reap(s_running, now);  // our last switch returned: that thread exited
-    }
+    busy_begin();
+    const uint64_t now = now_us();
+    // Here at the start, and each time a thread has exited: its last slice
+    // is billed, and every thread that has ended is forgotten.
+    charge_running(now);
+    s_running = nullptr;
+    reap_ended();
     if (s_registered == 0) {
-      s_busy = false;
       break;
     }
     ThreadRec* t = pick(now);
     if (t == nullptr) {
-      // Every ready thread's node is out of budget, or everything is blocked:
-      // idle until the earliest period reset or a wake, whichever is first.
-      idle_until(nullptr, next_event(now));
-      continue;
-    }
-    const uint64_t status = switch_to(t, now);
-    if (status != 0) {
-      // Refused: `t->thread` was not a live, halted thread. `switch_to` has
-      // reaped it and left `s_running` clear, so the next round picks afresh.
-      print_dec(s_gate_invoke, s_uart,
-                "[sched]    thread_switch refused, status ", status,
-                "; the thread is unregistered\n");
+      // Every thread that could run is on a node out of budget, or
+      // everything is asleep: idle until a period reset, a timeout or a wake.
+      idle_until(next_event(now));
+    } else {
+      switch_to(t, now);  // back once a thread exits, or at once if `t` had
     }
   }
+  busy_end();
   print(s_gate_invoke, s_uart,
         "[sched]    No registered threads left; dispatcher exiting\n");
   return 0;
@@ -1111,7 +1153,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
   s_self_comp = rw[compartment::SLOT_SELF];
-  Capability vm_quota = rw[compartment::SLOT_VM_QUOTA];
+  Capability vm_quota = rw[SLOT_VM_QUOTA];
   Capability timer_irq_auth = rw[SLOT_IRQ_TIMER];
   s_seal_auth = rw[SLOT_SEAL_AUTH];
   Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
@@ -1142,58 +1184,43 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->root_quota = nullptr;
   iface->run = nullptr;
 
-  // 1. Built-in policy catalogue.
-  for (size_t i = 0; i < MAX_POLICIES; ++i) {
-    s_policies[i] = Policy{};
-  }
-  s_policies[init::POLICY_SCHED_ROUND_ROBIN].used = true;
-  s_policies[init::POLICY_SCHED_FIFO].used = true;
-  s_policies[init::POLICY_SCHED_EDF].used = true;
-
-  // 3. Root node: the whole machine, funded from our own VM quota.
-  s_root = alloc_node(vm_quota, nullptr);
-  if (s_root == nullptr) {
+  // 1. Root node: the whole machine, funded from our own VM quota.
+  QuotaSched* root = alloc_node(vm_quota, nullptr, init::SCHED_ROOT_PERIOD_US,
+                                init::SCHED_ROOT_PERIOD_US, init::PRIORITY_RT,
+                                init::SCHED_PERMANENT);
+  if (root == nullptr) {
     return -1;
   }
-  s_root->budget_us = init::SCHED_ROOT_PERIOD_US;
-  s_root->period_us = init::SCHED_ROOT_PERIOD_US;
-  s_root->delegated_budget_us = 0;
-  s_root->priority_class = init::PRIORITY_INTERACTIVE;
-  s_root->deadline_us = init::SCHED_ROOT_PERIOD_US;
-  s_root->policy_id = init::POLICY_SCHED_ROUND_ROBIN;
-  s_root->policy_delegate = nullptr;
-  s_root->remaining_budget_us = s_root->budget_us;
-  s_root->last_replenish_tick = now_us();
-  s_root->active_thread_count = 0;
 
-  // 4. Entry points, published by name; `run` goes back to init only.
+  // 2. Entry points, published by name; `run` goes back to init only.
   auto entry = [&](const void* fn) {
     return mint_entry(s_gate_invoke, gate_sentry, s_self_comp, fn);
   };
-  Capability e_derive = entry(reinterpret_cast<const void*>(&sched_quota_derive_entry));
-  Capability e_destroy = entry(reinterpret_cast<const void*>(&sched_quota_destroy_entry));
-  Capability e_register = entry(reinterpret_cast<const void*>(&sched_thread_register_entry));
-  Capability e_yield = entry(reinterpret_cast<const void*>(&sched_yield_entry));
-  Capability e_block = entry(reinterpret_cast<const void*>(&sched_block_entry));
-  Capability e_wake = entry(reinterpret_cast<const void*>(&sched_wake_entry));
-  Capability e_kill = entry(reinterpret_cast<const void*>(&sched_thread_kill_entry));
-  Capability e_self = entry(reinterpret_cast<const void*>(&sched_self_entry));
-  Capability e_policy = entry(reinterpret_cast<const void*>(&sched_policy_register_entry));
-  Capability e_run = entry(reinterpret_cast<const void*>(&sched_run_entry));
-  publish_name(s_gate_invoke, naming_publish, "sched.quota_derive", e_derive);
-  publish_name(s_gate_invoke, naming_publish, "sched.quota_destroy", e_destroy);
-  publish_name(s_gate_invoke, naming_publish, "sched.thread_register", e_register);
-  publish_name(s_gate_invoke, naming_publish, "sched.yield", e_yield);
-  publish_name(s_gate_invoke, naming_publish, "sched.block", e_block);
-  publish_name(s_gate_invoke, naming_publish, "sched.wake", e_wake);
-  publish_name(s_gate_invoke, naming_publish, "sched.thread_kill", e_kill);
-  publish_name(s_gate_invoke, naming_publish, "sched.self", e_self);
-  publish_name(s_gate_invoke, naming_publish, "sched.policy_register", e_policy);
+  auto publish = [&](const char* name, const void* fn) {
+    publish_name(s_gate_invoke, naming_publish, name, entry(fn));
+  };
+  publish("sched.quota_derive",
+          reinterpret_cast<const void*>(&sched_quota_derive_entry));
+  publish("sched.quota_destroy",
+          reinterpret_cast<const void*>(&sched_quota_destroy_entry));
+  publish("sched.quota_query",
+          reinterpret_cast<const void*>(&sched_quota_query_entry));
+  publish("sched.thread_register",
+          reinterpret_cast<const void*>(&sched_thread_register_entry));
+  publish("sched.yield", reinterpret_cast<const void*>(&sched_yield_entry));
+  publish("sched.block", reinterpret_cast<const void*>(&sched_block_entry));
+  publish("sched.wake", reinterpret_cast<const void*>(&sched_wake_entry));
+  publish("sched.thread_kill",
+          reinterpret_cast<const void*>(&sched_thread_kill_entry));
+  publish("sched.lock_wait",
+          reinterpret_cast<const void*>(&sched_lock_wait_entry));
+  publish("sched.lock_wake",
+          reinterpret_cast<const void*>(&sched_lock_wake_entry));
 
-  iface->root_quota = seal_node(s_root, true);
-  iface->run = e_run;
+  iface->root_quota = seal_node(root);
+  iface->run = entry(reinterpret_cast<const void*>(&sched_run_entry));
 
-  // 5. Preemption: the kernel's tick is delivered to us from now on.
+  // 3. Preemption: the kernel's tick is delivered to us from now on.
   Capability e_tick = entry(reinterpret_cast<const void*>(&sched_tick_entry));
   using FnTrapBind = decltype(&sys_trap_bind);
   syscall::call<FnTrapBind>(s_gate_invoke, gate_trap_bind, s_self_comp,
