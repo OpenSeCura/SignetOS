@@ -60,6 +60,7 @@
 //
 
 #include <stdint.h>
+#include <signetos/fault.hpp>
 #include <signetos/types.hpp>
 #include <signetos/vm.hpp>
 
@@ -82,6 +83,12 @@ constexpr uint64_t ENTRY_FLAG_TRUSTED = 1u << 0;
 // THREADS).
 constexpr uint64_t ENTRY_FLAG_TRUSTED_TO_FINISH = 1u << 1;
 
+// ENTRY_FLAG_FAULT marks a record minted as a compartment's fault handler
+// (fault.hpp, `sys_sentry` with KIND_HANDLER). Such a record is entered only
+// by the trap dispatcher (`resolve_fault`): `resolve`, and so the switcher,
+// `sys_thread_create` and `sys_trap_bind`, refuse it.
+constexpr uint64_t ENTRY_FLAG_FAULT = 1u << 2;
+
 // Stack a `sys_sentry` entry is promised: the switcher refuses a call whose
 // caller has less than this free below `csp`, so a callee is never entered on
 // a stack too small to run its prologue and fault half way through an update.
@@ -96,9 +103,11 @@ struct alignas(16) EntryRecord {
   Capability pcc;      // CodeRx entry point, unsealed; null means the record is free
   Capability cgp;      // the owning compartment's writable capability table slice
                        // (null for a kernel entry: kernel code never uses cgp)
-  Capability owner;    // the owning compartment's page (kernel capability):
-                       // which compartment the record belongs to. Null for a
-                       // kernel entry: the kernel is not a compartment.
+  Capability owner;    // the owning compartment's canonical sealed handle
+                       // (`compartment::handle_of`), read through
+                       // `compartment::open`: which compartment the record
+                       // belongs to. Null for a kernel entry: the kernel is not
+                       // a compartment.
   uint64_t flags;      // ENTRY_FLAG_*
   uint64_t min_stack;  // bytes the caller must have free below csp; a trusted
                        // entry runs on exactly this much. 16-byte multiple.
@@ -130,13 +139,19 @@ void init(Capability root_data_cap);
 
 // Core of sys_sentry. Validates `code_cap`, strips permissions down to
 // `(perms_mask & perms::CodeRx)` (W^X, no Seal/Unseal/ASR), requires it to lie
-// inside `comp`'s memory, records it on `comp`'s entry pages, and returns the
-// sealed record pointer.
+// inside `comp`'s memory and records it on `comp`'s entry pages.
 //
-// The returned handle carries Permit_Load only if `perms_mask` does; invoking
-// requires it.
+// `kind` (fault.hpp) says what the record is:
+//   - fault::KIND_ENTRY: an ordinary entry point. Returns the sealed record
+//     pointer, which carries Permit_Load only if `perms_mask` does (invoking
+//     requires it).
+//   - fault::KIND_HANDLER: `comp`'s fault handler. The record is marked
+//     fault-only (ENTRY_FLAG_FAULT), installed with
+//     `compartment::install_fault_handler` (Permit_Store on `comp`, once),
+//     and its handle is never returned: the result is null, and
+//     `*out_status` says whether it was installed.
 Capability create(Capability comp, Capability code_cap,
-                  uint64_t perms_mask = perms::CodeRx,
+                  uint64_t perms_mask = perms::CodeRx, uint64_t kind = 0,
                   Status* out_status = nullptr);
 
 // Kernel-internal only: as create(), but skips the ownership check so an entry
@@ -144,7 +159,7 @@ Capability create(Capability comp, Capability code_cap,
 // syscall.
 Capability create_kernel(Capability comp, Capability code_cap,
                          uint64_t perms_mask = perms::CodeRx,
-                         Status* out_status = nullptr);
+                         uint64_t kind = 0, Status* out_status = nullptr);
 
 // Seals `record` (a kernel capability bounded to exactly one `EntryRecord`)
 // into the `OType::EntryPoint` handle a compartment holds: Permit_Load only,
@@ -156,16 +171,23 @@ Sentry handle_for(Capability record);
 struct Entry {
   Capability sentry;   // CT = 1 hardware sentry for the record's `pcc`
   Capability table;    // the callee's `cgp` (null for a kernel entry)
-  Capability owner;    // the callee's compartment page (null for a kernel entry)
+  Capability owner;    // the callee's compartment handle (null for a kernel
+                       // entry); live when `resolve` returned
   uint64_t flags;      // EntryRecord::flags
   uint64_t min_stack;  // EntryRecord::min_stack
 };
 
-// Authenticates an `OType::EntryPoint` handle, verifies Permit_Load and that
-// its record is still there, and fills `*out`. Nothing keeps the owning
+// Authenticates an `OType::EntryPoint` handle, verifies Permit_Load, that its
+// record is still there and that its owner is a live compartment, and fills
+// `*out`. Fault-only records (ENTRY_FLAG_FAULT) are refused
+// (InvalidSentry): only `resolve_fault` accepts them. Nothing keeps the owning
 // compartment alive while the callee runs: if it is destroyed and swept in
 // the meantime, the return into it is resolved by `unwind::resume`.
 Status resolve(Sentry entry_point, Entry* out);
+
+// resolve() for the trap dispatcher's fault path: accepts ONLY a fault-only
+// record (ENTRY_FLAG_FAULT), with every other check `resolve` makes.
+Status resolve_fault(Sentry entry_point, Entry* out);
 
 // resolve() for a compartment entry: returns the hardware `CT = 1` sentry, or
 // null (and `*out_status`) if `entry_point` is not a live, invokable compartment
@@ -192,10 +214,14 @@ struct alignas(16) ReturnFrame {
   uint64_t mstatus;      // 384: caller's `mstatus` at entry (MIE restored on
                          //      return and propagated to a compartment callee)
   uint64_t flags;        // 392: EntryRecord::flags of the callee
+  Capability callee_comp;  // 400: the callee's compartment handle (its entry
+                           //      record's `owner`; null for a kernel entry):
+                           //      whose code runs above this frame
+                           //      (trap.hpp, WHO FAULTED)
 };
 
-static_assert(sizeof(ReturnFrame) == 25 * sizeof(Capability),
-              "ReturnFrame must be 25 capability slots (400 bytes)");
+static_assert(sizeof(ReturnFrame) == 26 * sizeof(Capability),
+              "ReturnFrame must be 26 capability slots (416 bytes)");
 
 // Helpers called by the assembly domain switcher (`sys_compartment_invoke`):
 //   - `__signetos_switcher_prepare` validates `handle` and the caller's `csp`,

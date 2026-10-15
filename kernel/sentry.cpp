@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <signetos/asm_macros.h>
 #include <signetos/compartment.hpp>
+#include <signetos/fault.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
@@ -47,6 +48,7 @@ static_assert(offsetof(ReturnFrame, callee_sp) == RET_FRAME_CALLEE_SP);
 static_assert(offsetof(ReturnFrame, callee_gp) == RET_FRAME_CALLEE_GP);
 static_assert(offsetof(ReturnFrame, mstatus) == RET_FRAME_MSTATUS);
 static_assert(offsetof(ReturnFrame, flags) == RET_FRAME_FLAGS);
+static_assert(offsetof(ReturnFrame, callee_comp) == RET_FRAME_CALLEE_COMP);
 static_assert(sizeof(ReturnFrame) == RET_FRAME_SIZE);
 static_assert(ENTRY_FLAG_TRUSTED == ENTRY_TRUSTED);
 static_assert(static_cast<uint64_t>(Status::NoKernelStack) ==
@@ -56,7 +58,7 @@ static_assert((DEFAULT_MIN_STACK & 0xF) == 0);
 Capability s_root_code_cap = nullptr;
 
 Capability create_impl(Capability comp, Capability code_cap,
-                       uint64_t perms_mask, bool require_owned,
+                       uint64_t perms_mask, uint64_t kind, bool require_owned,
                        Status* out_status) {
   if (!capability_is_valid(code_cap) || sealing::is_sealed(code_cap)) {
     return fail_with(out_status, Status::InvalidCapability);
@@ -124,10 +126,30 @@ Capability create_impl(Capability comp, Capability code_cap,
   }
 
   // Record {code, comp} on the owner's entry pages (checks ownership and bills
-  // a fresh page to the owner's quota if the chain is full).
+  // a fresh page to the owner's quota if the chain is full). A fault handler's
+  // record is marked fault-only, so nothing but the trap dispatcher can enter
+  // it (fault.hpp).
+  uint64_t entry_flags = 0;
+  uint64_t min_stack = DEFAULT_MIN_STACK;
+  switch (kind) {
+    case fault::KIND_ENTRY:
+      break;
+    case fault::KIND_HANDLER:
+      entry_flags = ENTRY_FLAG_FAULT;
+      break;
+    default:
+      return fail_with(out_status, Status::InvalidSentry);
+  }
+  const bool handler = kind != fault::KIND_ENTRY;
+  // Installing a handler is administrative: checked before anything is
+  // recorded, so a refusal leaves no record behind.
+  if (handler && !capability_has_perms(comp, perms::Store)) {
+    return fail_with(out_status, Status::InsufficientPermission);
+  }
+
   compartment::Status c_status = compartment::Status::Ok;
-  Capability record =
-      compartment::add_entry(comp, rx, require_owned, &c_status);
+  Capability record = compartment::add_entry(comp, rx, require_owned,
+                                             entry_flags, min_stack, &c_status);
   if (c_status != compartment::Status::Ok || !capability_is_valid(record)) {
     return fail_with(out_status, c_status);
   }
@@ -135,13 +157,29 @@ Capability create_impl(Capability comp, Capability code_cap,
   __asm__ volatile("fence.i" ::: "memory");
 
   // The handle conveys nothing but the right to enter: Permit_Load if asked
-  // for (invoke requires it), and nothing that could write the record.
-  Capability handle = (perms_mask & perms::Load) != 0
+  // for (invoke requires it), and nothing that could write the record. A
+  // fault handler always gets Permit_Load: the dispatcher enters it through
+  // `resolve_fault`, which needs it.
+  Capability handle = (handler || (perms_mask & perms::Load) != 0)
                           ? handle_for(record)
                           : sealing::seal_as(OType::EntryPoint,
                                              capability_and_perms(record, 0));
   if (!capability_is_valid(handle)) {
+    reinterpret_cast<EntryRecord*>(record)->pcc = nullptr;  // free it again
     return fail_with(out_status, Status::SealFailed);
+  }
+
+  if (handler) {
+    // Into the compartment's descriptor, never back to the caller.
+    const Status installed = compartment::install_fault_handler(comp, handle);
+    if (installed != Status::Ok) {
+      *reinterpret_cast<EntryRecord*>(record) = EntryRecord{};  // free it again
+      return fail_with(out_status, installed);
+    }
+    if (out_status != nullptr) {
+      *out_status = Status::Ok;
+    }
+    return nullptr;
   }
 
   if (out_status != nullptr) {
@@ -260,13 +298,14 @@ void init(Capability root_data_cap) {
 }
 
 Capability create(Capability comp, Capability code_cap, uint64_t perms_mask,
-                  Status* out_status) {
-  return create_impl(comp, code_cap, perms_mask, true, out_status);
+                  uint64_t kind, Status* out_status) {
+  return create_impl(comp, code_cap, perms_mask, kind, true, out_status);
 }
 
 Capability create_kernel(Capability comp, Capability code_cap,
-                         uint64_t perms_mask, Status* out_status) {
-  return create_impl(comp, code_cap, perms_mask, false, out_status);
+                         uint64_t perms_mask, uint64_t kind,
+                         Status* out_status) {
+  return create_impl(comp, code_cap, perms_mask, kind, false, out_status);
 }
 
 Sentry handle_for(Capability record) {
@@ -279,7 +318,11 @@ Sentry handle_for(Capability record) {
   return sealing::seal_as(OType::EntryPoint, handle);
 }
 
-Status resolve(Sentry entry_point, Entry* out) {
+namespace {
+
+// `resolve` and `resolve_fault`: the same checks, and opposite answers on
+// whether the record may be a fault-only one.
+Status resolve_impl(Sentry entry_point, Entry* out, bool want_fault) {
   *out = Entry{};
   if (!capability_is_valid(entry_point)) {
     return Status::InvalidCapability;
@@ -316,6 +359,20 @@ Status resolve(Sentry entry_point, Entry* out) {
     return Status::InvalidCapability;
   }
 
+  // A fault handler is entered by the trap dispatcher and nothing else
+  // (fault.hpp); anything else is never entered by it.
+  const bool fault = (flags & ENTRY_FLAG_FAULT) != 0;
+  if (fault != want_fault || (fault && trusted)) {
+    return Status::InvalidSentry;
+  }
+
+  // The owner must still be live. Destroy clears the records too, but this
+  // also covers a record read just before that, and it is what lets every
+  // reader of `Entry::owner` rely on it.
+  if (!trusted && compartment::open(owner) == nullptr) {
+    return Status::InvalidCompartment;
+  }
+
   // Verify W^X and no privilege escalation before converting to a hardware
   // CT = 1 sentry for `cjalr`. Only the kernel's own entries run with ASR.
   const uint64_t forbidden =
@@ -336,6 +393,16 @@ Status resolve(Sentry entry_point, Entry* out) {
   out->flags = flags;
   out->min_stack = rec->min_stack;
   return Status::Ok;
+}
+
+}  // namespace
+
+Status resolve(Sentry entry_point, Entry* out) {
+  return resolve_impl(entry_point, out, false);
+}
+
+Status resolve_fault(Sentry entry_point, Entry* out) {
+  return resolve_impl(entry_point, out, true);
 }
 
 Capability unseal(Sentry entry_point, Status* out_status) {
@@ -426,11 +493,14 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
     zero_stack(narrowed);  // what the caller's own calls left below its csp
   }
   frame->callee_gp = entry.table;
+  // Whose code this call enters: what the trap dispatcher reads to tell which
+  // compartment faulted, when this frame is the one under a fault's
+  // `TrapFrame` (trap.hpp, WHO FAULTED). Null for a kernel entry.
+  frame->callee_comp = entry.owner;
   if (trusted) {
     entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;  // the kernel always finishes
-  } else if (entry.owner != nullptr) {
-    const auto* c =
-        reinterpret_cast<const compartment::Compartment*>(entry.owner);
+  } else if (const compartment::Compartment* c =
+                 compartment::open(entry.owner)) {
     if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
          compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
       entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;

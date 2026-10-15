@@ -55,6 +55,7 @@
 // own CPU time, unless it is inside code trusted to finish.
 //
 
+#include <signetos/fault.hpp>
 #include <signetos/types.hpp>
 
 namespace signetos::unwind {
@@ -87,10 +88,21 @@ Kind kind_at(Capability ksp);
 // `value` is what the first `ReturnFrame` resumed gets in `args[0]` if no
 // frame was skipped (the callee's return value); after a skipped frame it is
 // Status::CompartmentDestroyed, or Status::Killed if the frame was cut for a
-// kill. A `TrapFrame` resumed has its `mstatus.MPIE`
-// restored from the frame. Each popped frame's loaned stack slice
-// (`callee_sp` / `handler_sp`) is scrubbed whether it is resumed or skipped;
-// a skipped frame is wiped.
-Kind resume(Kind expected_top, Capability value);
+// kill, or the frame's `fault_status` (Status::Faulted) if it was a fault
+// frame. A `TrapFrame` resumed has its `mstatus.MPIE` restored from the
+// frame. Each popped frame's loaned stack slice (`callee_sp` / `handler_sp`)
+// is scrubbed whether it is resumed or skipped; a skipped frame is wiped.
+//
+// FAULT FRAMES (trap.hpp, TRAP_FLAG_FAULT; fault.hpp)
+//
+// A `TrapFrame` pushed for a fault in compartment code is resumed only if it
+// is the top frame (the one whose handler has just returned) and `verdict`,
+// that handler's return value, is fault::INSTALL_CONTEXT: its registers are
+// then reloaded from the ErrorState the handler left, and `mepcc` from the
+// faulting PCC re-addressed to the ErrorState's `pc` (trap::install_context).
+// Anything else abandons the faulting code: the frame is skipped like a dead
+// one.
+Kind resume(Kind expected_top, Capability value,
+            uint64_t verdict = fault::UNWIND);
 
 }  // namespace signetos::unwind

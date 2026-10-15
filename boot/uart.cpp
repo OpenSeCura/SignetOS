@@ -102,7 +102,36 @@ volatile uint8_t* uart_regs() {
                                   : nullptr;
 }
 
+// Sends `str`, up to its NUL or `max_len` bytes, turning "\n" into "\r\n".
+// Returns how many bytes of `str` it sent.
+size_t transmit(volatile uint8_t* uart, const char* str, size_t max_len) {
+  size_t i = 0;
+  for (; i < max_len && str[i] != '\0'; ++i) {
+    const char ch = str[i];
+    if (ch == '\n') {
+      while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
+      uart[REG_RBR_THR] = '\r';
+    }
+    while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
+    uart[REG_RBR_THR] = static_cast<uint8_t>(ch);
+  }
+  return i;
+}
+
 }  // namespace
+
+// The console's fault handler (fault.hpp) prints the report every other
+// compartment prints through it (SIGNETOS_DEFAULT_FAULT_HANDLER,
+// runtime.hpp), but straight to the device: the console cannot call itself.
+SIGNETOS_FAULT_HANDLER compartment_error_handler(fault::ErrorState* state) {
+  LineBuffer line;
+  describe_fault(line, "uart", *state);
+  volatile uint8_t* uart = uart_regs();
+  if (uart != nullptr) {
+    transmit(uart, line.buf, sizeof(line.buf));
+  }
+  return fault::UNWIND;
+}
 
 /// Interrupt context (see trap_mgr.cpp): short, no blocking, no switching.
 extern "C" uint64_t uart_irq_entry(uint64_t source) {
@@ -193,20 +222,8 @@ extern "C" uint64_t compartment_main(Capability arg) {
     }
   }
 
-  const char* str = reinterpret_cast<const char*>(arg);
-  const size_t max_len = capability_get_length(arg);
-  size_t i = 0;
-
-  for (; i < max_len && str[i] != '\0'; ++i) {
-    const char ch = str[i];
-    if (ch == '\n') {
-      while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
-      uart[REG_RBR_THR] = '\r';
-    }
-    while ((uart[REG_LSR] & LSR_THR_EMPTY) == 0) {}
-    uart[REG_RBR_THR] = static_cast<uint8_t>(ch);
-  }
-  return i;
+  return transmit(uart, reinterpret_cast<const char*>(arg),
+                  capability_get_length(arg));
 }
 
 }  // namespace signetos::user

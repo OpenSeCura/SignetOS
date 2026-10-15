@@ -129,7 +129,7 @@ EXT_SERVICE_OBJS = $(patsubst %.cpp,%.o,$(EXT_SERVICE_SRCS))
 EXT_SERVICE_ELFS = $(patsubst %,external/services/%.elf,$(EXT_SERVICES))
 EXT_SERVICE_BINS = $(patsubst %,external/services/%.bin,$(EXT_SERVICES))
 
-EXT_APPS     = hello logo
+EXT_APPS     = hello logo fault
 EXT_APP_SRCS = $(patsubst %,external/apps/%.cpp,$(EXT_APPS))
 EXT_APP_OBJS = $(patsubst %.cpp,%.o,$(EXT_APP_SRCS))
 EXT_APP_ELFS = $(patsubst %,external/apps/%.elf,$(EXT_APPS))

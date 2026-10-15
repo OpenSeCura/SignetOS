@@ -21,42 +21,68 @@
 //
 // SEALED TRAP AUTHORITIES (OType::Trap, CT = 19)
 // ----------------------------------------------
-// Each hardware trap vector (synchronous exceptions 0..31 and asynchronous
-// interrupts 0..15) has a dedicated slot in the kernel's static trap table.
-// At boot, `trap::authority_for(mcause)` mints a sealed `OType::Trap` handle
-// bounded to that vector's `TrapSlot` with `Permit_Load | Permit_Store`.
+// Each asynchronous interrupt vector (0..15) has a dedicated slot in the
+// kernel's static trap table. At boot, `trap::authority_for(mcause)` mints a
+// sealed `OType::Trap` handle bounded to that vector's `TrapSlot` with
+// `Permit_Load | Permit_Store`.
 //
 // Holding a sealed `OType::Trap` capability with `Permit_Load` authorizes
 // binding (`sys_trap_bind`) and unbinding (`sys_trap_unbind`) a compartment
-// `OType::EntryPoint` (CT = 18) sentry to that hardware vector.
+// `OType::EntryPoint` (CT = 18) sentry to that interrupt vector.
+//
+// Synchronous exceptions (0..31) are NOT bindable: no authority is minted
+// for them and `bind` refuses their slots. A fault is handled by the
+// compartment that raised it, through the fault handler it installed in its
+// own descriptor (fault.hpp, PER-COMPARTMENT FAULTS below).
 //
 // Everything runs in M-mode and nothing is delegated, so every trap is taken
-// in M-mode, by the kernel. When a bound trap or interrupt fires:
+// in M-mode, by the kernel. When a bound interrupt fires, or compartment code
+// faults:
 //   1. `_early_trap_entry` saves all 31 capability registers (`cra`, `csp`,
 //      `cgp`, `ctp`, `ct0`..`ct6`, `cs0`..`cs11`, `ca0`..`ca7`), `mepcc`, and
-//      the hart's `mscratchc` kernel SP into a 592-byte `TrapFrame` on the
+//      the hart's `mscratchc` kernel SP into a 640-byte `TrapFrame` on the
 //      active kernel stack.
-//   2. `__signetos_trap_dispatch` looks up the vector and resolves the bound
-//      `OType::EntryPoint` into a `CT = 1` hardware sentry. The handler
-//      runs below the interrupted `csp`, narrowed by the same stack rule as
-//      a callee's (`sentry::narrow_stack`: permissions including StoreLocal,
-//      the handler's `min_stack` free, exactly representable, never the
-//      kernel stack), and makes its kernel calls on the interrupted kernel
-//      stack, which must have `RET_FRAME_MIN_FREE` below the `TrapFrame`.
-//      A thread that fails either cannot take a trap, so cannot be
-//      preempted, and is ended there (`trap.cpp`, `end_interrupted_thread`).
-//   3. The handler sentry is invoked with `(mcause, mtval, mepc, mtval2,
-//      cap_table)` in `(a0, a1, a2, a3, ca4)` (with `cgp = ca4`) and all
-//      other registers scrubbed to `cnull`.
+//   2. `__signetos_trap_dispatch` picks the handler -- the vector's bound
+//      `OType::EntryPoint`, or the faulting compartment's fault handler --
+//      as a `CT = 1` hardware sentry. The handler runs below the interrupted
+//      `csp`, narrowed by the same stack rule as a callee's
+//      (`sentry::narrow_stack`: permissions including StoreLocal, the
+//      handler's `min_stack` free, exactly representable, never the kernel
+//      stack), and makes its kernel calls on the interrupted kernel stack,
+//      which must have `RET_FRAME_MIN_FREE` below the `TrapFrame`. An
+//      interrupted thread that fails either cannot be preempted and is ended
+//      there (`trap.cpp`, `end_interrupted_thread`); a fault that fails
+//      either is reported and unwound instead of delivered.
+//   3. The handler sentry is invoked with `(ca0, mtval, mepc, mtval2,
+//      cap_table)` in `(ca0, a1, a2, a3, ca4)` (with `cgp = ca4`) and all
+//      other registers scrubbed to `cnull`. For an interrupt `ca0` is the
+//      integer `mcause`; for a fault it is the compartment's ErrorState
+//      (fault.hpp), at the top of the handler's stack.
 //   4. Because `mscratchc` points to the `TrapFrame` while the handler runs,
 //      the handler may freely invoke syscalls or call `sys_thread_switch` to
 //      preempt the interrupted thread. An interrupt handler runs with
-//      interrupts masked. An exception handler runs with the interrupted
-//      code's `MIE`, so over thread code an interrupt can be handled on top
-//      of it and return into it (asm_macros.h, INTERRUPT MASKING RULE).
+//      interrupts masked. A fault handler runs with the interrupted code's
+//      `MIE`, so over thread code an interrupt can be handled on top of it
+//      and return into it (asm_macros.h, INTERRUPT MASKING RULE).
 //   5. When the handler returns, the kernel scrubs the handler's narrowed
-//      stack, and `_early_trap_entry` restores `mepcc` and all 31 capability
-//      registers from the `TrapFrame` and executes `mret`.
+//      stack and pops the `TrapFrame` (`__signetos_trap_return` =
+//      `unwind::resume`). An interrupted context is always resumed; a
+//      faulting one only on the handler's INSTALL_CONTEXT verdict, with the
+//      register file it left in the ErrorState, and otherwise unwound: the
+//      frame beneath gets `Status::Faulted` in a0. `_early_trap_entry` then
+//      restores `mepcc` and all 31 capability registers of whatever frame it
+//      stopped at and executes `mret` (or returns through the switcher).
+//
+// PER-COMPARTMENT FAULTS
+// ----------------------
+// The faulting compartment is named by the frame directly beneath the
+// fault's `TrapFrame`, never by anything the compartment controls (its
+// `cgp`, its table): a `ReturnFrame`'s `callee_comp` (the canonical handle
+// the switcher recorded from the entry record), a `TrapFrame`'s
+// `handler_comp` (if that frame is itself a fault frame, the fault was in a
+// fault handler: never delivered again, it unwinds), or, at the bottom of a
+// thread, the owner of the thread's entry sentry. `compartment::open` then
+// checks that compartment is still live.
 //
 // A synchronous fault raised by kernel code (`mepcc` with AccessSystemRegs)
 // is never delivered to a handler: it is a kernel bug and halts the machine.
@@ -144,6 +170,17 @@ constexpr size_t MAX_TRAP_SLOTS =
 using Status = signetos::Status;
 using signetos::status_name;
 
+// `TrapFrame::flags`. Bit 1 is sentry::ENTRY_FLAG_TRUSTED_TO_FINISH, so the
+// unwinder tests the same bit on either kind of frame.
+//
+// TRAP_FLAG_FAULT marks a frame pushed for a fault in compartment code
+// (fault.hpp): whether a handler was delivered on it or not, it is resumed
+// only on its handler's INSTALL_CONTEXT verdict, and otherwise skipped, the
+// frame beneath getting `fault_status`. A fault taken while the frame
+// beneath is such a frame is a fault in a fault handler, and is never
+// delivered.
+constexpr uint64_t TRAP_FLAG_FAULT = 1u << 4;
+
 // Saved context pushed onto the active kernel stack by `_early_trap_entry`
 // before dispatching a trap or interrupt.
 struct alignas(16) TrapFrame {
@@ -165,15 +202,27 @@ struct alignas(16) TrapFrame {
                                 //     interrupted code's MIE
   uint64_t handler_mie;         // 568 MSTATUS_MIE if the handler runs with
                                 //     interrupts enabled, else 0
-  uint64_t flags;               // 576 ENTRY_FLAG_TRUSTED_TO_FINISH if the
+  uint64_t flags;               // 576 TRAP_FLAG_* above, and
+                                //     ENTRY_FLAG_TRUSTED_TO_FINISH if the
                                 //     handler's compartment is trusted to
-                                //     finish, else 0 (unwind.hpp, KILLED
-                                //     THREADS)
-  uint64_t reserved;            // 584
+                                //     finish (unwind.hpp, KILLED THREADS)
+  uint64_t fault_status;        // 584 a fault frame: the `Status` the frame
+                                //     beneath gets if this one is skipped
+                                //     (Faulted, or CompartmentDestroyed)
+  Capability handler_comp;      // 592 the delivered handler's compartment
+                                //     handle; null if none was delivered
+                                //     (WHO FAULTED)
+  // The handler's ca0 and a3, written by __signetos_trap_dispatch (a1 and a2
+  // are always mtval and mepc, read from the CSRs): for an interrupt the
+  // integer `mcause` and `mtval2`; for a fault its ErrorState (fault.hpp) and
+  // `mtval2`.
+  Capability handler_ca0;       // 608
+  uint64_t handler_a3;          // 624
+  uint64_t reserved_;           // 632 (keeps the frame a capability multiple)
 };
 
-static_assert(sizeof(TrapFrame) == 37 * sizeof(Capability),
-              "TrapFrame must be 35 capabilities and four integers (592 "
+static_assert(sizeof(TrapFrame) == 40 * sizeof(Capability),
+              "TrapFrame must be 37 capabilities and six integers (640 "
               "bytes)");
 
 // One routing entry per supported `mcause`; the slot index encodes the cause.
@@ -209,16 +258,12 @@ void init_hart();
 void sync_all_harts();
 
 // Returns the sealed `OType::Trap` (CT = 19) authority handle for `mcause`,
-// or `nullptr` if `mcause` is outside the supported vector range or is
-// `IRQ_M_SOFT`, which nobody may bind (THE SOFTWARE INTERRUPT IS THE
-// KERNEL'S, above).
+// or `nullptr` if `mcause` is outside the supported vector range, is an
+// exception (PER-COMPARTMENT FAULTS, above), or is `IRQ_M_SOFT`, which
+// nobody may bind (THE SOFTWARE INTERRUPT IS THE KERNEL'S, above).
 Capability authority_for(uint64_t mcause);
 
-// Convenience wrappers for minting exception or interrupt authorities.
-inline Capability exception_authority(uint64_t exc_code) {
-  return (exc_code < MAX_EXCEPTION_VECTORS) ? authority_for(exc_code) : nullptr;
-}
-
+// Convenience wrapper for minting interrupt authorities.
 inline Capability irq_authority(uint64_t irq_code) {
   return (irq_code < MAX_INTERRUPT_VECTORS)
              ? authority_for(INTERRUPT_BIT | irq_code)
@@ -238,6 +283,14 @@ Status unbind(Capability comp, Capability auth_cap);
 // Called by `compartment::destroy` to purge any trap bindings owned by the
 // compartment with `comp_uid`.
 size_t purge_compartment(uint64_t comp_uid);
+
+// The fault handler delivered on fault frame `frame` returned INSTALL_CONTEXT
+// (fault.hpp): loads `frame`'s registers from the ErrorState the handler
+// left, and its `mepcc` from the faulting PCC re-addressed to the
+// ErrorState's `pc`. False, with `frame` untouched, if there is no
+// ErrorState or the new `mepcc` is not a valid capability; the frame is then
+// unwound as for any other verdict (unwind.cpp).
+bool install_context(TrapFrame* frame);
 
 // Diagnostics for tests.
 bool is_bound(uint64_t mcause, uint64_t* out_owner_uid = nullptr);

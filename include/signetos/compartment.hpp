@@ -108,6 +108,9 @@ constexpr uint32_t FLAG_LIVE = (1u << 0);
 // Set by `trust_to_finish`, never cleared: a killed thread inside this
 // compartment is left to finish its call (unwind.hpp, KILLED THREADS).
 constexpr uint32_t FLAG_TRUSTED_TO_FINISH = (1u << 1);
+// Set when the fault handler is installed, never cleared: it can be
+// installed once (`install_fault_handler`).
+constexpr uint32_t FLAG_FAULT_HANDLER_SET = (1u << 2);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -124,10 +127,16 @@ struct Compartment {
                            // allocation. See "WHO OWNS WHICH MEMORY" below.
     Capability entries;    // head of the entry page chain (sys_sentry records).
                            // Null until the first entry point is minted.
+    // The compartment's fault handler (fault.hpp): the `OType::EntryPoint`
+    // handle of a fault-only record on its own entry pages, or null. Written
+    // once, under `lock`, by `install_fault_handler`; the trap dispatcher
+    // reads it without it (one capability load).
+    Capability fault_handler;
     uint64_t   uid;        // monotonic, never reused. 0 is never issued.
     uint64_t   table_slots;  // slots in the table behind this header
     uint32_t   flags;
-    SpinLock   lock;       // protects `ranges` and `entries` chains
+    SpinLock   lock;       // protects `ranges` and `entries` chains and the
+                           // fault handler fields
 };
 
 static_assert(sizeof(Compartment) <= TABLE_OFFSET,
@@ -235,6 +244,8 @@ Capability table_writable(Capability handle);
 
 // Records `code` as an entry point of `comp` and returns a kernel capability
 // bounded to the new sentry::EntryRecord (for sentry::create to seal), or null.
+// The record gets `entry_flags` (sentry::ENTRY_FLAG_*; never TRUSTED) and
+// `min_stack`, and its `owner` is `comp`'s canonical handle (`handle_of`).
 //
 // If `require_owned`, `code`'s bounds must lie inside one allocation in
 // `comp`'s range chain; otherwise the caller could run arbitrary code with
@@ -244,7 +255,26 @@ Capability table_writable(Capability handle);
 // Takes a fresh entry page when the chain is full, charged to the
 // compartment's funding quota.
 Capability add_entry(Capability comp, Capability code, bool require_owned,
+                     uint64_t entry_flags, uint64_t min_stack,
                      Status* out_status = nullptr);
+
+// The live descriptor behind `handle`, or null if it is not a genuine handle
+// to a live compartment (destroyed, or swept). The one way kernel code outside
+// this file reads a compartment through a handle it holds -- an entry
+// record's `owner`, a frame's `callee_comp` / `handler_comp` -- so the
+// liveness check is never skipped.
+const Compartment* open(Capability handle);
+
+// The canonical sealed handle of the compartment behind `handle`: minted
+// afresh from its page with every permission `open` needs, whatever was
+// stripped from the copy presented. Null if `handle` does not `open`. What
+// entry records keep as their `owner`.
+Capability handle_of(Capability handle);
+
+// Stores `entry` (an `OType::EntryPoint` handle of a fault-only record of
+// `comp`'s) as `comp`'s fault handler (fault.hpp). It can be set once: Busy
+// if it already has been. `comp` needs Permit_Store.
+Status install_fault_handler(Capability comp, Capability entry);
 
 // Number of entry pages in `comp`'s chain. 0 for a bad handle.
 size_t entry_pages(Capability comp);

@@ -478,6 +478,8 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("blk")
+
 // Interrupt context (see trap_mgr.cpp): acknowledge, wake the waiter, return.
 extern "C" uint64_t blk_irq_entry(uint64_t source) {
   (void)source;  // the only source routed here is ours

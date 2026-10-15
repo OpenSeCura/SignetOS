@@ -110,7 +110,9 @@ The present build makes these simplifications, each expanded below:
   lazy replenishment and budgets enforced at the kernel's 10 ms tick (§2.6).
 * **Revocation sweeps run only under memory pressure.** Freed memory is
   quarantined and stays mapped until a sweep (§4.2).
-* **An unbound synchronous fault halts the whole machine** (§3.6).
+* **A fault is handled by the faulting compartment**, through the fault
+  handler it installed, or reported and unwound if it has none: the caller
+  gets `Faulted` (§3.6). Only a fault in kernel code halts the machine.
 
 ---
 
@@ -213,7 +215,9 @@ the kernel reaches through the compartment's sealed handle.
 followed by the capability table. It grows to more pages if a
 large seed array is passed. The pages are billed to the compartment's funding
 `QuotaVm`. The descriptor holds the funding quota, the chain of owned
-ranges, the chain of entry pages, the UID and liveness flags. It does not
+ranges, the chain of entry pages, the UID and liveness flags, and the
+compartment's fault handler (§3.6), which only the kernel writes. It
+does not
 record which threads are inside it, or how many. The kernel keeps no global
 list of compartments, or of threads.
 
@@ -440,12 +444,17 @@ switcher needs more than a code address:
   the minimum stack it requires.
 
 A record therefore holds the entry's code capability, the callee's capability
-table, the owning compartment, flags, and the minimum stack.
+table, the owning compartment (the canonical sealed handle, which the switcher
+copies into the call's `ReturnFrame::callee_comp` so the trap path can tell
+which compartment a fault came from), flags, and the minimum stack.
 
-* `sys_sentry(comp, code)` requires `code` to lie in executable memory owned
-  by `comp`. It writes a record on `comp`'s entry pages (billed to `comp`) and
-  returns a sealed `EntryPoint` handle bounded to the record. The handle is
-  not jumpable: it is a token presented to the switcher.
+* `sys_sentry(comp, code, kind)` requires `code` to lie in executable memory
+  owned by `comp`. It writes a record on `comp`'s entry pages (billed to
+  `comp`). With `kind = KIND_ENTRY` it returns a sealed `EntryPoint` handle
+  bounded to the record. The handle is not jumpable: it is a token presented
+  to the switcher. With `KIND_HANDLER` the record is marked as a fault
+  entry, installed as `comp`'s fault handler, and never
+  returned (§3.6).
 * The kernel's own system calls are records too, flagged `TRUSTED`. The
   kernel gives a compartment **one** hardware sentry, the switcher gate, and
   every domain crossing goes through it, kernel or not (§2.9).
@@ -622,7 +631,8 @@ the protection domain the loader builds around it (§2.2). One image can be
 loaded into many compartments. Today an image is a **flat binary** with a
 small header. The header starts with a jump to the trampoline and also gives
 a magic value, the extents of the capability relocations, read-only data, GOT
-and BSS, and the location of the manifest.
+and BSS, the location of the manifest, and the offsets of the image's fault
+handlers (0 for none).
 
 * The trampoline (`user/entry.S`) sets up `cgp` and globals, then calls
   `compartment_main(Capability arg)`.
@@ -631,6 +641,12 @@ and BSS, and the location of the manifest.
 * W^X: the PCC covers text, read-only data, relocations and GOT, page-padded
   so the bounds are exact. `.data` and `.bss` lie outside the PCC and are
   never executable.
+* Fault handler (optional): an image may define `extern "C"`
+  `compartment_error_handler(fault::ErrorState*)`. The header references it
+  weakly, so in an image without one the field is 0, meaning "none", and the
+  kernel unwinds every fault of that compartment (§3.6).
+  `SIGNETOS_DEFAULT_FAULT_HANDLER` (`user/runtime.hpp`) defines the usual
+  one.
 
 #### The manifest (`user/manifest.hpp`)
 
@@ -648,7 +664,8 @@ header points to.
   * `FILE`: an open-file handle.
   * `MMIO`: a device window.
   * `DMA`: physically contiguous memory.
-  * `IRQ` / `EXC`: trap authorities.
+  * `IRQ`: an interrupt authority. (`EXC` remains in the format, but
+    exceptions are not bindable and no launcher can meet it; §3.6.)
   * `QUOTA_VM`: the VM quota the compartment is funded from.
   * `QUOTA_THREAD`: a thread-memory quota.
   * `QUOTA_SCHED`: a `quota_sched` node (budget, period, class).
@@ -677,7 +694,8 @@ of its own. Given a VM quota, a seed array and an image, it:
 1. checks the manifest is well formed and matches the seeds;
 2. creates the compartment;
 3. installs the image into memory allocated from the same quota;
-4. mints the entry point;
+4. mints the entry point and installs the image's fault handler, if any
+   (`user::load_compartment_image`; a failed install fails the load);
 5. writes the handles back into the request.
 
 Failures are silent (null outputs). Dependency resolution, such as looking
@@ -722,7 +740,7 @@ filesystem; which is which is a build detail.
 | 5 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
 | 6 | `naming` | Once it is up, init publishes `uart`, `loader` and the `fs.*` entries. |
 | 7 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
-| 8 | `trap_mgr` | The PLIC window, the external-interrupt authority and the exception authorities it asks for. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
+| 8 | `trap_mgr` | The PLIC window and the external-interrupt authority. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
 | 9 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
 | 10 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
@@ -887,34 +905,110 @@ Rough edges:
 
 ### 3.6 Hardware trap and interrupt handling
 
+Interrupts and faults are routed differently. An interrupt goes to whoever
+bound its vector. A synchronous fault goes to **the compartment that raised
+it**, never to a global handler.
+
+#### Interrupts
+
 1. **Authority distribution:** at boot the kernel mints one `OType::Trap`
-   authority per exception code and interrupt number into `init`'s table. The
-   kernel keeps its own IPI vector. `init` passes the authorities on according
-   to manifests: the timer to `sched`, and the external interrupt and the
-   page/CHERI fault codes to `trap_mgr`.
+   authority per interrupt number into `init`'s table. The kernel keeps its
+   own IPI vector. Exceptions get no authority: their 32 seed slots stay null
+   (§5.8). `init` passes the authorities on according to manifests: the timer
+   to `sched`, and the external interrupt to `trap_mgr`.
 2. **Handler registration:** `sys_trap_bind(comp, auth, EntryPoint)` requires
-   the handler to be owned by `comp`. The kernel keeps a static trap table
-   under a seqlock, and every bind is synchronised to all harts by IPI.
-   Bindings are purged when their compartment is destroyed.
-3. **Trap occurrence (currently!):**
-   * Internal events (demand-paging and CoW faults) are meant to be handled
-     silently by the kernel. None exist yet (§3.7), so every trap is either
-     bound or fatal.
-   * A bound trap pushes a trap frame on the interrupted thread's kernel
-     stack. The handler then runs **on the interrupted thread's own, narrowed
-     stack**, with the cause and fault information as arguments.
-   * Interrupt handlers run with interrupts masked. Exception handlers inherit
-     the interrupted state when there is stack room. The handler's stack
-     region is scrubbed on return.
-   * The kernel re-arms the tick before each timer delivery.
-   * **An unbound synchronous exception, including a CHERI fault in a
-     compartment, is reported and halts the whole machine.** A fault inside
-     kernel code always halts. A thread with no kernel-stack room for the
-     frame is ended instead.
-4. **Resolution:** the handler returns through the switcher and the thread
-   resumes. The scheduler's handler may instead `sys_thread_switch` away, and
-   the thread then stays parked in its handler.
+   the handler to be owned by `comp`, and refuses exception slots. The kernel
+   keeps a static trap table under a seqlock, and every bind is synchronised
+   to all harts by IPI. Bindings are purged when their compartment is
+   destroyed.
+3. **Delivery:** a trap frame is pushed on the interrupted thread's kernel
+   stack. The handler then runs **on the interrupted thread's own, narrowed
+   stack**, masked, with `(mcause, mtval, mepc, mtval2)` as arguments. Its
+   stack region is scrubbed on return. The kernel re-arms the tick before
+   each timer delivery.
+4. **Resolution:** the handler returns and the thread resumes. The
+   scheduler's handler may instead `sys_thread_switch` away, and the thread
+   then stays parked in its handler.
 5. **Deregistration:** `sys_trap_unbind` exists, but nothing calls it yet.
+
+#### Per-compartment faults (`include/signetos/fault.hpp`)
+
+Modelled on CHERIoT's per-compartment error handlers. The kernel provides
+mechanism only: what a fault means, and what to do about it, is the
+faulting compartment's business.
+
+1. **Installation:** a compartment has at most one handler, held in a
+   kernel-written field of its `Compartment` descriptor (`fault_handler`).
+   It is installed with `sys_sentry(comp, code, KIND_HANDLER)`. The handle
+   needs `Permit_Store`. The handler can be set once (`Busy` afterwards).
+   The record is marked as a fault entry, which the switcher,
+   `sys_thread_create` and `sys_trap_bind` all refuse. Its handle is never
+   handed back: `sys_sentry` returns only an untagged `Status`. The loader
+   installs it from the image header (§2.8) before the compartment's first
+   instruction. A failed install fails the load.
+
+   A handler is optional: a compartment without one has every fault
+   reported by the kernel and unwound (6. below). Most images use the
+   runtime's default,
+   `SIGNETOS_DEFAULT_FAULT_HANDLER(name)` (`user/runtime.hpp`): the
+   compartment's own code, which prints one line giving the compartment, the
+   thread, the fault, the pc and the pc's offset in the image, then unwinds.
+   The line goes to the console like any other output, by a call to `uart`
+   through the compartment's own table. `uart`'s handler writes the same line
+   straight to the device. `fault.bin` defines its own, to exercise every
+   path.
+2. **Which compartment faulted:** the frame directly beneath the fault's
+   `TrapFrame` names it. Nothing the compartment controls (its `cgp`, its
+   table) is ever used for identity.
+   * A `ReturnFrame` gives `callee_comp`: the canonical handle the switcher
+     copied from the entry record.
+   * A `TrapFrame` gives `handler_comp`: the fault was in a handler.
+   * At the bottom of a thread, it is the owner of the thread's entry
+     sentry.
+
+   `compartment::open` then checks that the compartment is still live.
+3. **Delivery:** the kernel copies the faulting register file into a
+   `fault::ErrorState` at the top of the stack below the faulting `csp`:
+   `regs[n]` is xn, then `pc` (a plain address: the handler never holds the
+   faulting PCC), `mcause`, `mtval` and `mtval2`, raw. The handler runs on
+   the rest of that stack, below the `ErrorState`, with `ca0` = the
+   `ErrorState` and `cgp` = its own table. The kernel does not interpret the
+   fault; `fault::decode` turns `mcause`/`mtval2` into a class and, for
+   CHERI faults, a violation and access kind, for handlers that want it.
+4. **Verdict:** the handler returns one of two verdicts in `a0`:
+   * `INSTALL_CONTEXT`: the kernel loads the register file back from the
+     `ErrorState` and resumes at its `pc`. The resumed PCC is the faulting
+     PCC with only its address changed, so a handler can move the program
+     counter within its own code and nowhere else. Skipping the faulting
+     instruction (`pc += user::instruction_length(pc)`), retrying it,
+     repairing a register or jumping to a recovery point are all edits to
+     the `ErrorState` before this verdict.
+   * Anything else unwinds.
+5. **Unwinding:** the faulting activation is abandoned and its scrubbed
+   frames are popped. The caller's `sys_compartment_invoke` returns
+   `Status::Faulted`. A thread whose own bottom-level code faulted ends.
+6. **When the kernel unwinds without asking:** the fault is reported on the
+   console and unwound as above. This covers:
+   * no handler installed;
+   * no room below the faulting `csp` for the `ErrorState` plus the
+     handler's `min_stack`;
+   * less than `RET_FRAME_MIN_FREE` of kernel stack;
+   * a fault inside the handler itself: it is **never delivered again**.
+
+   There is no limit on how often an activation may fault. A handler that
+   keeps resuming code that keeps faulting is a busy loop like any other: no
+   kernel state grows (`INSTALL_CONTEXT` pops the `TrapFrame` before the code
+   runs again), the tick still preempts it, and a kill takes effect the next
+   time the handler returns. A compartment that wants a limit counts in its
+   own handler.
+
+   A fault inside kernel code always halts the machine.
+7. **Interrupt state:** a fault handler runs with the interrupted code's
+   `MIE` when there is kernel-stack room for a nested trap (asm_macros.h,
+   KERNEL-STACK ROOM). Otherwise it runs masked.
+
+Demand-paging and CoW faults are meant to be resolved silently by the kernel
+before this path. None exist yet (§3.7).
 
 **The trap manager (`external/services/trap_mgr.cpp`):**
 
@@ -923,8 +1017,15 @@ Rough edges:
   fills it and the routing entry is not published. There is no unroute.
 * On an interrupt it claims the source, invokes each routed handler, and
   completes the source.
-* Holds the exception authorities but **never binds them**. There is no fault
-  reporter yet, hence the machine-halt behaviour above.
+* Has nothing to do with faults: those never leave the faulting compartment.
+
+**Tests:** `run fault.bin skip|retry|fix|unwind|double|overflow|loop`
+exercises each path in a program that defines its own handler: resuming
+past, at, or with a repaired register; unwinding; a fault in the handler; no
+room for the handler; and a handler that retries until its own limit. The shell's
+`faulttest` faults inside a call into one of the shell's own entry points:
+the shell's default handler reports the fault, and the call returns
+`Faulted`.
 
 ### 3.7 Fork-less copy-on-write
 
@@ -1065,8 +1166,8 @@ status.
 | --- | --- |
 | `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 1, uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. |
 | `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
-| `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry). |
-| `Sentry sys_sentry(comp, code)` | §2.5. |
+| `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
+| `Sentry sys_sentry(comp, code, kind)` | §2.5. `KIND_ENTRY` returns the `EntryPoint` handle. `KIND_HANDLER` installs `comp`'s fault handler (needs `Permit_Store`, once) and return only an untagged `Status` (§3.6). |
 | `uint64_t sys_compartment_trust_to_finish(comp)` | §2.3. Permanent. Returns a `Status`. |
 | `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |
 | `capability_type_t sys_type_derive(key, permissions)` | Re-issues `key` with a subset of its unseal (Load) and seal (Store) rights. |
@@ -1087,7 +1188,7 @@ status.
 
 | Syscall | Behaviour |
 | --- | --- |
-| `void sys_trap_bind(comp, auth_cap, target)` | `auth_cap` is a `Trap` authority carrying `Permit_Load`. `target` is an `EntryPoint` owned by `comp`; a kernel entry is refused. Replaces any existing binding for the vector. |
+| `void sys_trap_bind(comp, auth_cap, target)` | `auth_cap` is an interrupt `Trap` authority carrying `Permit_Load` (exceptions have none, and their slots are refused). `target` is an `EntryPoint` owned by `comp`; a kernel entry or a fault entry is refused. Replaces any existing binding for the vector. |
 | `void sys_trap_unbind(comp, auth_cap)` | Not used yet. |
 
 The kernel's `Status` codes are defined in `types.hpp`. Only the few noted
@@ -1174,7 +1275,7 @@ their parent; there are no directory-entry blocks.
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
 | `trap_mgr` | External-interrupt routing | §3.6. |
 | `loader` | Compartment construction | §2.8. |
-| `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
+| `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
 
 TODO: isolate DMA access. `blk` writes physical addresses into the device's
 registers and descriptors, and nothing checks them, so it can point the
@@ -1202,7 +1303,6 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_VM_QUOTA` | The root `QuotaVm` |
 | `RW_SLOT_SYSCALL_BASE` … | One `EntryPoint` per syscall |
 | `RW_SLOT_IRQ_BASE` … | The interrupt `Trap` authorities |
-| `RW_SLOT_EXC_BASE` … | The exception `Trap` authorities |
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |

@@ -56,6 +56,8 @@ SIGNETOS_MANIFEST(LOADER_MANIFEST, 128 * 1024)
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("loader")
+
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 

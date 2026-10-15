@@ -2167,6 +2167,37 @@ void cmd_revoketest() {
           (now_us() - t_kill) / 1000, " ms after the kill\n");
 }
 
+// faulttest: a check of fault unwinding across a call, not part of the shell.
+// It invokes an entry point of its own that loads out of bounds. The shell's
+// fault handler (the runtime default, SIGNETOS_DEFAULT_FAULT_HANDLER) reports
+// the fault and unwinds the callee: the invocation returns `Status::Faulted`
+// and the shell carries on.
+alignas(16) volatile uint32_t s_faulttest_small[4];
+
+uint64_t faulttest_callee(Capability) {
+  Capability c = capability_set_bounds(
+      reinterpret_cast<Capability>(const_cast<uint32_t*>(&s_faulttest_small[0])),
+      sizeof(s_faulttest_small));
+  c = capability_set_address(c, capability_get_base(c) + 64);
+  return *reinterpret_cast<volatile uint32_t*>(c) + 1;
+}
+
+void cmd_faulttest() {
+  Capability* rw = rw_table();
+  const Capability entry =
+      mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp,
+                 reinterpret_cast<const void*>(&faulttest_callee));
+  if (!capability_is_valid(entry)) {
+    out("[faulttest] could not mint the entry\n");
+    return;
+  }
+  const int64_t st = invoke<int64_t>(s_gate_invoke, entry, 0ULL);
+  out_dec("[faulttest] the faulting call returned ", static_cast<uint64_t>(st),
+          "");
+  out(st == static_cast<int64_t>(Status::Faulted) ? " (Faulted) -- OK\n"
+                                                  : " -- expected Faulted\n");
+}
+
 // Runs one command line (edited in place to split off arguments). False means
 // the console should end.
 bool execute(char* line) {
@@ -2203,6 +2234,8 @@ bool execute(char* line) {
     cmd_killtest(rest);
   } else if (str_eq(cmd, "revoketest")) {
     cmd_revoketest();
+  } else if (str_eq(cmd, "faulttest")) {
+    cmd_faulttest();
   } else if (str_eq(cmd, "shutdown")) {
     return false;
   } else {
@@ -2267,6 +2300,8 @@ void console_loop() {
 }
 
 }  // namespace
+
+SIGNETOS_DEFAULT_FAULT_HANDLER("shell")
 
 // A worker: fixed slices of work until told to stop or the deadline passes.
 // Interactive workers yield after each slice; a batch worker never does, so it

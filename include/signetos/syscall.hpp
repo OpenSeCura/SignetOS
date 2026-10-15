@@ -221,9 +221,15 @@ uint64_t sys_compartment_invoke(
 // entry pages and returns a sealed pointer to that record. `code` must lie in
 // memory owned by `comp`. A new entry page is billed to `comp`'s quota when
 // the existing ones are full.
+//
+// `kind` (fault.hpp): fault::KIND_ENTRY for an ordinary entry point.
+// fault::KIND_HANDLER installs `code` as `comp`'s fault handler instead
+// (Permit_Store on `comp`, once). Its handle is never handed out: the result
+// is the `Status`, as an untagged integer (0 = installed).
 Sentry sys_sentry(
     capability_compartment_t comp,
-    capability_exec_t        code
+    capability_exec_t        code,
+    uint64_t                 kind
 );
 
 // Mints a type key naming `record`. The record's ADDRESS is the type identity;

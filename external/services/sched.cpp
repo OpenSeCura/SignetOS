@@ -754,6 +754,8 @@ void set_owner(uint64_t* word, const ThreadRec* to) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("sched")
+
 // --- Entry points --------------------------------------------------------------
 
 extern "C" int64_t sched_quota_derive_entry(Capability arg) {

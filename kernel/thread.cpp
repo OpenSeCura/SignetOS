@@ -617,4 +617,14 @@ uint64_t current_tid() {
   return t == nullptr ? 0 : t->tid;
 }
 
+Capability current_entry_sentry() {
+  ThreadState* t = cpu()->current;
+  return t == nullptr ? nullptr : t->entry_sentry;
+}
+
+Capability current_user_stack() {
+  ThreadState* t = cpu()->current;
+  return t == nullptr ? nullptr : t->user_sp;
+}
+
 }  // namespace signetos::thread

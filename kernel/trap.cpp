@@ -52,6 +52,7 @@
 #include <signetos/asm_macros.h>
 #include <signetos/clint.hpp>
 #include <signetos/compartment.hpp>
+#include <signetos/fault.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/sealing.hpp>
@@ -77,6 +78,13 @@ static_assert(offsetof(trap::TrapFrame, mstatus) == TRAP_FRAME_MSTATUS);
 static_assert(offsetof(trap::TrapFrame, handler_mie) ==
               TRAP_FRAME_HANDLER_MIE);
 static_assert(offsetof(trap::TrapFrame, flags) == TRAP_FRAME_FLAGS);
+static_assert(offsetof(trap::TrapFrame, fault_status) ==
+              TRAP_FRAME_FAULT_STATUS);
+static_assert(offsetof(trap::TrapFrame, handler_comp) ==
+              TRAP_FRAME_HANDLER_COMP);
+static_assert(offsetof(trap::TrapFrame, handler_ca0) ==
+              TRAP_FRAME_HANDLER_CA0);
+static_assert(offsetof(trap::TrapFrame, handler_a3) == TRAP_FRAME_HANDLER_A3);
 static_assert(sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE);
 
 // Standard RISC-V synchronous causes, indexed by exception code.
@@ -236,6 +244,33 @@ bool s_in_trap_report = false;
 
   // Exit non-zero so a scripted run can tell a fault from a clean finish.
   uart::qemu_poweroff(1);
+}
+
+// Reports, without halting, a fault in compartment code that no handler of
+// the compartment's took (`why`). The trap path then unwinds it.
+void fault_report(const char* why, uint64_t comp_uid, uint64_t mcause,
+                  uint64_t mepc, uint64_t mtval, uint64_t mtval2) {
+  uart::print("[fault] compartment ");
+  uart::print_dec(comp_uid);
+  uart::print(", thread ");
+  uart::print_dec(signetos::thread::current_tid());
+  uart::print(": ");
+  const char* text = cause_text(mcause);
+  uart::print(text != nullptr ? text : "unrecognised exception");
+  if (mcause == kCheriFault) {
+    uart::print(" (");
+    uart::print(cheri_violation(mtval2));
+    uart::print(", on ");
+    uart::print(cheri_access(mtval2));
+    uart::print(")");
+  }
+  uart::print(" at 0x");
+  uart::print_hex64(mepc);
+  uart::print(", mtval 0x");
+  uart::print_hex64(mtval);
+  uart::print("; ");
+  uart::print(why);
+  uart::print("\n");
 }
 
 }  // namespace
@@ -452,24 +487,246 @@ Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
               mepc, mtval, mtval2, capability_get_address(frame->sp));
 }
 
-Capability advance_sync_mepcc(Capability mepcc) {
-  const uint64_t addr = capability_get_address(mepcc);
-  uint64_t step = 4;
-  if (capability_is_valid(mepcc) && !sealing::is_sealed(mepcc) &&
-      (capability_get_perms(mepcc) & perms::Load) != 0) {
-    const uint64_t base = capability_get_base(mepcc);
-    const uint64_t len = capability_get_length(mepcc);
-    if (addr >= base && addr + 2 <= base + len) {
-      const uint16_t insn16 = *reinterpret_cast<const uint16_t*>(mepcc);
-      if ((insn16 & 0x3u) != 0x3u) {
-        step = 2;
-      }
+// What `__signetos_trap_dispatch` returns to make `_early_trap_entry` unwind
+// at once, without entering a handler: neither null (resume) nor a tagged
+// sentry (enter it). early_trap.S tells the three apart.
+Capability unwind_sentinel() {
+  return reinterpret_cast<Capability>(static_cast<uintptr_t>(1));
+}
+
+// Sets `frame` up for `entry` -- a handler bound to an interrupt, or a
+// compartment's fault handler -- to run on `h_sp` (zeroed first if `zero`)
+// with `a0`/`a3` as its first capability and last integer arguments, and
+// returns the sentry `_early_trap_entry` enters it through. `flags` are the
+// TRAP_FLAG_* of the delivery. `async`: an interrupt, whose handler always
+// runs masked.
+Capability deliver(TrapFrame* frame, const sentry::Entry& entry,
+                   Capability h_sp, bool zero, uint64_t flags, Capability a0,
+                   uint64_t a3, bool async) {
+  // `frame->active_kernel_sp` was written by the trap vector at push
+  // (asm_macros.h, FRAME LINK).
+  thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
+  frame->handler_sp = h_sp;
+  if (zero) {
+    sentry::zero_stack(h_sp);  // what the interrupted code left below its csp
+  }
+  frame->handler_rw_table = entry.table;
+  // Whose code runs above this frame (WHO FAULTED).
+  frame->handler_comp = entry.owner;
+  frame->handler_ca0 = a0;
+  frame->handler_a3 = a3;
+  frame->flags = flags;
+  // What a kill does to the handler (unwind.hpp, KILLED THREADS).
+  if (const compartment::Compartment* owner = compartment::open(entry.owner)) {
+    if ((__atomic_load_n(&owner->flags, __ATOMIC_ACQUIRE) &
+         compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
+      frame->flags |= sentry::ENTRY_FLAG_TRUSTED_TO_FINISH;
     }
   }
-  return capability_set_address(mepcc, addr + step);
+
+  // The MIE the handler runs with (asm_macros.h, INTERRUPT MASKING RULE): an
+  // interrupt handler, masked; a fault handler, the interrupted code's.
+  // Unmasked, it can be interrupted at its first instruction, so, like an
+  // unmasked callee (KERNEL-STACK ROOM, check 2), it also needs room for one
+  // more `TrapFrame` that still passes check 3; with less it runs masked.
+  //
+  // `mstatus` is as the trap left it: its MPIE is the MIE the interrupted
+  // code had (the dispatcher runs masked, so nothing has changed it since).
+  // The copy recorded here is what `__signetos_trap_return` resumes the
+  // interrupted code with.
+  uint64_t mstatus = 0;
+  __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
+  const bool unmasked =
+      !async && (mstatus & MSTATUS_MPIE) != 0 &&
+      thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
+          TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
+  frame->mstatus = mstatus;
+  frame->handler_mie = unmasked ? MSTATUS_MIE : 0;
+
+  // User-space trap delivery: verify that the handler's hardware sentry
+  // (`ct0`), stack (`csp`), capability table (`ca4`/`cgp`) and, if it is a
+  // capability, first argument (`ca0`) are restricted and do not overlap
+  // kernel memory before `early_trap.S` enters it.
+  inspect::assert_user_capability(entry.sentry, "trap_dispatch:hw_sentry");
+  inspect::assert_user_capability(frame->handler_sp,
+                                  "trap_dispatch:handler_sp");
+  inspect::assert_user_capability(frame->handler_rw_table,
+                                  "trap_dispatch:rw_table");
+  if (capability_is_valid(frame->handler_ca0)) {
+    inspect::assert_user_capability(frame->handler_ca0, "trap_dispatch:ca0");
+  }
+  return entry.sentry;
+}
+
+// Abandons the faulting code without entering any handler: `frame` becomes a
+// fault frame that `unwind::resume` skips, giving the frame beneath `status`
+// (unwind.hpp). `_early_trap_entry` goes straight to its return path.
+Capability unwind_now(TrapFrame* frame, Status status) {
+  frame->flags |= TRAP_FLAG_FAULT;
+  frame->fault_status = static_cast<uint64_t>(status);
+  frame->handler_sp = nullptr;
+  frame->handler_ca0 = nullptr;
+  thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
+  return unwind_sentinel();
+}
+
+// True if `a` and `b` are handles to the same compartment.
+bool same_compartment(Capability a, Capability b) {
+  return capability_is_valid(a) && capability_is_valid(b) &&
+         capability_get_base(a) == capability_get_base(b);
+}
+
+// Where `frame` keeps register xn (fault::ErrorState numbering), n = 1..31.
+Capability* frame_reg(TrapFrame* frame, uint32_t n) {
+  if (n == 1) return &frame->ra;
+  if (n == 2) return &frame->sp;
+  if (n == 3) return &frame->gp;
+  if (n == 4) return &frame->tp;
+  if (n <= 7) return &frame->t[n - 5];    // t0..t2 = x5..x7
+  if (n <= 9) return &frame->s[n - 8];    // s0..s1 = x8..x9
+  if (n <= 17) return &frame->a[n - 10];  // a0..a7 = x10..x17
+  if (n <= 27) return &frame->s[n - 16];  // s2..s11 = x18..x27
+  return &frame->t[n - 25];               // t3..t6 = x28..x31
+}
+
+// Copies the faulting context in `frame` into the ErrorState at `es`, on the
+// faulting compartment's own stack (fault.hpp). Every register is the
+// compartment's own; the program counter goes as a plain address, so the
+// handler never holds the faulting PCC.
+void save_context(TrapFrame* frame, Capability es, uint64_t mcause,
+                  uint64_t mtval, uint64_t mtval2) {
+  auto* state = reinterpret_cast<fault::ErrorState*>(es);
+  state->regs[0] = nullptr;
+  for (uint32_t n = 1; n < 32; ++n) {
+    state->regs[n] = *frame_reg(frame, n);
+  }
+  state->pc = capability_get_address(frame->mepcc);
+  state->mcause = mcause;
+  state->mtval = mtval;
+  state->mtval2 = mtval2;
+}
+
+// A synchronous exception raised by compartment code (fault.hpp): find which
+// compartment was running from the frame beneath `frame` (WHO FAULTED) and
+// deliver its fault handler with the faulting context in an ErrorState at the top of the
+// stack below the faulting `csp` -- or, if it cannot be delivered, report the
+// fault and unwind.
+Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
+                          TrapFrame* frame) {
+  const uint64_t mepc = capability_get_address(frame->mepcc);
+
+  // WHO FAULTED: the frame beneath this one entered the code that was
+  // running and recorded whose it is; with nothing beneath, it is the
+  // thread's initial compartment.
+  const Capability below = frame->active_kernel_sp;
+  Capability handle = nullptr;  // the faulting compartment
+  switch (unwind::kind_at(below)) {
+    case unwind::KIND_RETURN_FRAME: {
+      handle = reinterpret_cast<sentry::ReturnFrame*>(below)->callee_comp;
+      break;
+    }
+    case unwind::KIND_TRAP_FRAME: {
+      auto* t = reinterpret_cast<TrapFrame*>(below);
+      if ((t->flags & TRAP_FLAG_FAULT) != 0) {
+        // A fault in a fault handler is never delivered (fault.hpp).
+        const compartment::Compartment* x = compartment::open(t->handler_comp);
+        fault_report("in its fault handler; unwinding", x ? x->uid : 0, mcause,
+                     mepc, mtval, mtval2);
+        return unwind_now(frame, Status::Faulted);
+      }
+      handle = t->handler_comp;
+      break;
+    }
+    default: {
+      if (thread::current_tid() == 0) {
+        trap_report("raised in host context, where no compartment is running",
+                    mcause, mepc, mtval, mtval2,
+                    capability_get_address(frame->sp));
+      }
+      sentry::Entry start{};
+      if (sentry::resolve(thread::current_entry_sentry(), &start) !=
+          Status::Ok) {
+        return unwind_now(frame, Status::CompartmentDestroyed);
+      }
+      handle = start.owner;
+      break;
+    }
+  }
+  if (capability_get_address(handle) == 0) {
+    // Compartment code no kernel frame entered: a kernel bug.
+    trap_report("raised by compartment code that no kernel frame entered",
+                mcause, mepc, mtval, mtval2, capability_get_address(frame->sp));
+  }
+  const compartment::Compartment* x = compartment::open(handle);
+  if (x == nullptr) {
+    // Destroyed while its code ran (swept or not): nobody to hand it to, and
+    // whoever is beneath hears what it would have on any other return.
+    return unwind_now(frame, Status::CompartmentDestroyed);
+  }
+
+  // The handler makes its kernel calls on this kernel stack (asm_macros.h,
+  // KERNEL-STACK ROOM, check 3). Without the room, no handler can run, but
+  // unwinding needs none.
+  if (thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
+      RET_FRAME_MIN_FREE) {
+    fault_report("no kernel stack for its fault handler; unwinding", x->uid,
+                 mcause, mepc, mtval, mtval2);
+    return unwind_now(frame, Status::Faulted);
+  }
+
+  sentry::Entry e{};
+  if (sentry::resolve_fault(x->fault_handler, &e) != Status::Ok ||
+      (e.flags & sentry::ENTRY_FLAG_FAULT) == 0 ||
+      !same_compartment(e.owner, handle)) {
+    fault_report("no fault handler; unwinding", x->uid, mcause, mepc, mtval,
+                 mtval2);
+    return unwind_now(frame, Status::Faulted);
+  }
+
+  // Everything below the faulting `csp`, by the stack rule, with room for
+  // the ErrorState at its top and the handler's `min_stack` below that.
+  Status status = Status::Ok;
+  const Capability h_sp = handler_stack(
+      frame->sp, e.min_stack + sizeof(fault::ErrorState), frame, &status);
+  const uint64_t es_addr =
+      capability_get_address(h_sp) - sizeof(fault::ErrorState);
+  const Capability es = capability_set_bounds(
+      capability_set_address(h_sp, es_addr), sizeof(fault::ErrorState));
+  if (!capability_is_valid(h_sp) || !capability_is_valid(es)) {
+    fault_report("no room on its stack for its fault handler; unwinding",
+                 x->uid, mcause, mepc, mtval, mtval2);
+    return unwind_now(frame, Status::Faulted);
+  }
+
+  // `deliver` zeroes the whole stack, the ErrorState's place included, before
+  // the context is copied in; the handler's `csp` starts below it.
+  const Capability handler =
+      deliver(frame, e, capability_set_address(h_sp, es_addr), true,
+              TRAP_FLAG_FAULT, es, mtval2, false);
+  save_context(frame, es, mcause, mtval, mtval2);
+  return handler;
 }
 
 }  // namespace
+
+bool install_context(TrapFrame* frame) {
+  if (!capability_is_valid(frame->handler_ca0)) {
+    return false;
+  }
+  const auto* state =
+      reinterpret_cast<const fault::ErrorState*>(frame->handler_ca0);
+  // The faulting PCC with only its address changed: the handler moves the
+  // program counter within its own code and nowhere else.
+  const Capability pcc = capability_set_address(frame->mepcc, state->pc);
+  if (!capability_is_valid(pcc)) {
+    return false;
+  }
+  for (uint32_t n = 1; n < 32; ++n) {
+    *frame_reg(frame, n) = state->regs[n];
+  }
+  frame->mepcc = pcc;
+  return true;
+}
 
 void init() {
   s_lock = SpinLock{};
@@ -508,6 +765,12 @@ Capability authority_for(uint64_t mcause) {
   if (mcause == IRQ_M_SOFT) {
     return nullptr;
   }
+  // Exceptions are not bindable either: a synchronous fault is delivered to
+  // the faulting compartment's own fault handler (`fault.hpp`), never to a
+  // global one, so no authority over an exception slot is ever minted.
+  if ((mcause & INTERRUPT_BIT) == 0) {
+    return nullptr;
+  }
   size_t idx = 0;
   if (!slot_index(mcause, &idx)) {
     return nullptr;
@@ -526,6 +789,11 @@ Status bind(Capability comp, Capability auth_cap, Capability target_sentry) {
 
   TrapSlot* slot = unseal_auth(auth_cap);
   if (slot == nullptr) {
+    return Status::InvalidAuthority;
+  }
+  // Belt and braces: `authority_for` never mints an exception-slot handle,
+  // but refuse one here as well so the dispatcher never has to consider it.
+  if (slot < &s_slots[MAX_EXCEPTION_VECTORS]) {
     return Status::InvalidAuthority;
   }
   if ((capability_get_perms(auth_cap) & perms::Load) == 0) {
@@ -637,6 +905,10 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   const bool async = (mcause & INTERRUPT_BIT) != 0;
   const uint64_t mepc = capability_get_address(frame->mepcc);
   frame->flags = 0;
+  frame->fault_status = 0;
+  frame->handler_comp = nullptr;
+  frame->handler_sp = nullptr;
+  frame->handler_ca0 = nullptr;
 
   // A synchronous fault raised by kernel code is a kernel bug, and no handler
   // a compartment bound may stand in for the kernel: report and halt. Kernel
@@ -665,6 +937,13 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     sync_this_hart();
     return nullptr;
+  }
+
+  // A synchronous exception raised by compartment code is that compartment's
+  // fault, for its own handler (fault.hpp). The per-vector table holds only
+  // interrupts.
+  if (!async) {
+    return dispatch_fault(mcause, mtval, mtval2, frame);
   }
 
   // The slot is read once, into a copy (trap.hpp, `TrapSlot`). The dispatcher
@@ -699,65 +978,16 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
         end_interrupted_thread("its stack cannot host the handler", status,
                                mcause, mtval, mtval2, frame);
       }
-
-      // `frame->active_kernel_sp` was written by the trap vector at push
-      // (asm_macros.h, FRAME LINK).
-      thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
-      frame->handler_sp = h_sp;
-      sentry::zero_stack(h_sp);  // what the interrupted code left below its csp
-      frame->handler_rw_table = compartment::table_writable(slot.owner_comp);
-      // What a kill does to the handler (unwind.hpp, KILLED THREADS).
-      const auto* owner =
-          reinterpret_cast<const compartment::Compartment*>(entry.owner);
-      if ((__atomic_load_n(&owner->flags, __ATOMIC_ACQUIRE) &
-           compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
-        frame->flags = sentry::ENTRY_FLAG_TRUSTED_TO_FINISH;
+      if (mcause == IRQ_M_TIMER) {
+        // Re-arm before the handler runs: this clears MTIP, so a handler
+        // that simply returns is safe, and the period does not drift with
+        // the handler's running time.
+        clint::set_timer(clint::now() + tick_ticks());
       }
-
-      // The MIE the handler runs with (asm_macros.h, INTERRUPT MASKING
-      // RULE): an interrupt handler, masked; an exception handler, the
-      // interrupted code's. Unmasked, it can be interrupted at its first
-      // instruction, so, like an unmasked callee (KERNEL-STACK ROOM, check
-      // 2), it also needs room for one more `TrapFrame` that still passes
-      // check 3; with less it runs masked.
-      //
-      // `mstatus` is as the trap left it: its MPIE is the MIE the
-      // interrupted code had (the dispatcher runs masked, so nothing has
-      // changed it since). The copy recorded here is what
-      // `__signetos_trap_return` resumes the interrupted code with.
-      uint64_t mstatus = 0;
-      __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
-      const bool unmasked =
-          !async && (mstatus & MSTATUS_MPIE) != 0 &&
-          thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
-              TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
-      frame->mstatus = mstatus;
-      frame->handler_mie = unmasked ? MSTATUS_MIE : 0;
-
-      // User-space trap delivery: verify that the bound handler's hardware sentry (`ct0`), narrowed
-      // stack capability (`csp`), and capability table (`ca4`/`cgp`) are
-      // restricted and do not overlap kernel memory before `early_trap.S`
-      // enters the handler.
-      inspect::assert_user_capability(entry.sentry,
-                                      "trap_dispatch:hw_sentry");
-      inspect::assert_user_capability(frame->handler_sp,
-                                      "trap_dispatch:handler_sp");
-      inspect::assert_user_capability(frame->handler_rw_table,
-                                      "trap_dispatch:rw_table");
-
-      if (async) {
-        if (mcause == IRQ_M_TIMER) {
-          // Re-arm before the handler runs: this clears MTIP, so a handler
-          // that simply returns is safe, and the period does not drift
-          // with the handler's running time.
-          clint::set_timer(clint::now() + tick_ticks());
-        }
-      } else if (mcause != EXC_INST_PAGE_FAULT &&
-                 mcause != EXC_LOAD_PAGE_FAULT &&
-                 mcause != EXC_STORE_PAGE_FAULT) {
-        frame->mepcc = advance_sync_mepcc(frame->mepcc);
-      }
-      return entry.sentry;
+      return deliver(frame, entry, h_sp, true, 0,
+                     reinterpret_cast<Capability>(
+                         static_cast<uintptr_t>(mcause)),
+                     mtval2, true);
     }
   }
 
@@ -766,34 +996,38 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   // a hart whose poke has not arrived yet, or a binding whose owner has just
   // been destroyed. The timer is disarmed (MTIP can only be cleared by
   // reprogramming it); any other source has its `mie` bit cleared.
-  if (async) {
-    if (mcause == IRQ_M_TIMER) {
-      disarm_tick();
-    } else {
-      __asm__ volatile("csrc mie, %0" : : "r"(1ULL << (mcause & ~INTERRUPT_BIT)));
-    }
-    return nullptr;
+  if (mcause == IRQ_M_TIMER) {
+    disarm_tick();
+  } else {
+    __asm__ volatile("csrc mie, %0" : : "r"(1ULL << (mcause & ~INTERRUPT_BIT)));
   }
-
-  // Unbound synchronous exception: report and halt.
-  trap_report("no handler is bound to this exception", mcause, mepc, mtval,
-              mtval2, capability_get_address(frame->sp));
+  (void)mepc;
+  return nullptr;
 }
 
-extern "C" uint64_t __signetos_trap_return() {
+extern "C" uint64_t __signetos_trap_return(uint64_t verdict) {
   // Pop the handler's `TrapFrame`, scrub the stack loaned to the handler and
   // resume the interrupted code with the MIE it had -- or, if its
   // compartment has been destroyed and swept while the handler ran, the
-  // nearest live frame beneath (unwind.hpp). The top frame must be a
-  // `TrapFrame` the dispatcher pushed for a handler, not something else
-  // reached through a stashed trap-return sentry (e.g. a handler's own
-  // `ReturnFrame` from a call into itself); `resume` refuses anything else
-  // before it reads from the frame.
-  const unwind::Kind kind = unwind::resume(unwind::KIND_TRAP_FRAME, nullptr);
+  // nearest live frame beneath (unwind.hpp). A fault frame is resumed only
+  // on its handler's INSTALL_CONTEXT `verdict`, with the context it left
+  // (fault.hpp); otherwise the faulting code is abandoned and the frame
+  // beneath it gets the fault's status. The
+  // top frame must be a `TrapFrame` the dispatcher pushed for a handler, not
+  // something else reached through a stashed trap-return sentry (e.g. a
+  // handler's own `ReturnFrame` from a call into itself); `resume` refuses
+  // anything else before it reads from the frame.
+  const bool top_ok =
+      unwind::kind_at(thread::current_kernel_sp()) == unwind::KIND_TRAP_FRAME;
+  const unwind::Kind kind =
+      unwind::resume(unwind::KIND_TRAP_FRAME, nullptr, verdict);
   if (kind == unwind::KIND_NONE) {
-    uart::print("[trap] ending thread ");
-    uart::print_dec(thread::current_tid());
-    uart::print(": trap return with nothing to return to\n");
+    // If anything was popped, `resume` has already said why the thread ends.
+    if (!top_ok) {
+      uart::print("[trap] ending thread ");
+      uart::print_dec(thread::current_tid());
+      uart::print(": trap return with nothing to return to\n");
+    }
     thread::exit(-1);
     uart::panic("trap: trap return with nothing to return to");
   }

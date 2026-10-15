@@ -38,6 +38,8 @@ SIGNETOS_MANIFEST(LOGO_MANIFEST, 64 * 1024)
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("logo")
+
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   Capability invoke = rw[SLOT_SYS_COMP_INVOKE];

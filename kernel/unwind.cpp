@@ -132,8 +132,9 @@ Kind kind_at(Capability ksp) {
   }
 }
 
-Kind resume(Kind expected_top, Capability value) {
+Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
   bool popped = false;
+  bool faulted = false;  // a fault frame was skipped on the way
   for (;;) {
     const Capability ksp = thread::current_kernel_sp();
     const Kind kind = kind_at(ksp);
@@ -145,11 +146,14 @@ Kind resume(Kind expected_top, Capability value) {
       if (popped) {
         uart::print("[unwind] ending thread ");
         uart::print_dec(thread::current_tid());
-        uart::print(": every frame on its kernel stack is in a destroyed "
-                    "compartment\n");
+        uart::print(faulted ? ": its own code faulted, with nothing beneath "
+                              "to unwind to\n"
+                            : ": every frame on its kernel stack is in a "
+                              "destroyed compartment\n");
       }
       return KIND_NONE;
     }
+    const bool first = !popped;  // the frame whose code just returned
     popped = true;
 
     const Fate fate = fate_of(link_of(ksp));
@@ -181,21 +185,45 @@ Kind resume(Kind expected_top, Capability value) {
     } else {
       auto* f = reinterpret_cast<trap::TrapFrame*>(ksp);
       thread::set_kernel_sp(f->active_kernel_sp);  // pop
-      sentry::zero_stack(f->handler_sp);  // nor what a handler left
       // The interrupted code is live if `mepcc` still has its tag; it is
-      // resumed as if its handler had returned. `mret` sets MIE := MPIE, and
-      // the MPIE the hardware holds now is stale if anything trapped or
-      // switched threads since the trap was taken, so set it from the
-      // `mstatus` recorded then: the interrupted code resumes with exactly
-      // the MIE it had. Only MPIE is touched here; the trap vector forces
-      // MPP back to M just before its `mret` (early_trap.S, step 5).
-      if (fate == Fate::Run && capability_is_valid(f->mepcc)) {
+      // resumed as if its handler had returned. A fault frame (fault.hpp)
+      // only on the INSTALL_CONTEXT verdict of the handler that just
+      // returned from it -- never one beneath, whose handler was itself
+      // abandoned -- and with the context that handler left in its
+      // ErrorState, which is read before the handler's stack is zeroed.
+      bool resumable = fate == Fate::Run && capability_is_valid(f->mepcc);
+      const bool fault = (f->flags & trap::TRAP_FLAG_FAULT) != 0;
+      if (fault) {
+        resumable = resumable && first &&
+                    verdict == fault::INSTALL_CONTEXT &&
+                    trap::install_context(f);
+      }
+      sentry::zero_stack(f->handler_sp);  // nor what a handler left
+      // `mret` sets MIE := MPIE, and the MPIE the hardware holds now is
+      // stale if anything trapped or switched threads since the trap was
+      // taken, so set it from the `mstatus` recorded then: the interrupted
+      // code resumes with exactly the MIE it had. Only MPIE is touched here;
+      // the trap vector forces MPP back to M just before its `mret`
+      // (early_trap.S, step 5).
+      if (resumable) {
         if ((f->mstatus & MSTATUS_MPIE) != 0) {
           __asm__ volatile("csrs mstatus, %0" : : "r"(MSTATUS_MPIE));
         } else {
           __asm__ volatile("csrc mstatus, %0" : : "r"(MSTATUS_MPIE));
         }
         return KIND_TRAP_FRAME;
+      }
+      if (fault && fate == Fate::Run) {
+        // The faulting code is abandoned: whoever is beneath hears why
+        // (Faulted, or CompartmentDestroyed if it was gone already).
+        const uint64_t status = f->fault_status != 0
+                                    ? f->fault_status
+                                    : static_cast<uint64_t>(Status::Faulted);
+        wipe(reinterpret_cast<Capability*>(f),
+             sizeof(trap::TrapFrame) / sizeof(Capability));
+        value = reinterpret_cast<Capability>(static_cast<uintptr_t>(status));
+        faulted = true;
+        continue;
       }
       wipe(reinterpret_cast<Capability*>(f),
            sizeof(trap::TrapFrame) / sizeof(Capability));

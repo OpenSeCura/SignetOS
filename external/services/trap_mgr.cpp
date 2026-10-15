@@ -72,8 +72,9 @@ namespace {
 
 // --- What `trap_mgr` asks `init` for (user/manifest.hpp) ----------------------
 // The external-interrupt line and the PLIC window are what routing is made
-// of; the four exception bindings are the fault reporter; `vm_allocate` funds
-// the per-source route pages, out of its VM quota.
+// of; `vm_allocate` funds the per-source route pages, out of its VM quota.
+// (No exception authorities: a synchronous fault goes to the faulting
+// compartment's own fault handler, fault.hpp, never to a global one.)
 #define TRAP_MGR_MANIFEST(X)                             \
   M_QUOTA_VM(X, VM_QUOTA)                                \
   M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
@@ -83,10 +84,6 @@ namespace {
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
   M_IRQ(X, IRQ_EXT, 11)                                  \
-  M_EXC(X, EXC_INST_PF, trap::EXC_INST_PAGE_FAULT)       \
-  M_EXC(X, EXC_LOAD_PF, trap::EXC_LOAD_PAGE_FAULT)       \
-  M_EXC(X, EXC_STORE_PF, trap::EXC_STORE_PAGE_FAULT)     \
-  M_EXC(X, EXC_CHERI, trap::EXC_CHERI)                   \
   M_MMIO(X, PLIC_MMIO, "plic")                           \
   M_SERVICE(X, UART_SENTRY, "uart")
 SIGNETOS_MANIFEST(TRAP_MGR_MANIFEST, 64 * 1024)
@@ -169,6 +166,8 @@ Route* alloc_route(uint32_t source) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("trap_mgr")
+
 // --- Entry points
 // --------------------------------------------------------------
 
@@ -250,10 +249,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   Capability irq_ext = rw[SLOT_IRQ_EXT];
-  Capability exc_inst_pf = rw[SLOT_EXC_INST_PF];
-  Capability exc_load_pf = rw[SLOT_EXC_LOAD_PF];
-  Capability exc_store_pf = rw[SLOT_EXC_STORE_PF];
-  Capability exc_cheri = rw[SLOT_EXC_CHERI];
   Capability plic = rw[SLOT_PLIC_MMIO];
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
@@ -261,10 +256,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
       !sealing::is_sealed_as(OType::Trap, irq_ext) ||
-      !sealing::is_sealed_as(OType::Trap, exc_inst_pf) ||
-      !sealing::is_sealed_as(OType::Trap, exc_load_pf) ||
-      !sealing::is_sealed_as(OType::Trap, exc_store_pf) ||
-      !sealing::is_sealed_as(OType::Trap, exc_cheri) ||
       !capability_is_valid(plic) ||
       !capability_has_perms(plic, perms::Load | perms::Store)) {
     return -1;

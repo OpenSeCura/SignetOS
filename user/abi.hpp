@@ -416,8 +416,4 @@ __attribute__((always_inline)) inline constexpr size_t irq_slot(uint64_t irq) {
   return RW_SLOT_IRQ_BASE + static_cast<size_t>(irq);
 }
 
-__attribute__((always_inline)) inline constexpr size_t exc_slot(uint64_t exc) {
-  return RW_SLOT_EXC_BASE + static_cast<size_t>(exc);
-}
-
 }  // namespace signetos::init

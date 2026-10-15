@@ -138,7 +138,7 @@ struct Started {
 // bigger than a stack frame should be, and zero is the right initial value of
 // everything in it.
 struct Launcher {
-  Capability* rw;          // init's table: kernel entries, IRQ/EXC authorities
+  Capability* rw;          // init's table: kernel entries, IRQ authorities
   Capability invoke;       // the switcher
   Capability uart;         // the console, once there is one
   Capability self_comp;
@@ -431,8 +431,7 @@ struct Launcher {
         return e.count < trap::MAX_INTERRUPT_VECTORS ? rw[init::irq_slot(e.count)]
                                                      : nullptr;
       case init::MANIFEST_EXC:
-        return e.count < trap::MAX_EXCEPTION_VECTORS ? rw[init::exc_slot(e.count)]
-                                                     : nullptr;
+        return nullptr;  // exceptions are not bindable (fault.hpp)
       case init::MANIFEST_MMIO:
         if (str_eq(e.name, "uart")) return uart_mmio;
         if (str_eq(e.name, "plic")) return plic_mmio;
@@ -615,7 +614,15 @@ struct Launcher {
 
 Launcher s_launcher;
 
+// init has no manifest; these are the names its manifest would give the
+// switcher and the console in its fixed table (init.hpp, abi.hpp).
+constexpr size_t SLOT_SYS_COMP_INVOKE =
+    init::syscall_slot(syscall::Id::compartment_invoke);
+constexpr size_t SLOT_UART_SENTRY = init::RW_SLOT_UART_SENTRY;
+
 }  // namespace
+
+SIGNETOS_DEFAULT_FAULT_HANDLER("init")
 
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
@@ -1073,7 +1080,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 10. Scrub: nothing runs in `init` after this thread exits, so nothing
   //     here may still be able to act. Every seed the kernel gave it -- the
-  //     root VM quota, every kernel gate, every IRQ and exception authority,
+  //     root VM quota, every kernel gate, every IRQ authority,
   //     the root thread-memory quota and the two sealing authorities -- is
   //     cleared from the table, and the launcher's copies of everything it
   //     granted with them. What stays is inert without a gate: the handles

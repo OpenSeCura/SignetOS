@@ -28,6 +28,7 @@
  */
 
 #include <signetos/compartment.hpp>
+#include <signetos/fault.hpp>
 #include <signetos/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
@@ -237,9 +238,16 @@ extern "C" uint64_t sys_compartment_trust_to_finish(
 }
 
 extern "C" Sentry sys_sentry(capability_compartment_t comp,
-                               capability_exec_t code) {
+                               capability_exec_t code, uint64_t kind) {
   ::signetos::sentry::Status s_status = ::signetos::sentry::Status::Ok;
-  return ::signetos::sentry::create(comp, code, ::signetos::perms::CodeRx, &s_status);
+  Sentry handle = ::signetos::sentry::create(
+      comp, code, ::signetos::perms::CodeRx, kind, &s_status);
+  if (kind == ::signetos::fault::KIND_ENTRY) {
+    return handle;
+  }
+  // A fault handler's handle stays in the kernel (fault.hpp): the caller
+  // learns only whether it was installed, as an untagged Status.
+  return reinterpret_cast<Sentry>(static_cast<uintptr_t>(s_status));
 }
 
 extern "C" capability_type_t sys_type_mint(capability_t record) {

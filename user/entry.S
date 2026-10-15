@@ -20,7 +20,7 @@
  * Linked at offset 0 of every standalone user compartment image
  * (`user/compartment.ld`).
  *
- * Layout (80 bytes, 16-byte aligned, matching `CompartmentImageHeader` in
+ * Layout (96 bytes, 16-byte aligned, matching `CompartmentImageHeader` in
  * `signetos/init.hpp`):
  *   0x00: j _compartment_trampoline (4B) + 3 NOPs (12B)
  *   0x10: magic ("SIGNCOMP" = 0x5349474e434f4d50)
@@ -31,8 +31,20 @@
  *   0x38: _got_end (executable prefix: .text .. .got)
  *   0x40: _manifest_start (the `.manifest` block, `user/manifest.hpp`)
  *   0x48: _manifest_end   (== _manifest_start when the image has none)
- *   0x50: _compartment_trampoline -> jumps to `compartment_main`
+ *   0x50: compartment_error_handler
+ *   0x58: reserved (0)
+ *   0x60: _compartment_trampoline -> jumps to `compartment_main`
+ *
+ * FAULT HANDLER (signetos/fault.hpp): optional. An image that defines
+ * `compartment_error_handler` (`extern "C"`) gets it installed; the reference
+ * is weak, so in an image that does not, the field is 0, "none", and the
+ * kernel unwinds every fault of that compartment. Offset 0 is the header
+ * itself, so it can never be a real handler.
+ * `SIGNETOS_DEFAULT_FAULT_HANDLER` (runtime.hpp) defines one that reports
+ * the fault and unwinds.
  */
+
+    .weak compartment_error_handler
 
     .section .text.entry, "ax", @progbits
     .align 4
@@ -54,6 +66,8 @@ _compartment_start:
     .quad   _got_end                    /* +56: end of .got (PCC bound) */
     .quad   _manifest_start             /* +64: .manifest block start */
     .quad   _manifest_end               /* +72: .manifest block end */
+    .quad   compartment_error_handler   /* +80: fault handler */
+    .quad   0                           /* +88: reserved */
 
     .align 4
 _compartment_trampoline:

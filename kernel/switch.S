@@ -131,6 +131,7 @@ sys_compartment_invoke:
     csc     ca5, RET_FRAME_ARG4(ct1)
     sd      t2,  RET_FRAME_MSTATUS(ct1)
     sd      zero, RET_FRAME_FLAGS(ct1)
+    csc     cnull, RET_FRAME_CALLEE_COMP(ct1) /* set by _prepare if it enters */
     cmv     csp, ct1
 
     /*
@@ -248,7 +249,7 @@ __signetos_resume_return_frame:
     clc     cs11, 240(ct1)
     ld      t2,  RET_FRAME_MSTATUS(ct1)
     clc     ca0, RET_FRAME_ARG0(ct1)
-    /* Wipe all 25 slots of the popped frame. */
+    /* Wipe all 26 slots of the popped frame. */
     csc     cnull,   0(ct1)             /* ra */
     csc     cnull,  FRAME_SP(ct1)       /* sp */
     csc     cnull,  32(ct1)             /* gp */
@@ -274,6 +275,7 @@ __signetos_resume_return_frame:
     csc     cnull, RET_FRAME_CALLEE_SP(ct1)
     csc     cnull, RET_FRAME_CALLEE_GP(ct1)
     csc     cnull, RET_FRAME_MSTATUS(ct1) /* mstatus + flags */
+    csc     cnull, RET_FRAME_CALLEE_COMP(ct1)
 
     /*
      * Common exit to user code. `t2` holds the caller's `mstatus` as sampled

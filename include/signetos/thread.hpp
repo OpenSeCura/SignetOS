@@ -127,6 +127,9 @@ struct alignas(16) ThreadState {
   int32_t exit_status;
 };
 
+static_assert(sizeof(ThreadState) == 144,
+              "ThreadState is 144 bytes (asm_macros.h, KERNEL-STACK ROOM)");
+
 static_assert(sizeof(ThreadState) + sizeof(SwitchFrame) <= 1024,
               "ThreadState must leave room in the allocation for the kernel "
               "return stack");
@@ -208,6 +211,13 @@ uint64_t tid_of(Capability thread_handle);
 
 // The id of the thread running on this hart, or 0 in host context.
 uint64_t current_tid();
+
+// The thread running on this hart's entry point (`OType::EntryPoint`), and
+// its stack positioned at the top: whose code it runs when inside no call,
+// and the stack that code was entered with (trap.cpp, a fault at depth 0).
+// Null in host context.
+Capability current_entry_sentry();
+Capability current_user_stack();
 
 // Reads the current hart's active kernel stack capability from `mscratchc`
 // (the boot kernel stack when executing in host context).

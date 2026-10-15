@@ -33,6 +33,7 @@
 #include <signetos/compartment.hpp>
 #include "abi.hpp"
 #include "manifest.hpp"
+#include <signetos/fault.hpp>
 #include <signetos/platform.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/syscall.hpp>
@@ -178,7 +179,8 @@ inline Capability mint_entry(Capability invoke_gate, Capability sentry_gate,
       pcc, capability_get_address(
                reinterpret_cast<Capability>(const_cast<void*>(fn))));
   using FnSentry = decltype(&sys_sentry);
-  return syscall::call<FnSentry>(invoke_gate, sentry_gate, self_comp, code);
+  return syscall::call<FnSentry>(invoke_gate, sentry_gate, self_comp, code,
+                                 static_cast<uint64_t>(fault::KIND_ENTRY));
 }
 
 // Naming service clients.
@@ -329,7 +331,184 @@ inline Capability load_compartment_image(Capability invoke_gate,
   if (!capability_is_valid(code)) {
     return nullptr;
   }
-  return syscall::call<FnSentry>(invoke_gate, sentry_gate, target_comp, code);
+  Capability entry = syscall::call<FnSentry>(
+      invoke_gate, sentry_gate, target_comp, code,
+      static_cast<uint64_t>(fault::KIND_ENTRY));
+  if (!capability_is_valid(entry)) {
+    return nullptr;
+  }
+
+  // The image's fault handler (fault.hpp), if it defines one: installed in
+  // the compartment by the same gate, never handed back. Any failure fails
+  // the load -- a compartment that asked for a handler must not run without
+  // it -- and the caller destroys the compartment.
+  Capability handler_code = nullptr;
+  if (!init::image_fault_handler(code, hdr->fault_handler, &handler_code)) {
+    return nullptr;
+  }
+  if (handler_code != nullptr) {
+    Capability result = syscall::call<FnSentry>(
+        invoke_gate, sentry_gate, target_comp, handler_code,
+        static_cast<uint64_t>(fault::KIND_HANDLER));
+    if (capability_is_valid(result) || capability_get_address(result) != 0) {
+      return nullptr;  // not an untagged Status::Ok
+    }
+  }
+  return entry;
+}
+
+// --- Fault handlers (signetos/fault.hpp) -------------------------------------
+//
+// An image may define `compartment_error_handler(fault::ErrorState*)`
+// (user/entry.S); without one, the kernel unwinds the compartment's faults.
+// `SIGNETOS_DEFAULT_FAULT_HANDLER` below defines the usual one: print one
+// line describing the fault, then unwind.
+
+// One line of console text, built in a fixed buffer so it can be printed
+// with a single call. Text that does not fit is dropped; `buf` is always
+// NUL-terminated.
+struct LineBuffer {
+  char buf[160];
+  size_t len = 0;
+
+  LineBuffer() { buf[0] = '\0'; }
+
+  // Every write goes through here: one character, if there is room for it
+  // and the NUL after it.
+  void put(char c) {
+    if (len + 1 < sizeof(buf)) {
+      buf[len] = c;
+      len += 1;
+      buf[len] = '\0';
+    }
+  }
+  void str(const char* s) {
+    for (; s != nullptr && *s != '\0'; ++s) {
+      put(*s);
+    }
+  }
+  void dec(uint64_t v) { num(v, 10); }
+  void hex(uint64_t v) {
+    str("0x");
+    num(v, 16);
+  }
+
+ private:
+  void num(uint64_t v, uint64_t base) {
+    char digits[20];  // UINT64_MAX has 20 decimal digits
+    size_t n = 0;
+    do {
+      const uint64_t d = v % base;
+      digits[n] = static_cast<char>(d < 10 ? '0' + d : 'a' + (d - 10));
+      n += 1;
+      v /= base;
+    } while (v != 0);
+    while (n > 0) {
+      n -= 1;
+      put(digits[n]);
+    }
+  }
+};
+
+// The running code capability (PCC), which covers this image's code. A fault
+// handler runs in the same code as the code that faulted, so this is how it
+// reads that code (`instruction_length`) or locates a pc in it.
+__attribute__((always_inline)) inline Capability own_code() {
+  Capability pcc;
+  __asm__ volatile("auipcc %0, 0" : "=C"(pcc));
+  return pcc;
+}
+
+// The length in bytes (2 or 4) of the instruction at `pc` in this image's
+// code: what a handler adds to `ErrorState::pc` to skip the faulting
+// instruction. 0 if `pc` is not in this image's code (a fault on fetching
+// from a bad target), where there is no instruction to skip.
+inline uint64_t instruction_length(uint64_t pc) {
+  const Capability code = own_code();
+  const uint64_t base = capability_get_base(code);
+  if (pc < base || pc - base + 2 > capability_get_length(code) ||
+      !capability_has_perms(code, perms::Load)) {
+    return 0;
+  }
+  const uint16_t low = *reinterpret_cast<const volatile uint16_t*>(
+      capability_set_address(code, pc));
+  return (low & 0b11) == 0b11 ? 4 : 2;
+}
+
+// The line the default fault handler prints, for the fault `state` in the
+// compartment `who`:
+//
+//   [fs] fault in thread 5: CHERI bounds violation on data access at pc
+//   0x80443a1c (image +0x1a1c), mtval 0x80450040; unwinding
+//
+// The image offset is the pc less the base of the running PCC, which covers
+// the image's code, linked at 0: it is the address to look up in the image's
+// ELF file (`llvm-addr2line -e fs.elf 0x1a1c`). It is left out when the pc
+// is outside that code, as after a jump to a bad target.
+inline void describe_fault(LineBuffer& out, const char* who,
+                           const fault::ErrorState& state) {
+  const fault::Decoded d = fault::decode(state.mcause, state.mtval2);
+  out.str("[");
+  out.str(who);
+  out.str("] fault in thread ");
+  out.dec(self_tid());
+  out.str(": ");
+  if (d.cls == fault::CLASS_CAPABILITY) {
+    out.str("CHERI ");
+    out.str(fault::violation_name(fault::detail_violation(d.detail)));
+    out.str(" violation on ");
+    out.str(fault::access_name(fault::detail_access(d.detail)));
+  } else {
+    out.str(fault::class_name(d.cls));
+  }
+  out.str(" at pc ");
+  out.hex(state.pc);
+  const Capability code = own_code();
+  const uint64_t code_base = capability_get_base(code);
+  if (state.pc >= code_base &&
+      state.pc - code_base < capability_get_length(code)) {
+    out.str(" (image +");
+    out.hex(state.pc - code_base);
+    out.str(")");
+  }
+  out.str(", mtval ");
+  out.hex(state.mtval);
+  out.str("; unwinding\n");
+}
+
+// The default fault handler: prints `describe_fault`'s line through the
+// compartment's own `uart` sentry and unwinds.
+inline uint64_t report_fault_and_unwind(const char* who,
+                                        const fault::ErrorState& state,
+                                        Capability invoke_gate,
+                                        Capability uart_sentry) {
+  LineBuffer line;
+  describe_fault(line, who, state);
+  print(invoke_gate, uart_sentry, line.buf);
+  return fault::UNWIND;
 }
 
 }  // namespace signetos::user
+
+// Declares a fault handler: `extern "C"`, so user/entry.S finds it by name,
+// and 4-byte aligned, which the loader insists on (`init::image_fault_handler`)
+// but the compiler does not otherwise promise once compressed instructions
+// are on.
+#define SIGNETOS_FAULT_HANDLER extern "C" __attribute__((aligned(4))) uint64_t
+
+// Defines this image's fault handler as the default
+// (`report_fault_and_unwind`); `who` names the compartment in the report.
+// The handler is this compartment's own code. To print the report it calls
+// the console like any other `print`, through the switcher and the `uart`
+// entry in the compartment's capability table (`cgp`, which the kernel sets
+// for the handler), at the slots its manifest names `SLOT_SYS_COMP_INVOKE`
+// and `SLOT_UART_SENTRY`. Use it at namespace scope outside any unnamed
+// namespace: the handler must have external linkage for user/entry.S to find
+// it.
+#define SIGNETOS_DEFAULT_FAULT_HANDLER(who)                       \
+  SIGNETOS_FAULT_HANDLER compartment_error_handler(               \
+      ::signetos::fault::ErrorState* state) {                     \
+    const ::signetos::Capability* t = ::signetos::user::rw_table(); \
+    return ::signetos::user::report_fault_and_unwind(             \
+        who, *state, t[SLOT_SYS_COMP_INVOKE], t[SLOT_UART_SENTRY]); \
+  }

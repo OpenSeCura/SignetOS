@@ -1218,6 +1218,8 @@ bool read_path(Capability path_cap, char (&out)[init::FS_PATH_MAX]) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("fs")
+
 // --- Entry points ------------------------------------------------------------------------------
 
 extern "C" int64_t fs_quota_derive_entry(Capability arg) {

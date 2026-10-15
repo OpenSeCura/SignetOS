@@ -172,6 +172,8 @@ void leave_a_note(Capability* rw, const char* args) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("hello")
+
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
   s_invoke = rw[SLOT_SYS_COMP_INVOKE];

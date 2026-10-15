@@ -115,6 +115,8 @@ Entry* find(const char* name) {
 
 }  // namespace
 
+SIGNETOS_DEFAULT_FAULT_HANDLER("naming")
+
 extern "C" int64_t naming_publish_entry(Capability name_cap,
                                         Capability sentry) {
   char name[init::NAME_MAX];

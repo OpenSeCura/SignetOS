@@ -33,7 +33,9 @@
 //        - The hardware interrupt authorities (`trap::irq_authority`). The
 //          software interrupt has none -- it is the kernel's (trap.hpp) --
 //          so its slot holds null.
-//        - All 32 hardware exception authorities (`trap::exception_authority`)
+//        - 32 exception-authority slots, all null: exceptions are not
+//          bindable (a fault goes to the faulting compartment's own handler,
+//          fault.hpp). The slots are kept so the seed layout is stable.
 //        - `root_quota_thread_mem`
 //   2. Loads `boot/init.bin` into `init`'s own memory, processes its
 //      `__cap_relocs`, and mints `init`'s entry-point sentry.
@@ -76,10 +78,12 @@ struct CompartmentImageHeader {
   uint64_t manifest_start;    // 64: the `.manifest` block (user/manifest.hpp):
   uint64_t manifest_end;      // 72: what the image asks its launcher for; equal
                               //     offsets when it carries none
+  uint64_t fault_handler;     // 80: `compartment_error_handler`, or 0
+  uint64_t reserved_;         // 88: 0
 };
 
-static_assert(sizeof(CompartmentImageHeader) == 80,
-              "CompartmentImageHeader must be 80 bytes (5 capabilities)");
+static_assert(sizeof(CompartmentImageHeader) == 96,
+              "CompartmentImageHeader must be 96 bytes (6 capabilities)");
 
 // Validates `img_cap` as a compartment image and returns its header, or
 // nullptr if the capability is not a readable image with the right magic.
@@ -120,6 +124,25 @@ inline Capability image_code_window(Capability code_mem,
     return nullptr;  // would round up into `.data`
   }
   return code;
+}
+
+// The code capability for the image's fault handler (`hdr->fault_handler`):
+// `code` (from `image_code_window`) with its cursor moved to `offset`.
+// Returns true with `*out = nullptr` when `offset` is 0 (no handler),
+// true with the capability when `offset` is a 4-byte-aligned address past the
+// header and inside `code`, and false (a malformed image) otherwise.
+inline bool image_fault_handler(Capability code, uint64_t offset,
+                                Capability* out) {
+  *out = nullptr;
+  if (offset == 0) {
+    return true;
+  }
+  if ((offset & 3) != 0 || offset < sizeof(CompartmentImageHeader) ||
+      offset >= capability_get_length(code)) {
+    return false;
+  }
+  *out = capability_set_address(code, capability_get_base(code) + offset);
+  return capability_is_valid(*out);
 }
 
 // Bytes to allocate for an image: the file bytes plus any trailing `.bss`.
@@ -210,10 +233,8 @@ constexpr size_t RW_SLOT_VM_QUOTA =
 constexpr size_t RW_SLOT_SYSCALL_BASE = RW_SLOT_VM_QUOTA + 1;
 constexpr size_t RW_SLOT_IRQ_BASE =
     RW_SLOT_SYSCALL_BASE + syscall::kSyscallCount;   // 16 IRQ authorities
-constexpr size_t RW_SLOT_EXC_BASE =
-    RW_SLOT_IRQ_BASE + trap::MAX_INTERRUPT_VECTORS;  // 32 exception authorities
 constexpr size_t RW_SLOT_THREAD_QUOTA =
-    RW_SLOT_EXC_BASE + trap::MAX_EXCEPTION_VECTORS;  // root_quota_thread_mem
+    RW_SLOT_IRQ_BASE + trap::MAX_INTERRUPT_VECTORS;  // root_quota_thread_mem
 constexpr size_t RW_SLOT_SEAL_SCHED =
     RW_SLOT_THREAD_QUOTA + 1;                        // OType::QuotaSched authority
 constexpr size_t RW_SLOT_SEAL_DISK =

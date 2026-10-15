@@ -186,6 +186,15 @@ Capability unseal(Capability handle) {
   return reinterpret_cast<Capability>(c);
 }
 
+// The compartment's sealed handle, minted from its page: bounded to the
+// struct (so unsealing it cannot reach the table) and carrying every
+// permission of the page, which includes all that `unseal` asks for. `create`
+// hands this out, and `handle_of` mints it again for entry records.
+Capability canonical_handle(Capability page) {
+  Capability handle = capability_set_bounds(page, sizeof(Compartment));
+  return sealing::seal_as(OType::Compartment, handle);
+}
+
 // A capability covering slots [first, first + count) of the table in `page`.
 Capability table_slice(Capability page, size_t first, size_t count) {
   const uint64_t va =
@@ -288,8 +297,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   // The handle names the struct, not the page, so unsealing it cannot reach
   // the table. Its base is still the page base, which is what unseal()
   // reads.
-  Capability handle = capability_set_bounds(page, sizeof(Compartment));
-  handle = sealing::seal_as(OType::Compartment, handle);
+  Capability handle = canonical_handle(page);
   if (!capability_is_valid(handle)) {
     vm::free_pages(page);
     quota::refund(mem_quota, cost);
@@ -305,6 +313,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   c->quota = mem_quota;  // kept so destroy can refund the pages later
   c->ranges = nullptr;   // no memory owned yet, so no range pages
   c->entries = nullptr;  // no entry points yet, so no entry pages
+  c->fault_handler = nullptr;  // none until the loader installs one
   c->uid = uid;
   c->table_slots = slots;
   c->flags = FLAG_LIVE;
@@ -346,10 +355,15 @@ Capability table_writable(Capability handle) {
 }
 
 Capability add_entry(Capability comp, Capability code, bool require_owned,
+                     uint64_t entry_flags, uint64_t min_stack,
                      Status* out_status) {
   Capability comp_page = unseal(comp);
   if (!capability_is_valid(comp_page) || !capability_is_valid(code)) {
     return fail_with(out_status, Status::InvalidCapability);
+  }
+  // Only `syscall::gate` makes kernel entries, and not through here.
+  if ((entry_flags & sentry::ENTRY_FLAG_TRUSTED) != 0) {
+    return fail_with(out_status, Status::InvalidSentry);
   }
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
@@ -361,6 +375,14 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
   if (require_owned &&
       !owns(comp_page, capability_get_base(code), capability_get_length(code))) {
     return fail_with(out_status, Status::NotOwned);
+  }
+
+  // The owner is kept as a sealed handle, opened with `open` (and so checked
+  // live) by whoever reads it. Minted here rather than copied from `comp`,
+  // which may have had permissions stripped that `open` needs.
+  const Capability owner = canonical_handle(comp_page);
+  if (!capability_is_valid(owner)) {
+    return fail_with(out_status, Status::SealFailed);
   }
 
   EntryRecord* record = find_free_entry(comp_page);
@@ -386,9 +408,9 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
 
   record->pcc = code;
   record->cgp = user_view(table_slice(comp_page, 0, c->table_slots));
-  record->owner = comp_page;
-  record->flags = 0;  // a compartment entry is never trusted
-  record->min_stack = sentry::DEFAULT_MIN_STACK;
+  record->owner = owner;
+  record->flags = entry_flags;  // a compartment entry is never trusted
+  record->min_stack = min_stack;
 
   Capability out = capability_set_bounds(reinterpret_cast<Capability>(record),
                                          sizeof(EntryRecord));
@@ -396,6 +418,43 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
     *out_status = Status::Ok;
   }
   return out;
+}
+
+const Compartment* open(Capability handle) {
+  return reinterpret_cast<const Compartment*>(unseal(handle));
+}
+
+Capability handle_of(Capability handle) {
+  Capability page = unseal(handle);
+  if (!capability_is_valid(page)) {
+    return nullptr;
+  }
+  return canonical_handle(page);
+}
+
+Status install_fault_handler(Capability comp, Capability entry) {
+  if (!capability_has_perms(comp, perms::Store)) {
+    return Status::InsufficientPermission;
+  }
+  Capability comp_page = unseal(comp);
+  if (!capability_is_valid(comp_page)) {
+    return Status::InvalidCapability;
+  }
+  Compartment* c = reinterpret_cast<Compartment*>(comp_page);
+  Locked hold(c->lock);
+  const uint32_t flags = __atomic_load_n(&c->flags, __ATOMIC_ACQUIRE);
+  if ((flags & FLAG_LIVE) == 0) {
+    return Status::InvalidCapability;
+  }
+  if ((flags & FLAG_FAULT_HANDLER_SET) != 0) {
+    return Status::Busy;  // once only (fault.hpp)
+  }
+  // The dispatcher reads the field without the lock: the handle is a single
+  // capability store, and the flag (which nothing reads without the lock)
+  // follows it.
+  c->fault_handler = entry;
+  __atomic_fetch_or(&c->flags, FLAG_FAULT_HANDLER_SET, __ATOMIC_RELEASE);
+  return Status::Ok;
 }
 
 size_t entry_pages(Capability comp) {
@@ -706,6 +765,8 @@ Status destroy(Capability handle) {
       p = next;
     }
     c->entries = nullptr;
+    // The fault handler names a record just cleared; drop it too.
+    c->fault_handler = nullptr;
 
     // The page is quarantined below, not unmapped, so a stale handle still
     // reaches the struct; unseal() refuses it because FLAG_LIVE is clear
