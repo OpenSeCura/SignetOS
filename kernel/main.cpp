@@ -20,12 +20,12 @@
  * Brings up the kernel subsystems and launches the `init` compartment.
  */
 
-#include <signetos/clint.hpp>
+#include <signetos/hw/clint.hpp>
 #include <signetos/compartment.hpp>
 #include <signetos/frame.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/init.hpp>
-#include <signetos/logo.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
@@ -33,7 +33,7 @@
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/types.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/hw/uart.hpp>
 #include <signetos/vm.hpp>
 
 using namespace signetos;
@@ -51,24 +51,22 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   // Initialize UART Console
   uart::init(root_data_cap);
 
-  logo::play(uart::print, platform::timebase_hz() / 1000ULL, true);
-
   // Establish the sealing authority root. Every subsystem below assumes its
   // `sealing::authority_for(OType)` is valid, so this is fatal.
   if (!sealing::init_type_root(root_data_cap)) {
-    uart::panic(
+    debug::panic(
         "no sealing authority: needs a zyseal -march and "
         "a QEMU run with -cpu rv64,Zyseal=on");
   }
 
   if (!vm::is_initialized()) {
-    uart::panic("vm: boot mappings could not be built");
+    debug::panic("vm: boot mappings could not be built");
   }
 
   // Physical frame allocator, bitmap reached through the direct map.
   frame::init();
   if (!frame::is_initialized()) {
-    uart::panic("frame allocator did not initialise");
+    debug::panic("frame allocator did not initialise");
   }
 
   // Initialize kernel subsystems
@@ -93,7 +91,7 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
       thread::create_root_quota(system_quota, THREAD_MEMORY_BYTES);
 
 #ifdef SIGNETOS_QUOTA_SELFTEST
-  quota::self_test(system_quota);
+  debug::quota_self_test(system_quota);
 #endif
 
   (void)hartid;

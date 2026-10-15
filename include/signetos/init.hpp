@@ -53,7 +53,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <signetos/compartment.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/types.hpp>

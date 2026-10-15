@@ -63,7 +63,7 @@
  * `init` makes, not something any compartment holding `lookup` may.
  */
 
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 
 #include "runtime.hpp"
 

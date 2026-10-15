@@ -30,11 +30,11 @@
  * here are the ones with teeth against a kernel bug that leaks real authority.
  */
 
-#include <signetos/inspect.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/debug/inspect.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/hw/uart.hpp>
 #include <signetos/vm.hpp>
 
 namespace signetos::inspect {

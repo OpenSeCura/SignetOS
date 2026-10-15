@@ -27,11 +27,11 @@
 #include <signetos/asm_macros.h>
 #include <signetos/compartment.hpp>
 #include <signetos/fault.hpp>
-#include <signetos/inspect.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 
@@ -293,7 +293,7 @@ void init(Capability root_data_cap) {
     }
   }
   if (!capability_is_valid(s_root_code_cap)) {
-    uart::panic("sentry: cannot derive the compartment code root");
+    debug::panic("sentry: cannot derive the compartment code root");
   }
 }
 

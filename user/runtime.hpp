@@ -34,7 +34,7 @@
 #include "abi.hpp"
 #include "manifest.hpp"
 #include <signetos/fault.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/types.hpp>

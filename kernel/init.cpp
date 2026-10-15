@@ -23,15 +23,15 @@
 
 #include <signetos/compartment.hpp>
 #include <signetos/init.hpp>
-#include <signetos/inspect.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/debug/inspect.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/vm.hpp>
 
 extern "C" {
@@ -122,8 +122,8 @@ Status launch(Capability system_quota, Capability thread_quota,
     return Status::InvalidCapability;
   }
 
-  uart::print_cap("system quota", system_quota);
-  uart::print_cap("thread quota", thread_quota);
+  debug::boot_capability("system quota", system_quota);
+  debug::boot_capability("thread quota", thread_quota);
 
   alignas(sizeof(Capability)) static Capability init_seeds[INIT_SEED_COUNT];
   size_t idx = 0;
@@ -133,11 +133,11 @@ Status launch(Capability system_quota, Capability thread_quota,
   init_seeds[idx++] = system_quota;
   for (size_t i = 0; i < syscall::kSyscallCount; ++i) {
     init_seeds[idx++] = syscall::gate(static_cast<syscall::Id>(i));
-    uart::print_cap("syscall", syscall::gate(static_cast<syscall::Id>(i)));
+    debug::boot_capability("syscall", syscall::gate(static_cast<syscall::Id>(i)));
   }
   for (uint64_t i = 0; i < trap::MAX_INTERRUPT_VECTORS; ++i) {
     init_seeds[idx++] = trap::irq_authority(i);
-    uart::print_cap("irq auth", trap::irq_authority(i));
+    debug::boot_capability("irq auth", trap::irq_authority(i));
   }
   init_seeds[idx++] = thread_quota;
   init_seeds[idx++] = sealing::authority_for(OType::QuotaSched);
@@ -147,7 +147,7 @@ Status launch(Capability system_quota, Capability thread_quota,
   // are written straight into `init`'s capability table.
   for (size_t i = 0; i < INIT_SEED_COUNT; ++i) {
     inspect::assert_user_capability(init_seeds[i], "init::launch:seed");
-    uart::print_cap("init seed", init_seeds[i]);
+    debug::boot_capability("init seed", init_seeds[i]);
   }
 
   Capability seed_cap = reinterpret_cast<Capability>(&init_seeds[0]);
@@ -171,7 +171,7 @@ Status launch(Capability system_quota, Capability thread_quota,
   Status load_status = Status::Ok;
   Capability init_sentry =
       load_image_kernel(init_comp, system_quota, init_img, &load_status);
-  uart::print_cap("init sentry", init_sentry);
+  debug::boot_capability("init sentry", init_sentry);
   if (load_status != Status::Ok || !capability_is_valid(init_sentry)) {
     compartment::destroy(init_comp);
     return load_status;
@@ -227,14 +227,14 @@ Status launch(Capability system_quota, Capability thread_quota,
       capability_set_bounds(manifest_mem, sizeof(manifest));
   manifest_cap = capability_and_perms(
       manifest_cap, perms::Load | perms::LoadCapability | perms::LoadMutable);
-  uart::print_cap("manifest cap", manifest_cap);
+  debug::boot_capability("manifest cap", manifest_cap);
   inspect::assert_user_capability(manifest_cap, "init::launch:manifest_cap");
 
   // 5. Create and dispatch the initial `init` thread on `thread_quota`.
   thread::Status t_status = thread::Status::Ok;
   Capability init_thread = thread::create(thread_quota, INIT_STACK_SIZE,
                                           init_sentry, manifest_cap, &t_status);
-  uart::print_cap("init thread", init_thread);
+  debug::boot_capability("init thread", init_thread);
   if (t_status != thread::Status::Ok || !capability_is_valid(init_thread)) {
     compartment::destroy(init_comp);
     return Status::ThreadCreateFailed;

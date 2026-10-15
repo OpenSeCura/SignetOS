@@ -18,8 +18,8 @@
  * thread.cpp - SignetOS Thread Memory Quotas and Thread Execution State
  */
 
-#include <signetos/clint.hpp>
-#include <signetos/inspect.hpp>
+#include <signetos/hw/clint.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
@@ -27,7 +27,7 @@
 #include <signetos/syscall.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/vm.hpp>
 
 // Thread context switching, restoration, teardown pivot, and startup trampoline
@@ -150,7 +150,7 @@ void init() {
 
 void init_hart(uint64_t hartid) {
   if (hartid >= MAX_HARTS || !platform::hart_present(hartid)) {
-    uart::panic("thread: hart id not in DTB or beyond MAX_HARTS");
+    debug::panic("thread: hart id not in DTB or beyond MAX_HARTS");
   }
   Cpu* c = &s_cpus[hartid];
   *c = Cpu{};
@@ -194,7 +194,7 @@ void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart) {
       continue;
     }
     if (cursor + HOST_STACK_BYTES + KSP_STACK_BYTES > limit) {
-      uart::panic("thread: out of boot region for secondary hart stacks");
+      debug::panic("thread: out of boot region for secondary hart stacks");
     }
 
     Capability sp = capability_set_address(root_data_cap, cursor);
@@ -223,13 +223,7 @@ void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart) {
     }
   }
 
-  uart::print("[smp]      ");
-  uart::print_dec(online_harts());
-  uart::print("/");
-  uart::print_dec(platform::hart_count());
-  uart::print(" hart(s) online in M-mode (boot hart ");
-  uart::print_dec(boot_hart);
-  uart::print(")\n");
+  debug::harts_online(online_harts(), platform::hart_count(), boot_hart);
 }
 
 size_t online_harts() {
@@ -395,7 +389,7 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
   const Capability start_ra = __thread_start_link();
   if (capability_get_address(start_ra) !=
       capability_get_address(reinterpret_cast<Capability>(&__thread_start))) {
-    uart::panic("thread::create: __thread_start_link does not link to __thread_start");
+    debug::panic("thread::create: __thread_start_link does not link to __thread_start");
   }
   frame->ra = start_ra;
 
@@ -521,21 +515,9 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
   c->current = t;
   set_utidc(c->hart_id, t->tid);
 
-#ifdef SIGNETOS_TRACE_SWITCH
-  // Emitted only once the switch is committed, so a refused handle never
-  // shows up here. The kernel UART is polled, so this is safe on the masked
-  // tick path.
-  uart::print("[switch] ");
-  if (prev != nullptr) {
-    uart::print("tid ");
-    uart::print_dec(prev->tid);
-  } else {
-    uart::print("host");
-  }
-  uart::print(" -> tid ");
-  uart::print_dec(t->tid);
-  uart::print("\n");
-#endif
+  // Only once the switch is committed, so a refused handle never shows up
+  // (TRACE_SWITCH=1 builds only).
+  debug::trace_switch(prev != nullptr ? prev->tid : 0, t->tid);
 
   // The incoming frame is reloaded as-is. Every register in it was either
   // seeded by `create()` (asserted there) or saved from the thread's own

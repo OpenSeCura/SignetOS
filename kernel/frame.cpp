@@ -22,7 +22,7 @@
 
 #include <signetos/frame.hpp>
 #include <signetos/lock.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 
 namespace signetos::frame {
 namespace {

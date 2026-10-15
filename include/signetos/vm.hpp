@@ -300,19 +300,4 @@ size_t max_table_pages();
 size_t allocated_pages();    // pages handed out by alloc_pages and not freed
 size_t quarantined_pages();  // pages freed, still mapped, awaiting the sweep
 
-//
-// Page table dumps. Both read the live tables the hardware walks, so what they
-// print is what the MMU sees -- not a record the VM keeps alongside.
-//
-
-// One address: the physical address it translates to, the page size of the leaf
-// that covers it, and that leaf's flags (Q marks a quarantined page). Says NOT
-// MAPPED if there is no leaf.
-void dump_mapping(uint64_t va);
-
-// Every valid leaf in the table, in address order. Entries that are contiguous
-// in both virtual and physical address and share their flags are printed as one
-// run. Returns the number of leaf entries found.
-size_t dump_mappings(const char* label);
-
 } // namespace signetos::vm

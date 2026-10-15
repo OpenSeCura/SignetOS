@@ -18,9 +18,9 @@
  * uart.cpp - SignetOS Capability-Bounded UART 16550 Console & Diagnostic Utilities
  */
 
-#include <signetos/uart.hpp>
+#include <signetos/hw/uart.hpp>
 #include <signetos/lock.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/sealing.hpp>
 
 namespace signetos::uart {
@@ -218,14 +218,6 @@ void print_cap(const char* label, Capability cap) {
 
 void halting() {
     __atomic_store_n(&s_halting, true, __ATOMIC_RELAXED);
-}
-
-[[noreturn]] void panic(const char* msg) {
-  halting();
-  print("[PANIC] ");
-  print(msg);
-  print("\n");
-  qemu_poweroff(1);
 }
 
 [[noreturn]] void qemu_poweroff(int exit_code) {

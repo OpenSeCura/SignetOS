@@ -66,7 +66,7 @@
 
 #include <assert.h>
 
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 
 #include "hw.hpp"
 #include "runtime.hpp"

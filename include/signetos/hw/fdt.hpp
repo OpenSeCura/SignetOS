@@ -20,7 +20,7 @@
 // fdt.hpp - Flattened Device Tree (DTB) walker
 //
 // Header-only and freestanding, so the same code reads the DTB in the kernel
-// (`kernel/platform.cpp`: RAM, harts, timebase, console, poweroff device --
+// (`kernel/hw/platform.cpp`: RAM, harts, timebase, console, poweroff device --
 // what the kernel needs to run itself) and in user space (`user/init.cpp`:
 // everything else, which is policy about devices the kernel never touches).
 //

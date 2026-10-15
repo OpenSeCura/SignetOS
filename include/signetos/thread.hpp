@@ -41,7 +41,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/types.hpp>

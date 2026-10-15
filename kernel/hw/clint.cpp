@@ -18,7 +18,7 @@
  * clint.cpp - The machine timer and the cross-hart poke (clint.hpp)
  */
 
-#include <signetos/clint.hpp>
+#include <signetos/hw/clint.hpp>
 
 namespace signetos::clint {
 namespace {

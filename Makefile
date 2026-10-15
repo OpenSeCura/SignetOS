@@ -70,7 +70,8 @@ endif
 OPT ?= -O2
 
 # TRACE_SWITCH=1 makes the kernel print one line on the UART for every
-# successful `sys_thread_switch` (`kernel/thread.cpp`, `__signetos_thread_dispatch`).
+# successful `sys_thread_switch` (`debug::trace_switch`, called from
+# `__signetos_thread_dispatch` in `kernel/thread.cpp`).
 # Every switch the scheduler compartment makes -- dispatcher, yield and the
 # timer tick -- goes through it, so it sees them all. Off by default.
 TRACE_SWITCH ?= 0
@@ -80,8 +81,8 @@ else
 TRACE_DEFS =
 endif
 
-# QUOTA_SELFTEST=1 runs `quota::self_test` (`kernel/quota.cpp`) at boot, before
-# `init` starts, and panics on the first failed check. Off by default.
+# QUOTA_SELFTEST=1 runs `debug::quota_self_test` (`kernel/debug/quota_selftest.cpp`)
+# at boot, before `init` starts, and panics on the first failed check. Off by default.
 QUOTA_SELFTEST ?= 0
 ifeq ($(QUOTA_SELFTEST),1)
 TEST_DEFS = -DSIGNETOS_QUOTA_SELFTEST
@@ -155,11 +156,10 @@ ASM_SRCS = kernel/boot.S \
            kernel/switch.S \
            kernel/boot_images.S
 
-CXX_SRCS = kernel/kstring.cpp \
-           kernel/platform.cpp \
-           kernel/clint.cpp \
-           kernel/vm.cpp \
-           kernel/uart.cpp \
+# The core kernel is kernel/*.cpp. Around it: hardware drivers (kernel/hw/),
+# diagnostics and self-tests (kernel/debug/) and freestanding C library
+# routines (kernel/lib/).
+CXX_SRCS = kernel/vm.cpp \
            kernel/trap.cpp \
            kernel/frame.cpp \
            kernel/quota.cpp \
@@ -169,9 +169,15 @@ CXX_SRCS = kernel/kstring.cpp \
            kernel/thread.cpp \
            kernel/unwind.cpp \
            kernel/syscall.cpp \
-           kernel/inspect.cpp \
            kernel/init.cpp \
-           kernel/main.cpp
+           kernel/main.cpp \
+           kernel/hw/platform.cpp \
+           kernel/hw/clint.cpp \
+           kernel/hw/uart.cpp \
+           kernel/debug/report.cpp \
+           kernel/debug/inspect.cpp \
+           kernel/debug/quota_selftest.cpp \
+           kernel/lib/kstring.cpp
 
 OBJS = $(patsubst %.S,%.o,$(ASM_SRCS)) $(patsubst %.cpp,%.o,$(CXX_SRCS))
 DEPS = $(OBJS:.o=.d) $(COMP_OBJS:.o=.d)
@@ -245,7 +251,7 @@ term: signetos.elf $(DISK_IMG)
 
 clean:
 	rm -f $(OBJS) $(DEPS) $(COMP_OBJS) $(COMP_ELFS) $(COMP_BINS) signetos.elf \
-	      kernel/*.o kernel/*.d user/*.o user/*.d \
+	      kernel/*.o kernel/*.d kernel/*/*.o kernel/*/*.d user/*.o user/*.d \
 	      boot/*.o boot/*.d boot/*.elf boot/*.bin \
 	      external/services/*.o external/services/*.d external/services/*.elf external/services/*.bin \
 	      external/apps/*.o external/apps/*.d external/apps/*.elf external/apps/*.bin \
@@ -265,6 +271,6 @@ FLAGS_STAMP = .build_flags
 FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST)
 $(FLAGS_STAMP): FORCE
 	@echo $(FLAG_VALUES) | cmp -s - $@ 2>/dev/null || echo $(FLAG_VALUES) > $@
-kernel/thread.o kernel/quota.o kernel/main.o: $(FLAGS_STAMP)
+kernel/thread.o kernel/main.o kernel/debug/report.o: $(FLAGS_STAMP)
 FORCE:
 .PHONY: FORCE

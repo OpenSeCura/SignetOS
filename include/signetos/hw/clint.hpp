@@ -39,7 +39,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <signetos/platform.hpp>
+#include <signetos/hw/platform.hpp>
 #include <signetos/types.hpp>
 
 namespace signetos::clint {

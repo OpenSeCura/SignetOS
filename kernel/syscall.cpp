@@ -29,7 +29,7 @@
 
 #include <signetos/compartment.hpp>
 #include <signetos/fault.hpp>
-#include <signetos/inspect.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
@@ -37,7 +37,7 @@
 #include <signetos/syscall.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 
 namespace signetos::syscall {
 namespace {
@@ -71,7 +71,7 @@ void init() {
   if (!capability_is_valid(kcode) ||
       (capability_get_perms(kcode) &
        (perms::Store | perms::Seal | perms::Unseal)) != 0) {
-    uart::panic("syscall: kernel PCC is not a usable entry capability");
+    debug::panic("syscall: kernel PCC is not a usable entry capability");
   }
   auto at = [&](const void* fn) -> Capability {
     return capability_set_address(

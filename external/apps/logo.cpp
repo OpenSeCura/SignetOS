@@ -22,7 +22,7 @@
  *   run logo.bin [loops]
  */
 
-#include <signetos/logo.hpp>
+#include "logo.hpp"
 
 #include "runtime.hpp"
 

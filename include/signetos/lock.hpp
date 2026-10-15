@@ -63,7 +63,7 @@
 
 #include <stdint.h>
 #include <signetos/asm_macros.h>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 
 namespace signetos {
 
@@ -74,7 +74,7 @@ struct SpinLock {
     uint64_t mstatus;
     __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
     if ((mstatus & MSTATUS_MIE) != 0) {
-      uart::panic("lock: taken with interrupts unmasked");
+      debug::panic("lock: taken with interrupts unmasked");
     }
     for (;;) {
       if (__atomic_exchange_n(&held, 1u, __ATOMIC_ACQUIRE) == 0) {

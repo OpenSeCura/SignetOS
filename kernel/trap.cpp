@@ -22,7 +22,7 @@
  * M-mode and nothing is delegated, so that is every trap there is.
  *
  * A synchronous fault raised by kernel code (`mepcc` carries AccessSystemRegs)
- * is a kernel bug: `trap_report()` prints it and halts, whatever is bound.
+ * is a kernel bug: `debug::trap_report()` prints it and halts, whatever is bound.
  *
  * Otherwise, if a compartment has bound an `OType::EntryPoint` (CT = 18)
  * handler sentry to the vector via `sys_trap_bind`, `__signetos_trap_dispatch`
@@ -50,16 +50,16 @@
  */
 
 #include <signetos/asm_macros.h>
-#include <signetos/clint.hpp>
+#include <signetos/hw/clint.hpp>
 #include <signetos/compartment.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/fault.hpp>
-#include <signetos/inspect.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
-#include <signetos/uart.hpp>
 #include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 #include <stddef.h>
@@ -86,192 +86,6 @@ static_assert(offsetof(trap::TrapFrame, handler_ca0) ==
               TRAP_FRAME_HANDLER_CA0);
 static_assert(offsetof(trap::TrapFrame, handler_a3) == TRAP_FRAME_HANDLER_A3);
 static_assert(sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE);
-
-// Standard RISC-V synchronous causes, indexed by exception code.
-const char* const kStandardCause[16] = {
-    "Instruction address misaligned",  // 0
-    "Instruction access fault",        // 1
-    "Illegal instruction",             // 2
-    "Breakpoint",                      // 3
-    "Load address misaligned",         // 4
-    "Load access fault",               // 5
-    "Store/AMO address misaligned",    // 6
-    "Store/AMO access fault",          // 7
-    "Environment call from U-mode",    // 8
-    "Environment call from S-mode",    // 9
-    "reserved (10)",                   // 10
-    "Environment call from M-mode",    // 11
-    "Instruction page fault",          // 12
-    "Load page fault",                 // 13
-    "reserved (14)",                   // 14
-    "Store/AMO page fault",            // 15
-};
-
-// This CHERI implementation raises one unified exception code for every
-// capability check failure rather than a family of them, and reports which
-// check failed separately in mtval2. Verified against the running machine and
-// against target/riscv/cpu_bits.h in the QEMU tree:
-//     RISCV_EXCP_CHERI = 0x1c
-constexpr uint64_t kCheriFault = 28;
-
-// mtval2 layout for mcause 28, from cpu_helper.c:
-//     cheri_exc_info = cheri093_cap_cause(cause) | (type << 16)
-// Values from Cheri093CapExcCause / Cheri093CapExcType in
-// target/riscv/cheri-archspecific-early.h.
-const char* cheri_violation(uint64_t mtval2) {
-  switch (mtval2 & 0xffff) {
-    case 0:
-      return "tag violation (the capability was not valid)";
-    case 1:
-      return "seal violation (the capability was sealed)";
-    case 2:
-      return "permission violation";
-    case 3:
-      return "invalid address violation";
-    case 4:
-      return "bounds violation (address outside base..top)";
-    default:
-      return "unknown violation";
-  }
-}
-
-const char* cheri_access(uint64_t mtval2) {
-  switch ((mtval2 >> 16) & 0xff) {
-    case 0:
-      return "instruction fetch";
-    case 1:
-      return "data access";
-    case 2:
-      return "branch or jump";
-    default:
-      return "unknown access";
-  }
-}
-
-// Turns an exception code into text. Returns null for codes this kernel has no
-// name for, so the caller can still print the number on its own.
-const char* cause_text(uint64_t code) {
-  if (code < 16) {
-    return kStandardCause[code];
-  }
-  if (code == kCheriFault) {
-    return "CHERI fault";
-  }
-  return nullptr;
-}
-
-// One "  label : 0x...." line.
-void field(const char* label, uint64_t value) {
-  uart::print("  ");
-  uart::print(label);
-  uart::print(" : 0x");
-  uart::print_hex64(value);
-  uart::print("\n");
-}
-
-bool s_in_trap_report = false;
-
-//
-// Reports a synchronous exception and halts the machine.
-//
-// why    - one line on why nothing short of halting is possible
-// mcause - machine cause register; the interrupt bit is known to be clear
-// mepc   - address of the faulting instruction, read out of mepcc
-// mtval  - trap value register; its meaning depends on the cause
-// mtval2 - for a CHERI fault, which capability check failed
-// ssp    - stack pointer at the point of the fault, for orientation
-//
-[[noreturn]] void trap_report(const char* why, uint64_t mcause, uint64_t mepc,
-                              uint64_t mtval, uint64_t mtval2, uint64_t ssp) {
-  if (s_in_trap_report) {
-    for (;;) {
-      __asm__ volatile("wfi");
-    }
-  }
-  s_in_trap_report = true;
-  // This hart may hold the console lock (a fault inside a print); from here
-  // on prints do not wait for it.
-  uart::halting();
-
-  uart::print("\n");
-  uart::print(
-      "########################################################################"
-      "########\n");
-  uart::print("# TRAP: synchronous exception -- the kernel is halting\n");
-  uart::print("# ");
-  uart::print(why);
-  uart::print("\n");
-  uart::print(
-      "########################################################################"
-      "########\n");
-
-  // The cause first, since it decides what is worth looking at next.
-  uart::print("  mcause : ");
-  uart::print_dec(mcause);
-  const char* text = cause_text(mcause);
-  if (text != nullptr) {
-    uart::print("  (");
-    uart::print(text);
-    uart::print(")");
-  } else {
-    uart::print("  (unrecognised exception code)");
-  }
-  uart::print("\n");
-
-  // For a CHERI fault the code above is the same for every kind of
-  // violation, so this line is the one that says what actually went wrong.
-  if (mcause == kCheriFault) {
-    uart::print("  detail : ");
-    uart::print(cheri_violation(mtval2));
-    uart::print(", on ");
-    uart::print(cheri_access(mtval2));
-    uart::print("\n");
-  }
-
-  // mepc is the instruction that faulted, not the one after it, so the
-  // address can be looked up directly in the disassembly:
-  //   llvm-objdump -d --start-address=0x... signetos.elf
-  field("mepc  ", mepc);
-
-  // The address the instruction was trying to reach.
-  field("mtval ", mtval);
-  field("mtval2", mtval2);
-  field("sp    ", ssp);
-
-  uart::print(
-      "########################################################################"
-      "########\n");
-
-  // Exit non-zero so a scripted run can tell a fault from a clean finish.
-  uart::qemu_poweroff(1);
-}
-
-// Reports, without halting, a fault in compartment code that no handler of
-// the compartment's took (`why`). The trap path then unwinds it.
-void fault_report(const char* why, uint64_t comp_uid, uint64_t mcause,
-                  uint64_t mepc, uint64_t mtval, uint64_t mtval2) {
-  uart::print("[fault] compartment ");
-  uart::print_dec(comp_uid);
-  uart::print(", thread ");
-  uart::print_dec(signetos::thread::current_tid());
-  uart::print(": ");
-  const char* text = cause_text(mcause);
-  uart::print(text != nullptr ? text : "unrecognised exception");
-  if (mcause == kCheriFault) {
-    uart::print(" (");
-    uart::print(cheri_violation(mtval2));
-    uart::print(", on ");
-    uart::print(cheri_access(mtval2));
-    uart::print(")");
-  }
-  uart::print(" at 0x");
-  uart::print_hex64(mepc);
-  uart::print(", mtval 0x");
-  uart::print_hex64(mtval);
-  uart::print("; ");
-  uart::print(why);
-  uart::print("\n");
-}
 
 }  // namespace
 
@@ -468,22 +282,12 @@ Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
                                          uint64_t mtval2,
                                          const TrapFrame* frame) {
   const uint64_t mepc = capability_get_address(frame->mepcc);
-  uart::print("[trap] ending thread ");
-  uart::print_dec(thread::current_tid());
-  uart::print(": ");
-  uart::print(why);
-  uart::print(" (");
-  uart::print(status_name(status));
-  uart::print("), mcause 0x");
-  uart::print_hex64(mcause);
-  uart::print(" at 0x");
-  uart::print_hex64(mepc);
-  uart::print("\n");
+  debug::interrupted_thread_ending(why, status, mcause, mepc);
   if (mcause == IRQ_M_TIMER) {
     clint::set_timer(clint::now() + tick_ticks());
   }
   thread::exit(-1);
-  trap_report("in host context, and the host cannot take this trap", mcause,
+  debug::trap_report("in host context, and the host cannot take this trap", mcause,
               mepc, mtval, mtval2, capability_get_address(frame->sp));
 }
 
@@ -630,7 +434,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
       if ((t->flags & TRAP_FLAG_FAULT) != 0) {
         // A fault in a fault handler is never delivered (fault.hpp).
         const compartment::Compartment* x = compartment::open(t->handler_comp);
-        fault_report("in its fault handler; unwinding", x ? x->uid : 0, mcause,
+        debug::fault_report("in its fault handler; unwinding", x ? x->uid : 0, mcause,
                      mepc, mtval, mtval2);
         return unwind_now(frame, Status::Faulted);
       }
@@ -639,7 +443,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
     }
     default: {
       if (thread::current_tid() == 0) {
-        trap_report("raised in host context, where no compartment is running",
+        debug::trap_report("raised in host context, where no compartment is running",
                     mcause, mepc, mtval, mtval2,
                     capability_get_address(frame->sp));
       }
@@ -654,7 +458,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   }
   if (capability_get_address(handle) == 0) {
     // Compartment code no kernel frame entered: a kernel bug.
-    trap_report("raised by compartment code that no kernel frame entered",
+    debug::trap_report("raised by compartment code that no kernel frame entered",
                 mcause, mepc, mtval, mtval2, capability_get_address(frame->sp));
   }
   const compartment::Compartment* x = compartment::open(handle);
@@ -669,7 +473,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   // unwinding needs none.
   if (thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
       RET_FRAME_MIN_FREE) {
-    fault_report("no kernel stack for its fault handler; unwinding", x->uid,
+    debug::fault_report("no kernel stack for its fault handler; unwinding", x->uid,
                  mcause, mepc, mtval, mtval2);
     return unwind_now(frame, Status::Faulted);
   }
@@ -678,7 +482,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   if (sentry::resolve_fault(x->fault_handler, &e) != Status::Ok ||
       (e.flags & sentry::ENTRY_FLAG_FAULT) == 0 ||
       !same_compartment(e.owner, handle)) {
-    fault_report("no fault handler; unwinding", x->uid, mcause, mepc, mtval,
+    debug::fault_report("no fault handler; unwinding", x->uid, mcause, mepc, mtval,
                  mtval2);
     return unwind_now(frame, Status::Faulted);
   }
@@ -693,7 +497,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   const Capability es = capability_set_bounds(
       capability_set_address(h_sp, es_addr), sizeof(fault::ErrorState));
   if (!capability_is_valid(h_sp) || !capability_is_valid(es)) {
-    fault_report("no room on its stack for its fault handler; unwinding",
+    debug::fault_report("no room on its stack for its fault handler; unwinding",
                  x->uid, mcause, mepc, mtval, mtval2);
     return unwind_now(frame, Status::Faulted);
   }
@@ -921,7 +725,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   // delivered like any other.
   if (!async &&
       (capability_get_perms(frame->mepcc) & perms::AccessSystemRegs) != 0) {
-    trap_report("raised by kernel code (mepcc carries AccessSystemRegs)",
+    debug::trap_report("raised by kernel code (mepcc carries AccessSystemRegs)",
                 mcause, mepc, mtval, mtval2,
                 capability_get_address(frame->sp));
   }
@@ -1024,12 +828,10 @@ extern "C" uint64_t __signetos_trap_return(uint64_t verdict) {
   if (kind == unwind::KIND_NONE) {
     // If anything was popped, `resume` has already said why the thread ends.
     if (!top_ok) {
-      uart::print("[trap] ending thread ");
-      uart::print_dec(thread::current_tid());
-      uart::print(": trap return with nothing to return to\n");
+      debug::thread_ending("trap", "trap return with nothing to return to");
     }
     thread::exit(-1);
-    uart::panic("trap: trap return with nothing to return to");
+    debug::panic("trap: trap return with nothing to return to");
   }
   return kind;
 }

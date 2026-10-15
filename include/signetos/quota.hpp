@@ -245,11 +245,6 @@ inline size_t live_nodes() {
     return __atomic_load_n(&vm_tree().live_nodes, __ATOMIC_RELAXED);
 }
 
-#ifdef SIGNETOS_QUOTA_SELFTEST
-// Boot-time check of destroy, refund and reclaim against a scratch subtree of
-// `root` (QUOTA_SELFTEST=1). Panics on the first failure.
-void self_test(Capability root);
-#endif
 
 
 } // namespace signetos::quota

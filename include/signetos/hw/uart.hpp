@@ -43,20 +43,17 @@ void print_dec(uint64_t val);
 
 // Inspects and prints CHERI capability metadata (tag, perms, base, length,
 // address, and whether it is sealed and if so with which object type). Used
-// by the kernel's panic reports.
+// by the kernel's diagnostics (debug/report.hpp).
 void print_cap(const char* label, Capability cap);
 
 // The kernel is stopping. From here on the printing calls do not wait for the
 // console lock: the hart that is stopping may be the one holding it (a fault
 // inside a print), and what it has to say must not be lost to a wait. Called
-// by `panic`, `qemu_poweroff` and `trap::trap_report` before they print.
+// by `qemu_poweroff`, `debug::panic` and `debug::trap_report` before they
+// print.
 void halting();
 
 // Signals QEMU to terminate cleanly via the virt test device at 0x100000
 [[noreturn]] void qemu_poweroff(int exit_code);
-
-// Prints `[PANIC] msg` and powers off. For boot-time invariants that, if
-// broken, leave the kernel unable to mint any handle at all.
-[[noreturn]] void panic(const char* msg);
 
 } // namespace signetos::uart

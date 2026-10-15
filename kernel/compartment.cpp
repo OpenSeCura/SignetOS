@@ -21,7 +21,7 @@
  */
 
 #include <signetos/compartment.hpp>
-#include <signetos/inspect.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>

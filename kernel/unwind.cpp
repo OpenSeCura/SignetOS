@@ -22,11 +22,11 @@
 #include <stddef.h>
 
 #include <signetos/asm_macros.h>
-#include <signetos/inspect.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
-#include <signetos/uart.hpp>
+#include <signetos/debug/report.hpp>
 #include <signetos/unwind.hpp>
 
 namespace signetos::unwind {
@@ -144,12 +144,11 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
     // refused before anything is popped.
     if (kind == KIND_NONE || (!popped && kind != expected_top)) {
       if (popped) {
-        uart::print("[unwind] ending thread ");
-        uart::print_dec(thread::current_tid());
-        uart::print(faulted ? ": its own code faulted, with nothing beneath "
-                              "to unwind to\n"
-                            : ": every frame on its kernel stack is in a "
-                              "destroyed compartment\n");
+        debug::thread_ending(
+            "unwind", faulted ? "its own code faulted, with nothing beneath "
+                                "to unwind to"
+                              : "every frame on its kernel stack is in a "
+                                "destroyed compartment");
       }
       return KIND_NONE;
     }
@@ -158,11 +157,9 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
 
     const Fate fate = fate_of(link_of(ksp));
     if (fate == Fate::End) {
-      uart::print("[unwind] ending thread ");
-      uart::print_dec(thread::current_tid());
-      uart::print(": killed\n");
+      debug::thread_ending("unwind", "killed");
       thread::exit(-1);
-      uart::panic("unwind: a killed thread did not end");
+      debug::panic("unwind: a killed thread did not end");
     }
 
     if (kind == KIND_RETURN_FRAME) {

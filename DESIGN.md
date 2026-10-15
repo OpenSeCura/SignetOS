@@ -51,8 +51,11 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 
 | Path | Contents |
 | --- | --- |
-| `kernel/` | The microkernel: boot, syscalls, the domain switcher (`sentry.cpp` + `switch.S`), compartments, quotas, threads, VM and frame allocator, revocation, traps, sealing, the outbound capability check (`inspect.cpp`) |
-| `include/signetos/` | Kernel headers (`types.hpp` holds `OType`, `Status`, perms) |
+| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`sentry.cpp` + `switch.S`), compartments, quotas, threads, VM and frame allocator, revocation, traps, unwinding. It does not print: it reports through `debug/report.hpp`. |
+| `kernel/hw/` | Drivers for the board: the console (`uart.cpp`), timer and cross-hart poke (`clint.cpp`), DTB discovery (`platform.cpp`) |
+| `kernel/debug/` | Diagnostics and checks: everything the kernel prints (`report.cpp`), the outbound capability check (`inspect.cpp`), boot self-tests (`quota_selftest.cpp`) |
+| `kernel/lib/` | Freestanding C library routines (`kstring.cpp`) |
+| `include/signetos/` | Kernel headers (`types.hpp` holds `OType`, `Status`, perms), with `hw/` and `debug/` mirroring the sources |
 | `include/libc/` | The few freestanding helpers used in place of a libc |
 | `user/` | Shared user-space runtime: `abi.hpp` (every cross-compartment request struct and slot layout), `manifest.hpp`, `runtime.hpp`, `entry.S` (image trampoline), `compartment.ld` |
 | `boot/` | Compartments **embedded in the kernel image** |
@@ -865,7 +868,7 @@ So the cost depends on how much stack the caller has free, not on how much
 the callee uses. Kernel entries always zero their full 4 KiB slice. We need a
 faster way to do this zeroing.
 
-**Outbound capability policy (`kernel/inspect.cpp`):** every capability
+**Outbound capability policy (`kernel/debug/inspect.cpp`):** every capability
 leaving the kernel, as an argument on the way in or a return value on the way
 out, must:
 

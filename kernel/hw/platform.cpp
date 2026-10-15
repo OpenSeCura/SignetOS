@@ -24,8 +24,8 @@
  * is `init`'s business.
  */
 
-#include <signetos/fdt.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/fdt.hpp>
+#include <signetos/hw/platform.hpp>
 
 namespace signetos::platform {
 namespace {

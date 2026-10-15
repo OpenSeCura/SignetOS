@@ -103,7 +103,9 @@ directory that contains `clang`) and `QEMU` (the full path to
 ## Layout
 
 ```
-kernel/      the microkernel (boot, VM, traps, threads, sealing, syscalls)
+kernel/      the microkernel (boot, VM, traps, threads, sealing, syscalls), with
+             hw/ (uart, clint, DTB), debug/ (reports, checks, self-tests)
+             and lib/ (kstring) around it
 include/     kernel headers and a minimal freestanding libc
 user/        runtime and linker script shared by all user compartments
 boot/        compartments embedded in the kernel: init, loader, fs, uart, blk

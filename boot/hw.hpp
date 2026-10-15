@@ -29,8 +29,8 @@
 // Header-only and freestanding: nothing here allocates or links a C library.
 //
 
-#include <signetos/fdt.hpp>
-#include <signetos/platform.hpp>
+#include <signetos/hw/fdt.hpp>
+#include <signetos/hw/platform.hpp>
 
 namespace signetos::user::hw {
 
