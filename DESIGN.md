@@ -1168,10 +1168,7 @@ incremental.
 | Capabilities are the sole source of authority; the MMU is never used for access control, only for backing, demand paging and CoW write detection | Page permissions are permissive everywhere. Demand paging and CoW write detection do not exist yet, so the MMU currently does *only* backing. |
 | Accessibility invariant: never unmap under a valid capability | Quarantine keeps freed pages mapped until the sweep has cleared every tag. |
 | Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities and service quotas (`QuotaSched`, `QuotaDisk`) use hardware types. Compartment-minted objects use software types (§2.7), whose identity is a hardware tag and cannot be made by writing memory. |
-| Compartment UID permanence | UIDs are never reused, so UID-tagged records can never be misattributed. |
-| Type identity (address of the type record) | Subject to the sweep caveat in §2.7. |
-| Deterministic quotas and write guarantees | All memory is backed at allocation time; nothing is lazy, so nothing can fail later. |
-| Immutable quota partitions | Quotas cannot be resized after derivation (§3.5). |
+| Immutable quota partitions | Quotas cannot be increased after derivation (§3.5). |
 | Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, revocation backlog pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
 
 ### 4.4 Multi-hart status
@@ -1364,10 +1361,6 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
-
-These are ordinary seeds: the layout is the kernel's choice as `init`'s
-creator, not something `sys_compartment_create` imposes. `init`'s entry
-argument is the boot manifest.
 
 ---
 
