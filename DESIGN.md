@@ -589,8 +589,9 @@ kernel. After `init` exits, the kernel creates a thread on that entry and
 **re-dispatches it every time the running thread exits**. That is how the
 scheduler learns about exits: it is resumed, asks the kernel which of its
 threads have ended (`sys_thread_tid` returns 0), and forgets them. When no
-registered threads remain, the run loop returns and the kernel powers the
-machine off.
+registered thread is on a node any more, the run loop returns and the kernel
+powers the machine off. Stopped threads (on no node) do not keep it running:
+they are never picked, and only a thread that runs could move them to a node.
 
 ### 2.7 Compartment-minted sealing types
 

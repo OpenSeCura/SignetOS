@@ -71,8 +71,9 @@
  *   the dispatcher: its `sys_thread_switch` returns, and it forgets every
  *   registered thread the kernel no longer knows (`sys_thread_tid` is 0).
  *   `yield`, `block`, `lock_wait` and the tick handler switch thread-to-thread
- *   directly (`reschedule`). The dispatcher exits when nothing is registered,
- *   which ends the system.
+ *   directly (`reschedule`). The dispatcher exits when no registered thread
+ *   is on a node, which ends the system: a stopped thread (DESTROYING) is
+ *   never picked, and only a thread that runs can put it on a node again.
  *
  * PREEMPTION
  *   The scheduler binds `IRQ_M_TIMER` to `sched_tick_entry`. The handler runs
@@ -619,6 +620,17 @@ void reap(ThreadRec* t) {
   s_registered -= 1;
 }
 
+// True if some registered thread is on a node, so something can still run
+// (DISPATCH).
+bool any_on_node() {
+  for (const ThreadRec& t : s_threads) {
+    if (t.state != T_FREE && t.node != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Forgets every registered thread the kernel no longer knows: the one that
 // has just exited, and any that was killed before it ever ran (DISPATCH).
 void reap_ended() {
@@ -1135,7 +1147,7 @@ extern "C" uint64_t sched_run_entry(Capability arg) {
     charge_running(now);
     s_running = nullptr;
     reap_ended();
-    if (s_registered == 0) {
+    if (!any_on_node()) {
       break;
     }
     ThreadRec* t = pick(now);
@@ -1149,7 +1161,7 @@ extern "C" uint64_t sched_run_entry(Capability arg) {
   }
   busy_end();
   print(s_gate_invoke, s_uart,
-        "[sched]    No registered threads left; dispatcher exiting\n");
+        "[sched]    No thread left on a node; dispatcher exiting\n");
   return 0;
 }
 
