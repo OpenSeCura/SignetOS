@@ -29,8 +29,9 @@
  *                           `quota::destroy`'s walk down a subtree holds more
  *                           than one, each parent's taken before its
  *                           child's (quota.hpp, LOCKING).
- *   3. `revoke::s_lock`     protects the pending revocation table `g_pending`
- *                           and serializes `revoke::sweep()`.
+ *   3. `revoke::s_lock`     protects the pending revocation backlog
+ *                           (`g_pending_pages`) and serializes
+ *                           `revoke::sweep()`.
  *   4. `vm::s_lock`         protects the virtual address free list and Sv39
  *                           page tables (never held while zeroing pages).
  *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
@@ -40,8 +41,8 @@
  *
  * Locks are acquired strictly in the order listed above (outermost to
  * innermost). Pure capability-derivation and read-only syscalls (`sys_seal`,
- * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_revoke_derive`,
- * `sys_revoke_query`, `sys_thread_tid`) take no lock at all.
+ * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_revoke_query`,
+ * `sys_thread_tid`) take no lock at all.
  *
  * `vm::alloc_pages` may run a revocation sweep, which takes `revoke::s_lock`
  * and then refunds into quota nodes. So it is never called with a

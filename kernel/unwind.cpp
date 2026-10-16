@@ -24,6 +24,7 @@
 #include <signetos/asm_macros.h>
 #include <signetos/debug/inspect.hpp>
 #include <signetos/sentry.hpp>
+#include <signetos/switcher.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
@@ -35,15 +36,15 @@ static_assert(KIND_NONE == UNWIND_NONE &&
                   KIND_RETURN_FRAME == UNWIND_RETURN_FRAME &&
                   KIND_TRAP_FRAME == UNWIND_TRAP_FRAME,
               "unwind::Kind must match the UNWIND_* codes the assembly tests");
-static_assert(offsetof(sentry::ReturnFrame, prev_ksp) == FRAME_LINK &&
+static_assert(offsetof(switcher::ReturnFrame, prev_ksp) == FRAME_LINK &&
                   offsetof(trap::TrapFrame, active_kernel_sp) == FRAME_LINK &&
                   offsetof(thread::SwitchFrame, active_kernel_sp) == FRAME_LINK,
               "every kernel frame keeps its link at FRAME_LINK");
-static_assert(offsetof(sentry::ReturnFrame, tp) == RET_FRAME_TP &&
+static_assert(offsetof(switcher::ReturnFrame, tp) == RET_FRAME_TP &&
                   offsetof(trap::TrapFrame, tp) == FRAME_TP &&
                   offsetof(thread::SwitchFrame, tp) == FRAME_TP,
               "ctp save slots must match asm_macros.h");
-static_assert(sizeof(sentry::ReturnFrame) == RET_FRAME_SIZE &&
+static_assert(sizeof(switcher::ReturnFrame) == RET_FRAME_SIZE &&
                   sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE &&
                   sizeof(thread::SwitchFrame) == SWITCH_FRAME_SIZE,
               "frame sizes must match asm_macros.h");
@@ -53,12 +54,6 @@ static_assert(RET_FRAME_SIZE != TRAP_FRAME_SIZE &&
               "kind_at tells frames apart by their size");
 
 namespace {
-
-void wipe(Capability* slot, size_t count) {
-  for (size_t i = 0; i < count; ++i) {
-    slot[i] = nullptr;
-  }
-}
 
 // The kernel SP kept in the frame at `ksp` (FRAME LINK): where the frame
 // beneath it starts.
@@ -99,7 +94,7 @@ Kind kind_at(Capability ksp) {
     return KIND_NONE;
   }
   switch (capability_get_address(link) - addr) {
-    case sizeof(sentry::ReturnFrame):
+    case sizeof(switcher::ReturnFrame):
       return KIND_RETURN_FRAME;
     case sizeof(trap::TrapFrame):
       return KIND_TRAP_FRAME;
@@ -141,9 +136,8 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
     }
 
     if (kind == KIND_RETURN_FRAME) {
-      auto* f = reinterpret_cast<sentry::ReturnFrame*>(ksp);
+      auto* f = reinterpret_cast<switcher::ReturnFrame*>(ksp);
       thread::set_kernel_sp(f->prev_ksp);  // pop
-      sentry::zero_stack(f->callee_sp);  // nothing the callee left reaches the caller
       // The caller is live if its return address still has its tag. Only
       // `ra` is judged: a host-context caller has no `cgp`, and a
       // compartment's code and table die together anyway. The saved caller
@@ -155,8 +149,6 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
         f->args[0] = value;
         return KIND_RETURN_FRAME;
       }
-      wipe(reinterpret_cast<Capability*>(f),
-           sizeof(sentry::ReturnFrame) / sizeof(Capability));
     } else {
       auto* f = reinterpret_cast<trap::TrapFrame*>(ksp);
       thread::set_kernel_sp(f->active_kernel_sp);  // pop
@@ -165,7 +157,8 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
       // only on the INSTALL_CONTEXT verdict of the handler that just
       // returned from it -- never one beneath, whose handler was itself
       // abandoned -- and with the context that handler left in its
-      // ErrorState, which is read before the handler's stack is zeroed.
+      // ErrorState, which is read here, before the assembly zeroes the
+      // handler's stack.
       bool resumable = capability_is_valid(f->mepcc);
       const bool fault = (f->flags & trap::TRAP_FLAG_FAULT) != 0;
       if (fault) {
@@ -173,7 +166,6 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
                     verdict == fault::INSTALL_CONTEXT &&
                     trap::install_context(f);
       }
-      sentry::zero_stack(f->handler_sp);  // nor what a handler left
       // `mret` sets MIE := MPIE, and the MPIE the hardware holds now is
       // stale if anything trapped or switched threads since the trap was
       // taken, so set it from the `mstatus` recorded then: the interrupted
@@ -194,14 +186,10 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
         const uint64_t status = f->fault_status != 0
                                     ? f->fault_status
                                     : static_cast<uint64_t>(Status::Faulted);
-        wipe(reinterpret_cast<Capability*>(f),
-             sizeof(trap::TrapFrame) / sizeof(Capability));
         value = reinterpret_cast<Capability>(static_cast<uintptr_t>(status));
         faulted = true;
         continue;
       }
-      wipe(reinterpret_cast<Capability*>(f),
-           sizeof(trap::TrapFrame) / sizeof(Capability));
     }
 
     // The frame just skipped belonged to a compartment that is gone. Whoever

@@ -19,8 +19,8 @@
 //
 // syscall.hpp - SignetOS microkernel system call interface
 //
-// The complete kernel ABI: all 25 calls. Nothing outside this header is
-// reachable by a compartment.
+// The complete kernel ABI: every call is in SIGNETOS_SYSCALLS below. Nothing
+// outside this header is reachable by a compartment.
 //
 // Calls are `extern "C"` because they are reached by jumping through a sealed
 // sentry held in the caller's capability table, so the symbol names must be
@@ -45,7 +45,6 @@ using capability_quota_vm_t         = signetos::Capability;  // OTYPE_QUOTA_VM
 using capability_quota_thread_mem_t = signetos::Capability;  // OTYPE_QUOTA_THREAD_MEM
 using capability_compartment_t      = signetos::Capability;  // OTYPE_COMPARTMENT
 using capability_thread_t           = signetos::Capability;  // OTYPE_THREAD
-using capability_revoker_t          = signetos::Capability;  // OTYPE_REVOKER
 using Sentry                       = signetos::Sentry;
 using capability_sentry_t           = Sentry;                // OTYPE_SENTRY
 using capability_type_t             = signetos::Capability;  // OTYPE_TYPE_KEY
@@ -95,38 +94,23 @@ capability_t sys_cow(
     size_t                   len
 );
 
-// Mints a revocation authority (`OType::Revoker`) covering `mem_cap`'s bounds
-// `[base, top)` with `Permit_Load | Permit_Store`. Requires `mem_cap` to carry
-// `Permit_Load | Permit_Store` and lie wholly within a virtual memory range
-// owned by `comp`, so a compartment cannot obtain revocation authority over
-// borrowed memory. Uses 0 bytes of kernel memory.
-capability_revoker_t sys_revoke_create(
-    capability_compartment_t comp,
-    capability_t             mem_cap
-);
-
-// Derives a child revocation authority (`OType::Revoker`) bounded to `sub_cap`
-// with permissions restricted to `permissions & (Permit_Load | Permit_Store)`.
-// Requires `Permit_Store` on `parent_revoker` and `sub_cap` to lie wholly
-// within `parent_revoker`'s range. Uses 0 bytes of kernel memory.
-capability_revoker_t sys_revoke_derive(
-    capability_revoker_t parent_revoker,
-    capability_t         sub_cap,
-    uint32_t             permissions
-);
-
-// Queues `mem_cap`'s range for the next revocation sweep. Returns the target
-// epoch, or 0 if the range was refused.
+// Queues `mem_cap`'s range for the next revocation sweep, which revokes every
+// capability whose BASE lies in it (revoke.hpp, THE BASE RULE): the way an
+// owner takes back part of an allocation it keeps, such as an object its
+// heap is freeing. The range must lie inside one of `comp`'s own allocations
+// and must not include that allocation's first byte, which is where the
+// owner's own capability to the allocation is based. Returns the epoch to
+// wait for (`sys_revoke_query`), or 0 if the range was refused.
 //
 // The backlog is paid for: the range is recorded on a page funded by
 // `mem_quota` (a `QuotaVm` handle with `Permit_Load`). One page holds a few
 // hundred ranges; a new one is charged when the caller's current page is full,
-// and every page is refunded once the sweep has run. A caller that registers
+// and every page is refunded once the sweep has run. A caller that revokes
 // faster than the kernel sweeps exhausts only its own quota.
-uint64_t sys_revoke_register(
-    capability_revoker_t  revoker_cap,
-    capability_t          mem_cap,
-    capability_quota_vm_t mem_quota
+uint64_t sys_revoke(
+    capability_compartment_t comp,
+    capability_t             mem_cap,
+    capability_quota_vm_t    mem_quota
 );
 
 // The highest epoch whose sweep has finished.
@@ -211,15 +195,18 @@ uint64_t sys_compartment_invoke(
 // entry pages and returns a sealed pointer to that record. `code` must lie in
 // memory owned by `comp`. A new entry page is billed to `comp`'s quota when
 // the existing ones are full.
-//
-// `kind` (fault.hpp): fault::KIND_ENTRY for an ordinary entry point.
-// fault::KIND_HANDLER installs `code` as `comp`'s fault handler instead
-// (Permit_Store on `comp`, once). Its handle is never handed out: the result
-// is the `Status`, as an untagged integer (0 = installed).
 Sentry sys_sentry(
     capability_compartment_t comp,
-    capability_exec_t        code,
-    uint64_t                 kind
+    capability_exec_t        code
+);
+
+// Makes `code` `comp`'s fault handler (fault.hpp), replacing any installed
+// before. `code` must lie in memory owned by `comp`, as for `sys_sentry`. The
+// handler is kept in `comp`'s descriptor and never handed out: only the trap
+// dispatcher enters it. Returns a `Status` (0 = installed).
+uint64_t sys_fault_install(
+    capability_compartment_t comp,
+    capability_exec_t        code
 );
 
 // Mints a type key naming `record`. The record's ADDRESS is the type identity;
@@ -311,9 +298,7 @@ namespace signetos::syscall {
   X(vm_allocate)                  \
   X(vm_deallocate)                \
   X(cow)                          \
-  X(revoke_create)                \
-  X(revoke_derive)                \
-  X(revoke_register)              \
+  X(revoke)                       \
   X(revoke_query)                 \
   X(quota_vm_create_root)         \
   X(quota_vm_derive)              \
@@ -325,6 +310,7 @@ namespace signetos::syscall {
   X(compartment_destroy)          \
   X(compartment_invoke)           \
   X(sentry)                       \
+  X(fault_install)                \
   X(type_mint)                    \
   X(type_derive)                  \
   X(seal)                         \

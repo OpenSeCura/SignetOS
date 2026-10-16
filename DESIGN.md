@@ -51,7 +51,7 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 
 | Path | Contents |
 | --- | --- |
-| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`sentry.cpp` + `switch.S`), compartments, quotas, threads, VM and frame allocator, revocation, trap dispatch and fault delivery (`trap.cpp`), the two interrupt handlers and each hart's interrupt state (`irq.cpp`), unwinding. It does not print: it reports through `debug/report.hpp`. |
+| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`switcher.cpp` + `switch.S`), entry records (`sentry.cpp`), compartments, quotas, threads, VM and frame allocator, revocation, trap dispatch and fault delivery (`trap.cpp`), the two interrupt handlers and each hart's interrupt state (`irq.cpp`), unwinding. It does not print: it reports through `debug/report.hpp`. |
 | `kernel/hw/` | Drivers for the board: the console (`uart.cpp`), timer and cross-hart poke (`clint.cpp`), DTB discovery (`platform.cpp`) |
 | `kernel/debug/` | Diagnostics and checks: everything the kernel prints (`report.cpp`), the outbound capability check (`inspect.cpp`), boot self-tests (`quota_selftest.cpp`) |
 | `kernel/lib/` | Freestanding C library routines (`kstring.cpp`) |
@@ -172,7 +172,6 @@ Sealed types managed by the kernel:
 | `QuotaThreadMem` | `capability_quota_thread_mem_t` | Budget for thread stacks and thread state (§2.4). |
 | `Compartment` | `capability_compartment_t` | Handle to a compartment (§2.2). |
 | `Thread` | `capability_thread_t` | Handle to a thread; Load → switch to it, Store → kill it. |
-| `Revoker` | `capability_revoker_t` | Authority over a VA range, used to register it for revocation. |
 | `TypeKey` | `capability_type_t` | Compartment-minted type key (§2.7). |
 | `SealedObject` | `capability_sealed_t` | Compartment-sealed object (§2.7). |
 | `EntryPoint` | `Sentry` | Sealed pointer to an entry record describing a compartment or kernel entry point (§2.5). |
@@ -189,7 +188,7 @@ seal and unseal them:
 
 **Permission convention on handles:** `Permit_Load` is the *operational*
 right (use it) and `Permit_Store` the *administrative* right (derive from it,
-destroy it, kill it). Quotas, threads, revokers and type keys all follow it.
+destroy it, kill it). Quotas, threads and type keys all follow it.
 
 #### Global vs. local capabilities
 
@@ -367,7 +366,7 @@ or disk space etc.
    parent at once, a closed node keeps only what is outstanding and passes
    every later refund straight to its first live ancestor, and it is freed
    when nothing is outstanding, because memory can only come back through
-   the revoker. `sched` **cascades**: destroying a node frees it and its
+   the revocation sweep. `sched` **cascades**: destroying a node frees it and its
    subtree at once and their bandwidth goes back to the parent, because
    bandwidth is a promise the parent needs back at once. The threads on them
    stop, which is free (§2.6).
@@ -475,13 +474,13 @@ table, the owning compartment (the canonical sealed handle, which the switcher
 copies into the call's `ReturnFrame::callee_comp` so the trap path can tell
 which compartment a fault came from), flags, and the minimum stack.
 
-* `sys_sentry(comp, code, kind)` requires `code` to lie in executable memory
-  owned by `comp`. It writes a record on `comp`'s entry pages (billed to
-  `comp`). With `kind = KIND_ENTRY` it returns a sealed `EntryPoint` handle
-  bounded to the record. The handle is not jumpable: it is a token presented
-  to the switcher. With `KIND_HANDLER` the record is marked as a fault
-  entry, installed as `comp`'s fault handler, and never
-  returned (§3.6).
+* `sys_sentry(comp, code)` requires `code` to lie in executable memory owned
+  by `comp`. It writes a record on `comp`'s entry pages (billed to `comp`)
+  and returns a sealed `EntryPoint` handle bounded to the record. The handle
+  is not jumpable: it is a token presented to the switcher.
+* A fault handler is not an entry record. Nothing but the kernel ever holds
+  it, so there is no handle to seal: it is a code sentry kept in the
+  compartment's descriptor (§3.6).
 * The kernel's own system calls are records too, flagged `TRUSTED`. The
   kernel gives a compartment **one** hardware sentry, the switcher gate, and
   every domain crossing goes through it, kernel or not (§2.9).
@@ -887,6 +886,13 @@ Caller                       Switcher (switch.S + sentry.cpp)                 Ca
    * The return value (`ca0`) is checked by `inspect` (§4.5) before the caller
      sees it.
 
+All stack zeroing is done in assembly (`switch.S`, `early_trap.S`): below the
+callee's (or trap handler's) `csp` just before it is entered, and over the
+whole slice it was lent when the frame that lent it is resumed. Unwinding past
+dead frames zeroes only the slice of the frame it resumes, which covers every
+slice carved above it. Popped kernel frames are not wiped: nothing reads a
+frame once it is popped, and no compartment holds the kernel stack's bounds.
+
 TODO: a compartment callee is lent everything below the caller's `csp`, and
 that whole region is zeroed on entry and again on return (trap handlers too).
 So the cost depends on how much stack the caller has free, not on how much
@@ -968,14 +974,14 @@ mechanism only: what a fault means, and what to do about it, is the
 faulting compartment's business.
 
 1. **Installation:** a compartment has at most one handler, held in a
-   kernel-written field of its `Compartment` descriptor (`fault_handler`).
-   It is installed with `sys_sentry(comp, code, KIND_HANDLER)`. The handle
-   needs `Permit_Store`. The handler can be set once (`Busy` afterwards).
-   The record is marked as a fault entry, which the switcher,
-   `sys_thread_create` and `sys_trap_install` all refuse. Its handle is never
-   handed back: `sys_sentry` returns only an untagged `Status`. The loader
-   installs it from the image header (§2.8) before the compartment's first
-   instruction. A failed install fails the load.
+   kernel-written field of its `Compartment` descriptor (`fault_handler`):
+   a code sentry, checked as an entry point's code is (in the compartment's
+   own memory, W^X, no ASR). It is installed with
+   `sys_fault_install(comp, code)`, which returns a `Status`; installing
+   again replaces it. It is not an entry record and no handle to it exists,
+   so only the fault path can enter it. The loader installs it from the image
+   header (§2.8) before the compartment's first instruction. A failed install
+   fails the load.
 
    A handler is optional: a compartment without one has every fault
    reported by the kernel and unwound (6. below). Most images use the
@@ -1129,7 +1135,40 @@ usual leak is physical memory held in quarantine until a sweep.
 | 2. Persistent sharing via sealed handles | The owner seals handles under its hardware `OType` (§2.1) or a compartment-minted type (§2.7) and hands out handles that only it can open. Used for `fs` file handles and for both services' quota handles. |
 | 3. Direct global sharing with quarantine + revocation | Raw global capabilities shared across compartments require the memory to be revoked before it is reused. The mechanism is complete, but the **sweep trigger policy is missing** (see below). |
 
-**Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):** (Early, janky and very much an area of active thought and design)
+**Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):**
+
+* **The base rule.** A sweep revokes every capability whose *base* lies in
+  memory being taken back: a quarantined page, or a range queued with
+  `sys_revoke`. Every capability derived from a range has its base inside it,
+  so all of them die; a capability based outside it (the owner's capability
+  to the enclosing allocation, the kernel's record of it) was not derived
+  from it and survives. This is CHERIoT's rule.
+* **Freeing a whole allocation** (`sys_vm_deallocate`, compartment destroy)
+  quarantines it; that is all the registration it needs.
+* **Revoking part of an allocation** (`sys_revoke(comp, mem, quota)`) is for
+  an owner that keeps the allocation and reuses the part, as a heap does with
+  a freed object. The authority is the compartment handle: the range must lie
+  inside one of `comp`'s allocations, and must not include its first byte,
+  where the owner's own capability to it is based. The backlog is billed to
+  `quota`. The owner reuses the memory once `sys_revoke_query` reaches the
+  returned epoch. Nobody else can revoke; whoever needs memory revoked asks
+  its owner.
+* **When a sweep runs:** only when `vm::alloc_pages` runs out of addresses or
+  frames while pages are quarantined. A queued range alone does not start
+  one, so its epoch can wait indefinitely.
+
+TODO: decide who triggers sweeps. The trigger inside `vm::alloc_pages` is
+policy in the kernel, never fires for queued ranges alone, and makes every
+page allocation re-entrant (a sweep refunds quotas, which is behind the
+"never call `alloc_pages` holding a node lock" rule, the unlock/relock in
+`quota::derive` and the two-phase locking in `revoke::revoke`). The direction
+discussed: a `sys_revoke_sweep` gate (sweep if anything is pending, return
+the completed epoch) that `init` hands to one trusted compartment, likely the
+scheduler, which sweeps when idle and at least once per period while
+something is pending; `alloc_pages` then just fails with `NoMemory` and an
+allocator waits for the next epoch. A sweep runs masked and scans all live
+memory, so the gate holder must be trusted for latency until sweeps are made
+incremental.
 
 ### 4.3 Architectural invariants
 
@@ -1173,9 +1212,7 @@ status.
 | `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. The one flag, `FLAG_DMA`, makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at; any other flag is refused. |
 | `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. Refunds and **quarantines** the memory (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
-| `capability_revoker_t sys_revoke_create(comp, mem_cap)` | Creates a `Revoker` over `mem_cap`'s bounds, which must lie within a range `comp` owns. |
-| `capability_revoker_t sys_revoke_derive(parent_revoker, sub_cap, permissions)` | Creates a child authority within the parent's range. |
-| `uint64_t sys_revoke_register(revoker_cap, mem_cap, mem_quota)` | Records a range within the revoker's bounds for the next sweep, funded by `mem_quota`. Returns the target epoch, or 0 if refused. |
+| `uint64_t sys_revoke(comp, mem_cap, mem_quota)` | Queues `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s allocations, not including its first byte. The backlog is funded by `mem_quota`. Returns the epoch to wait for, or 0 if refused. |
 | `uint64_t sys_revoke_query(void)` | Highest completed epoch (§4.2). |
 
 ### 5.2 Virtual memory quotas
@@ -1199,7 +1236,8 @@ status.
 | `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 1, uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. |
 | `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
-| `Sentry sys_sentry(comp, code, kind)` | §2.5. `KIND_ENTRY` returns the `EntryPoint` handle. `KIND_HANDLER` installs `comp`'s fault handler (needs `Permit_Store`, once) and return only an untagged `Status` (§3.6). |
+| `Sentry sys_sentry(comp, code)` | §2.5. Returns the `EntryPoint` handle. |
+| `uint64_t sys_fault_install(comp, code)` | Makes `code` (in `comp`'s own memory) `comp`'s fault handler, replacing any earlier one. Returns a `Status` (§3.6). |
 | `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |
 | `capability_type_t sys_type_derive(key, permissions)` | Re-issues `key` with a subset of its unseal (Load) and seal (Store) rights. |
 | `capability_sealed_t sys_seal(key, obj)` | §2.7. Returns the `SealedObject` handle, or NULL. |

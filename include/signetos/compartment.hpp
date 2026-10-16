@@ -47,6 +47,10 @@
 #include <signetos/types.hpp>
 #include <signetos/vm.hpp>
 
+namespace signetos::sentry {
+struct Entry;  // sentry.hpp
+}
+
 namespace signetos::compartment {
 
 // How big a compartment is, stated in pages: the struct and the table share
@@ -105,10 +109,6 @@ constexpr size_t RW_SLOT_SEED_BASE = 1;  // first seed slot in the table
 // (vm.hpp), so the handle still unseals and still reaches the struct until the
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
-// (1u << 1) is unused.
-// Set when the fault handler is installed, never cleared: it can be
-// installed once (`install_fault_handler`).
-constexpr uint32_t FLAG_FAULT_HANDLER_SET = (1u << 2);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -125,10 +125,11 @@ struct Compartment {
                            // allocation. See "WHO OWNS WHICH MEMORY" below.
     Capability entries;    // head of the entry page chain (sys_sentry records).
                            // Null until the first entry point is minted.
-    // The compartment's fault handler (fault.hpp): the `OType::EntryPoint`
-    // handle of a fault-only record on its own entry pages, or null. Written
-    // once, under `lock`, by `install_fault_handler`; the trap dispatcher
-    // reads it without it (one capability load).
+    // The compartment's fault handler (fault.hpp): a `CT = 1` sentry over
+    // code in the compartment's own memory (`sentry::entry_code`), or null.
+    // Never handed out; only the trap dispatcher enters it
+    // (`fault_entry`). Written under `lock` by `install_fault_handler`; read
+    // without it (one capability load).
     Capability fault_handler;
     uint64_t   uid;        // monotonic, never reused. 0 is never issued.
     uint64_t   table_slots;  // slots in the table behind this header
@@ -242,8 +243,8 @@ Capability table_writable(Capability handle);
 
 // Records `code` as an entry point of `comp` and returns a kernel capability
 // bounded to the new sentry::EntryRecord (for sentry::create to seal), or null.
-// The record gets `entry_flags` (sentry::ENTRY_FLAG_*; never TRUSTED) and
-// `min_stack`, and its `owner` is `comp`'s canonical handle (`handle_of`).
+// The record gets `min_stack` and no flags (a compartment entry is never
+// trusted), and its `owner` is `comp`'s canonical handle (`handle_of`).
 //
 // If `require_owned`, `code`'s bounds must lie inside one allocation in
 // `comp`'s range chain; otherwise the caller could run arbitrary code with
@@ -253,8 +254,7 @@ Capability table_writable(Capability handle);
 // Takes a fresh entry page when the chain is full, charged to the
 // compartment's funding quota.
 Capability add_entry(Capability comp, Capability code, bool require_owned,
-                     uint64_t entry_flags, uint64_t min_stack,
-                     Status* out_status = nullptr);
+                     uint64_t min_stack, Status* out_status = nullptr);
 
 // The live descriptor behind `handle`, or null if it is not a genuine handle
 // to a live compartment (destroyed, or swept). The one way kernel code outside
@@ -269,10 +269,16 @@ const Compartment* open(Capability handle);
 // entry records keep as their `owner`.
 Capability handle_of(Capability handle);
 
-// Stores `entry` (an `OType::EntryPoint` handle of a fault-only record of
-// `comp`'s) as `comp`'s fault handler (fault.hpp). It can be set once: Busy
-// if it already has been. `comp` needs Permit_Store.
-Status install_fault_handler(Capability comp, Capability entry);
+// Makes `code` `comp`'s fault handler (fault.hpp): `code` must be a valid
+// entry's code (`sentry::entry_code`) lying inside one allocation in `comp`'s
+// range chain, as an entry point's must. Replaces any handler installed
+// before.
+Status install_fault_handler(Capability comp, Capability code);
+
+// What the trap dispatcher enters `comp`'s fault handler with: its sentry,
+// the compartment's table as `cgp`, `comp`'s canonical handle as the owner
+// and the default `min_stack`. False if `comp` is not live or has no handler.
+bool fault_entry(Capability comp, sentry::Entry* out);
 
 // Number of entry pages in `comp`'s chain. 0 for a bad handle.
 size_t entry_pages(Capability comp);
@@ -335,12 +341,9 @@ Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
 // first page is released.
 //
 // Every released range, and the compartment's own page, is quarantined rather
-// than unmapped, so capabilities to them stay usable until the sweep. A stale
-// handle to the compartment is refused by the cleared FLAG_LIVE.
-//
-// TODO: does NOT register the released ranges with the revoker so a sweep can
-// clear their tags, after which they could be unmapped and their frames reused.
-// deallocate has the same gap. Both need fixing when the revoker is wired up.
+// than unmapped, so capabilities to them stay usable until the sweep, which
+// revokes them and reclaims the pages (revoke.hpp). A stale handle to the
+// compartment is refused by the cleared FLAG_LIVE.
 Status destroy(Capability handle);
 
 // Kernel-internal introspection. False if the handle is not genuine.
@@ -353,9 +356,11 @@ bool query_range(Capability comp, uint64_t va, Range* out_copy,
                  Capability* out_funder = nullptr);
 
 // True if `comp` is a genuine live compartment and `[base, base + len)` lies
-// wholly inside one allocation recorded in `comp`'s range chain.
-bool owns_range(Capability comp, uint64_t base, uint64_t len,
-                Status* out_status = nullptr);
+// wholly inside one allocation recorded in `comp`'s range chain, without
+// including that allocation's first byte: what `revoke::revoke` may queue
+// (revoke.hpp, WHO MAY REVOKE).
+bool owns_inside(Capability comp, uint64_t base, uint64_t len,
+                 Status* out_status = nullptr);
 
 // Diagnostics for tests.
 size_t live_count();

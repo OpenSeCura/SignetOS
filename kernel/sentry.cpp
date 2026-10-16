@@ -24,42 +24,23 @@
  */
 
 #include <stddef.h>
-#include <signetos/asm_macros.h>
 #include <signetos/compartment.hpp>
-#include <signetos/fault.hpp>
-#include <signetos/debug/inspect.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
-#include <signetos/thread.hpp>
 #include <signetos/debug/report.hpp>
-#include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 
 namespace signetos::sentry {
 namespace {
 
-// The assembly switcher addresses the frame by these offsets.
-static_assert(offsetof(ReturnFrame, prev_ksp) == FRAME_LINK);
-static_assert(offsetof(ReturnFrame, tp) == RET_FRAME_TP);
-static_assert(offsetof(ReturnFrame, args) == RET_FRAME_ARG0);
-static_assert(offsetof(ReturnFrame, args) + 4 * sizeof(Capability) ==
-              RET_FRAME_ARG4);
-static_assert(offsetof(ReturnFrame, callee_sp) == RET_FRAME_CALLEE_SP);
-static_assert(offsetof(ReturnFrame, callee_gp) == RET_FRAME_CALLEE_GP);
-static_assert(offsetof(ReturnFrame, mstatus) == RET_FRAME_MSTATUS);
-static_assert(offsetof(ReturnFrame, flags) == RET_FRAME_FLAGS);
-static_assert(offsetof(ReturnFrame, callee_comp) == RET_FRAME_CALLEE_COMP);
-static_assert(sizeof(ReturnFrame) == RET_FRAME_SIZE);
-static_assert(ENTRY_FLAG_TRUSTED == ENTRY_TRUSTED);
-static_assert(static_cast<uint64_t>(Status::NoKernelStack) ==
-              STATUS_NO_KERNEL_STACK);
 static_assert((DEFAULT_MIN_STACK & 0xF) == 0);
 
 Capability s_root_code_cap = nullptr;
 
-Capability create_impl(Capability comp, Capability code_cap,
-                       uint64_t perms_mask, uint64_t kind, bool require_owned,
-                       Status* out_status) {
+// `entry_code`, with permissions limited to `perms_mask` as well, and, unless
+// `require_owned`, allowed over kernel text (`create_kernel`).
+Capability make_code(Capability code_cap, uint64_t perms_mask,
+                     bool require_owned, Status* out_status) {
   if (!capability_is_valid(code_cap) || sealing::is_sealed(code_cap)) {
     return fail_with(out_status, Status::InvalidCapability);
   }
@@ -124,32 +105,23 @@ Capability create_impl(Capability comp, Capability code_cap,
                                    perms::AccessSystemRegs)) != 0) {
     return fail_with(out_status, Status::SealFailed);
   }
+  return rx;
+}
+
+Capability create_impl(Capability comp, Capability code_cap,
+                       uint64_t perms_mask, bool require_owned,
+                       Status* out_status) {
+  const Capability rx =
+      make_code(code_cap, perms_mask, require_owned, out_status);
+  if (!capability_is_valid(rx)) {
+    return nullptr;
+  }
 
   // Record {code, comp} on the owner's entry pages (checks ownership and bills
-  // a fresh page to the owner's quota if the chain is full). A fault handler's
-  // record is marked fault-only, so nothing but the trap dispatcher can enter
-  // it (fault.hpp).
-  uint64_t entry_flags = 0;
-  uint64_t min_stack = DEFAULT_MIN_STACK;
-  switch (kind) {
-    case fault::KIND_ENTRY:
-      break;
-    case fault::KIND_HANDLER:
-      entry_flags = ENTRY_FLAG_FAULT;
-      break;
-    default:
-      return fail_with(out_status, Status::InvalidSentry);
-  }
-  const bool handler = kind != fault::KIND_ENTRY;
-  // Installing a handler is administrative: checked before anything is
-  // recorded, so a refusal leaves no record behind.
-  if (handler && !capability_has_perms(comp, perms::Store)) {
-    return fail_with(out_status, Status::InsufficientPermission);
-  }
-
+  // a fresh page to the owner's quota if the chain is full).
   compartment::Status c_status = compartment::Status::Ok;
   Capability record = compartment::add_entry(comp, rx, require_owned,
-                                             entry_flags, min_stack, &c_status);
+                                             DEFAULT_MIN_STACK, &c_status);
   if (c_status != compartment::Status::Ok || !capability_is_valid(record)) {
     return fail_with(out_status, c_status);
   }
@@ -157,29 +129,14 @@ Capability create_impl(Capability comp, Capability code_cap,
   __asm__ volatile("fence.i" ::: "memory");
 
   // The handle conveys nothing but the right to enter: Permit_Load if asked
-  // for (invoke requires it), and nothing that could write the record. A
-  // fault handler always gets Permit_Load: the dispatcher enters it through
-  // `resolve_fault`, which needs it.
-  Capability handle = (handler || (perms_mask & perms::Load) != 0)
+  // for (invoke requires it), and nothing that could write the record.
+  Capability handle = (perms_mask & perms::Load) != 0
                           ? handle_for(record)
                           : sealing::seal_as(OType::EntryPoint,
                                              capability_and_perms(record, 0));
   if (!capability_is_valid(handle)) {
     reinterpret_cast<EntryRecord*>(record)->pcc = nullptr;  // free it again
     return fail_with(out_status, Status::SealFailed);
-  }
-
-  if (handler) {
-    // Into the compartment's descriptor, never back to the caller.
-    const Status installed = compartment::install_fault_handler(comp, handle);
-    if (installed != Status::Ok) {
-      *reinterpret_cast<EntryRecord*>(record) = EntryRecord{};  // free it again
-      return fail_with(out_status, installed);
-    }
-    if (out_status != nullptr) {
-      *out_status = Status::Ok;
-    }
-    return nullptr;
   }
 
   if (out_status != nullptr) {
@@ -189,90 +146,6 @@ Capability create_impl(Capability comp, Capability code_cap,
 }
 
 }  // namespace
-
-// The permissions a stack capability must carry for anyone -- the callee or
-// the kernel -- to run on it: loads and stores of data and capabilities,
-// capabilities loaded back with their Store permission intact (LoadMutable),
-// local capabilities storable (StoreLocal: spilled stack pointers are local)
-// and loaded back as they were (LoadGlobal). A capability without StoreLocal
-// is by construction not a thread stack (`compartment::allocate` and the
-// capability table withhold it), so this check is also what keeps the kernel
-// from ever running on memory another thread can reach.
-constexpr uint64_t kStackPerms = perms::Load | perms::Store |
-                                 perms::LoadCapability |
-                                 perms::StoreCapability | perms::LoadMutable |
-                                 perms::StoreLocal | perms::LoadGlobal;
-
-// Validates the caller's stack capability and returns the stack the callee
-// gets: `[addr - want, addr)` if `want` is non-zero, else everything below
-// the caller's address, `[base, addr)`. Either way the result is at least
-// `min_stack` bytes, 16-byte aligned at both ends, exactly representable (so
-// `csetbounds` cannot round it up into the caller's live frames), and
-// positioned at its own top. Null (and `*out_status`) if the caller's stack
-// cannot be used. Declared in sentry.hpp: the trap path uses it too.
-Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
-                        uint64_t want, Status* out_status) {
-  if (!capability_is_valid(caller_sp) || sealing::is_sealed(caller_sp)) {
-    *out_status = Status::InvalidCapability;
-    return nullptr;
-  }
-  const uint64_t sp_perms = capability_get_perms(caller_sp);
-  if ((sp_perms & kStackPerms) != kStackPerms ||
-      (sp_perms & perms::Execute) != 0) {
-    *out_status = Status::InsufficientPermission;
-    return nullptr;
-  }
-
-  const uint64_t base = capability_get_base(caller_sp);
-  const uint64_t addr = capability_get_address(caller_sp);
-  const uint64_t top = base + capability_get_length(caller_sp);
-  if (addr <= base || addr > top || (base & 0xFULL) != 0 ||
-      (addr & 0xFULL) != 0) {
-    *out_status = Status::BadAlignment;
-    return nullptr;
-  }
-  if (addr - base < min_stack || addr - base < want) {
-    *out_status = Status::StackTooSmall;
-    return nullptr;
-  }
-  const uint64_t lo = want != 0 ? addr - want : base;
-
-  // For large regions, `csetbounds` (`scbndsr`) rounds the length up if `lo`
-  // or the length is not aligned to the representable alignment mask. Round
-  // `lo` up and `addr` down to `mask` so `[aligned_lo, aligned_top)` is
-  // strictly inside `[lo, addr)` and never overlaps the caller's frame.
-  const size_t mask = __builtin_cheri_representable_alignment_mask(
-      static_cast<size_t>(addr - lo));
-  const uint64_t aligned_lo = (lo + ~mask) & mask;
-  const uint64_t aligned_top = addr & mask;
-  if (aligned_top <= aligned_lo || aligned_top - aligned_lo < min_stack) {
-    *out_status = Status::StackTooSmall;
-    return nullptr;
-  }
-  Capability narrowed = capability_set_address(caller_sp, aligned_lo);
-  narrowed = capability_set_bounds(narrowed,
-                                   static_cast<size_t>(aligned_top - aligned_lo));
-  const uint64_t narrowed_top =
-      capability_get_base(narrowed) + capability_get_length(narrowed);
-  if (!capability_is_valid(narrowed) || narrowed_top > addr ||
-      (narrowed_top & 0xFULL) != 0) {
-    *out_status = Status::BadAlignment;
-    return nullptr;
-  }
-  return capability_set_address(narrowed, narrowed_top);
-}
-
-void zero_stack(Capability stack) {
-  if (!capability_is_valid(stack)) {
-    return;
-  }
-  Capability* slot = reinterpret_cast<Capability*>(
-      capability_set_address(stack, capability_get_base(stack)));
-  for (size_t i = 0; i < capability_get_length(stack) / sizeof(Capability);
-       ++i) {
-    slot[i] = nullptr;
-  }
-}
 
 void init(Capability root_data_cap) {
   // Derive `s_root_code_cap` bounded strictly to the dynamic compartment VA
@@ -297,15 +170,18 @@ void init(Capability root_data_cap) {
   }
 }
 
+Capability entry_code(Capability code_cap, Status* out_status) {
+  return make_code(code_cap, perms::CodeRx, true, out_status);
+}
+
 Capability create(Capability comp, Capability code_cap, uint64_t perms_mask,
-                  uint64_t kind, Status* out_status) {
-  return create_impl(comp, code_cap, perms_mask, kind, true, out_status);
+                  Status* out_status) {
+  return create_impl(comp, code_cap, perms_mask, true, out_status);
 }
 
 Capability create_kernel(Capability comp, Capability code_cap,
-                         uint64_t perms_mask, uint64_t kind,
-                         Status* out_status) {
-  return create_impl(comp, code_cap, perms_mask, kind, false, out_status);
+                         uint64_t perms_mask, Status* out_status) {
+  return create_impl(comp, code_cap, perms_mask, false, out_status);
 }
 
 Sentry handle_for(Capability record) {
@@ -318,11 +194,7 @@ Sentry handle_for(Capability record) {
   return sealing::seal_as(OType::EntryPoint, handle);
 }
 
-namespace {
-
-// `resolve` and `resolve_fault`: the same checks, and opposite answers on
-// whether the record may be a fault-only one.
-Status resolve_impl(Sentry entry_point, Entry* out, bool want_fault) {
+Status resolve(Sentry entry_point, Entry* out) {
   *out = Entry{};
   if (!capability_is_valid(entry_point)) {
     return Status::InvalidCapability;
@@ -359,13 +231,6 @@ Status resolve_impl(Sentry entry_point, Entry* out, bool want_fault) {
     return Status::InvalidCapability;
   }
 
-  // A fault handler is entered by the trap dispatcher and nothing else
-  // (fault.hpp); anything else is never entered by it.
-  const bool fault = (flags & ENTRY_FLAG_FAULT) != 0;
-  if (fault != want_fault || (fault && trusted)) {
-    return Status::InvalidSentry;
-  }
-
   // The owner must still be live. Destroy clears the records too, but this
   // also covers a record read just before that, and it is what lets every
   // reader of `Entry::owner` rely on it.
@@ -392,148 +257,6 @@ Status resolve_impl(Sentry entry_point, Entry* out, bool want_fault) {
   out->owner = trusted ? nullptr : owner;
   out->flags = flags;
   out->min_stack = rec->min_stack;
-  return Status::Ok;
-}
-
-}  // namespace
-
-Status resolve(Sentry entry_point, Entry* out) {
-  return resolve_impl(entry_point, out, false);
-}
-
-Status resolve_fault(Sentry entry_point, Entry* out) {
-  return resolve_impl(entry_point, out, true);
-}
-
-Capability unseal(Sentry entry_point, Status* out_status) {
-  Entry entry{};
-  const Status status = resolve(entry_point, &entry);
-  if (status != Status::Ok) {
-    return fail_with(out_status, status);
-  }
-  if ((entry.flags & ENTRY_FLAG_TRUSTED) != 0) {
-    return fail_with(out_status, Status::InvalidSentry);
-  }
-  if (out_status != nullptr) {
-    *out_status = Status::Ok;
-  }
-  return entry.sentry;
-}
-
-extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
-                                                  ReturnFrame* frame) {
-  if (frame == nullptr) {
-    return nullptr;
-  }
-  auto refuse = [&](Status s) -> Capability {
-    frame->args[0] =
-        reinterpret_cast<Capability>(static_cast<uintptr_t>(s));
-    return nullptr;
-  };
-
-  // Unseal `entry_point` (`OType::EntryPoint`, CT = 18), verify its owning
-  // compartment is still live, and extract the `EntryRecord`'s `pcc` (sealed
-  // as a `CT = 1` hardware sentry), `cgp`, flags and stack requirement.
-  Entry entry{};
-  Status status = resolve(entry_point, &entry);
-  if (status != Status::Ok) {
-    return refuse(status);
-  }
-  // `trusted` means a kernel syscall gate (syscall::gate); otherwise it's a
-  // user compartment. Unmasked compartments can be interrupted at any time,
-  // so ensure enough kernel stack remains for a trap frame and handler.
-  const bool trusted = (entry.flags & ENTRY_FLAG_TRUSTED) != 0;
-  if (!trusted && (frame->mstatus & MSTATUS_MIE) != 0 &&
-      thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
-          TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE) {
-    return refuse(Status::NoKernelStack);
-  }
-
-  // The callee's stack is carved out of the caller's, below the caller's
-  // current `csp`, so CHERI monotonicity guarantees the callee cannot reach
-  // the caller's live frames at `[addr, top)`. A compartment gets everything
-  // below `csp` (it may need any amount); the kernel gets exactly the
-  // `min_stack` bytes its system calls are sized for, so what it touches --
-  // and what `__signetos_switcher_return` has to scrub -- is bounded.
-  Capability narrowed = nullptr;
-  if (entry.min_stack != 0) {
-    narrowed = narrow_stack(frame->sp, entry.min_stack,
-                            trusted ? entry.min_stack : 0, &status);
-    if (!capability_is_valid(narrowed)) {
-      return refuse(status);
-    }
-  } else if (!trusted) {
-    return refuse(Status::InvalidSentry);  // a compartment entry always has one
-  }
-
-  // Domain switcher entry: verify that every capability about to be loaded into a compartment
-  // callee's register file (`ct0 = sentry`, `cgp = table`, `csp = narrowed`,
-  // `ca0..ca4 = args[0..4]`) is restricted, obeys W^X, carries no
-  // sealing/unsealing authority, and does not overlap kernel memory. A kernel
-  // entry's arguments go to the kernel and are not checked.
-  inspect::assert_user_capability(entry.sentry, "switcher_prepare:sentry");
-  inspect::assert_user_capability(entry.table, "switcher_prepare:callee_gp");
-  inspect::assert_user_capability(narrowed, "switcher_prepare:callee_sp");
-  if (!trusted) {
-    // Code never crosses a compartment boundary, only entry points do
-    // (DESIGN.md §2.5): a call carrying code, plain or a sentry, is refused.
-    for (size_t i = 0; i < 5; ++i) {
-      if (inspect::is_user_code(frame->args[i])) {
-        return refuse(Status::InvalidCapability);
-      }
-    }
-    for (size_t i = 0; i < 5; ++i) {
-      inspect::assert_user_capability(frame->args[i], "switcher_prepare:arg");
-    }
-  }
-
-  frame->callee_sp = narrowed;
-  // the kernel is already privileged...
-  if (!trusted) {
-    zero_stack(narrowed);  // what the caller's own calls left below its csp
-  }
-  frame->callee_gp = entry.table;
-  // Whose code this call enters: what the trap dispatcher reads to tell which
-  // compartment faulted, when this frame is the one under a fault's
-  // `TrapFrame` (trap.hpp, WHO FAULTED). Null for a kernel entry.
-  frame->callee_comp = entry.owner;
-  frame->flags = entry.flags;  // ENTRY_FLAG_TRUSTED: a kill never cuts the kernel
-  thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
-  return entry.sentry;
-}
-
-extern "C" uint64_t __signetos_switcher_return(Capability ret) {
-  // Pop the callee's `ReturnFrame`, scrub the stack it ran on and hand `ret`
-  // to the caller -- or, if the caller's compartment has been destroyed and
-  // swept since the call, to the nearest live frame beneath (unwind.hpp).
-  // The top frame must be a `ReturnFrame`, so a stashed/replayed `cra`
-  // return sentry cannot underflow the kernel stack or confuse a `TrapFrame`
-  // for a `ReturnFrame`. The assembly resumes whatever kind of frame this
-  // stops at.
-  //
-  // Code never crosses a compartment boundary (DESIGN.md §2.5), so code
-  // returned by the callee reaches the caller as `InvalidCapability`.
-  if (inspect::is_user_code(ret)) {
-    ret = reinterpret_cast<Capability>(
-        static_cast<uintptr_t>(Status::InvalidCapability));
-  }
-  return unwind::resume(unwind::KIND_RETURN_FRAME, ret);
-}
-
-Status invoke(Sentry entry_point, uint64_t arg0, uint64_t* out_result) {
-  Status status = Status::Ok;
-  Capability hw_sentry = unseal(entry_point, &status);
-  if (status != Status::Ok || !capability_is_valid(hw_sentry)) {
-    return status;
-  }
-
-  using EntryFn = uint64_t (*)(uint64_t);
-  EntryFn fn = reinterpret_cast<EntryFn>(hw_sentry);
-  const uint64_t result = fn(arg0);
-
-  if (out_result != nullptr) {
-    *out_result = result;
-  }
   return Status::Ok;
 }
 

@@ -177,8 +177,7 @@ inline Capability mint_entry(Capability invoke_gate, Capability sentry_gate,
       pcc, capability_get_address(
                reinterpret_cast<Capability>(const_cast<void*>(fn))));
   using FnSentry = decltype(&sys_sentry);
-  return syscall::call<FnSentry>(invoke_gate, sentry_gate, self_comp, code,
-                                 static_cast<uint64_t>(fault::KIND_ENTRY));
+  return syscall::call<FnSentry>(invoke_gate, sentry_gate, self_comp, code);
 }
 
 // Naming service clients.
@@ -293,18 +292,19 @@ inline void unlock(Capability invoke_gate, Capability lock_wake,
 // Copies a standalone compartment binary image (`img_cap`) into a fresh
 // allocation inside `target_comp` funded by `target_quota`, resolves its
 // internal `__cap_relocs` entries into `.got`, and mints its `OType::EntryPoint`
-// (`CT = 18`) entry sentry. `alloc_gate` and `sentry_gate` are the
-// `vm_allocate` and `sentry` kernel entries, reached through the switcher
-// `invoke_gate`.
+// (`CT = 18`) entry sentry. `alloc_gate`, `sentry_gate` and `fault_gate` are
+// the `vm_allocate`, `sentry` and `fault_install` kernel entries, reached
+// through the switcher `invoke_gate`.
 inline Capability load_compartment_image(Capability invoke_gate,
                                          Capability alloc_gate,
                                          Capability sentry_gate,
+                                         Capability fault_gate,
                                          Capability target_comp,
                                          Capability target_quota,
                                          Capability img_cap) {
   if (!capability_is_valid(invoke_gate) || !capability_is_valid(alloc_gate) ||
-      !capability_is_valid(sentry_gate) || !capability_is_valid(target_comp) ||
-      !capability_is_valid(target_quota)) {
+      !capability_is_valid(sentry_gate) || !capability_is_valid(fault_gate) ||
+      !capability_is_valid(target_comp) || !capability_is_valid(target_quota)) {
     return nullptr;
   }
   const init::CompartmentImageHeader* hdr = init::image_header(img_cap);
@@ -314,6 +314,7 @@ inline Capability load_compartment_image(Capability invoke_gate,
 
   using FnAlloc = decltype(&sys_vm_allocate);
   using FnSentry = decltype(&sys_sentry);
+  using FnFaultInstall = decltype(&sys_fault_install);
 
   Capability code_mem = syscall::call<FnAlloc>(
       invoke_gate, alloc_gate, target_comp, target_quota,
@@ -329,28 +330,25 @@ inline Capability load_compartment_image(Capability invoke_gate,
   if (!capability_is_valid(code)) {
     return nullptr;
   }
-  Capability entry = syscall::call<FnSentry>(
-      invoke_gate, sentry_gate, target_comp, code,
-      static_cast<uint64_t>(fault::KIND_ENTRY));
+  Capability entry =
+      syscall::call<FnSentry>(invoke_gate, sentry_gate, target_comp, code);
   if (!capability_is_valid(entry)) {
     return nullptr;
   }
 
-  // The image's fault handler (fault.hpp), if it defines one: installed in
-  // the compartment by the same gate, never handed back. Any failure fails
-  // the load -- a compartment that asked for a handler must not run without
-  // it -- and the caller destroys the compartment.
+  // The image's fault handler (fault.hpp), if it defines one: kept in the
+  // compartment's descriptor, never handed back. Any failure fails the load
+  // -- a compartment that asked for a handler must not run without it -- and
+  // the caller destroys the compartment.
   Capability handler_code = nullptr;
   if (!init::image_fault_handler(code, hdr->fault_handler, &handler_code)) {
     return nullptr;
   }
-  if (handler_code != nullptr) {
-    Capability result = syscall::call<FnSentry>(
-        invoke_gate, sentry_gate, target_comp, handler_code,
-        static_cast<uint64_t>(fault::KIND_HANDLER));
-    if (capability_is_valid(result) || capability_get_address(result) != 0) {
-      return nullptr;  // not an untagged Status::Ok
-    }
+  if (handler_code != nullptr &&
+      syscall::call<FnFaultInstall>(invoke_gate, fault_gate, target_comp,
+                                    handler_code) !=
+          static_cast<uint64_t>(Status::Ok)) {
+    return nullptr;
   }
   return entry;
 }

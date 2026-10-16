@@ -123,7 +123,6 @@ const char* otype_name(uint64_t ct) {
         case OType::QuotaDisk:      return "QuotaDisk";
         case OType::Compartment:    return "Compartment";
         case OType::Thread:         return "Thread";
-        case OType::Revoker:        return "Revoker";
         case OType::TypeKey:        return "TypeKey";
         case OType::SealedObject:   return "SealedObject";
         case OType::EntryPoint:     return "EntryPoint";

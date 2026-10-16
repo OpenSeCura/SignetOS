@@ -26,6 +26,7 @@
  * n + 1 from x.
  */
 
+#include <signetos/compartment.hpp>
 #include <signetos/debug/report.hpp>
 #include <signetos/hw/uart.hpp>
 #include <signetos/quota.hpp>
@@ -214,6 +215,55 @@ void run(Capability root) {
     check(refund(q, PAGE) == Status::Ok, "refund after the sweep");
     check(available_of(root) == root_before, "root restored after the sweep");
     check(live_nodes() == nodes, "no nodes leaked after the sweep");
+  }
+
+  // 10. Revoking part of an allocation (revoke.hpp, THE BASE RULE): every
+  //     capability based inside the range dies at the sweep; the owner's
+  //     capabilities based at the allocation, and the kernel's record of it,
+  //     survive, so the allocation can still be freed.
+  {
+    Capability q = derive(root, 64 * PAGE, RW);
+    Capability comp = compartment::create(q, nullptr);
+    check(capability_is_valid(comp), "create a scratch compartment");
+    Capability arena = compartment::allocate(comp, q, 4 * PAGE, 0);
+    check(capability_is_valid(arena), "allocate an arena");
+    const uint64_t a = capability_get_base(arena);
+    auto carve = [](Capability from, uint64_t at, uint64_t len) {
+      return capability_set_bounds(capability_set_address(from, at), len);
+    };
+    Capability object = carve(arena, a + 256, 64);
+    Capability inner = carve(object, a + 272, 16);  // derived from the object
+    Capability head = carve(arena, a, 256);         // based at the allocation
+
+    // Kept in memory the sweep scans, outside the object.
+    Capability* slots = reinterpret_cast<Capability*>(arena);
+    slots[64] = object;
+    slots[65] = inner;
+    slots[66] = arena;
+    slots[67] = head;
+
+    uint64_t epoch = 0;
+    check(revoke::revoke(comp, arena, q) != Status::Ok,
+          "the whole allocation cannot be revoked");
+    check(revoke::revoke(comp, head, q) != Status::Ok,
+          "a range with the allocation's first byte cannot be revoked");
+    check(revoke::revoke(comp, object, q, &epoch) == Status::Ok,
+          "revoke an object inside the allocation");
+    check(revoke::completed_epoch() < epoch, "not swept yet");
+    revoke::sweep();
+    check(revoke::completed_epoch() >= epoch, "the sweep completes the epoch");
+    check(!capability_is_valid(slots[64]), "the object is revoked");
+    check(!capability_is_valid(slots[65]), "what was derived from it too");
+    check(capability_is_valid(slots[66]), "the owner keeps the allocation");
+    check(capability_is_valid(slots[67]), "and what is based at its start");
+    check(compartment::deallocate(comp, q, arena) == Status::Ok,
+          "the kernel's record survives: the allocation can be freed");
+    check(compartment::destroy(comp) == Status::Ok, "destroy the compartment");
+    check(destroy(q) == Status::Ok, "destroy its quota");
+    revoke::sweep();
+    check(vm::quarantined_pages() == 0, "everything freed is reclaimed");
+    check(available_of(root) == root_before, "root restored after revoking");
+    check(live_nodes() == nodes, "no nodes leaked after revoking");
   }
   uart::print("[quota]    self-test passed\n");
 }

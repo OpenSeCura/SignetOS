@@ -41,8 +41,9 @@ namespace {
 
 // --- What `loader` asks `init` for (user/manifest.hpp) ------------------------
 // Only kernel entries, and the console: creating a compartment is
-// `compartment_create` + `vm_allocate` for its code + `sentry` for its entry,
-// each funded by the quota the requester passes in. `init` loads the loader
+// `compartment_create` + `vm_allocate` for its code + `sentry` for its entry
+// (+ `fault_install` for its fault handler, if it has one), each funded by
+// the quota the requester passes in. `init` loads the loader
 // itself directly, since it is the thing that loads everything else.
 #define LOADER_MANIFEST(X)                               \
   M_SYSCALL(X, SYS_COMP_CREATE, compartment_create)      \
@@ -50,6 +51,7 @@ namespace {
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
+  M_SYSCALL(X, SYS_FAULT_INSTALL, fault_install)         \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SERVICE(X, UART_SENTRY, "uart")
 SIGNETOS_MANIFEST(LOADER_MANIFEST, 128 * 1024)
@@ -66,6 +68,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_create = rw[SLOT_SYS_COMP_CREATE];
   Capability gate_alloc = rw[SLOT_SYS_VM_ALLOC];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
+  Capability gate_fault = rw[SLOT_SYS_FAULT_INSTALL];
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
 
@@ -114,8 +117,9 @@ extern "C" int64_t compartment_main(Capability arg) {
     return -1;
   }
 
-  Capability entry = load_compartment_image(
-      gate_invoke, gate_alloc, gate_sentry, comp, req->vm_quota, req->image);
+  Capability entry =
+      load_compartment_image(gate_invoke, gate_alloc, gate_sentry, gate_fault,
+                             comp, req->vm_quota, req->image);
   if (!capability_is_valid(entry)) {
     using FnCompDestroy = decltype(&sys_compartment_destroy);
     Capability gate_destroy = rw[SLOT_SYS_COMP_DESTROY];

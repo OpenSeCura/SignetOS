@@ -15,9 +15,7 @@
  */
 
 /*
- * revoke.cpp - SignetOS Revocation Authority Subsystem
- *
- * See revoke.hpp for the 0-byte hardware-sealed OType::Revoker model.
+ * revoke.cpp - SignetOS revocation (revoke.hpp)
  */
 
 #include <signetos/compartment.hpp>
@@ -30,8 +28,6 @@
 namespace signetos::revoke {
 
 namespace {
-
-constexpr uint64_t kRevokerPerms = perms::Load | perms::Store;
 
 SpinLock s_lock;
 
@@ -118,40 +114,19 @@ void release_pages(Capability p) {
   }
 }
 
-// Unseals `handle` as `OType::Revoker` and verifies the canonical shape of a
-// kernel-minted revoker capability: non-empty bounds, `address == base`, and
-// permissions carrying at most `Permit_Load | Permit_Store`.
-Capability unseal_revoker(Capability handle) {
-  Capability open = sealing::unseal_as(OType::Revoker, handle);
-  if (!capability_is_valid(open)) {
-    return nullptr;
+// True if `address` lies in a range awaiting the sweep. Caller holds
+// `s_lock`.
+bool in_pending_range(uint64_t address) {
+  for (Capability p = g_pending_pages; capability_is_valid(p);
+       p = page_of(p)->next) {
+    const PendingPage* page = page_of(p);
+    for (uint64_t i = 0; i < page->count; ++i) {
+      if (address >= page->ranges[i].base && address < page->ranges[i].top) {
+        return true;
+      }
+    }
   }
-  const uint64_t base = capability_get_base(open);
-  const uint64_t len = capability_get_length(open);
-  const uint64_t addr = capability_get_address(open);
-  const uint64_t p = capability_get_perms(open);
-  if (len == 0 || base + len < base || addr != base ||
-      (p & ~(kRevokerPerms | perms::Levels)) != 0) {
-    return nullptr;
-  }
-  return open;
-}
-
-// Seals an unsealed capability covering `[base, base + len)` as an
-// `OType::Revoker` handle carrying `perms_mask & (Permit_Load | Permit_Store)`.
-Capability seal_revoker(Capability cap, uint64_t perms_mask) {
-  const uint64_t base = capability_get_base(cap);
-  const uint64_t len = capability_get_length(cap);
-  if (!capability_is_valid(cap) || sealing::is_sealed(cap) || len == 0 ||
-      base + len < base) {
-    return nullptr;
-  }
-  Capability c = capability_set_address(cap, base);
-  c = capability_and_perms(c, perms_mask & kRevokerPerms);
-  if (!capability_is_valid(c)) {
-    return nullptr;
-  }
-  return sealing::seal_as(OType::Revoker, c);
+  return false;
 }
 
 } // namespace
@@ -180,130 +155,31 @@ uint64_t pending_epoch() {
   return __atomic_load_n(&g_pending_epoch, __ATOMIC_ACQUIRE);
 }
 
-Capability create_root(Capability mem_cap, Status* out_status) {
+Status revoke(Capability comp, Capability mem_cap, Capability mem_quota,
+              uint64_t* out_epoch) {
+  // The range comes from the caller's capability to it.
   if (!capability_is_valid(mem_cap) || sealing::is_sealed(mem_cap)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (!capability_has_perms(mem_cap, perms::Load | perms::Store)) {
-    return fail_with(out_status, Status::InsufficientPermission);
-  }
-  const uint64_t base = capability_get_base(mem_cap);
-  const uint64_t len = capability_get_length(mem_cap);
-  if (len == 0 || base + len < base) {
-    return fail_with(out_status, Status::InvalidRange);
-  }
-  Capability handle = seal_revoker(mem_cap, kRevokerPerms);
-  if (!capability_is_valid(handle)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (out_status != nullptr) {
-    *out_status = Status::Ok;
-  }
-  return handle;
-}
-
-Capability create(Capability comp, Capability mem_cap, Status* out_status) {
-  if (!capability_is_valid(mem_cap) || sealing::is_sealed(mem_cap)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (!capability_has_perms(mem_cap, perms::Load | perms::Store)) {
-    return fail_with(out_status, Status::InsufficientPermission);
-  }
-  const uint64_t base = capability_get_base(mem_cap);
-  const uint64_t len = capability_get_length(mem_cap);
-  Status own_status = Status::Ok;
-  if (!compartment::owns_range(comp, base, len, &own_status)) {
-    return fail_with(out_status, own_status);
-  }
-  return create_root(mem_cap, out_status);
-}
-
-Capability derive(Capability parent_handle, uint64_t base, uint64_t top,
-                  uint64_t perms_mask, Status* out_status) {
-  Capability open_parent = unseal_revoker(parent_handle);
-  if (!capability_is_valid(open_parent)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (!capability_has_perms(open_parent, perms::Store)) {
-    return fail_with(out_status, Status::InsufficientPermission);
-  }
-  if (top <= base) {
-    return fail_with(out_status, Status::InvalidRange);
-  }
-  const uint64_t parent_base = capability_get_base(open_parent);
-  const uint64_t parent_top = parent_base + capability_get_length(open_parent);
-  if (base < parent_base || top > parent_top) {
-    return fail_with(out_status, Status::NotInRange);
-  }
-  const uint64_t len = top - base;
-  Capability child = capability_set_address(open_parent, base);
-  child = capability_set_bounds(child, len);
-  if (!capability_is_valid(child) || capability_get_base(child) != base ||
-      capability_get_length(child) != len) {
-    return fail_with(out_status, Status::InvalidRange);
-  }
-  Capability handle = seal_revoker(child, perms_mask);
-  if (!capability_is_valid(handle)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (out_status != nullptr) {
-    *out_status = Status::Ok;
-  }
-  return handle;
-}
-
-Capability derive(Capability parent_handle, Capability sub_cap,
-                  uint64_t perms_mask, Status* out_status) {
-  if (!capability_is_valid(sub_cap) || sealing::is_sealed(sub_cap)) {
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  const uint64_t base = capability_get_base(sub_cap);
-  const uint64_t len = capability_get_length(sub_cap);
-  if (len == 0 || base + len < base) {
-    return fail_with(out_status, Status::InvalidRange);
-  }
-  return derive(parent_handle, base, base + len, perms_mask, out_status);
-}
-
-Status register_range(Capability revoker_handle, Capability mem_cap,
-                      Capability mem_quota, uint64_t* out_epoch) {
-  // 1. Authenticate the OType::Revoker handle in hardware.
-  Capability open_auth = unseal_revoker(revoker_handle);
-  if (!capability_is_valid(open_auth)) {
-    return Status::InvalidCapability;
-  }
-
-  // 2. Operational authority (`Permit_Load`) is required to register.
-  if (!capability_has_perms(open_auth, perms::Load)) {
-    return Status::InsufficientPermission;
-  }
-
-  // 3. The range to revoke comes from the caller's memory capability.
-  if (!capability_is_valid(mem_cap)) {
     return Status::InvalidCapability;
   }
   const uint64_t mem_base = capability_get_base(mem_cap);
   const uint64_t mem_len = capability_get_length(mem_cap);
-  if (mem_len == 0) {
+  const uint64_t mem_top = mem_base + mem_len;
+  if (mem_len == 0 || mem_top < mem_base) {
     return Status::InvalidRange;
   }
-  const uint64_t mem_top = mem_base + mem_len;
-  if (mem_top < mem_base) {
-    return Status::InvalidRange;  // wrapped
+
+  // WHO MAY REVOKE: the owner, for memory strictly inside one of its
+  // allocations.
+  Status owned = Status::Ok;
+  if (!compartment::owns_inside(comp, mem_base, mem_len, &owned)) {
+    return owned;
   }
 
-  // 4. Containment is checked against the unsealed revoker's hardware bounds.
-  const uint64_t auth_base = capability_get_base(open_auth);
-  const uint64_t auth_top = auth_base + capability_get_length(open_auth);
-  if (mem_base < auth_base || mem_top > auth_top) {
-    return Status::NotInRange;
-  }
-
-  // 5. The backlog is paid for. The record goes on a page funded by
-  //    `mem_quota`; a page is bought from it when none of its pages has room.
-  //    `quota::charge` is the full check on the handle when a page is bought
-  //    (genuine QuotaVm, Permit_Load); the type check here keeps a stray
-  //    capability with a matching base from riding on an existing page.
+  // The backlog is paid for. The record goes on a page funded by
+  // `mem_quota`; a page is bought from it when none of its pages has room.
+  // `quota::charge` is the full check on the handle when a page is bought
+  // (genuine QuotaVm, Permit_Load); the type check here keeps a stray
+  // capability with a matching base from riding on an existing page.
   if (!sealing::is_sealed_as(OType::QuotaVm, mem_quota)) {
     return Status::InvalidCapability;
   }
@@ -344,20 +220,6 @@ Status register_range(Capability revoker_handle, Capability mem_cap,
   return Status::Ok;
 }
 
-bool is_pending(uint64_t address) {
-  Locked hold(s_lock);
-  for (Capability p = g_pending_pages; capability_is_valid(p);
-       p = page_of(p)->next) {
-    const PendingPage* page = page_of(p);
-    for (uint64_t i = 0; i < page->count; ++i) {
-      if (address >= page->ranges[i].base && address < page->ranges[i].top) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 bool should_revoke(Capability cap) {
   if (!capability_is_valid(cap)) {
     return false;
@@ -370,59 +232,20 @@ bool should_revoke(Capability cap) {
   }
   const uint64_t base = capability_get_base(cap);
   const uint64_t len = capability_get_length(cap);
-  const uint64_t addr = capability_get_address(cap);
   // Never revoke standing kernel derivation roots (e.g. `vm::s_dynamic`,
-  // `sentry::s_root_code_cap`, `vm::s_direct`, `tests::g_root_cap`).
+  // `sentry::s_root_code_cap`, `vm::s_direct`), whose base is the base of
+  // the whole dynamic space.
   if (len >= vm::DYNAMIC_TOP - vm::DYNAMIC_BASE || base >= vm::DIRECT_BASE) {
     return false;
   }
-  const uint64_t top = (base + len < base) ? ~uint64_t{0} : (base + len);
-  const bool is_revoker = sealing::is_sealed_as(OType::Revoker, cap);
 
-  // 1. Explicitly registered revocation ranges (`revoke::register_range`).
-  //    For a `capability_revoker_t` (`OType::Revoker`), registering a chunk
-  //    or resetting its own `[base, top)` arena must not self-revoke the
-  //    revoker handle; a revoker handle is only revoked by a pending range
-  //    when a strictly wider parent range encompasses `[base, top)`.
-  //    Called by the sweep with `s_lock` already held.
-  for (Capability pg = g_pending_pages; capability_is_valid(pg);
-       pg = page_of(pg)->next) {
-    const PendingPage* page = page_of(pg);
-    for (uint64_t i = 0; i < page->count; ++i) {
-      const uint64_t r_base = page->ranges[i].base;
-      const uint64_t r_top = page->ranges[i].top;
-      if (is_revoker) {
-        if (len > 0 && r_base <= base && r_top >= top &&
-            (r_base < base || r_top > top)) {
-          return true;
-        }
-      } else if ((addr >= r_base && addr < r_top) ||
-                 (len > 0 && base < r_top && top > r_base)) {
-        return true;
-      }
-    }
+  // THE BASE RULE: a queued range (called by the sweep with `s_lock` held),
+  // or a quarantined page.
+  if (in_pending_range(base)) {
+    return true;
   }
-
-  // 2. Quarantined dynamic pages (`vm::free_pages`). When backing pages are
-  //    unmapped/quarantined, every capability overlapping them -- including
-  //    any `OType::Revoker` handle over that VM allocation -- is revoked.
-  if (vm::quarantined_pages() > 0) {
-    if (addr >= vm::DYNAMIC_BASE && addr < vm::DYNAMIC_TOP &&
-        vm::is_quarantined(addr)) {
-      return true;
-    }
-    if (len > 0 && top > vm::DYNAMIC_BASE && base < vm::DYNAMIC_TOP) {
-      const uint64_t clip_lo =
-          (base < vm::DYNAMIC_BASE) ? vm::DYNAMIC_BASE : base;
-      const uint64_t clip_hi = (top > vm::DYNAMIC_TOP) ? vm::DYNAMIC_TOP : top;
-      if (clip_hi > clip_lo &&
-          vm::range_has_quarantined(clip_lo,
-                                    static_cast<size_t>(clip_hi - clip_lo))) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return vm::quarantined_pages() > 0 && base >= vm::DYNAMIC_BASE &&
+         base < vm::DYNAMIC_TOP && vm::is_quarantined(base);
 }
 
 namespace {
@@ -513,18 +336,6 @@ void sweep() {
       : "cs0", "cs1", "cs2", "cs3", "cs4", "cs5", "cs6", "cs7", "cs8", "cs9",
         "cs10", "cs11", "ct0", "ct1", "ct2", "ct3", "ct4", "ct5", "ct6", "ca0",
         "ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "memory");
-}
-
-bool query(Capability handle, RevokerAuthority* out_copy) {
-  Capability open = unseal_revoker(handle);
-  if (!capability_is_valid(open)) {
-    return false;
-  }
-  if (out_copy != nullptr) {
-    out_copy->base = capability_get_base(open);
-    out_copy->top = out_copy->base + capability_get_length(open);
-  }
-    return true;
 }
 
 } // namespace signetos::revoke

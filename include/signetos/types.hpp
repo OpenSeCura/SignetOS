@@ -54,7 +54,6 @@ enum class OType : uint64_t {
     QuotaDisk        = 12,
     Compartment      = 13,
     Thread           = 14,
-    Revoker          = 15,
     TypeKey          = 16,
     SealedObject     = 17,
 

@@ -37,7 +37,7 @@
 //      handler --
 //      as a `CT = 1` hardware sentry. The handler runs below the interrupted
 //      `csp`, narrowed by the same stack rule as a callee's
-//      (`sentry::narrow_stack`: permissions including StoreLocal, the
+//      (`switcher::narrow_stack`: permissions including StoreLocal, the
 //      handler's `min_stack` free, exactly representable, never the kernel
 //      stack), and makes its kernel calls on the interrupted kernel stack,
 //      which must have `RET_FRAME_MIN_FREE` below the `TrapFrame`. An

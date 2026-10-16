@@ -63,7 +63,7 @@ using Status = signetos::Status;
 // asm_macros.h as UNWIND_*: it is what the two return paths get back in a0.
 enum Kind : uint64_t {
   KIND_NONE = 0,          // nothing recognisable: empty stack, or not a frame
-  KIND_RETURN_FRAME = 1,  // sentry::ReturnFrame, resumed with `ret`
+  KIND_RETURN_FRAME = 1,  // switcher::ReturnFrame, resumed with `ret`
   KIND_TRAP_FRAME = 2,    // trap::TrapFrame, resumed with `mret`
 };
 
@@ -85,9 +85,11 @@ Kind kind_at(Capability ksp);
 // `value` is what the first `ReturnFrame` resumed gets in `args[0]` if no
 // frame was skipped (the callee's return value); after a skipped frame it is
 // Status::CompartmentDestroyed, or the frame's `fault_status`
-// (Status::Faulted) if it was a fault frame. A `TrapFrame` resumed has its `mstatus.MPIE` restored from the
-// frame. Each popped frame's loaned stack slice (`callee_sp` / `handler_sp`)
-// is scrubbed whether it is resumed or skipped; a skipped frame is wiped.
+// (Status::Faulted) if it was a fault frame. A `TrapFrame` resumed has its
+// `mstatus.MPIE` restored from the frame. Nothing here zeroes stacks: the
+// assembly zeroes the slice the resumed frame lent (`callee_sp` /
+// `handler_sp`), which covers every slice above it (switch.S, STACK
+// ZEROING).
 //
 // FAULT FRAMES (trap.hpp, TRAP_FLAG_FAULT; fault.hpp)
 //

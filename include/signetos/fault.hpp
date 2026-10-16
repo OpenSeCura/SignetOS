@@ -66,12 +66,11 @@
 //
 // HOW A HANDLER IS INSTALLED
 // --------------------------
-// `sys_sentry(comp, code, KIND_HANDLER)`. The code must lie in `comp`'s own
-// memory (as for any entry point), the handle needs Permit_Store, and the
-// handler can be set once. The record is marked as a fault entry, which the
-// switcher, `sys_thread_create` and `sys_trap_install` all refuse, and its
-// handle is never handed back: only the fault path can enter it. The loader
-// installs it from the image header (`compartment_error_handler`;
+// `sys_fault_install(comp, code)`. The code must lie in `comp`'s own memory
+// (as for any entry point). The kernel keeps it in `comp`'s descriptor as a
+// plain code sentry: it is not an entry record and no handle to it exists,
+// so nothing but the fault path can enter it. Installing again replaces it.
+// The loader installs it from the image header (`compartment_error_handler`;
 // user/entry.S) before the compartment's first instruction, if the image
 // defines one: a handler is optional. Most use the runtime's default
 // (`SIGNETOS_DEFAULT_FAULT_HANDLER`, user/runtime.hpp), which prints one line
@@ -114,12 +113,6 @@ enum Reg : uint32_t {
 enum Verdict : uint64_t {
   UNWIND = 0,
   INSTALL_CONTEXT = 0x5e5e,
-};
-
-// `sys_sentry`'s `kind`.
-enum Kind : uint64_t {
-  KIND_ENTRY = 0,    // an ordinary entry point: the handle is returned
-  KIND_HANDLER = 1,  // install as the compartment's fault handler
 };
 
 // --- Decoding (for handlers; the kernel does not interpret faults) ----------

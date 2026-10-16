@@ -84,25 +84,20 @@ Capability load_image_kernel(Capability target_comp, Capability target_quota,
     return fail_with(out_status, Status::InvalidCapability);
   }
 
-  Capability entry = sentry::create(target_comp, code, perms::CodeRx,
-                                    fault::KIND_ENTRY, nullptr);
+  Capability entry = sentry::create(target_comp, code, perms::CodeRx);
   if (!capability_is_valid(entry)) {
     return fail_with(out_status, Status::SentryFailed);
   }
 
   // The image's fault handler, if it defines one (as
-  // `user::load_compartment_image`). `create` installs it and returns null.
+  // `user::load_compartment_image`).
   Capability handler_code = nullptr;
   if (!image_fault_handler(code, hdr->fault_handler, &handler_code)) {
     return fail_with(out_status, Status::InvalidCapability);
   }
-  if (handler_code != nullptr) {
-    sentry::Status s_status = sentry::Status::Ok;
-    sentry::create(target_comp, handler_code, perms::CodeRx,
-                   fault::KIND_HANDLER, &s_status);
-    if (s_status != sentry::Status::Ok) {
-      return fail_with(out_status, Status::SentryFailed);
-    }
+  if (handler_code != nullptr && compartment::install_fault_handler(
+                                     target_comp, handler_code) != Status::Ok) {
+    return fail_with(out_status, Status::SentryFailed);
   }
 
   *out_status = Status::Ok;

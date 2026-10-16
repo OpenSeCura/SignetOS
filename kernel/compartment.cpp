@@ -126,8 +126,10 @@ Range* find_free_record(Capability comp_page, Capability mem_quota) {
 }
 
 // True if [base, base + len) lies wholly inside one allocation recorded in
-// this compartment's range chain.
-bool owns(Capability comp_page, uint64_t base, uint64_t len) {
+// this compartment's range chain. With `interior`, it must also leave out the
+// allocation's first byte (revoke.hpp, WHO MAY REVOKE).
+bool owns(Capability comp_page, uint64_t base, uint64_t len,
+          bool interior = false) {
   const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
   for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
     const Range* records = records_of(p);
@@ -137,7 +139,8 @@ bool owns(Capability comp_page, uint64_t base, uint64_t len) {
       }
       const uint64_t start = capability_get_base(records[i].cap);
       const uint64_t end = start + capability_get_length(records[i].cap);
-      if (base >= start && len <= end - base && base < end) {
+      if ((interior ? base > start : base >= start) && base < end &&
+          len <= end - base) {
         return true;
       }
     }
@@ -355,15 +358,10 @@ Capability table_writable(Capability handle) {
 }
 
 Capability add_entry(Capability comp, Capability code, bool require_owned,
-                     uint64_t entry_flags, uint64_t min_stack,
-                     Status* out_status) {
+                     uint64_t min_stack, Status* out_status) {
   Capability comp_page = unseal(comp);
   if (!capability_is_valid(comp_page) || !capability_is_valid(code)) {
     return fail_with(out_status, Status::InvalidCapability);
-  }
-  // Only `syscall::gate` makes kernel entries, and not through here.
-  if ((entry_flags & sentry::ENTRY_FLAG_TRUSTED) != 0) {
-    return fail_with(out_status, Status::InvalidSentry);
   }
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
@@ -409,7 +407,7 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
   record->pcc = code;
   record->cgp = user_view(table_slice(comp_page, 0, c->table_slots));
   record->owner = owner;
-  record->flags = entry_flags;  // a compartment entry is never trusted
+  record->flags = 0;  // a compartment entry is never trusted
   record->min_stack = min_stack;
 
   Capability out = capability_set_bounds(reinterpret_cast<Capability>(record),
@@ -432,9 +430,15 @@ Capability handle_of(Capability handle) {
   return canonical_handle(page);
 }
 
-Status install_fault_handler(Capability comp, Capability entry) {
-  if (!capability_has_perms(comp, perms::Store)) {
-    return Status::InsufficientPermission;
+Status install_fault_handler(Capability comp, Capability code) {
+  Status status = Status::Ok;
+  const Capability rx = sentry::entry_code(code, &status);
+  if (!capability_is_valid(rx)) {
+    return status;
+  }
+  const Capability handler = sealing::seal_entry(rx);
+  if (!capability_is_valid(handler)) {
+    return Status::SealFailed;
   }
   Capability comp_page = unseal(comp);
   if (!capability_is_valid(comp_page)) {
@@ -442,19 +446,36 @@ Status install_fault_handler(Capability comp, Capability entry) {
   }
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Locked hold(c->lock);
-  const uint32_t flags = __atomic_load_n(&c->flags, __ATOMIC_ACQUIRE);
-  if ((flags & FLAG_LIVE) == 0) {
+  if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
     return Status::InvalidCapability;
   }
-  if ((flags & FLAG_FAULT_HANDLER_SET) != 0) {
-    return Status::Busy;  // once only (fault.hpp)
+  // As for an entry point: otherwise the handler could run arbitrary code
+  // with this compartment's table in `cgp`.
+  if (!owns(comp_page, capability_get_base(rx), capability_get_length(rx))) {
+    return Status::NotOwned;
   }
-  // The dispatcher reads the field without the lock: the handle is a single
-  // capability store, and the flag (which nothing reads without the lock)
-  // follows it.
-  c->fault_handler = entry;
-  __atomic_fetch_or(&c->flags, FLAG_FAULT_HANDLER_SET, __ATOMIC_RELEASE);
+  __asm__ volatile("fence.i" ::: "memory");
+  // One capability store: the dispatcher reads it without the lock.
+  c->fault_handler = handler;
   return Status::Ok;
+}
+
+bool fault_entry(Capability comp, sentry::Entry* out) {
+  *out = sentry::Entry{};
+  Capability comp_page = unseal(comp);
+  if (!capability_is_valid(comp_page)) {
+    return false;
+  }
+  const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
+  const Capability handler = c->fault_handler;
+  if (!capability_is_valid(handler)) {
+    return false;
+  }
+  out->sentry = handler;
+  out->table = user_view(table_slice(comp_page, 0, c->table_slots));
+  out->owner = canonical_handle(comp_page);
+  out->min_stack = sentry::DEFAULT_MIN_STACK;
+  return capability_is_valid(out->table) && capability_is_valid(out->owner);
 }
 
 size_t entry_pages(Capability comp) {
@@ -810,8 +831,8 @@ bool query_range(Capability comp, uint64_t va, Range* out_copy,
   return true;
 }
 
-bool owns_range(Capability comp, uint64_t base, uint64_t len,
-                Status* out_status) {
+bool owns_inside(Capability comp, uint64_t base, uint64_t len,
+                 Status* out_status) {
   Capability comp_page = unseal(comp);
   if (!capability_is_valid(comp_page)) {
     if (out_status != nullptr) {
@@ -833,7 +854,7 @@ bool owns_range(Capability comp, uint64_t base, uint64_t len,
     }
     return false;
   }
-  if (!owns(comp_page, base, len)) {
+  if (!owns(comp_page, base, len, true)) {
     if (out_status != nullptr) {
       *out_status = Status::NotInRange;
     }

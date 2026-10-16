@@ -39,8 +39,8 @@
  *             (ENTRY_FLAG_TRUSTED)  caller's csp, ca0..ca4 = args[0..4],
  *                             nothing scrubbed, interrupts stay masked.
  *
- *      On return, calls `__signetos_switcher_return` to pop the `ReturnFrame`
- *      and scrub the callee's stack region, restores the caller's state and
+ *      On return, calls `__signetos_switcher_return` to pop the `ReturnFrame`,
+ *      zeroes the callee's stack region, restores the caller's state and
  *      `MIE`, and scrubs all volatile registers (`ct0..ct6`, `ca1..ca7`).
  *      `ca0` carries the callee's checked return value, or the `Status` of a
  *      refused call.
@@ -59,10 +59,23 @@
  * caller's `MIE` is re-established only by the last few instructions before
  * control returns to user code, after every kernel frame has been popped.
  *
+ * STACK ZEROING: a compartment never sees what other code left on the
+ * thread's stack. Everything below the `csp` a compartment callee or a trap
+ * handler starts with is zeroed just before it is entered, and the whole
+ * slice it was lent (`callee_sp`, `handler_sp`) when the frame that lent it
+ * is resumed. Both are done here and in `early_trap.S`, with
+ * `__signetos_zero_stack` (section 3). Unwinding past dead frames zeroes only
+ * the slice of the frame it resumes: every slice above it was carved from
+ * that one, so it covers them all.
+ *
+ * POPPED FRAMES ARE NOT WIPED: once a frame is popped nothing reads it again
+ * (every field is written before it is read, at push or by the C++ that set
+ * the frame up) and no compartment holds the kernel stack's bounds.
+ *
  * NO MACROS: every register sequence in this file is written out in place so
  * each path reads top to bottom. Only constants come from `asm_macros.h`: the
  * frame offsets (`RET_FRAME_*`, `FRAME_SP`, `SWITCH_FRAME_SIZE`), which
- * `sentry.cpp` static_asserts against `ReturnFrame`, and the `mstatus`,
+ * `switcher.cpp` static_asserts against `ReturnFrame`, and the `mstatus`,
  * `ENTRY_TRUSTED` and `Status` values.
  */
 
@@ -163,10 +176,14 @@ sys_compartment_invoke:
     bnez    t1, .Lenter_kernel
 
     /*
-     * 4a. Compartment callee: give it the caller's `MIE`, scrub every other
-     *     register, and jump (`cjalr` seals `.Lcomp_restore` into `cra` as a
-     *     `CT = 2` return sentry).
+     * 4a. Compartment callee: zero everything below its `csp` (what the
+     *     caller's own calls left there), give it the caller's `MIE`, scrub
+     *     every other register, and jump (`cjalr` seals `.Lcomp_restore` into
+     *     `cra` as a `CT = 2` return sentry).
      */
+    clc     ct3, RET_FRAME_CALLEE_SP(csp)
+    mv      t4, t3                      /* up to its csp */
+    cjal    cra, __signetos_zero_stack
     ld      t1,  RET_FRAME_MSTATUS(csp)
     clc     csp, RET_FRAME_CALLEE_SP(csp)
     andi    t1, t1, MSTATUS_MIE
@@ -224,12 +241,18 @@ sys_compartment_invoke:
 __signetos_resume_return_frame:
     csrr    ct1, mscratchc
     caddi   ct1, ct1, -RET_FRAME_SIZE   /* ct1 = ReturnFrame* to resume */
+    /* Zero the whole slice the callee was lent (null for `thread_switch`). */
+    clc     ct3, RET_FRAME_CALLEE_SP(ct1)
+    gcbase  t4, ct3
+    gclen   t5, ct3
+    add     t4, t4, t5
+    cjal    cra, __signetos_zero_stack
 
 .Lcomp_pop_frame:
     /*
      * 6. Restore caller's callee-saved registers and full `csp`, load the
-     *    caller's `ca0` from `args[0]`, wipe the popped `ReturnFrame`, scrub
-     *    all volatile registers, and return.
+     *    caller's `ca0` from `args[0]`, scrub all volatile registers, and
+     *    return. A refused call comes straight here: its callee never ran.
      */
     clc     cra,   0(ct1)               /* ReturnFrame::ra */
     clc     csp,  FRAME_SP(ct1)         /* ReturnFrame::sp (full bounds) */
@@ -249,40 +272,13 @@ __signetos_resume_return_frame:
     clc     cs11, 240(ct1)
     ld      t2,  RET_FRAME_MSTATUS(ct1)
     clc     ca0, RET_FRAME_ARG0(ct1)
-    /* Wipe all 26 slots of the popped frame. */
-    csc     cnull,   0(ct1)             /* ra */
-    csc     cnull,  FRAME_SP(ct1)       /* sp */
-    csc     cnull,  32(ct1)             /* gp */
-    csc     cnull, FRAME_LINK(ct1)      /* prev_ksp */
-    csc     cnull,  64(ct1)             /* s[0..11] */
-    csc     cnull,  80(ct1)
-    csc     cnull,  96(ct1)
-    csc     cnull, 112(ct1)
-    csc     cnull, 128(ct1)
-    csc     cnull, 144(ct1)
-    csc     cnull, 160(ct1)
-    csc     cnull, 176(ct1)
-    csc     cnull, 192(ct1)
-    csc     cnull, 208(ct1)
-    csc     cnull, 224(ct1)
-    csc     cnull, 240(ct1)
-    csc     cnull, RET_FRAME_TP(ct1)    /* tp */
-    csc     cnull, RET_FRAME_ARG0(ct1)
-    csc     cnull, RET_FRAME_ARG1(ct1)
-    csc     cnull, RET_FRAME_ARG2(ct1)
-    csc     cnull, RET_FRAME_ARG3(ct1)
-    csc     cnull, RET_FRAME_ARG4(ct1)
-    csc     cnull, RET_FRAME_CALLEE_SP(ct1)
-    csc     cnull, RET_FRAME_CALLEE_GP(ct1)
-    csc     cnull, RET_FRAME_MSTATUS(ct1) /* mstatus + flags */
-    csc     cnull, RET_FRAME_CALLEE_COMP(ct1)
 
     /*
      * Common exit to user code. `t2` holds the caller's `mstatus` as sampled
      * on entry (every path that reaches here has loaded it): re-enable
      * interrupts only if the caller had them enabled. Every kernel frame has
-     * been popped and wiped by now, so a trap taken between `csrsi` and `ret`
-     * carves its `TrapFrame` from `mscratchc` over dead stack only.
+     * been popped by now, so a trap taken between `csrsi` and `ret` carves
+     * its `TrapFrame` from `mscratchc` over dead stack only.
      */
 .Lscrub_caller_and_ret:
     cmv     ct0, cnull
@@ -423,9 +419,9 @@ sys_thread_switch:
 
     /*
      * 3. `__thread_restore(Capability next_ksp)`
-     *    Restores all 31 capability registers from the `SwitchFrame` at `ca0`,
-     *    wipes the frame to `cnull`, re-installs `mscratchc = frame + 512`, and
-     *    jumps to `cra` -- always still masked. Every frame restored here
+     *    Re-installs `mscratchc = frame + SWITCH_FRAME_SIZE`, restores all 31
+     *    capability registers from the `SwitchFrame` at `ca0` and jumps to
+     *    `cra` -- always still masked. Every frame restored here
      *    resumes kernel code that unmasks on its own way out: the switcher's
      *    `.Lcomp_restore` (a thread parked by `sys_thread_switch`),
      *    `__thread_start` (a new thread) or the host loop (which never
@@ -436,81 +432,44 @@ sys_thread_switch:
     .type __thread_restore, @function
 __thread_restore:
     /*
-     * `ct6` is the frame base for the whole sequence and the last register
-     * reloaded: its saved value is parked in `mscratchc` meanwhile and swapped
-     * back by the final `csrrw`, which at the same time re-installs the kernel
-     * SP (`frame + SWITCH_FRAME_SIZE`). Each of the 32 slots is loaded and then
-     * overwritten with `cnull`, so the popped frame leaves no capability on
-     * the kernel stack. Same sequence as `.Ltrap_restore` in `early_trap.S`,
-     * except that the base comes from `ca0`, not `csp`.
+     * `ct6` is the frame base, reloaded last. Same sequence as
+     * `.Ltrap_restore` in `early_trap.S`, except that the base comes from
+     * `ca0`, not `csp`.
      */
     cmv     ct6, ca0                    /* ct6 = frame base */
-    clc     ct5, 160(ct6)               /* ct5 = saved ct6 */
-    csrw    mscratchc, ct5              /* park saved ct6 in mscratchc */
-    csc     cnull, 160(ct6)
+    caddi   ct5, ct6, SWITCH_FRAME_SIZE
+    csrw    mscratchc, ct5              /* kernel SP: just above the frame */
     clc     cra,   0(ct6)
-    csc     cnull, 0(ct6)
-    clc     cgp,  32(ct6)
-    csc     cnull, 32(ct6)
-    clc     ctp, FRAME_TP(ct6)
-    csc     cnull, FRAME_TP(ct6)
-    clc     ct0,  64(ct6)
-    csc     cnull, 64(ct6)
-    clc     ct1,  80(ct6)
-    csc     cnull, 80(ct6)
-    clc     ct2,  96(ct6)
-    csc     cnull, 96(ct6)
-    clc     ct3, 112(ct6)
-    csc     cnull, 112(ct6)
-    clc     ct4, 128(ct6)
-    csc     cnull, 128(ct6)
-    clc     ct5, 144(ct6)
-    csc     cnull, 144(ct6)
-    clc     cs0, 176(ct6)
-    csc     cnull, 176(ct6)
-    clc     cs1, 192(ct6)
-    csc     cnull, 192(ct6)
-    clc     cs2, 208(ct6)
-    csc     cnull, 208(ct6)
-    clc     cs3, 224(ct6)
-    csc     cnull, 224(ct6)
-    clc     cs4, 240(ct6)
-    csc     cnull, 240(ct6)
-    clc     cs5, 256(ct6)
-    csc     cnull, 256(ct6)
-    clc     cs6, 272(ct6)
-    csc     cnull, 272(ct6)
-    clc     cs7, 288(ct6)
-    csc     cnull, 288(ct6)
-    clc     cs8, 304(ct6)
-    csc     cnull, 304(ct6)
-    clc     cs9, 320(ct6)
-    csc     cnull, 320(ct6)
-    clc     cs10, 336(ct6)
-    csc     cnull, 336(ct6)
-    clc     cs11, 352(ct6)
-    csc     cnull, 352(ct6)
-    clc     ca0, 368(ct6)
-    csc     cnull, 368(ct6)
-    clc     ca1, 384(ct6)
-    csc     cnull, 384(ct6)
-    clc     ca2, 400(ct6)
-    csc     cnull, 400(ct6)
-    clc     ca3, 416(ct6)
-    csc     cnull, 416(ct6)
-    clc     ca4, 432(ct6)
-    csc     cnull, 432(ct6)
-    clc     ca5, 448(ct6)
-    csc     cnull, 448(ct6)
-    clc     ca6, 464(ct6)
-    csc     cnull, 464(ct6)
-    clc     ca7, 480(ct6)
-    csc     cnull, 480(ct6)
-    csc     cnull, FRAME_LINK(ct6)      /* active_kernel_sp */
     clc     csp,  16(ct6)
-    csc     cnull, 16(ct6)
-    caddi   ct6, ct6, SWITCH_FRAME_SIZE /* ct6 = kernel SP above the frame */
-    csrrw   ct6, mscratchc, ct6         /* mscratchc = kernel SP, ct6 = saved ct6 */
+    clc     cgp,  32(ct6)
+    clc     ctp, FRAME_TP(ct6)
+    clc     ct0,  64(ct6)
+    clc     ct1,  80(ct6)
+    clc     ct2,  96(ct6)
+    clc     ct3, 112(ct6)
+    clc     ct4, 128(ct6)
+    clc     ct5, 144(ct6)
+    clc     cs0, 176(ct6)
+    clc     cs1, 192(ct6)
+    clc     cs2, 208(ct6)
+    clc     cs3, 224(ct6)
+    clc     cs4, 240(ct6)
+    clc     cs5, 256(ct6)
+    clc     cs6, 272(ct6)
+    clc     cs7, 288(ct6)
+    clc     cs8, 304(ct6)
+    clc     cs9, 320(ct6)
+    clc     cs10, 336(ct6)
+    clc     cs11, 352(ct6)
+    clc     ca0, 368(ct6)
+    clc     ca1, 384(ct6)
+    clc     ca2, 400(ct6)
+    clc     ca3, 416(ct6)
+    clc     ca4, 432(ct6)
+    clc     ca5, 448(ct6)
+    clc     ca6, 464(ct6)
+    clc     ca7, 480(ct6)
+    clc     ct6, 160(ct6)               /* the base, last */
     ret
     .size __thread_restore, . - __thread_restore
 
@@ -582,3 +541,31 @@ __thread_start:
     cmv     ca0, cra
     cmv     cra, ct1
     ret
+
+
+/* =========================================================================
+ * 3. STACK ZEROING (`__signetos_zero_stack`)
+ * =========================================================================
+ * Zeroes `[base(ct3), t4)`: `ct3` is a stack capability (its address is
+ * ignored), `t4` the address to stop at -- its `csp` to zero below a stack
+ * pointer, its top to zero all of it. Nothing if `ct3` is untagged. Both ends
+ * are 16-byte aligned: every stack slice is (`switcher::narrow_stack`).
+ * Clobbers `ct3`, `t5`; called with `cjal cra` and returns with `ret`.
+ * Interrupts are masked throughout.
+ */
+    .align 4
+    .globl __signetos_zero_stack
+    .type __signetos_zero_stack, @function
+__signetos_zero_stack:
+    gctag   t5, ct3
+    beqz    t5, 2f
+    gcbase  t5, ct3
+    scaddr  ct3, ct3, t5                /* from the base */
+1:
+    bgeu    t3, t4, 2f
+    csc     cnull, 0(ct3)
+    caddi   ct3, ct3, 16
+    j       1b
+2:
+    ret
+    .size __signetos_zero_stack, . - __signetos_zero_stack

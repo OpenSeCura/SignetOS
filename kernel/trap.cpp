@@ -32,7 +32,7 @@
  * active kernel stack -- provided the
  * interrupted context can take a trap at all: its kernel stack must have the
  * room of asm_macros.h (KERNEL-STACK ROOM, check 3) and its `csp` must pass
- * the stack rule every callee's stack passes (`sentry::narrow_stack`), since
+ * the stack rule every callee's stack passes (`switcher::narrow_stack`), since
  * the handler runs below it. A thread that fails either cannot be preempted
  * and is ended on the spot (`end_interrupted_thread`); in host context the
  * machine halts.
@@ -54,6 +54,7 @@
 #include <signetos/debug/inspect.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
+#include <signetos/switcher.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/unwind.hpp>
@@ -91,14 +92,14 @@ namespace {
 
 // The stack an interrupt handler runs on: the interrupted context's own stack,
 // everything below its `csp`, by the rule the switcher applies to every
-// callee (`sentry::narrow_stack`, with the handler's `min_stack`). One check
+// callee (`switcher::narrow_stack`, with the handler's `min_stack`). One check
 // the switcher never needs: it must not be the kernel stack the `TrapFrame`
 // sits on, or the handler could read the interrupted registers out of it.
 // `frame` carries that stack's bounds.
 Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
                          TrapFrame* frame, Status* out_status) {
   Capability h_sp =
-      sentry::narrow_stack(interrupted_sp, min_stack, 0, out_status);
+      switcher::narrow_stack(interrupted_sp, min_stack, 0, out_status);
   if (!capability_is_valid(h_sp)) {
     return nullptr;
   }
@@ -143,21 +144,19 @@ Capability unwind_sentinel() {
 }
 
 // Sets `frame` up for `entry` -- an interrupt handler, or a
-// compartment's fault handler -- to run on `h_sp` (zeroed first if `zero`)
+// compartment's fault handler -- to run on `h_sp` (the trap vector zeroes it
+// below its address before entering it, early_trap.S step 3)
 // with `a0`/`a3` as its first capability and last integer arguments, and
 // returns the sentry `_early_trap_entry` enters it through. `flags` are the
 // TRAP_FLAG_* of the delivery. `async`: an interrupt, whose handler always
 // runs masked.
 Capability deliver(TrapFrame* frame, const sentry::Entry& entry,
-                   Capability h_sp, bool zero, uint64_t flags, Capability a0,
-                   uint64_t a3, bool async) {
+                   Capability h_sp, uint64_t flags, Capability a0, uint64_t a3,
+                   bool async) {
   // `frame->active_kernel_sp` was written by the trap vector at push
   // (asm_macros.h, FRAME LINK).
   thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
   frame->handler_sp = h_sp;
-  if (zero) {
-    sentry::zero_stack(h_sp);  // what the interrupted code left below its csp
-  }
   frame->handler_rw_table = entry.table;
   // Whose code runs above this frame (WHO FAULTED).
   frame->handler_comp = entry.owner;
@@ -211,12 +210,6 @@ Capability unwind_now(TrapFrame* frame, Status status) {
   return unwind_sentinel();
 }
 
-// True if `a` and `b` are handles to the same compartment.
-bool same_compartment(Capability a, Capability b) {
-  return capability_is_valid(a) && capability_is_valid(b) &&
-         capability_get_base(a) == capability_get_base(b);
-}
-
 // Where `frame` keeps register xn (fault::ErrorState numbering), n = 1..31.
 Capability* frame_reg(TrapFrame* frame, uint32_t n) {
   if (n == 1) return &frame->ra;
@@ -263,7 +256,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   Capability handle = nullptr;  // the faulting compartment
   switch (unwind::kind_at(below)) {
     case unwind::KIND_RETURN_FRAME: {
-      handle = reinterpret_cast<sentry::ReturnFrame*>(below)->callee_comp;
+      handle = reinterpret_cast<switcher::ReturnFrame*>(below)->callee_comp;
       break;
     }
     case unwind::KIND_TRAP_FRAME: {
@@ -316,9 +309,7 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   }
 
   sentry::Entry e{};
-  if (sentry::resolve_fault(x->fault_handler, &e) != Status::Ok ||
-      (e.flags & sentry::ENTRY_FLAG_FAULT) == 0 ||
-      !same_compartment(e.owner, handle)) {
+  if (!compartment::fault_entry(handle, &e)) {
     debug::fault_report("no fault handler; unwinding", x->uid, mcause, mepc, mtval,
                  mtval2);
     return unwind_now(frame, Status::Faulted);
@@ -339,11 +330,12 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
     return unwind_now(frame, Status::Faulted);
   }
 
-  // `deliver` zeroes the whole stack, the ErrorState's place included, before
-  // the context is copied in; the handler's `csp` starts below it.
+  // The handler's `csp` starts just below the ErrorState: the trap vector
+  // zeroes everything below that, and the ErrorState itself is filled in
+  // whole here.
   const Capability handler =
-      deliver(frame, e, capability_set_address(h_sp, es_addr), true,
-              TRAP_FLAG_FAULT, es, mtval2, false);
+      deliver(frame, e, capability_set_address(h_sp, es_addr), TRAP_FLAG_FAULT,
+              es, mtval2, false);
   save_context(frame, es, mcause, mtval, mtval2);
   return handler;
 }
@@ -445,10 +437,10 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
         // the handler's running time.
         irq::rearm_tick();
       }
-      return deliver(frame, entry, h_sp, true, 0,
-                     reinterpret_cast<Capability>(
-                         static_cast<uintptr_t>(mcause)),
-                     mtval2, true);
+      return deliver(
+          frame, entry, h_sp, 0,
+          reinterpret_cast<Capability>(static_cast<uintptr_t>(mcause)), mtval2,
+          true);
     }
   }
 
@@ -461,9 +453,9 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
 }
 
 extern "C" uint64_t __signetos_trap_return(uint64_t verdict) {
-  // Pop the handler's `TrapFrame`, scrub the stack loaned to the handler and
-  // resume the interrupted code with the MIE it had -- or, if its
-  // compartment has been destroyed and swept while the handler ran, the
+  // Pop the handler's `TrapFrame` (the assembly then zeroes the stack loaned
+  // to the handler) and resume the interrupted code with the MIE it had -- or,
+  // if its compartment has been destroyed and swept while the handler ran, the
   // nearest live frame beneath (unwind.hpp). A fault frame is resumed only
   // on its handler's INSTALL_CONTEXT `verdict`, with the context it left
   // (fault.hpp); otherwise the faulting code is abandoned and the frame

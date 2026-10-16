@@ -82,7 +82,7 @@
  *      624       handler_a3         the handler's `a3` (`mtval2`)
  *      632       (reserved)
  *
- * 2. `ReturnFrame` (416 bytes = 26 capability slots, `sentry.hpp`):
+ * 2. `ReturnFrame` (416 bytes = 26 capability slots, `switcher.hpp`):
  *    Saves the caller's callee-saved state across a synchronous
  *    `sys_compartment_invoke` call on the same thread:
  *

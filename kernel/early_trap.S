@@ -143,8 +143,10 @@ _early_trap_entry:
      *      csp = narrowed handler_sp
      *    (`handler_ca0` is the integer `mcause` for an interrupt handler,
      *    the ErrorState for a fault handler: fault.hpp)
-     *    all other registers scrubbed to `cnull`, and `mstatus.MIE` set from
-     *    the frame's `handler_mie`.
+     *    all other registers scrubbed to `cnull`, everything below `csp` zeroed
+     *    (what the interrupted code left there; a fault handler's ErrorState
+     *    sits just above its `csp`), and `mstatus.MIE` set from the frame's
+     *    `handler_mie`.
      *
      *    `MIE` is set last, after the CSRs have been read: from then on an
      *    interrupt can be taken here, and it is an ordinary nested trap
@@ -152,6 +154,9 @@ _early_trap_entry:
      *    it, and every register set up here is saved and restored).
      */
     cmv     ct0, ca0                    /* ct0 = handler CT = 1 sentry */
+    clc     ct3, TRAP_FRAME_HANDLER_SP(csp)
+    mv      t4, t3                      /* up to the handler's csp */
+    cjal    cra, __signetos_zero_stack  /* switch.S */
     /* Everything except ct0 and csp (replaced below) and cra (set by cjalr). */
     cmv     ctp, cnull
     cmv     ct1, cnull
@@ -216,18 +221,25 @@ _early_trap_entry:
 
     /*
      *    Resume a `TrapFrame`: the one just popped, directly below the kernel
-     *    SP. Also the switcher's way out when its unwind stops at a
-     *    `TrapFrame` (switch.S, `.Lresume_trap_frame`).
+     *    SP, after zeroing the whole stack its handler was lent. Also the
+     *    switcher's way out when its unwind stops at a `TrapFrame` (switch.S,
+     *    `.Lresume_trap_frame`).
      */
     .globl __signetos_resume_trap_frame
 __signetos_resume_trap_frame:
     csrr    csp, mscratchc
     caddi   csp, csp, -TRAP_FRAME_SIZE  /* csp = TrapFrame* to resume */
+    clc     ct3, TRAP_FRAME_HANDLER_SP(csp)
+    gcbase  t4, ct3
+    gclen   t5, ct3
+    add     t4, t4, t5
+    cjal    cra, __signetos_zero_stack  /* switch.S */
 
 .Ltrap_restore:
     /*
-     * 5. Restore `mepcc` and all 31 GPRs from the `TrapFrame` at `csp`, wiping
-     *    every slot of the frame, then `mret` (`MIE := MPIE`, mode := MPP).
+     * 5. Restore `mepcc` and all 31 GPRs from the `TrapFrame` at `csp`, then
+     *    `mret` (`MIE := MPIE`, mode := MPP). The frame is not wiped: nothing
+     *    reads a popped frame (switch.S, POPPED FRAMES ARE NOT WIPED).
      *
      *    `MPP` must be forced back to M: every `mret` sets it to U, so if
      *    the handler switched threads and the thread that ran meanwhile took
@@ -235,94 +247,47 @@ __signetos_resume_trap_frame:
      *    context resumes. Everything in SignetOS runs in M-mode, and no
      *    `mret` may leave it.
      *
-     *    The trap-only slots (512..576) are wiped first, while `csp` is
-     *    still the frame. Then `ct6` becomes the base for the 32 shared slots:
-     *    it is the last register reloaded, so its saved value is parked in
-     *    `mscratchc` meanwhile and swapped back by the final `csrrw`, which at
-     *    the same time re-installs the kernel SP as `frame + TRAP_FRAME_SIZE`
-     *    (every frame is carved from `mscratchc`, so that is where it was).
-     *    Interrupts are masked throughout; a trap in this window would push
-     *    onto the parked value.
+     *    The kernel SP is re-installed as `frame + TRAP_FRAME_SIZE` (every
+     *    frame is carved from `mscratchc`, so that is where it was), then
+     *    every register is reloaded with `csp`, the base, last.
      */
     li      t0, MSTATUS_MPP
     csrs    mstatus, t0
     clc     ct0, TRAP_FRAME_MEPCC(csp)
     csrw    mepcc, ct0
-    csc     cnull, TRAP_FRAME_MEPCC(csp)
-    csc     cnull, TRAP_FRAME_HANDLER_SP(csp)
-    csc     cnull, TRAP_FRAME_RW_TABLE(csp)
-    csc     cnull, TRAP_FRAME_MSTATUS(csp)  /* mstatus and handler_mie */
-    csc     cnull, TRAP_FRAME_FLAGS(csp)    /* flags and fault_status */
-    csc     cnull, TRAP_FRAME_HANDLER_COMP(csp)
-    csc     cnull, TRAP_FRAME_HANDLER_CA0(csp)
-    csc     cnull, TRAP_FRAME_HANDLER_A3(csp)  /* handler_a3 and reserved_ */
-    cmv     ct6, csp                    /* ct6 = frame base; csp reloaded last */
-    clc     ct5, 160(ct6)               /* ct5 = saved ct6 */
-    csrw    mscratchc, ct5              /* park saved ct6 in mscratchc */
-    csc     cnull, 160(ct6)
-    clc     cra,   0(ct6)
-    csc     cnull, 0(ct6)
-    clc     cgp,  32(ct6)
-    csc     cnull, 32(ct6)
-    clc     ctp, FRAME_TP(ct6)
-    csc     cnull, FRAME_TP(ct6)
-    clc     ct0,  64(ct6)
-    csc     cnull, 64(ct6)
-    clc     ct1,  80(ct6)
-    csc     cnull, 80(ct6)
-    clc     ct2,  96(ct6)
-    csc     cnull, 96(ct6)
-    clc     ct3, 112(ct6)
-    csc     cnull, 112(ct6)
-    clc     ct4, 128(ct6)
-    csc     cnull, 128(ct6)
-    clc     ct5, 144(ct6)
-    csc     cnull, 144(ct6)
-    clc     cs0, 176(ct6)
-    csc     cnull, 176(ct6)
-    clc     cs1, 192(ct6)
-    csc     cnull, 192(ct6)
-    clc     cs2, 208(ct6)
-    csc     cnull, 208(ct6)
-    clc     cs3, 224(ct6)
-    csc     cnull, 224(ct6)
-    clc     cs4, 240(ct6)
-    csc     cnull, 240(ct6)
-    clc     cs5, 256(ct6)
-    csc     cnull, 256(ct6)
-    clc     cs6, 272(ct6)
-    csc     cnull, 272(ct6)
-    clc     cs7, 288(ct6)
-    csc     cnull, 288(ct6)
-    clc     cs8, 304(ct6)
-    csc     cnull, 304(ct6)
-    clc     cs9, 320(ct6)
-    csc     cnull, 320(ct6)
-    clc     cs10, 336(ct6)
-    csc     cnull, 336(ct6)
-    clc     cs11, 352(ct6)
-    csc     cnull, 352(ct6)
-    clc     ca0, 368(ct6)
-    csc     cnull, 368(ct6)
-    clc     ca1, 384(ct6)
-    csc     cnull, 384(ct6)
-    clc     ca2, 400(ct6)
-    csc     cnull, 400(ct6)
-    clc     ca3, 416(ct6)
-    csc     cnull, 416(ct6)
-    clc     ca4, 432(ct6)
-    csc     cnull, 432(ct6)
-    clc     ca5, 448(ct6)
-    csc     cnull, 448(ct6)
-    clc     ca6, 464(ct6)
-    csc     cnull, 464(ct6)
-    clc     ca7, 480(ct6)
-    csc     cnull, 480(ct6)
-    csc     cnull, FRAME_LINK(ct6)      /* active_kernel_sp */
-    clc     csp,  16(ct6)
-    csc     cnull, 16(ct6)
-    caddi   ct6, ct6, TRAP_FRAME_SIZE   /* ct6 = kernel SP above the frame */
-    csrrw   ct6, mscratchc, ct6         /* mscratchc = kernel SP, ct6 = saved ct6 */
+    caddi   ct0, csp, TRAP_FRAME_SIZE
+    csrw    mscratchc, ct0
+    clc     cra,   0(csp)
+    clc     cgp,  32(csp)
+    clc     ctp, FRAME_TP(csp)
+    clc     ct0,  64(csp)
+    clc     ct1,  80(csp)
+    clc     ct2,  96(csp)
+    clc     ct3, 112(csp)
+    clc     ct4, 128(csp)
+    clc     ct5, 144(csp)
+    clc     ct6, 160(csp)
+    clc     cs0, 176(csp)
+    clc     cs1, 192(csp)
+    clc     cs2, 208(csp)
+    clc     cs3, 224(csp)
+    clc     cs4, 240(csp)
+    clc     cs5, 256(csp)
+    clc     cs6, 272(csp)
+    clc     cs7, 288(csp)
+    clc     cs8, 304(csp)
+    clc     cs9, 320(csp)
+    clc     cs10, 336(csp)
+    clc     cs11, 352(csp)
+    clc     ca0, 368(csp)
+    clc     ca1, 384(csp)
+    clc     ca2, 400(csp)
+    clc     ca3, 416(csp)
+    clc     ca4, 432(csp)
+    clc     ca5, 448(csp)
+    clc     ca6, 464(csp)
+    clc     ca7, 480(csp)
+    clc     csp,  16(csp)               /* the base, last */
     mret
 
 .Lresume_return_frame:

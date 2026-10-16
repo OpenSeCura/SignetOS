@@ -28,7 +28,6 @@
  */
 
 #include <signetos/compartment.hpp>
-#include <signetos/fault.hpp>
 #include <signetos/debug/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
@@ -141,23 +140,11 @@ extern "C" capability_t sys_cow(capability_compartment_t comp,
   return ::signetos::compartment::cow(comp, mem_quota, src_memory, len);
 }
 
-extern "C" capability_revoker_t sys_revoke_create(
-    capability_compartment_t comp, capability_t mem_cap) {
-  return ::signetos::revoke::create(comp, mem_cap);
-}
-
-extern "C" capability_revoker_t sys_revoke_derive(
-    capability_revoker_t parent_revoker, capability_t sub_cap,
-    uint32_t permissions) {
-  return ::signetos::revoke::derive(parent_revoker, sub_cap, permissions);
-}
-
-extern "C" uint64_t sys_revoke_register(capability_revoker_t revoker_cap,
-                                        capability_t mem_cap,
-                                        capability_quota_vm_t mem_quota) {
+extern "C" uint64_t sys_revoke(capability_compartment_t comp,
+                               capability_t mem_cap,
+                               capability_quota_vm_t mem_quota) {
   uint64_t epoch = 0;
-  if (::signetos::revoke::register_range(revoker_cap, mem_cap, mem_quota,
-                                         &epoch) !=
+  if (::signetos::revoke::revoke(comp, mem_cap, mem_quota, &epoch) !=
       ::signetos::revoke::Status::Ok) {
     return 0;
   }
@@ -228,16 +215,14 @@ extern "C" void sys_compartment_destroy(capability_compartment_t comp) {
 }
 
 extern "C" Sentry sys_sentry(capability_compartment_t comp,
-                               capability_exec_t code, uint64_t kind) {
-  ::signetos::sentry::Status s_status = ::signetos::sentry::Status::Ok;
-  Sentry handle = ::signetos::sentry::create(
-      comp, code, ::signetos::perms::CodeRx, kind, &s_status);
-  if (kind == ::signetos::fault::KIND_ENTRY) {
-    return handle;
-  }
-  // A fault handler's handle stays in the kernel (fault.hpp): the caller
-  // learns only whether it was installed, as an untagged Status.
-  return reinterpret_cast<Sentry>(static_cast<uintptr_t>(s_status));
+                             capability_exec_t code) {
+  return ::signetos::sentry::create(comp, code, ::signetos::perms::CodeRx);
+}
+
+extern "C" uint64_t sys_fault_install(capability_compartment_t comp,
+                                      capability_exec_t code) {
+  return static_cast<uint64_t>(
+      ::signetos::compartment::install_fault_handler(comp, code));
 }
 
 extern "C" capability_type_t sys_type_mint(capability_t record) {

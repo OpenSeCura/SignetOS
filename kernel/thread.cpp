@@ -480,8 +480,8 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
 
   SwitchFrame* next_frame = reinterpret_cast<SwitchFrame*>(t->kernel_sp);
 
-  // `__thread_restore` wipes the incoming frame and re-derives the hart's
-  // kernel SP as `frame + sizeof(SwitchFrame)`. Refuse to switch if the
+  // `__thread_restore` re-derives the hart's kernel SP as
+  // `frame + sizeof(SwitchFrame)`. Refuse to switch if the
   // frame's recorded `active_kernel_sp` disagrees: that would mean the frame
   // was not carved from `mscratchc` by `sys_thread_switch` / `thread::create`.
   if (!capability_is_valid(next_frame->active_kernel_sp) ||
