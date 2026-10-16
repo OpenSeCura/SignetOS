@@ -225,13 +225,6 @@ list of compartments, or of threads.
 
 TODO: a capability table is currently 1 page!!!! That's not really very useful right now.
 
-#### Compartment UID
-
-A UID is a 64-bit value from a monotonic counter, assigned at creation and
-never reused. The trap table tags each binding with the owner's UID, so a
-stale binding can never be attributed to a later compartment that occupies the
-same memory. The UID conveys no authority.
-
 #### Capability table layout
 
 | Slot | Contents |
