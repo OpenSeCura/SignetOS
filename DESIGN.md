@@ -333,9 +333,6 @@ state page, accounted to its `QuotaThreadMem`, and nothing more.
 | Computing in a service | The service finishes and returns; then as above. | The service's work being bounded. |
 | Spinning in a compartment that neither returns nor waits | Nothing. The thread stays; the killer learns it is still there (`sys_thread_tid` is not 0) and knows which compartment has it. | Not guaranteed. A trusted service doing this has a bug; an untrusted compartment is destroyed by its owner, and the thread is unwound past it. |
 
-`killtest spin|sleep|fs|stuck` (shell) exercises the first, second (with
-`fs` and `blk` in the way) and last rows. What a compartment has to do for
-this to work is in §7.
 
 
 ### 2.4 Quotas and allocation authorities
