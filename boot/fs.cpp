@@ -140,8 +140,12 @@
  *   tables. Its caller can be preempted, or parked in `sched.block` inside
  *   `blk` while a disk request is in flight, half way through an update; a
  *   second caller waits for the lock rather than see the half-updated tables,
- *   and lends the holder its time meanwhile. `fs` is trusted to finish, so a
- *   thread does not end while it holds the lock. `init` hands over the
+ *   and lends the holder its time meanwhile; a kill never cuts a call short,
+ *   so a killed holder releases the lock too. A holder can still end with the
+ *   lock held (the kernel ends a thread that has no room to take a trap, or
+ *   whose every frame is in a destroyed compartment); the next caller then
+ *   gets it with SCHED_OWNER_DEAD and is warned that the tables may be
+ *   half-updated (`LockScope`). `init` hands over the
  *   scheduler's lock entries once there is a scheduler; until then it is the
  *   only thread there is.
  */
@@ -627,7 +631,7 @@ QuotaDisk* alloc_node(Capability funding, QuotaDisk* parent) {
   using FnAlloc = decltype(&sys_vm_allocate);
   Capability page = syscall::call<FnAlloc>(s_gate_invoke, s_gate_alloc,
                                            s_self_comp, funding, vm::PAGE_SIZE,
-                                           FLAG_ZERO);
+                                           0);
   if (!capability_is_valid(page)) {
     return nullptr;
   }
@@ -646,7 +650,7 @@ QuotaDisk* alloc_node(Capability funding, QuotaDisk* parent) {
   n->used_inodes = 0;
   n->delegated_inodes = 0;
   n->root_dir = parent != nullptr ? parent->root_dir : ROOT_DIR;
-  n->file_cursor = 0;  // the records after the struct are zero (FLAG_ZERO)
+  n->file_cursor = 0;  // the records after the struct are zero (allocations are)
   if (parent != nullptr) {
     n->tree.next_sibling = parent->tree.first_child;
     if (parent->tree.first_child != nullptr) {
@@ -1003,13 +1007,13 @@ bool alloc_metadata_tables() {
 
   Capability bm = syscall::call<FnAlloc>(
       s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, bitmap_bytes,
-      FLAG_ZERO);
+      0);
   Capability in = syscall::call<FnAlloc>(
       s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, inode_bytes,
-      FLAG_ZERO);
+      0);
   Capability ow = syscall::call<FnAlloc>(
       s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, owner_bytes,
-      FLAG_ZERO);
+      0);
   if (!capability_is_valid(bm) || !capability_is_valid(in) ||
       !capability_is_valid(ow)) {
     return false;

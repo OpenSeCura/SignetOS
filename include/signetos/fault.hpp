@@ -69,7 +69,7 @@
 // `sys_sentry(comp, code, KIND_HANDLER)`. The code must lie in `comp`'s own
 // memory (as for any entry point), the handle needs Permit_Store, and the
 // handler can be set once. The record is marked as a fault entry, which the
-// switcher, `sys_thread_create` and `sys_trap_bind` all refuse, and its
+// switcher, `sys_thread_create` and `sys_trap_install` all refuse, and its
 // handle is never handed back: only the fault path can enter it. The loader
 // installs it from the image header (`compartment_error_handler`;
 // user/entry.S) before the compartment's first instruction, if the image

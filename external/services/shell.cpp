@@ -1080,7 +1080,7 @@ Capability read_image(const char* what, const char* name) {
     const size_t bytes =
         (static_cast<size_t>(size) + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
     image = syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc, s_self_comp,
-                                   s_vm_quota, bytes, FLAG_ZERO);
+                                   s_vm_quota, bytes, 0);
     ok = capability_is_valid(image);
     if (!ok) {
       out("[shell]    ");
@@ -1933,8 +1933,10 @@ uint64_t s_killtest_mode = 0;
 Capability s_killtest_stuck = nullptr;
 alignas(16) char s_killtest_buf[4096];
 
-// Never returns. Reached through a sentry, so a thread in here is inside a
-// call to the shell -- which is not trusted to finish.
+// Never returns, and never waits. Reached through a sentry, so a thread in
+// here is inside a call to the shell: a kill cannot end it (a kill never cuts
+// a call short, unwind.hpp), only stopping it can. `killtest stuck` shows
+// exactly that.
 uint64_t killtest_stuck() {
   for (;;) {
     __asm__ volatile("" ::: "memory");
@@ -1995,8 +1997,13 @@ void cmd_killtest(const char* mode) {
   out_dec("[killtest] sched.thread_kill: status -", static_cast<uint64_t>(-st),
           "\n");
   while (node_threads(node) > 0) {
-    if (now_us() - t0 > 2'000'000) {
-      out("[killtest] the thread is still there 2 s after the kill\n");
+    if (now_us() - t0 > 500'000) {
+      // A thread inside a callee that neither returns nor waits cannot be
+      // killed (DESIGN.md §7). Destroying its node stops it: it keeps its
+      // stack, parked in the shell, until it is run again.
+      out("[killtest] still inside the shell 500 ms after the kill: a callee "
+          "that never returns cannot be killed; stopping it instead\n");
+      destroy_sched_node(node);
       return;
     }
     sleep_us(1'000);

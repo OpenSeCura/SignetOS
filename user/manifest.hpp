@@ -95,19 +95,18 @@ constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
 //                 count = period T (us), param = priority class (PRIORITY_*)
 //   MMIO          name = a device window: "uart", "plic", "virtio"
 //   DMA           amount = bytes of physically contiguous memory
-//   IRQ, EXC      count = the interrupt number / exception code
 //   QUOTA_THREAD  amount = bytes of thread memory, as an ADMIN QuotaThreadMem
 //   ROOT          count = ROOT_*: one of the system's root quotas
 //   OTYPE         count = OType: hardware sealing authority for a service OType
-// The last six are the system's own: no launcher but `init` can meet them.
+// The last five are the system's own: no launcher but `init` can meet them.
+// (Kinds 7 and 8, interrupt and exception authorities, are retired: the two
+// interrupt handlers are installed by `init` itself, trap.hpp.)
 constexpr uint32_t MANIFEST_SYSCALL      = 1;
 constexpr uint32_t MANIFEST_SERVICE      = 2;
 constexpr uint32_t MANIFEST_DISK         = 3;
 constexpr uint32_t MANIFEST_FILE         = 4;
 constexpr uint32_t MANIFEST_MMIO         = 5;
 constexpr uint32_t MANIFEST_DMA          = 6;
-constexpr uint32_t MANIFEST_IRQ          = 7;
-constexpr uint32_t MANIFEST_EXC          = 8;
 constexpr uint32_t MANIFEST_QUOTA_THREAD = 9;
 constexpr uint32_t MANIFEST_ROOT         = 10;
 constexpr uint32_t MANIFEST_OTYPE        = 11;
@@ -215,8 +214,6 @@ inline const char* manifest_kind_name(uint32_t kind) {
     case MANIFEST_FILE: return "file";
     case MANIFEST_MMIO: return "mmio";
     case MANIFEST_DMA: return "dma";
-    case MANIFEST_IRQ: return "irq";
-    case MANIFEST_EXC: return "exception";
     case MANIFEST_QUOTA_THREAD: return "thread memory";
     case MANIFEST_QUOTA_VM: return "vm quota";
     case MANIFEST_QUOTA_SCHED: return "cpu bandwidth";
@@ -264,12 +261,6 @@ inline const char* manifest_syscall_name(uint32_t id) {
   X(slot, ::signetos::init::MANIFEST_MMIO, 0, 0, 0, 0, 0, device)
 #define M_DMA_OPT(X, slot, bytes)                                            \
   X(slot, ::signetos::init::MANIFEST_DMA, 0, 0, 0, bytes, 0, "")
-#define M_IRQ(X, slot, number)                                               \
-  X(slot, ::signetos::init::MANIFEST_IRQ, ::signetos::init::MANIFEST_REQUIRED, \
-    0, number, 0, 0, "")
-#define M_EXC(X, slot, code)                                                 \
-  X(slot, ::signetos::init::MANIFEST_EXC, ::signetos::init::MANIFEST_REQUIRED, \
-    0, code, 0, 0, "")
 #define M_QUOTA_VM(X, slot)                                                  \
   X(slot, ::signetos::init::MANIFEST_QUOTA_VM,                               \
     ::signetos::init::MANIFEST_REQUIRED, 0, 0, 0, 0, "")

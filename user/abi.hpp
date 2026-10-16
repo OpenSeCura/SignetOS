@@ -103,6 +103,8 @@ constexpr int64_t IRQ_FULL        = -2;
 
 struct alignas(16) TrapMgrInterface {
   Capability irq_route;     // out: OType::EntryPoint -> trap_mgr_irq_route_entry
+  Capability irq;           // out: OType::EntryPoint -> the IRQ_M_EXT handler,
+                            //      which `init` installs
   uint32_t plic_ndev;       // in: max PLIC source number (from DTB; 0 = default)
   uint32_t pad_;
   uint32_t plic_m_context[platform::MAX_HARTS];  // in: hart -> M-mode PLIC context
@@ -215,6 +217,8 @@ struct alignas(16) SchedQueryRequest {
 struct alignas(16) SchedInterface {
   Capability root_quota;    // out: handle of the root node
   Capability run;           // out: OType::EntryPoint -> dispatcher (RW_SLOT_SCHED_RUN)
+  Capability tick;          // out: OType::EntryPoint -> the tick handler, which
+                            //      `init` installs for IRQ_M_TIMER
   uint64_t timebase_hz;     // in: `time` CSR frequency in Hz (from DTB; 0 = default)
   uint64_t pad_;
 };
@@ -225,7 +229,8 @@ struct alignas(16) SchedInterface {
 //   int64_t  blk.read(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   int64_t  blk.write(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   uint64_t blk.irq(uint64_t source)
-//   int64_t  blk(Capability block, Capability wake) [2nd call]
+//   int64_t  blk(Capability block, Capability wake, Capability lock_wait,
+//                Capability lock_wake) [2nd call]
 constexpr uint64_t BLK_SECTOR_BYTES   = 512;
 constexpr uint64_t BLK_MAX_XFER_BYTES = 4096;  // per request: the bounce buffer
 
@@ -410,10 +415,6 @@ constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 32;
 __attribute__((always_inline)) inline constexpr size_t syscall_slot(
     syscall::Id id) {
   return RW_SLOT_SYSCALL_BASE + static_cast<size_t>(id);
-}
-
-__attribute__((always_inline)) inline constexpr size_t irq_slot(uint64_t irq) {
-  return RW_SLOT_IRQ_BASE + static_cast<size_t>(irq);
 }
 
 }  // namespace signetos::init

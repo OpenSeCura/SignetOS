@@ -25,7 +25,7 @@
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
-#include <signetos/trap.hpp>
+#include <signetos/syscall.hpp>  // FLAG_DMA
 
 namespace signetos::compartment {
 namespace {
@@ -476,8 +476,9 @@ size_t entry_pages(Capability comp) {
 
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status) {
-  // TODO
-  (void)flags;
+  if ((flags & ~FLAG_DMA) != 0) {
+    return fail_with(out_status, Status::InvalidSize);
+  }
 
   // Whose chain this range will be recorded in.
   Capability comp_page = unseal(comp);
@@ -538,6 +539,22 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   if (!capability_is_valid(memory)) {
     quota::refund(mem_quota, bytes);
     return fail_with(out_status, Status::NoMemory);
+  }
+
+  // FLAG_DMA: one contiguous run, its physical base in its first word.
+  if ((flags & FLAG_DMA) != 0) {
+    const uint64_t va = capability_get_base(memory);
+    const uint64_t pa = vm::translate(va);
+    bool contiguous = pa != 0;
+    for (size_t i = 1; contiguous && i < pages; ++i) {
+      contiguous = vm::translate(va + i * vm::PAGE_SIZE) == pa + i * vm::PAGE_SIZE;
+    }
+    if (!contiguous) {
+      vm::free_pages(memory);
+      quota::refund(mem_quota, bytes);
+      return fail_with(out_status, Status::NoMemory);
+    }
+    *reinterpret_cast<volatile uint64_t*>(memory) = pa;
   }
 
   // Write the record last, so no failure above can leave a half-filled one.
@@ -664,29 +681,6 @@ Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
   return dst;
 }
 
-uint64_t phys(Capability comp, Capability mem_capability) {
-  if (!capability_is_valid(mem_capability) ||
-      sealing::is_sealed(mem_capability)) {
-    return 0;
-  }
-  const uint64_t base = capability_get_base(mem_capability);
-  const uint64_t len = capability_get_length(mem_capability);
-  if (len == 0 || (base & (vm::PAGE_SIZE - 1)) != 0 ||
-      !owns_range(comp, base, len)) {
-    return 0;
-  }
-  const uint64_t pa = vm::translate(base);
-  if (pa == 0) {
-    return 0;
-  }
-  for (uint64_t off = vm::PAGE_SIZE; off < len; off += vm::PAGE_SIZE) {
-    if (vm::translate(base + off) != pa + off) {
-      return 0;
-    }
-  }
-  return pa;
-}
-
 Status destroy(Capability handle) {
   Capability comp_page = unseal(handle);
   if (!capability_is_valid(comp_page)) {
@@ -748,9 +742,6 @@ Status destroy(Capability handle) {
     }
     c->ranges = nullptr;
 
-    // Purge any hardware trap/interrupt bindings registered to this compartment.
-    trap::purge_compartment(c->uid);
-
     // Release the entry chain. Every record is cleared first so a sentry that
     // still names one resolves to nothing, then the page is refunded.
     for (Capability p = c->entries; capability_is_valid(p);) {
@@ -792,19 +783,6 @@ bool query(Capability handle, Compartment* out_copy) {
     *out_copy = *reinterpret_cast<const Compartment*>(page);
   }
   return true;
-}
-
-Status trust_to_finish(Capability handle) {
-  // TODO: no permission is required of `handle`; only the syscall slot gates
-  // this, and only `init` has it. Require one (e.g. Store) before any other
-  // compartment is given the slot.
-  Capability page = unseal(handle);
-  if (!capability_is_valid(page)) {
-    return Status::InvalidCapability;
-  }
-  Compartment* c = reinterpret_cast<Compartment*>(page);
-  __atomic_fetch_or(&c->flags, FLAG_TRUSTED_TO_FINISH, __ATOMIC_RELEASE);
-  return Status::Ok;
 }
 
 bool query_range(Capability comp, uint64_t va, Range* out_copy,

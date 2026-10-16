@@ -33,26 +33,23 @@
 //
 // KILLED THREADS
 //
-// `resume` is also where a killed thread (thread.hpp, `kill`) is stopped:
-// it runs every time the kernel hands control back to compartment code. The
-// frame under the one being popped says whose code that is, and so what
-// happens to it:
+// `resume` is also where a killed thread (thread.hpp, `kill`) ends: when the
+// kernel is about to hand control back to the thread's own code -- the
+// compartment it was created in, inside no call, which is when nothing lies
+// beneath the frame being popped. Nothing else is ever cut short: a call the
+// thread has made into another compartment runs to its return, as a kill
+// never leaves a compartment half-way through anything. A kill is "return
+// this thread to its owner" (DESIGN.md §2.3, §7).
 //
-//   - nothing beneath: the thread's own code (the compartment it was created
-//     in, inside no call). The thread ends there instead of running on.
-//   - the kernel, or a compartment marked trusted to finish
-//     (compartment.hpp, `trust_to_finish`): it runs on and returns as usual.
-//     This holds for trap handlers too.
-//   - any other compartment: it is cut. Its frame is skipped and wiped, its
-//     caller gets Status::Killed instead of a return value, and the same
-//     rule is applied to that caller.
-//
-// The rule is applied only when the thread is resumed: at every return from
-// a call, and at the end of every trap, the timer tick included, so a thread
-// that is running meets it within a tick. One that is asleep would not, which
-// is why the scheduler wakes a killed thread and never sleeps it again
-// (`sched.thread_kill`). So a killed thread ends after at most a tick of its
-// own CPU time, unless it is inside code trusted to finish.
+// The check is made whenever the thread is resumed: at every return from a
+// call, and at the end of every trap, the timer tick included. So a killed
+// thread in its own code ends within a tick, whatever that code does. One
+// inside a call ends once the call returns: the scheduler sees to it that a
+// killed thread never sleeps (`sched.thread_kill`; its `block` returns
+// SCHED_KILLED at once), so a callee that waits is sent back with an error,
+// and a callee that computes finishes. A callee that neither returns nor
+// waits keeps the thread; that is the callee's bug, or its owner's business
+// (destroy it, and the thread is unwound past it).
 //
 
 #include <signetos/fault.hpp>
@@ -87,9 +84,8 @@ Kind kind_at(Capability ksp);
 //
 // `value` is what the first `ReturnFrame` resumed gets in `args[0]` if no
 // frame was skipped (the callee's return value); after a skipped frame it is
-// Status::CompartmentDestroyed, or Status::Killed if the frame was cut for a
-// kill, or the frame's `fault_status` (Status::Faulted) if it was a fault
-// frame. A `TrapFrame` resumed has its `mstatus.MPIE` restored from the
+// Status::CompartmentDestroyed, or the frame's `fault_status`
+// (Status::Faulted) if it was a fault frame. A `TrapFrame` resumed has its `mstatus.MPIE` restored from the
 // frame. Each popped frame's loaned stack slice (`callee_sp` / `handler_sp`)
 // is scrubbed whether it is resumed or skipped; a skipped frame is wiped.
 //

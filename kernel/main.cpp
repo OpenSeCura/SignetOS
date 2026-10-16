@@ -30,6 +30,7 @@
 #include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
+#include <signetos/irq.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/types.hpp>
@@ -79,8 +80,8 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   compartment::init();
   thread::init();
   thread::init_hart(hartid);
-  trap::init();
-  trap::init_hart();
+  irq::init();
+  irq::init_hart();
   thread::bring_up_secondary_harts(root_data_cap, hartid);
 
   // The thread memory root, paid for out of the VM root so that between them

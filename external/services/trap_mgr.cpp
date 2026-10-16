@@ -17,10 +17,11 @@
 /*
  * trap_mgr.cpp - SignetOS User-Space Hardware Trap & Interrupt Manager
  *
- * The service that routes hardware exceptions and interrupts. The kernel
- * delivers a vector to whoever holds that vector's `OType::Trap` authority
- * and bound it (trap.hpp); this is the compartment where delivery of the
- * *external* interrupt turns into "which device, and who wants to know".
+ * The service that routes device interrupts. The kernel delivers the
+ * external interrupt to the one handler `init` installed for it (trap.hpp,
+ * INTERRUPT HANDLERS): this compartment's `trap_mgr_irq_entry`, which `init`
+ * gets back in `TrapMgrInterface`. This is where that interrupt turns into
+ * "which device, and who wants to know".
  *
  * THE PLIC
  *   Every device interrupt on the board is a PLIC source, and the PLIC
@@ -28,7 +29,7 @@
  *   code 11; everything runs in M-mode, so devices interrupt through each
  *   hart's M-mode context). The kernel does not touch the PLIC: `init`
  *   delegates its register window (BootManifest, platform.hpp) to this
- *   compartment alone, together with the code 11 authority. So the PLIC is a
+ *   compartment alone, and installs its handler for code 11. So the PLIC is a
  *   driver like any other -- in user space, behind a capability -- and the
  *   kernel's whole part in an external interrupt is one `mie` bit and the
  *   ordinary trap delivery.
@@ -71,19 +72,15 @@ namespace signetos::user {
 namespace {
 
 // --- What `trap_mgr` asks `init` for (user/manifest.hpp) ----------------------
-// The external-interrupt line and the PLIC window are what routing is made
-// of; `vm_allocate` funds the per-source route pages, out of its VM quota.
-// (No exception authorities: a synchronous fault goes to the faulting
-// compartment's own fault handler, fault.hpp, never to a global one.)
+// The PLIC window is what routing is made of; `vm_allocate` funds the
+// per-source route pages, out of its VM quota. It asks for no interrupt
+// authority: `init` installs its handler for the external interrupt.
 #define TRAP_MGR_MANIFEST(X)                             \
   M_QUOTA_VM(X, VM_QUOTA)                                \
-  M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)                 \
-  M_SYSCALL(X, SYS_TRAP_UNBIND, trap_unbind)             \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)            \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
-  M_IRQ(X, IRQ_EXT, 11)                                  \
   M_MMIO(X, PLIC_MMIO, "plic")                           \
   M_SERVICE(X, UART_SENTRY, "uart")
 SIGNETOS_MANIFEST(TRAP_MGR_MANIFEST, 64 * 1024)
@@ -246,16 +243,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability self_comp = rw[compartment::SLOT_SELF];
   Capability vm_quota = rw[SLOT_VM_QUOTA];
 
-  Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
-  Capability irq_ext = rw[SLOT_IRQ_EXT];
   Capability plic = rw[SLOT_PLIC_MMIO];
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
 
   if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
-      !sealing::is_sealed_as(OType::Trap, irq_ext) ||
       !capability_is_valid(plic) ||
       !capability_has_perms(plic, perms::Load | perms::Store)) {
     return -1;
@@ -270,6 +264,7 @@ extern "C" int64_t compartment_main(Capability arg) {
       capability_get_length(arg) == sizeof(init::TrapMgrInterface)) {
     iface = reinterpret_cast<init::TrapMgrInterface*>(arg);
     iface->irq_route = nullptr;
+    iface->irq = nullptr;
   }
   if (s_online) {
     return 0;
@@ -322,19 +317,16 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[SLOT_IRQ_ROUTE_ENTRY] = e_route;
   rw[SLOT_IRQ_ENTRY] = e_irq;
 
-  // Bind code 11. The kernel sets `mie.MEIE` on every hart; from now on any
-  // source we enable at the PLIC lands in `trap_mgr_irq_entry`.
-  using FnTrapBind = decltype(&sys_trap_bind);
-  syscall::call<FnTrapBind>(gate_invoke, gate_trap_bind, self_comp, irq_ext,
-                            e_irq);
   s_online = true;
 
+  // `init` installs `e_irq` as the IRQ_M_EXT handler; from then on any source
+  // enabled at the PLIC lands in `trap_mgr_irq_entry`.
   if (iface != nullptr) {
     iface->irq_route = e_route;
+    iface->irq = e_irq;
   }
   print_dec(gate_invoke, uart_sentry, "[trap_mgr] PLIC online (hart ", hart,
-            " M-mode context, threshold 0); IRQ_M_EXT bound; routes via "
-            "irq_route\n");
+            " M-mode context, threshold 0); routes via irq_route\n");
   return 0;
 }
 

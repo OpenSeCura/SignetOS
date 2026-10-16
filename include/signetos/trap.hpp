@@ -17,33 +17,24 @@
 #pragma once
 
 //
-// trap.hpp - SignetOS Hardware Trap and Interrupt Binding Subsystem
+// trap.hpp - SignetOS trap dispatch: delivering interrupts and faults
 //
-// SEALED TRAP AUTHORITIES (OType::Trap, CT = 19)
-// ----------------------------------------------
-// Each asynchronous interrupt vector (0..15) has a dedicated slot in the
-// kernel's static trap table. At boot, `trap::authority_for(mcause)` mints a
-// sealed `OType::Trap` handle bounded to that vector's `TrapSlot` with
-// `Permit_Load | Permit_Store`.
-//
-// Holding a sealed `OType::Trap` capability with `Permit_Load` authorizes
-// binding (`sys_trap_bind`) and unbinding (`sys_trap_unbind`) a compartment
-// `OType::EntryPoint` (CT = 18) sentry to that interrupt vector.
-//
-// Synchronous exceptions (0..31) are NOT bindable: no authority is minted
-// for them and `bind` refuses their slots. A fault is handled by the
+// Two interrupts leave the kernel, each to the one handler `init` installed
+// for it (irq.hpp, which also keeps every hart's `mie` and timer in line).
+// Synchronous exceptions have no handler there: a fault is handled by the
 // compartment that raised it, through the fault handler it installed in its
 // own descriptor (fault.hpp, PER-COMPARTMENT FAULTS below).
 //
 // Everything runs in M-mode and nothing is delegated, so every trap is taken
-// in M-mode, by the kernel. When a bound interrupt fires, or compartment code
-// faults:
+// in M-mode, by the kernel. When an installed interrupt fires, or compartment
+// code faults:
 //   1. `_early_trap_entry` saves all 31 capability registers (`cra`, `csp`,
 //      `cgp`, `ctp`, `ct0`..`ct6`, `cs0`..`cs11`, `ca0`..`ca7`), `mepcc`, and
 //      the hart's `mscratchc` kernel SP into a 640-byte `TrapFrame` on the
 //      active kernel stack.
-//   2. `__signetos_trap_dispatch` picks the handler -- the vector's bound
-//      `OType::EntryPoint`, or the faulting compartment's fault handler --
+//   2. `__signetos_trap_dispatch` picks the handler -- the interrupt's
+//      installed `OType::EntryPoint`, or the faulting compartment's fault
+//      handler --
 //      as a `CT = 1` hardware sentry. The handler runs below the interrupted
 //      `csp`, narrowed by the same stack rule as a callee's
 //      (`sentry::narrow_stack`: permissions including StoreLocal, the
@@ -87,46 +78,6 @@
 // A synchronous fault raised by kernel code (`mepcc` with AccessSystemRegs)
 // is never delivered to a handler: it is a kernel bug and halts the machine.
 //
-// THE KERNEL TICK
-// ---------------
-// The kernel owns the machine timer, which it drives itself through the
-// CLINT (clint.hpp). Binding `IRQ_M_TIMER` arms a fixed periodic tick
-// (`TICK_US`) on every hart; before every delivery to the bound handler the
-// kernel re-arms that hart's next tick, so the handler only ever observes
-// the interrupt (no syscall exists to program the timer). Unbinding, or a
-// tick arriving with nothing bound, disarms it.
-//
-// OTHER INTERRUPTS
-// ----------------
-// Every other interrupt vector is gated by its `mie` bit alone: the bit is
-// set while the slot is bound and clear while it is not, and an interrupt
-// that arrives unbound has its bit cleared on the spot. The kernel does
-// nothing device-specific. In particular `IRQ_M_EXT` (code 11) is the single
-// wire every PLIC device shares; the PLIC itself is a device window delegated
-// to the compartment that binds code 11 (`trap_mgr`), and claiming and
-// completing the source there -- which is what drops the level-triggered
-// interrupt -- is that handler's job. The handler runs masked, so a source
-// that is not claimed simply fires again at the next `mret`.
-//
-// SEVERAL HARTS
-// -------------
-// `mie` and the timer belong to a hart, and a hart can only change its own.
-// So each hart keeps its own `mie` and timer in line with the one trap table
-// (`sync_all_harts`): a system call that changes the table brings its own
-// hart in line and then pokes every other hart, which brings itself in line
-// when the poke arrives. Which hart a device interrupt is sent to is not
-// decided here: that is a PLIC setting, and `trap_mgr` owns the PLIC.
-//
-// THE SOFTWARE INTERRUPT IS THE KERNEL'S
-// --------------------------------------
-// The poke is the machine software interrupt (`IRQ_M_SOFT`), sent by setting
-// the target hart's CLINT `msip` (`clint::send_ipi`). It is the only way one
-// hart can interrupt another, and it carries no message, so it cannot be
-// shared: if a compartment could bind it, the kernel could not tell its own
-// pokes from the compartment's. No authority is minted for it
-// (`authority_for` returns null), its `mie` bit is always set, and the
-// dispatcher handles it itself.
-//
 
 #include <stddef.h>
 #include <stdint.h>
@@ -159,19 +110,10 @@ constexpr uint64_t IRQ_M_SOFT  = INTERRUPT_BIT | 3;
 constexpr uint64_t IRQ_M_TIMER = INTERRUPT_BIT | 7;
 constexpr uint64_t IRQ_M_EXT   = INTERRUPT_BIT | 11;
 
-// Period of the kernel tick delivered to the `IRQ_M_TIMER` handler.
-constexpr uint64_t TICK_US = 10'000;
-
-constexpr size_t MAX_EXCEPTION_VECTORS = 32;
-constexpr size_t MAX_INTERRUPT_VECTORS = 16;
-constexpr size_t MAX_TRAP_SLOTS =
-    MAX_EXCEPTION_VECTORS + MAX_INTERRUPT_VECTORS;
-
 using Status = signetos::Status;
 using signetos::status_name;
 
-// `TrapFrame::flags`. Bit 1 is sentry::ENTRY_FLAG_TRUSTED_TO_FINISH, so the
-// unwinder tests the same bit on either kind of frame.
+// `TrapFrame::flags`.
 //
 // TRAP_FLAG_FAULT marks a frame pushed for a fault in compartment code
 // (fault.hpp): whether a handler was delivered on it or not, it is resumed
@@ -202,10 +144,7 @@ struct alignas(16) TrapFrame {
                                 //     interrupted code's MIE
   uint64_t handler_mie;         // 568 MSTATUS_MIE if the handler runs with
                                 //     interrupts enabled, else 0
-  uint64_t flags;               // 576 TRAP_FLAG_* above, and
-                                //     ENTRY_FLAG_TRUSTED_TO_FINISH if the
-                                //     handler's compartment is trusted to
-                                //     finish (unwind.hpp, KILLED THREADS)
+  uint64_t flags;               // 576 TRAP_FLAG_* above
   uint64_t fault_status;        // 584 a fault frame: the `Status` the frame
                                 //     beneath gets if this one is skipped
                                 //     (Faulted, or CompartmentDestroyed)
@@ -225,65 +164,6 @@ static_assert(sizeof(TrapFrame) == 40 * sizeof(Capability),
               "TrapFrame must be 37 capabilities and six integers (640 "
               "bytes)");
 
-// One routing entry per supported `mcause`; the slot index encodes the cause.
-// `owner_comp_uid == 0` means unbound. The uid is kept alongside the handle so
-// a binding left behind by a destroyed compartment is refused.
-//
-// Only system calls (`bind`, `unbind`, `purge_compartment`) write a slot; the
-// trap dispatcher only reads. A writer bumps `seq` to odd before touching the
-// other fields and back to even after; a reader copies the slot and accepts
-// the copy only if `seq` was even and unchanged across the copy (`read_slot`).
-// So a reader never acts on a half-written slot and never waits -- what the
-// trap path needs once writers can run on another hart.
-struct alignas(16) TrapSlot {
-  Capability owner_comp;
-  Capability target_sentry;
-  uint64_t owner_comp_uid;
-  uint64_t seq;
-};
-
-// Clears the static trap routing table.
-void init();
-
-// Per-hart initialisation: turns on this hart's poke bit, turns its timer
-// off, clears any poke left pending, adds the hart to the ones that pokes are
-// sent to, and brings its `mie` and timer in line with the trap table. Every
-// hart calls it once, on itself, after `thread::init_hart` (and the boot
-// hart, whichever hart won the boot lottery in boot.S, after `init`).
-void init_hart();
-
-// Brings every hart's `mie` and timer in line with the trap table: this hart
-// now, every other hart when the poke this sends arrives. `bind`, `unbind`
-// and `purge_compartment` call it after changing the table.
-void sync_all_harts();
-
-// Returns the sealed `OType::Trap` (CT = 19) authority handle for `mcause`,
-// or `nullptr` if `mcause` is outside the supported vector range, is an
-// exception (PER-COMPARTMENT FAULTS, above), or is `IRQ_M_SOFT`, which
-// nobody may bind (THE SOFTWARE INTERRUPT IS THE KERNEL'S, above).
-Capability authority_for(uint64_t mcause);
-
-// Convenience wrapper for minting interrupt authorities.
-inline Capability irq_authority(uint64_t irq_code) {
-  return (irq_code < MAX_INTERRUPT_VECTORS)
-             ? authority_for(INTERRUPT_BIT | irq_code)
-             : nullptr;
-}
-
-// Core of `sys_trap_bind`. Authenticates `comp` (OType::Compartment),
-// `auth_cap` (OType::Trap with Permit_Load), and `target_sentry`
-// (OType::EntryPoint with Permit_Load), then binds `target_sentry` to the
-// vector named by `auth_cap`, tagged with `comp`'s UID.
-Status bind(Capability comp, Capability auth_cap, Capability target_sentry);
-
-// Core of `sys_trap_unbind`. Authenticates `comp` and `auth_cap`, verifies
-// that the vector is currently bound to `comp`, and clears the binding.
-Status unbind(Capability comp, Capability auth_cap);
-
-// Called by `compartment::destroy` to purge any trap bindings owned by the
-// compartment with `comp_uid`.
-size_t purge_compartment(uint64_t comp_uid);
-
 // The fault handler delivered on fault frame `frame` returned INSTALL_CONTEXT
 // (fault.hpp): loads `frame`'s registers from the ErrorState the handler
 // left, and its `mepcc` from the faulting PCC re-addressed to the
@@ -291,9 +171,5 @@ size_t purge_compartment(uint64_t comp_uid);
 // ErrorState or the new `mepcc` is not a valid capability; the frame is then
 // unwound as for any other verdict (unwind.cpp).
 bool install_context(TrapFrame* frame);
-
-// Diagnostics for tests.
-bool is_bound(uint64_t mcause, uint64_t* out_owner_uid = nullptr);
-size_t bound_count();
 
 }  // namespace signetos::trap

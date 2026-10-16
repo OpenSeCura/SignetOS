@@ -34,8 +34,8 @@
  *   4. `vm::s_lock`         protects the virtual address free list and Sv39
  *                           page tables (never held while zeroing pages).
  *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
- *   6. `trap::s_lock`       leaf lock serializing `s_slots` writes and
- *                           `sync_all_harts()`.
+ *   6. `irq::s_lock`        leaf lock serializing the two handler installs
+ *                           (`irq::install`).
  *   7. `uart::s_lock`       leaf lock protecting console line output.
  *
  * Locks are acquired strictly in the order listed above (outermost to

@@ -73,20 +73,13 @@ namespace signetos::sentry {
 // way in, interrupts stay masked, the callee's stack is exactly `min_stack`
 // bytes of the caller's, and the callee's `a0` comes back to the caller. Only
 // `syscall::gate` ever sets it; `sys_sentry` records are never trusted, and
-// `sys_thread_create` / `sys_trap_bind` refuse trusted entries.
+// `sys_thread_create` / `sys_trap_install` refuse trusted entries.
 constexpr uint64_t ENTRY_FLAG_TRUSTED = 1u << 0;
-
-// ENTRY_FLAG_TRUSTED_TO_FINISH is never in an `EntryRecord`. The switcher
-// sets it in a `ReturnFrame` when the callee is the kernel or its compartment
-// is trusted to finish, and the trap dispatcher in a `TrapFrame` when the
-// handler's compartment is, for the unwinder to test (unwind.hpp, KILLED
-// THREADS).
-constexpr uint64_t ENTRY_FLAG_TRUSTED_TO_FINISH = 1u << 1;
 
 // ENTRY_FLAG_FAULT marks a record minted as a compartment's fault handler
 // (fault.hpp, `sys_sentry` with KIND_HANDLER). Such a record is entered only
 // by the trap dispatcher (`resolve_fault`): `resolve`, and so the switcher,
-// `sys_thread_create` and `sys_trap_bind`, refuse it.
+// `sys_thread_create` and `sys_trap_install`, refuse it.
 constexpr uint64_t ENTRY_FLAG_FAULT = 1u << 2;
 
 // Stack a `sys_sentry` entry is promised: the switcher refuses a call whose

@@ -71,8 +71,7 @@
  *      568       handler_mie        `MSTATUS_MIE` or 0: what the trap vector
  *                                   sets in `mstatus` just before it enters
  *                                   the bound handler
- *      576       flags              TRAP_FLAG_* (trap.hpp): trusted to finish,
- *                                   fault delivery, ...
+ *      576       flags              TRAP_FLAG_* (trap.hpp): fault delivery
  *      584       fault_status       for a fault frame, the `Status` whoever
  *                                   is beneath gets if it is unwound
  *      592       handler_comp       the handler's compartment handle (null if

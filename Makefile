@@ -161,6 +161,7 @@ ASM_SRCS = kernel/boot.S \
 # routines (kernel/lib/).
 CXX_SRCS = kernel/vm.cpp \
            kernel/trap.cpp \
+           kernel/irq.cpp \
            kernel/frame.cpp \
            kernel/quota.cpp \
            kernel/compartment.cpp \

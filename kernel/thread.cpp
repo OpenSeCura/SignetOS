@@ -25,6 +25,7 @@
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
+#include <signetos/irq.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
@@ -40,7 +41,7 @@ extern "C" signetos::Capability __thread_start_link(void);
 
 extern "C" void secondary_hart_init(uint64_t hartid) {
   signetos::thread::init_hart(hartid);
-  signetos::trap::init_hart();
+  signetos::irq::init_hart();
 }
 
 namespace signetos::thread {

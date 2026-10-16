@@ -30,7 +30,6 @@
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/thread.hpp>
-#include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
 #include <signetos/vm.hpp>
 
@@ -72,7 +71,7 @@ Capability load_image_kernel(Capability target_comp, Capability target_quota,
   }
 
   Capability code_mem = compartment::allocate(
-      target_comp, target_quota, image_alloc_size(hdr, img_cap), FLAG_ZERO);
+      target_comp, target_quota, image_alloc_size(hdr, img_cap), 0);
   if (!capability_is_valid(code_mem)) {
     return fail_with(out_status, Status::CodeAllocFailed);
   }
@@ -135,10 +134,6 @@ Status launch(Capability system_quota, Capability thread_quota,
     init_seeds[idx++] = syscall::gate(static_cast<syscall::Id>(i));
     debug::boot_capability("syscall", syscall::gate(static_cast<syscall::Id>(i)));
   }
-  for (uint64_t i = 0; i < trap::MAX_INTERRUPT_VECTORS; ++i) {
-    init_seeds[idx++] = trap::irq_authority(i);
-    debug::boot_capability("irq auth", trap::irq_authority(i));
-  }
   init_seeds[idx++] = thread_quota;
   init_seeds[idx++] = sealing::authority_for(OType::QuotaSched);
   init_seeds[idx++] = sealing::authority_for(OType::QuotaDisk);
@@ -188,7 +183,7 @@ Status launch(Capability system_quota, Capability thread_quota,
   const size_t manifest_bytes = vm::PAGE_SIZE * (1 + dtb_pages);
   compartment::Status m_status = compartment::Status::Ok;
   Capability manifest_mem = compartment::allocate(
-      init_comp, system_quota, manifest_bytes, FLAG_ZERO, &m_status);
+      init_comp, system_quota, manifest_bytes, 0, &m_status);
   if (m_status != compartment::Status::Ok ||
       !capability_is_valid(manifest_mem)) {
     compartment::destroy(init_comp);

@@ -82,7 +82,8 @@ constexpr uint32_t FLAG_EXITED = (1u << 3);
 // be inside a compartment call, and `kill` only marks it.
 constexpr uint32_t FLAG_STARTED = (1u << 4);
 // Set by `kill` on a thread that has run. The thread ends the next time the
-// kernel is about to resume its own code (unwind.hpp, KILLED THREADS).
+// kernel is about to resume its own code, inside no call (unwind.hpp,
+// KILLED THREADS).
 constexpr uint32_t FLAG_KILL_PENDING = (1u << 5);
 
 using Status = signetos::Status;
@@ -149,7 +150,7 @@ void init_hart(uint64_t hartid);
 // Brings up every secondary hart present in the DTB (`platform::hart_present`),
 // carving each hart's 64 KiB host stack (`csp`) and 16 KiB kernel entry stack
 // (`mscratchc`) from the identity-mapped kernel region above `_kernel_end` and
-// waiting until each hart has completed `init_hart` and `trap::init_hart`.
+// waiting until each hart has completed `init_hart` and `irq::init_hart`.
 void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart);
 
 // Number of harts that have completed `init_hart`.

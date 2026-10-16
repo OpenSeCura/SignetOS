@@ -35,6 +35,7 @@
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
+#include <signetos/irq.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
@@ -140,12 +141,6 @@ extern "C" capability_t sys_cow(capability_compartment_t comp,
   return ::signetos::compartment::cow(comp, mem_quota, src_memory, len);
 }
 
-// TODO mostly for testing, I don't want this here long term
-extern "C" uint64_t sys_vm_phys(capability_compartment_t comp,
-                                capability_t mem_capability) {
-  return ::signetos::compartment::phys(comp, mem_capability);
-}
-
 extern "C" capability_revoker_t sys_revoke_create(
     capability_compartment_t comp, capability_t mem_cap) {
   return ::signetos::revoke::create(comp, mem_cap);
@@ -232,11 +227,6 @@ extern "C" void sys_compartment_destroy(capability_compartment_t comp) {
   SIGNETOS_CLEAR_RETURN();
 }
 
-extern "C" uint64_t sys_compartment_trust_to_finish(
-    capability_compartment_t comp) {
-  return static_cast<uint64_t>(::signetos::compartment::trust_to_finish(comp));
-}
-
 extern "C" Sentry sys_sentry(capability_compartment_t comp,
                                capability_exec_t code, uint64_t kind) {
   ::signetos::sentry::Status s_status = ::signetos::sentry::Status::Ok;
@@ -299,15 +289,6 @@ extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {
 
 // --- Traps and interrupts --------------------------------------------------
 
-extern "C" void sys_trap_bind(capability_compartment_t comp,
-                              capability_t auth_cap,
-                              Sentry target) {
-  ::signetos::trap::bind(comp, auth_cap, target);
-  SIGNETOS_CLEAR_RETURN();
-}
-
-extern "C" void sys_trap_unbind(capability_compartment_t comp,
-                                capability_t auth_cap) {
-  ::signetos::trap::unbind(comp, auth_cap);
-  SIGNETOS_CLEAR_RETURN();
+extern "C" uint64_t sys_trap_install(uint64_t irq, Sentry handler) {
+  return static_cast<uint64_t>(::signetos::irq::install(irq, handler));
 }

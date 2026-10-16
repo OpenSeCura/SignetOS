@@ -105,9 +105,7 @@ constexpr size_t RW_SLOT_SEED_BASE = 1;  // first seed slot in the table
 // (vm.hpp), so the handle still unseals and still reaches the struct until the
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
-// Set by `trust_to_finish`, never cleared: a killed thread inside this
-// compartment is left to finish its call (unwind.hpp, KILLED THREADS).
-constexpr uint32_t FLAG_TRUSTED_TO_FINISH = (1u << 1);
+// (1u << 1) is unused.
 // Set when the fault handler is installed, never cleared: it can be
 // installed once (`install_fault_handler`).
 constexpr uint32_t FLAG_FAULT_HANDLER_SET = (1u << 2);
@@ -287,9 +285,11 @@ size_t entry_pages(Capability comp);
 // `mem_quota`. That is the only variable cost, and it is paid by the caller
 // that made the chain grow.
 //
-// `flags` changes nothing: all three of FLAG_ZERO, NO_ALIAS and FLAG_PINNED are
-// already unconditionally true. alloc_pages always zeroes, vm::reserve never
-// reissues an address, and nothing is ever swapped.
+// Every allocation is zeroed and at fresh addresses. With FLAG_DMA
+// (syscall.hpp) it must also be one physically contiguous run -- every
+// allocation is today: alloc_pages maps one frame run linearly; the check is
+// still made page by page -- and its physical base is written into its first
+// 8 bytes. Any other flag is refused (InvalidSize).
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status = nullptr);
 
@@ -316,13 +316,6 @@ Status deallocate(Capability comp, Capability mem_quota,
 // return later to make this lazy page-table copy-on-write.
 Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
                size_t len, Status* out_status = nullptr);
-
-// `sys_vm_phys`. Physical address of `mem_capability`'s base if its whole
-// bounds lie inside one allocation `comp` owns and every page of it is
-// physically contiguous with the first; 0 otherwise. `alloc_pages` backs each
-// allocation with one frame run mapped linearly, so a single allocation
-// always qualifies; the check is still made page by page, not assumed.
-uint64_t phys(Capability comp, Capability mem_capability);
 
 // Tears the compartment down completely: every live allocation in its range
 // chain, every page of the chain, and finally its own page. Each refund goes to
@@ -352,11 +345,6 @@ Status destroy(Capability handle);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Capability handle, Compartment* out_copy);
-
-// `sys_compartment_trust_to_finish`: marks the compartment behind `handle`
-// trusted to finish (FLAG_TRUSTED_TO_FINISH). `init` marks the core services
-// with it at boot.
-Status trust_to_finish(Capability handle);
 
 // The record for the allocation based at `va` within `comp`'s chain.
 // `out_funder`, if given, receives the quota that paid for it -- which is the

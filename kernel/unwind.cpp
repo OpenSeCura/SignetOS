@@ -67,33 +67,12 @@ Capability link_of(Capability ksp) {
       capability_set_address(ksp, capability_get_address(ksp) + FRAME_LINK));
 }
 
-// What happens to the code about to be resumed (unwind.hpp, KILLED THREADS).
-enum class Fate {
-  Run,  // resume it as usual
-  End,  // end the thread instead
-  Cut,  // skip it: its caller gets Status::Killed
-};
-
-// `below` is the frame under the one being popped: it says whose code is
-// about to be resumed.
-Fate fate_of(Capability below) {
-  if (!thread::current_kill_pending()) {
-    return Fate::Run;
-  }
-  const Kind kind = kind_at(below);
-  if (kind == KIND_NONE) {
-    return Fate::End;  // nothing beneath: the thread's own code
-  }
-  // `below` is the call (`ReturnFrame`) or trap delivery (`TrapFrame`) into
-  // that code. Both carry its flags.
-  const uint64_t flags =
-      kind == KIND_RETURN_FRAME
-          ? reinterpret_cast<const sentry::ReturnFrame*>(below)->flags
-          : reinterpret_cast<const trap::TrapFrame*>(below)->flags;
-  if ((flags & sentry::ENTRY_FLAG_TRUSTED_TO_FINISH) != 0) {
-    return Fate::Run;  // the kernel, or a compartment trusted to finish
-  }
-  return Fate::Cut;
+// True if the code about to be resumed is a killed thread's own: nothing
+// beneath `below`, the frame under the one being popped, so the thread is
+// inside no call. That is where, and only where, a killed thread ends
+// (unwind.hpp, KILLED THREADS).
+bool kill_lands_here(Capability below) {
+  return thread::current_kill_pending() && kind_at(below) == KIND_NONE;
 }
 
 }  // namespace
@@ -155,8 +134,7 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
     const bool first = !popped;  // the frame whose code just returned
     popped = true;
 
-    const Fate fate = fate_of(link_of(ksp));
-    if (fate == Fate::End) {
+    if (kill_lands_here(link_of(ksp))) {
       debug::thread_ending("unwind", "killed");
       thread::exit(-1);
       debug::panic("unwind: a killed thread did not end");
@@ -172,7 +150,7 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
       // registers are reloaded as-is by the assembly: the caller already held
       // every one of them, and CHERI monotonicity means they cannot have
       // widened.
-      if (fate == Fate::Run && capability_is_valid(f->ra)) {
+      if (capability_is_valid(f->ra)) {
         inspect::assert_user_capability(value, "unwind:ca0");
         f->args[0] = value;
         return KIND_RETURN_FRAME;
@@ -188,7 +166,7 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
       // returned from it -- never one beneath, whose handler was itself
       // abandoned -- and with the context that handler left in its
       // ErrorState, which is read before the handler's stack is zeroed.
-      bool resumable = fate == Fate::Run && capability_is_valid(f->mepcc);
+      bool resumable = capability_is_valid(f->mepcc);
       const bool fault = (f->flags & trap::TRAP_FLAG_FAULT) != 0;
       if (fault) {
         resumable = resumable && first &&
@@ -210,7 +188,7 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
         }
         return KIND_TRAP_FRAME;
       }
-      if (fault && fate == Fate::Run) {
+      if (fault) {
         // The faulting code is abandoned: whoever is beneath hears why
         // (Faulted, or CompartmentDestroyed if it was gone already).
         const uint64_t status = f->fault_status != 0
@@ -226,11 +204,10 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
            sizeof(trap::TrapFrame) / sizeof(Capability));
     }
 
-    // The frame just skipped was cut for a kill, or belonged to a compartment
-    // that is gone. Whoever is beneath it is told which instead of getting a
-    // return value.
-    value = reinterpret_cast<Capability>(static_cast<uintptr_t>(
-        fate == Fate::Cut ? Status::Killed : Status::CompartmentDestroyed));
+    // The frame just skipped belonged to a compartment that is gone. Whoever
+    // is beneath it is told so instead of getting a return value.
+    value = reinterpret_cast<Capability>(
+        static_cast<uintptr_t>(Status::CompartmentDestroyed));
   }
 }
 

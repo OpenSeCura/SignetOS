@@ -25,8 +25,8 @@
  * (`mscratchc`, or `csp` if in boot/host context) without clobbering any
  * register, then calls `__signetos_trap_dispatch`.
  *
- * Interrupts go to the handler sentry a compartment bound via
- * `sys_trap_bind`; synchronous faults go to the faulting compartment's own
+ * The tick and the external interrupt go to the handlers `init` installed
+ * (`sys_trap_install`, trap.hpp); synchronous faults go to the faulting compartment's own
  * fault handler (`compartment_error_handler`), if it installed one, or unwind
  * it. A handler runs on a narrowed stack capability with
  * `(ca0, mtval, mepc, mtval2, cap_table_rw)` in `(ca0, a1, a2, a3, ca4)` --

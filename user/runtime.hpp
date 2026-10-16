@@ -156,8 +156,6 @@ inline void print_manifest_entry(Capability invoke_gate, Capability uart_sentry,
       out(" us class ");
       dec(e.param);
       break;
-    case init::MANIFEST_IRQ:
-    case init::MANIFEST_EXC:
     case init::MANIFEST_ROOT:
     default:
       out(" ");
@@ -319,7 +317,7 @@ inline Capability load_compartment_image(Capability invoke_gate,
 
   Capability code_mem = syscall::call<FnAlloc>(
       invoke_gate, alloc_gate, target_comp, target_quota,
-      init::image_alloc_size(hdr, img_cap), FLAG_ZERO);
+      init::image_alloc_size(hdr, img_cap), 0);
   if (!capability_is_valid(code_mem)) {
     return nullptr;
   }

@@ -53,9 +53,17 @@ using capability_sealed_t           = signetos::Capability;  // OTYPE_SEALED_OBJ
 
 // --- sys_vm_allocate flags -------------------------------------------------
 
-constexpr uint32_t FLAG_PINNED = (1u << 0);  // never swapped or migrated
-constexpr uint32_t FLAG_ZERO   = (1u << 1);  // zero the pages before returning
-constexpr uint32_t NO_ALIAS    = (1u << 2);  // refuse if the range is already mapped
+// Every allocation comes back zeroed, at addresses never handed out before.
+//
+// FLAG_DMA: memory a device will be pointed at. The allocation is one
+// physically contiguous run, and its first 8 bytes hold the physical address
+// of its base (everything else is zero). A device without an IOMMU needs that
+// address, and it is the one fact about its memory a compartment cannot learn
+// itself; it reveals nothing about anyone else's memory, and a compartment
+// that can program a DMA engine can reach all of RAM anyway. Refused (null)
+// if the run is not contiguous. Nothing moves memory today; anything that
+// does later must leave these allocations where they are.
+constexpr uint32_t FLAG_DMA = (1u << 0);
 
 extern "C" {
 
@@ -85,16 +93,6 @@ capability_t sys_cow(
     capability_quota_vm_t    mem_quota,
     capability_data_t        src_memory,
     size_t                   len
-);
-
-// Physical address of the base of an allocation `comp` owns, if the whole
-// of `mem_capability`'s bounds is one physically contiguous run; 0 otherwise.
-// This is the one fact about its memory a compartment cannot learn itself,
-// and the one a device driver needs before it can point a DMA engine at a
-// buffer. Reveals nothing about memory the caller does not already hold.
-uint64_t sys_vm_phys(
-    capability_compartment_t comp,
-    capability_t             mem_capability
 );
 
 // Mints a revocation authority (`OType::Revoker`) covering `mem_cap`'s bounds
@@ -190,14 +188,6 @@ capability_compartment_t sys_compartment_create(
 );
 
 void sys_compartment_destroy(
-    capability_compartment_t comp
-);
-
-// Marks `comp` trusted to finish: a killed thread inside it is left to finish
-// its call instead of being cut (unwind.hpp, KILLED THREADS). Permanent.
-// `init` marks the core services with it. Returns a `Status`: Ok, or
-// InvalidCapability if `comp` is not a live compartment handle.
-uint64_t sys_compartment_trust_to_finish(
     capability_compartment_t comp
 );
 
@@ -300,15 +290,14 @@ uint64_t sys_thread_tid(
 
 // --- Traps and interrupts --------------------------------------------------
 
-void sys_trap_bind(
-    capability_compartment_t comp,
-    capability_t             auth_cap,
-    Sentry                   target
-);
-
-void sys_trap_unbind(
-    capability_compartment_t comp,
-    capability_t             auth_cap
+// Installs `handler`, a compartment entry point, as the handler of `irq`:
+// IRQ_M_TIMER (the scheduler's tick) or IRQ_M_EXT (the trap manager). Once
+// each, for good (irq.hpp, INTERRUPT HANDLERS). `init` calls it at boot and
+// hands the gate to nobody. Returns a `Status`: Ok, InvalidAuthority (another
+// `irq`), InvalidSentry, or Busy (already installed).
+uint64_t sys_trap_install(
+    uint64_t irq,
+    Sentry   handler
 );
 
 } // extern "C"
@@ -322,7 +311,6 @@ namespace signetos::syscall {
   X(vm_allocate)                  \
   X(vm_deallocate)                \
   X(cow)                          \
-  X(vm_phys)                      \
   X(revoke_create)                \
   X(revoke_derive)                \
   X(revoke_register)              \
@@ -346,9 +334,7 @@ namespace signetos::syscall {
   X(thread_kill)                  \
   X(thread_switch)                \
   X(thread_tid)                   \
-  X(trap_bind)                    \
-  X(trap_unbind)                  \
-  X(compartment_trust_to_finish)
+  X(trap_install)
 
 enum class Id : uint32_t {
 #define SIGNETOS_SYSCALL_ID(n) n,

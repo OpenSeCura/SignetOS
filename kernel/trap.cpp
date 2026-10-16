@@ -15,19 +15,21 @@
  */
 
 /*
- * trap.cpp - SignetOS trap dispatch, reporting and user trap binding
+ * trap.cpp - SignetOS trap dispatch: the two interrupt handlers and faults
  *
  * Called from _early_trap_entry (early_trap.S) when a synchronous exception or
  * asynchronous interrupt reaches the machine trap vector. Everything runs in
  * M-mode and nothing is delegated, so that is every trap there is.
  *
  * A synchronous fault raised by kernel code (`mepcc` carries AccessSystemRegs)
- * is a kernel bug: `debug::trap_report()` prints it and halts, whatever is bound.
+ * is a kernel bug: `debug::trap_report()` prints it and halts.
  *
- * Otherwise, if a compartment has bound an `OType::EntryPoint` (CT = 18)
- * handler sentry to the vector via `sys_trap_bind`, `__signetos_trap_dispatch`
- * resolves it and `_early_trap_entry` invokes it with the interrupted context
- * saved in a `TrapFrame` on the active kernel stack -- provided the
+ * A fault in compartment code goes to that compartment's fault handler
+ * (fault.hpp, `dispatch_fault`). The tick and the external interrupt go to
+ * the handlers `init` installed (irq.hpp, INTERRUPT HANDLERS):
+ * `__signetos_trap_dispatch` resolves the handler and `_early_trap_entry`
+ * invokes it with the interrupted context saved in a `TrapFrame` on the
+ * active kernel stack -- provided the
  * interrupted context can take a trap at all: its kernel stack must have the
  * room of asm_macros.h (KERNEL-STACK ROOM, check 3) and its `csp` must pass
  * the stack rule every callee's stack passes (`sentry::narrow_stack`), since
@@ -35,27 +37,21 @@
  * and is ended on the spot (`end_interrupted_thread`); in host context the
  * machine halts.
  *
- * An unbound asynchronous interrupt is silenced at its source on this hart
- * (the timer is disarmed, any other has its `mie` bit cleared) and returned
- * from; an unbound synchronous exception is reported and halts the machine.
+ * An interrupt with no handler that resolves is silenced at its source on
+ * this hart (`irq::silence`) and returned from.
  *
- * Each hart keeps its `mie` and timer in line with the trap table, and the
- * software interrupt is the kernel's own poke that tells a hart to do so
- * (see trap.hpp, SEVERAL HARTS and THE SOFTWARE INTERRUPT IS THE KERNEL'S).
- *
- * The kernel also owns the periodic tick behind `IRQ_M_TIMER` (see trap.hpp,
- * THE KERNEL TICK), and decides which `MIE` a handler runs with and which
- * the interrupted context resumes with (see asm_macros.h, INTERRUPT MASKING
- * RULE).
+ * Who each interrupt goes to, the tick, and keeping every hart's `mie` and
+ * timer in line are irq.cpp's. This file decides which `MIE` a handler runs
+ * with and which the interrupted context resumes with (see asm_macros.h,
+ * INTERRUPT MASKING RULE).
  */
 
 #include <signetos/asm_macros.h>
-#include <signetos/hw/clint.hpp>
 #include <signetos/compartment.hpp>
 #include <signetos/debug/report.hpp>
 #include <signetos/fault.hpp>
+#include <signetos/irq.hpp>
 #include <signetos/debug/inspect.hpp>
-#include <signetos/lock.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/thread.hpp>
@@ -92,160 +88,8 @@ static_assert(sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE);
 namespace signetos::trap {
 namespace {
 
-SpinLock s_lock;
-TrapSlot s_slots[MAX_TRAP_SLOTS];
 
-// `mie` bits. `MSTATUS_MPIE` comes from asm_macros.h.
-constexpr uint64_t MIE_MSIE = 1ULL << 3;
-constexpr uint64_t MIE_MTIE = 1ULL << 7;
-constexpr uint64_t SOFT_CODE = IRQ_M_SOFT & ~INTERRUPT_BIT;
-constexpr uint64_t TIMER_CODE = IRQ_M_TIMER & ~INTERRUPT_BIT;
-
-uint64_t tick_ticks() { return clint::us_to_ticks(TICK_US); }
-
-// The harts that have run `init_hart`, one bit per hart number: the harts a
-// poke is sent to.
-uint64_t s_harts_up = 0;
-
-void arm_tick() {
-  __asm__ volatile("csrs mie, %0" : : "r"(MIE_MTIE));
-  clint::set_timer(clint::now() + tick_ticks());
-}
-
-// Clears MTIE as well, so on each hart MTIE is set exactly while that hart's
-// tick is armed (`sync_this_hart` reads it that way).
-void disarm_tick() {
-  clint::set_timer(clint::TIMER_OFF);
-  __asm__ volatile("csrc mie, %0" : : "r"(MIE_MTIE));
-}
-
-// Slot write/read protocol (trap.hpp, `TrapSlot`). Writers are system calls
-// and run masked under `s_lock`; the trap dispatcher and `sync_this_hart`
-// only read.
-void slot_write_begin(TrapSlot* slot) {
-  slot->seq += 1;  // odd: in progress
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-}
-
-void slot_write_end(TrapSlot* slot) {
-  __atomic_thread_fence(__ATOMIC_RELEASE);
-  slot->seq += 1;  // even: stable
-}
-
-TrapSlot read_slot(const TrapSlot* slot) {
-  TrapSlot copy{};
-  for (;;) {
-    const uint64_t before = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
-    if ((before & 1) != 0) {
-      continue;  // a writer is mid-update
-    }
-    copy.owner_comp = slot->owner_comp;
-    copy.target_sentry = slot->target_sentry;
-    copy.owner_comp_uid = slot->owner_comp_uid;
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    if (__atomic_load_n(&slot->seq, __ATOMIC_RELAXED) == before) {
-      copy.seq = before;
-      return copy;
-    }
-  }
-}
-
-void clear_slot(TrapSlot* slot) {
-  slot_write_begin(slot);
-  slot->owner_comp_uid = 0;
-  slot->owner_comp = nullptr;
-  slot->target_sentry = nullptr;
-  slot_write_end(slot);
-}
-
-bool irq_bound(uint64_t code) {
-  return read_slot(&s_slots[MAX_EXCEPTION_VECTORS + code]).owner_comp_uid != 0;
-}
-
-// Brings this hart's `mie` and timer in line with the trap table: the poke
-// bit always set, every other interrupt's bit set exactly while its slot is
-// bound, and the tick armed exactly while the timer slot is bound. Nothing
-// here is device-specific: code 11 is one bit like the rest, and what sits
-// behind it is `trap_mgr`'s business.
-void sync_this_hart() {
-  uint64_t on = MIE_MSIE;
-  uint64_t off = 0;
-  for (uint64_t code = 0; code < MAX_INTERRUPT_VECTORS; ++code) {
-    if (code == SOFT_CODE || code == TIMER_CODE) {
-      continue;
-    }
-    if (irq_bound(code)) {
-      on |= 1ULL << code;
-    } else {
-      off |= 1ULL << code;
-    }
-  }
-  __asm__ volatile("csrs mie, %0" : : "r"(on));
-  __asm__ volatile("csrc mie, %0" : : "r"(off));
-
-  uint64_t mie = 0;
-  __asm__ volatile("csrr %0, mie" : "=r"(mie));
-  const bool armed = (mie & MIE_MTIE) != 0;
-  if (irq_bound(TIMER_CODE)) {
-    if (!armed) {
-      arm_tick();
-    }
-  } else if (armed) {
-    disarm_tick();
-  }
-}
-
-// Pokes every other hart that is up. The fence makes the table writes before
-// it visible to a poked hart before that hart can read the table; the poked
-// hart fences too (`__signetos_trap_dispatch`).
-void poke_other_harts() {
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  const uint64_t others = __atomic_load_n(&s_harts_up, __ATOMIC_SEQ_CST) &
-                          ~(1ULL << thread::this_hart());
-  if (others != 0) {
-    clint::send_ipi(others);
-  }
-}
-
-bool slot_index(uint64_t mcause, size_t* out_idx) {
-  const uint64_t code = mcause & ~INTERRUPT_BIT;
-  if ((mcause & INTERRUPT_BIT) != 0) {
-    if (code >= MAX_INTERRUPT_VECTORS) {
-      return false;
-    }
-    *out_idx = MAX_EXCEPTION_VECTORS + static_cast<size_t>(code);
-    return true;
-  }
-  if (code >= MAX_EXCEPTION_VECTORS) {
-    return false;
-  }
-  *out_idx = static_cast<size_t>(code);
-  return true;
-}
-
-TrapSlot* unseal_auth(Capability auth_cap) {
-  Capability open = sealing::unseal_as(OType::Trap, auth_cap);
-  if (!capability_is_valid(open)) {
-    return nullptr;
-  }
-  if (capability_get_length(open) != sizeof(TrapSlot)) {
-    return nullptr;
-  }
-  const uint64_t addr = capability_get_base(open);
-  const uint64_t base =
-      capability_get_address(reinterpret_cast<Capability>(&s_slots[0]));
-  const uint64_t total_bytes = sizeof(s_slots);
-  if (addr < base || addr + sizeof(TrapSlot) > base + total_bytes) {
-    return nullptr;
-  }
-  const size_t offset = static_cast<size_t>(addr - base);
-  if ((offset % sizeof(TrapSlot)) != 0) {
-    return nullptr;
-  }
-  return &s_slots[offset / sizeof(TrapSlot)];
-}
-
-// The stack a bound handler runs on: the interrupted context's own stack,
+// The stack an interrupt handler runs on: the interrupted context's own stack,
 // everything below its `csp`, by the rule the switcher applies to every
 // callee (`sentry::narrow_stack`, with the handler's `min_stack`). One check
 // the switcher never needs: it must not be the kernel stack the `TrapFrame`
@@ -284,7 +128,7 @@ Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
   const uint64_t mepc = capability_get_address(frame->mepcc);
   debug::interrupted_thread_ending(why, status, mcause, mepc);
   if (mcause == IRQ_M_TIMER) {
-    clint::set_timer(clint::now() + tick_ticks());
+    irq::rearm_tick();
   }
   thread::exit(-1);
   debug::trap_report("in host context, and the host cannot take this trap", mcause,
@@ -298,7 +142,7 @@ Capability unwind_sentinel() {
   return reinterpret_cast<Capability>(static_cast<uintptr_t>(1));
 }
 
-// Sets `frame` up for `entry` -- a handler bound to an interrupt, or a
+// Sets `frame` up for `entry` -- an interrupt handler, or a
 // compartment's fault handler -- to run on `h_sp` (zeroed first if `zero`)
 // with `a0`/`a3` as its first capability and last integer arguments, and
 // returns the sentry `_early_trap_entry` enters it through. `flags` are the
@@ -320,13 +164,6 @@ Capability deliver(TrapFrame* frame, const sentry::Entry& entry,
   frame->handler_ca0 = a0;
   frame->handler_a3 = a3;
   frame->flags = flags;
-  // What a kill does to the handler (unwind.hpp, KILLED THREADS).
-  if (const compartment::Compartment* owner = compartment::open(entry.owner)) {
-    if ((__atomic_load_n(&owner->flags, __ATOMIC_ACQUIRE) &
-         compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
-      frame->flags |= sentry::ENTRY_FLAG_TRUSTED_TO_FINISH;
-    }
-  }
 
   // The MIE the handler runs with (asm_macros.h, INTERRUPT MASKING RULE): an
   // interrupt handler, masked; a fault handler, the interrupted code's.
@@ -532,176 +369,6 @@ bool install_context(TrapFrame* frame) {
   return true;
 }
 
-void init() {
-  s_lock = SpinLock{};
-  for (TrapSlot& slot : s_slots) {
-    slot = TrapSlot{};
-  }
-}
-
-void init_hart() {
-  // A known start, so that MTIE means "this hart's tick is armed" from here
-  // on: only the poke bit on, the timer off, and no poke pending (the one
-  // that started a secondary hart is still set, thread.cpp).
-  clint::set_timer(clint::TIMER_OFF);
-  clint::clear_ipi();
-  __asm__ volatile("csrw mie, %0" : : "r"(MIE_MSIE));
-
-  // Publish this hart, then read the table. A binder does the opposite --
-  // writes the table, then reads `s_harts_up` (`poke_other_harts`). Both
-  // sides write, fence, then read, so at least one sees the other: either
-  // the binder pokes this hart, or the sync below sees the binding.
-  __atomic_fetch_or(&s_harts_up, 1ULL << thread::this_hart(),
-                    __ATOMIC_SEQ_CST);
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  sync_this_hart();
-}
-
-void sync_all_harts() {
-  sync_this_hart();
-  poke_other_harts();
-}
-
-Capability authority_for(uint64_t mcause) {
-  // The software interrupt is the kernel's poke (trap.hpp, THE SOFTWARE
-  // INTERRUPT IS THE KERNEL'S). Nobody may bind it, so no authority for it
-  // exists.
-  if (mcause == IRQ_M_SOFT) {
-    return nullptr;
-  }
-  // Exceptions are not bindable either: a synchronous fault is delivered to
-  // the faulting compartment's own fault handler (`fault.hpp`), never to a
-  // global one, so no authority over an exception slot is ever minted.
-  if ((mcause & INTERRUPT_BIT) == 0) {
-    return nullptr;
-  }
-  size_t idx = 0;
-  if (!slot_index(mcause, &idx)) {
-    return nullptr;
-  }
-  Capability slot_cap = reinterpret_cast<Capability>(&s_slots[idx]);
-  slot_cap = capability_set_bounds(slot_cap, sizeof(TrapSlot));
-  slot_cap = capability_and_perms(slot_cap, perms::Load | perms::Store);
-  return sealing::seal_as(OType::Trap, slot_cap);
-}
-
-Status bind(Capability comp, Capability auth_cap, Capability target_sentry) {
-  compartment::Compartment comp_info{};
-  if (!compartment::query(comp, &comp_info)) {
-    return Status::InvalidCompartment;
-  }
-
-  TrapSlot* slot = unseal_auth(auth_cap);
-  if (slot == nullptr) {
-    return Status::InvalidAuthority;
-  }
-  // Belt and braces: `authority_for` never mints an exception-slot handle,
-  // but refuse one here as well so the dispatcher never has to consider it.
-  if (slot < &s_slots[MAX_EXCEPTION_VECTORS]) {
-    return Status::InvalidAuthority;
-  }
-  if ((capability_get_perms(auth_cap) & perms::Load) == 0) {
-    return Status::InsufficientPermission;
-  }
-
-  // Both handles are kept in the slot until unbound. A local copy (one the
-  // holder relabelled, or that came through a stack) is not accepted: nothing
-  // the kernel remembers may be local.
-  if ((capability_get_perms(comp) & perms::Global) == 0 ||
-      (capability_get_perms(target_sentry) & perms::Global) == 0) {
-    return Status::InvalidSentry;
-  }
-
-  // The handler must be one of `comp`'s own entries. The dispatcher runs the
-  // handler with `comp`'s tables and counts it inside `comp`, so an entry of
-  // some other compartment -- whose code would then run with this one's
-  // tables in `cgp` -- is refused. A kernel entry is refused too: a system
-  // call is not a trap handler.
-  sentry::Entry entry{};
-  if (sentry::resolve(target_sentry, &entry) != Status::Ok ||
-      (entry.flags & sentry::ENTRY_FLAG_TRUSTED) != 0 ||
-      !capability_is_valid(entry.owner) ||
-      capability_get_base(entry.owner) !=
-          capability_get_base(comp_info.self_page)) {
-    return Status::InvalidSentry;
-  }
-
-  Locked hold(s_lock);
-  slot_write_begin(slot);
-  slot->owner_comp_uid = comp_info.uid;
-  slot->owner_comp = comp;
-  slot->target_sentry = target_sentry;
-  slot_write_end(slot);
-  sync_all_harts();
-  return Status::Ok;
-}
-
-Status unbind(Capability comp, Capability auth_cap) {
-  compartment::Compartment comp_info{};
-  if (!compartment::query(comp, &comp_info)) {
-    return Status::InvalidCompartment;
-  }
-
-  TrapSlot* slot = unseal_auth(auth_cap);
-  if (slot == nullptr) {
-    return Status::InvalidAuthority;
-  }
-  if ((capability_get_perms(auth_cap) & perms::Load) == 0) {
-    return Status::InsufficientPermission;
-  }
-
-  Locked hold(s_lock);
-  if (slot->owner_comp_uid == 0 || slot->owner_comp_uid != comp_info.uid) {
-    return Status::NotBoundToCompartment;
-  }
-
-  clear_slot(slot);
-  sync_all_harts();
-  return Status::Ok;
-}
-
-size_t purge_compartment(uint64_t comp_uid) {
-  if (comp_uid == 0) {
-    return 0;
-  }
-  Locked hold(s_lock);
-  size_t purged = 0;
-  for (size_t i = 0; i < MAX_TRAP_SLOTS; ++i) {
-    if (s_slots[i].owner_comp_uid == comp_uid) {
-      clear_slot(&s_slots[i]);
-      purged += 1;
-    }
-  }
-  if (purged != 0) {
-    sync_all_harts();
-  }
-  return purged;
-}
-
-bool is_bound(uint64_t mcause, uint64_t* out_owner_uid) {
-  size_t idx = 0;
-  if (!slot_index(mcause, &idx)) {
-    return false;
-  }
-  const TrapSlot slot = read_slot(&s_slots[idx]);
-  if (slot.owner_comp_uid == 0) {
-    return false;
-  }
-  if (out_owner_uid != nullptr) {
-    *out_owner_uid = slot.owner_comp_uid;
-  }
-  return true;
-}
-
-size_t bound_count() {
-  size_t n = 0;
-  for (size_t i = 0; i < MAX_TRAP_SLOTS; ++i) {
-    if (read_slot(&s_slots[i]).owner_comp_uid != 0) {
-      n += 1;
-    }
-  }
-  return n;
-}
 
 extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
                                                uint64_t mtval2,
@@ -714,8 +381,8 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   frame->handler_sp = nullptr;
   frame->handler_ca0 = nullptr;
 
-  // A synchronous fault raised by kernel code is a kernel bug, and no handler
-  // a compartment bound may stand in for the kernel: report and halt. Kernel
+  // A synchronous fault raised by kernel code is a kernel bug, and no
+  // compartment's handler may stand in for the kernel: report and halt. Kernel
   // code is known by its PCC: only the kernel's own text runs with
   // AccessSystemRegs; every compartment entry, including the kernel-text
   // stubs the test suites run as compartments, is CodeRx without it. An
@@ -730,16 +397,11 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
                 capability_get_address(frame->sp));
   }
 
-  // A software interrupt is a poke from the kernel (trap.hpp, THE SOFTWARE
-  // INTERRUPT IS THE KERNEL'S): the trap table has changed, so this hart
-  // brings its `mie` and timer in line with it, and the interrupted context
-  // resumes. The poke is cleared (this hart's `msip`) before the table is
-  // read, so a poke sent after that sets it again and brings this hart back
-  // here.
+  // A software interrupt is a poke from the kernel (irq.hpp, THE SOFTWARE
+  // INTERRUPT IS THE KERNEL'S): a handler was installed, so this hart brings
+  // its `mie` and timer in line, and the interrupted context resumes.
   if (mcause == IRQ_M_SOFT) {
-    clint::clear_ipi();
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    sync_this_hart();
+    irq::on_poke();
     return nullptr;
   }
 
@@ -750,18 +412,13 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     return dispatch_fault(mcause, mtval, mtval2, frame);
   }
 
-  // The slot is read once, into a copy (trap.hpp, `TrapSlot`). The dispatcher
-  // never writes the table: a binding whose owner is gone is treated as
-  // unbound here and left for `purge_compartment`, which destroy runs.
-  size_t idx = 0;
-  if (slot_index(mcause, &idx)) {
-    const TrapSlot slot = read_slot(&s_slots[idx]);
-    compartment::Compartment comp_info{};
+  // The installed handler, if it still resolves: `resolve` refuses an entry
+  // whose compartment has been destroyed.
+  {
+    const Capability handler = irq::handler_for(mcause);
     sentry::Entry entry{};
-    if (slot.owner_comp_uid != 0 &&
-        compartment::query(slot.owner_comp, &comp_info) &&
-        comp_info.uid == slot.owner_comp_uid &&
-        sentry::resolve(slot.target_sentry, &entry) == Status::Ok &&
+    if (handler != nullptr &&
+        sentry::resolve(handler, &entry) == Status::Ok &&
         (entry.flags & sentry::ENTRY_FLAG_TRUSTED) == 0) {
       // The handler makes its kernel calls on this kernel stack and runs on
       // the interrupted context's own stack, below its `csp`. The context
@@ -786,7 +443,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
         // Re-arm before the handler runs: this clears MTIP, so a handler
         // that simply returns is safe, and the period does not drift with
         // the handler's running time.
-        clint::set_timer(clint::now() + tick_ticks());
+        irq::rearm_tick();
       }
       return deliver(frame, entry, h_sp, true, 0,
                      reinterpret_cast<Capability>(
@@ -795,16 +452,10 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     }
   }
 
-  // Unbound asynchronous interrupt: silence that source on this hart only
-  // and return to the interrupted PC. With `mie` following the table this is
-  // a hart whose poke has not arrived yet, or a binding whose owner has just
-  // been destroyed. The timer is disarmed (MTIP can only be cleared by
-  // reprogramming it); any other source has its `mie` bit cleared.
-  if (mcause == IRQ_M_TIMER) {
-    disarm_tick();
-  } else {
-    __asm__ volatile("csrc mie, %0" : : "r"(1ULL << (mcause & ~INTERRUPT_BIT)));
-  }
+  // An interrupt with no handler that resolves: silence it on this hart and
+  // return to the interrupted PC. This is a hart whose poke has not arrived
+  // yet, or a handler whose compartment has been destroyed.
+  irq::silence(mcause);
   (void)mepc;
   return nullptr;
 }

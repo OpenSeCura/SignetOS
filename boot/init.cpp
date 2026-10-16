@@ -44,8 +44,8 @@
  *      one-shot handshake that mints `uart.read`.
  *   2. Starts `loader` directly; everything after goes through it.
  *   3. `blk`: its manifest asks for the virtio window and a DMA arena, which
- *      `init` allocates (`sys_vm_phys` for its physical address, which the
- *      handshake tells the driver).
+ *      `init` allocates with FLAG_DMA (which reports its physical address;
+ *      the handshake tells the driver).
  *   4. `fs`: asks for `blk.read`/`blk.write`; its VM quota is sized to the
  *      disk; its handshake returns the root `quota_disk` handle and its entry
  *      points. From here on every image is a file read off the disk.
@@ -149,7 +149,6 @@ struct Launcher {
   Capability gate_tq_derive;
   Capability gate_vm_alloc;
   Capability gate_vm_dealloc;
-  Capability gate_vm_phys;
   Capability gate_comp_create;
   Capability gate_sentry;
   Capability loader;       // `loader`'s entry, once it is up
@@ -252,7 +251,7 @@ struct Launcher {
   Capability alloc(size_t bytes) const {
     using Fn = decltype(&sys_vm_allocate);
     return syscall::call<Fn>(invoke, gate_vm_alloc, self_comp, mem_quota, bytes,
-                             FLAG_ZERO);
+                             0);
   }
 
   void release(Capability mem) const {
@@ -262,10 +261,10 @@ struct Launcher {
     }
   }
 
-  // DMA: a zeroed allocation of `init`'s own. `sys_vm_phys` reports its
-  // physical base only if the whole arena is one contiguous run, which is
-  // what lets a single address describe it to a device. One arena per
-  // system, sized by the first image to ask; none on a board without a
+  // DMA: an allocation of `init`'s own with FLAG_DMA, so it is one
+  // contiguous run and arrives with its physical base in its first word,
+  // which is read and cleared before the arena goes to the driver. One arena
+  // per system, sized by the first image to ask; none on a board without a
   // device window to DMA for.
   Capability dma_arena(uint64_t bytes) {
     if (capability_is_valid(dma_window)) {
@@ -274,16 +273,16 @@ struct Launcher {
     if (!capability_is_valid(virtio_mmio) || bytes == 0) {
       return nullptr;
     }
-    Capability dma = alloc(static_cast<size_t>(bytes));
+    using Fn = decltype(&sys_vm_allocate);
+    Capability dma = syscall::call<Fn>(invoke, gate_vm_alloc, self_comp,
+                                       mem_quota, static_cast<size_t>(bytes),
+                                       FLAG_DMA);
     if (!capability_is_valid(dma)) {
       return nullptr;
     }
-    using FnPhys = decltype(&sys_vm_phys);
-    dma_phys = syscall::call<FnPhys>(invoke, gate_vm_phys, self_comp, dma);
-    if (dma_phys == 0) {
-      release(dma);
-      return nullptr;
-    }
+    auto* first = reinterpret_cast<volatile uint64_t*>(dma);
+    dma_phys = *first;
+    *first = 0;
     dma_window = dma;
     return dma;
   }
@@ -427,11 +426,6 @@ struct Launcher {
         return e.count < syscall::kSyscallCount
                    ? rw[init::syscall_slot(static_cast<syscall::Id>(e.count))]
                    : nullptr;
-      case init::MANIFEST_IRQ:
-        return e.count < trap::MAX_INTERRUPT_VECTORS ? rw[init::irq_slot(e.count)]
-                                                     : nullptr;
-      case init::MANIFEST_EXC:
-        return nullptr;  // exceptions are not bindable (fault.hpp)
       case init::MANIFEST_MMIO:
         if (str_eq(e.name, "uart")) return uart_mmio;
         if (str_eq(e.name, "plic")) return plic_mmio;
@@ -638,14 +632,22 @@ extern "C" int64_t compartment_main(Capability arg) {
   L.gate_tq_derive = rw[init::syscall_slot(syscall::Id::quota_thread_mem_derive)];
   L.gate_vm_alloc = rw[init::syscall_slot(syscall::Id::vm_allocate)];
   L.gate_vm_dealloc = rw[init::syscall_slot(syscall::Id::vm_deallocate)];
-  L.gate_vm_phys = rw[init::syscall_slot(syscall::Id::vm_phys)];
   L.gate_comp_create = rw[init::syscall_slot(syscall::Id::compartment_create)];
   L.gate_sentry = rw[init::syscall_slot(syscall::Id::sentry)];
   Capability gate_thread_create =
       rw[init::syscall_slot(syscall::Id::thread_create)];
   Capability gate_thread_exit = rw[init::syscall_slot(syscall::Id::thread_exit)];
+  // Installs the handler for one of the two interrupts that leave the kernel
+  // (irq.hpp, INTERRUPT HANDLERS). Only `init` holds this gate.
+  const Capability gate_trap_install =
+      rw[init::syscall_slot(syscall::Id::trap_install)];
+  auto install_irq = [&](uint64_t irq, Capability handler) -> bool {
+    using Fn = decltype(&sys_trap_install);
+    return sealing::is_sealed_as(OType::EntryPoint, handler) &&
+           syscall::call<Fn>(L.invoke, gate_trap_install, irq, handler) ==
+               static_cast<uint64_t>(Status::Ok);
+  };
 
-  assert(sealing::is_sealed(L.gate_vm_phys));
   assert(sealing::is_sealed(L.gate_vm_alloc));
 
   // Every kernel entry is an `OType::EntryPoint` handle passed to the
@@ -868,8 +870,9 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 6. `sched`
   // =========================================================================
   const Started sched = L.start_file("sched.bin");
-  // `sched` hands back the root `quota_sched` handle and its dispatcher entry
-  // point; it publishes its operations ("sched.*") itself.
+  // `sched` hands back the root `quota_sched` handle, its dispatcher entry
+  // point and its tick handler; it publishes its operations ("sched.*")
+  // itself.
   init::SchedInterface sched_if{};
   sched_if.timebase_hz = board.timebase_hz;
   if (capability_is_valid(sched.sentry)) {
@@ -877,6 +880,11 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
   L.root_sched = sched_if.root_quota;
   L.offer("sched", sched.sentry);
+  // The kernel tick goes to the scheduler, and to nobody else.
+  if (!install_irq(trap::IRQ_M_TIMER, sched_if.tick)) {
+    say("[init]     WARNING: the scheduler's tick handler is not installed; "
+        "threads will not be preempted\n");
+  }
   Capability sched_run = sched_if.run;
   L.sched_derive = lookup("sched.quota_derive");
   const Capability sched_thread_register = lookup("sched.thread_register");
@@ -898,11 +906,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   if (blk_if.status == init::BLK_OK) {
     const Capability s_block = lookup("sched.block");
     const Capability s_wake = lookup("sched.wake");
+    const Capability s_lock_wait = lookup("sched.lock_wait");
+    const Capability s_lock_wake = lookup("sched.lock_wake");
     int64_t st = init::BLK_BAD_REQUEST;
     if (sealing::is_sealed_as(OType::EntryPoint, s_block) &&
         sealing::is_sealed_as(OType::EntryPoint, s_wake)) {
       st = ::signetos::user::invoke<int64_t>(invoke, blk.sentry, s_block,
-                                             s_wake);
+                                             s_wake, s_lock_wait, s_lock_wake);
     }
     if (st != init::BLK_OK) {
       say("[init]     WARNING: blk has no scheduler entries; the block device "
@@ -927,8 +937,9 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 7. `trap_mgr`
   // =========================================================================
-  // Its manifest is the only one that asks for the PLIC or `IRQ_M_EXT`: it
-  // decides which handler each device interrupt reaches.
+  // Its manifest is the only one that asks for the PLIC, and `init` installs
+  // its handler for `IRQ_M_EXT`: it decides which handler each device
+  // interrupt reaches.
   const Started trap_mgr = L.start_file("trap_mgr.bin");
   // Like `uart`, `trap_mgr` hands its routing entry to whoever brings it up
   // and to nobody else: `irq_route` is not published by name.
@@ -939,6 +950,11 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
   if (capability_is_valid(trap_mgr.sentry)) {
     comp_invoke(trap_mgr.sentry, bounded(&tm_if));
+  }
+  // The external interrupt goes to the trap manager, which owns the PLIC.
+  if (!install_irq(trap::IRQ_M_EXT, tm_if.irq)) {
+    say("[init]     WARNING: the trap manager's interrupt handler is not "
+        "installed; device interrupts will not arrive\n");
   }
   const bool have_irq_route =
       sealing::is_sealed_as(OType::EntryPoint, tm_if.irq_route);
@@ -1016,24 +1032,6 @@ extern "C" int64_t compartment_main(Capability arg) {
     say("[init]     WARNING: no shell thread or no scheduler; nothing to "
         "dispatch\n");
     sched_run = nullptr;  // nothing to dispatch: let the kernel return
-  }
-
-  // =========================================================================
-  // Trusted to finish: a killed thread inside one of these finishes its call
-  // instead of being cut (unwind.hpp, KILLED THREADS), so a kill never
-  // leaves a core service half-updated. The shell is not marked.
-  // =========================================================================
-  {
-    using Fn = decltype(&sys_compartment_trust_to_finish);
-    const Capability gate_trust =
-        rw[init::syscall_slot(syscall::Id::compartment_trust_to_finish)];
-    const Started* trusted[] = {&uart,   &loader, &blk,     &fs,
-                                &naming, &sched,  &trap_mgr};
-    for (const Started* s : trusted) {
-      if (capability_is_valid(s->comp)) {
-        syscall::call<Fn>(invoke, gate_trust, s->comp);
-      }
-    }
   }
 
   // =========================================================================

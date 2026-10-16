@@ -356,7 +356,7 @@ _start:
 
 .Lsecondary_start:
     /* The poke that ended the wait above stays pending (`msip` is still set)
-     * until `trap::init_hart` clears it, inside `secondary_hart_init`. */
+     * until `irq::init_hart` clears it, inside `secondary_hart_init`. */
     fence   r, r
 
     /* Load bounded 64 KiB host stack (csp) and scrub handoff slot */

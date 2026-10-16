@@ -497,16 +497,7 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   // compartment faulted, when this frame is the one under a fault's
   // `TrapFrame` (trap.hpp, WHO FAULTED). Null for a kernel entry.
   frame->callee_comp = entry.owner;
-  if (trusted) {
-    entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;  // the kernel always finishes
-  } else if (const compartment::Compartment* c =
-                 compartment::open(entry.owner)) {
-    if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) &
-         compartment::FLAG_TRUSTED_TO_FINISH) != 0) {
-      entry.flags |= ENTRY_FLAG_TRUSTED_TO_FINISH;
-    }
-  }
-  frame->flags = entry.flags;
+  frame->flags = entry.flags;  // ENTRY_FLAG_TRUSTED: a kill never cuts the kernel
   thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
   return entry.sentry;
 }

@@ -45,6 +45,17 @@
  *   syscall.
  *
  * ONE REQUEST AT A TIME
+ *   Every request holds `s_lock`, the scheduler's lock (runtime.hpp, `lock`),
+ *   from submission to completion. A caller that is stopped (its scheduler
+ *   node taken back) while it holds it is lent time by the next caller until
+ *   it releases it (sched.cpp, LOCKS). A caller can also end while it holds
+ *   it -- the kernel ends a thread that has no room to take a trap, or whose
+ *   every frame is in a destroyed compartment -- possibly with its request
+ *   still in flight. The next caller then gets the lock with SCHED_OWNER_DEAD
+ *   and recovers before using the device (`recover`): it waits for the device
+ *   to finish everything submitted and catches the used ring up. Before there
+ *   is a scheduler (`init` alone) the lock is taken without waiting.
+ *
  *   A request is a three-descriptor chain (header, data, status) placed in
  *   the available ring, then a notify. Completion is a new entry in the used
  *   ring. While it is in flight the calling thread sleeps in `sched.block`;
@@ -70,7 +81,8 @@
  *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
  *   serves, so at its handshake there is nothing to look up and no interrupt
  *   route. Every request polls until `init` has loaded the scheduler and
- *   hands over its entries (`block`, `wake`) in a second call, and until
+ *   hands over its entries (`block`, `wake`, `lock_wait`, `lock_wake`) in a
+ *   second call, and until
  *   `trap_mgr` is up and the device's interrupt is routed here.
  */
 
@@ -192,6 +204,8 @@ Capability s_gate_invoke = nullptr;
 Capability s_uart = nullptr;
 Capability s_sched_block = nullptr;
 Capability s_sched_wake = nullptr;
+Capability s_lock_wait = nullptr;
+Capability s_lock_wake = nullptr;
 
 volatile uint32_t* s_regs = nullptr;  // the chosen slot's registers
 uint8_t* s_dma = nullptr;             // the arena, as the driver sees it
@@ -199,7 +213,7 @@ uint64_t s_dma_phys = 0;              // ... and as the device sees it
 uint64_t s_capacity = 0;              // sectors
 uint32_t s_slot = 0;
 bool s_present = false;
-bool s_busy = false;
+uint64_t s_lock = 0;                  // ONE REQUEST AT A TIME
 bool s_first_call_done = false;
 uint16_t s_last_used = 0;             // used-ring entries consumed so far
 
@@ -395,11 +409,10 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
   reg_write(R_QUEUE_NOTIFY, 0);
 
   // Sleep until the used ring moves. Polling instead if we are not a
-  // scheduled thread or no interrupt has ever arrived (no route).
-  // A killed thread never sleeps (`block` returns SCHED_KILLED at once), so
-  // for one this loop polls. It must still wait for the completion: the
-  // device owns the request until then, and `s_busy`, `s_waiter_tid` and
-  // `s_last_used` are only right again after it.
+  // scheduled thread or no interrupt has ever arrived (no route). A killed
+  // thread never sleeps (`block` returns SCHED_KILLED at once), so for one
+  // this loop polls. It must still wait for the completion: the device owns
+  // the request until then.
   volatile VirtqUsed* us = used();
   bool scheduled = capability_is_valid(s_sched_block);
   for (;;) {
@@ -431,6 +444,28 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
   return init::BLK_OK;
 }
 
+// The previous holder of `s_lock` ended without releasing it (ONE REQUEST AT
+// A TIME), maybe with its request still in flight. The device owns that
+// request until it completes, so wait for everything submitted to complete,
+// and consume it: the dead caller will never read its result. It may have
+// been cut between publishing its request and notifying the device, so
+// notify again first; a second notify is harmless.
+void recover() {
+  volatile VirtqAvail* av = avail();
+  volatile VirtqUsed* us = used();
+  fence();
+  reg_write(R_QUEUE_NOTIFY, 0);
+  for (;;) {
+    fence();
+    if (us->idx == av->idx) {
+      break;
+    }
+  }
+  s_last_used = us->idx;
+  s_waiter_tid = 0;
+  out("[blk]      a caller ended mid-request; recovered the device queue\n");
+}
+
 // Shared by read and write: validates the arguments and moves the data through
 // the bounce buffer.
 int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
@@ -454,10 +489,12 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
   if (end < addr || end - addr < bytes) {
     return init::BLK_BAD_REQUEST;
   }
-  if (s_busy) {
+  const int64_t taken = lock(s_gate_invoke, s_lock_wait, &s_lock);
+  if (taken == init::SCHED_OWNER_DEAD) {
+    recover();
+  } else if (taken != init::SCHED_OK) {
     return init::BLK_BUSY;
   }
-  s_busy = true;
 
   auto* user = reinterpret_cast<uint8_t*>(buf);
   uint8_t* bounce = data();
@@ -472,7 +509,7 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
       user[i] = bounce[i];
     }
   }
-  s_busy = false;
+  unlock(s_gate_invoke, s_lock_wake, &s_lock);
   return status;
 }
 
@@ -516,21 +553,28 @@ extern "C" int64_t blk_write_entry(Capability buf, uint64_t sector,
 namespace {
 
 // A later call from `init` (abi.hpp): the scheduler's entries (`block`,
-// `wake`), now that there is a scheduler. Nothing else reaches our sentry, so
-// the entries are taken on the strength of their shape alone.
-int64_t bind_sched(Capability block_ep, Capability wake_ep) {
+// `wake`, `lock_wait`, `lock_wake`), now that there is a scheduler. Nothing
+// else reaches our sentry, so the entries are taken on the strength of their
+// shape alone.
+int64_t bind_sched(Capability block_ep, Capability wake_ep,
+                   Capability lock_wait_ep, Capability lock_wake_ep) {
   if (!sealing::is_sealed_as(OType::EntryPoint, block_ep) ||
-      !sealing::is_sealed_as(OType::EntryPoint, wake_ep)) {
+      !sealing::is_sealed_as(OType::EntryPoint, wake_ep) ||
+      !sealing::is_sealed_as(OType::EntryPoint, lock_wait_ep) ||
+      !sealing::is_sealed_as(OType::EntryPoint, lock_wake_ep)) {
     return init::BLK_BAD_REQUEST;
   }
   s_sched_block = block_ep;
   s_sched_wake = wake_ep;
+  s_lock_wait = lock_wait_ep;
+  s_lock_wake = lock_wake_ep;
   return init::BLK_OK;
 }
 
 }  // namespace
 
-extern "C" int64_t compartment_main(Capability arg0, Capability arg1) {
+extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
+                                    Capability arg2, Capability arg3) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
@@ -539,7 +583,7 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1) {
   // argument of `BlkInterface`'s size is `init` bringing us up. Any later
   // call can only be `init` handing over the scheduler's entries.
   if (s_first_call_done) {
-    return bind_sched(arg0, arg1);
+    return bind_sched(arg0, arg1, arg2, arg3);
   }
   s_first_call_done = true;
   if (!capability_is_valid(arg0) || sealing::is_sealed(arg0) ||

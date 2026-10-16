@@ -109,9 +109,11 @@
  *
  * KILLING
  *   `thread_kill` asks the kernel to end a thread (`sys_thread_kill`, see
- *   unwind.hpp). The thread only ends once it runs, so a killed thread never
- *   sleeps: `thread_kill` wakes it as `wake` does, and every later `block`
- *   returns SCHED_KILLED at once. Its record is forgotten like any exited
+ *   unwind.hpp): it ends when it is next back in its own code, inside no
+ *   call; a call it is inside runs to its return. The thread only ends once
+ *   it runs, so a killed thread never sleeps: `thread_kill` wakes it as
+ *   `wake` does, and every later `block` returns SCHED_KILLED at once, so a
+ *   callee that was waiting on its behalf returns instead. Its record is forgotten like any exited
  *   thread's (DISPATCH), or, if the kernel tore it down before it ever ran,
  *   on the next refused switch to it. A stopped thread (DESTROYING) is put on
  *   the killer's node first, which pays for it to run to its end. A thread
@@ -140,8 +142,8 @@
  *   waiting longest. A thread that ends holding a lock wakes its waiters,
  *   and the first to try again gets the lock with SCHED_OWNER_DEAD. A wait
  *   that would close a loop of owners is refused with SCHED_DEADLOCK. A
- *   killed thread still waits for a lock: it is inside the scheduler, which
- *   is trusted to finish, and its node lends the owner its time meanwhile.
+ *   killed thread waits for a lock like any other, and holds it until it
+ *   releases it: a kill never cuts a call short (unwind.hpp).
  *
  * IDLE
  *   When nothing can run the CPU idles in the scheduler (`idle_until`): a
@@ -154,14 +156,16 @@
  *   when nothing else can run.
  */
 
+#include <signetos/irq.hpp>
+
 #include "runtime.hpp"
 
 namespace signetos::user {
 namespace {
 
-// --- What `sched` asks `init` for (user/manifest.hpp)
-// ------------------------- The timer interrupt is the scheduler's clock;
-// `trap_bind` is how it attaches to it; `thread_switch`, `thread_tid` and
+// --- What `sched` asks `init` for (user/manifest.hpp) -----------------------
+// The timer interrupt is the scheduler's clock, but `sched` asks for nothing
+// to get it: `init` installs its tick handler. `thread_switch`, `thread_tid` and
 // `thread_kill` are what dispatching and killing are made of;
 // `OType::QuotaSched` makes `quota_sched` handles; the VM entries fund the
 // per-node pages. `naming.publish` is asked for because the scheduler publishes
@@ -169,9 +173,7 @@ namespace {
 // the handshake. Its VM quota pays for the root node's page.
 #define SCHED_MANIFEST(X)                              \
   M_QUOTA_VM(X, VM_QUOTA)                              \
-  M_IRQ(X, IRQ_TIMER, 7)                               \
   M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched) \
-  M_SYSCALL(X, SYS_TRAP_BIND, trap_bind)               \
   M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)       \
   M_SYSCALL(X, SYS_THREAD_TID, thread_tid)             \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)           \
@@ -188,7 +190,7 @@ constexpr size_t MAX_NODES = 64;
 
 // The most a node may owe into its next periods (BUDGETS): a tick, which is
 // as far as one pick can overrun.
-constexpr int64_t MAX_DEBT_US = static_cast<int64_t>(trap::TICK_US);
+constexpr int64_t MAX_DEBT_US = static_cast<int64_t>(irq::TICK_US);
 
 // `time` ticks per microsecond; populated from `SchedInterface::timebase_hz`
 // (`/cpus` `timebase-frequency` in the DTB, fallback 10 MHz).
@@ -402,7 +404,7 @@ QuotaSched* alloc_node(Capability funding, QuotaSched* parent,
   using FnAlloc = decltype(&sys_vm_allocate);
   Capability page =
       syscall::call<FnAlloc>(s_gate_invoke, s_gate_alloc, s_self_comp, funding,
-                             vm::PAGE_SIZE, FLAG_ZERO);
+                             vm::PAGE_SIZE, 0);
   if (!capability_is_valid(page)) {
     return nullptr;
   }
@@ -1156,9 +1158,7 @@ extern "C" int64_t compartment_main(Capability arg) {
 
   s_self_comp = rw[compartment::SLOT_SELF];
   Capability vm_quota = rw[SLOT_VM_QUOTA];
-  Capability timer_irq_auth = rw[SLOT_IRQ_TIMER];
   s_seal_auth = rw[SLOT_SEAL_AUTH];
-  Capability gate_trap_bind = rw[SLOT_SYS_TRAP_BIND];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   Capability naming_publish = rw[SLOT_NAMING_PUBLISH];
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];
@@ -1171,7 +1171,6 @@ extern "C" int64_t compartment_main(Capability arg) {
 
   if (!sealing::is_sealed_as(OType::Compartment, s_self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, vm_quota) ||
-      !sealing::is_sealed_as(OType::Trap, timer_irq_auth) ||
       !capability_has_perms(s_seal_auth, perms::Seal | perms::Unseal) ||
       !sealing::is_sealed_as(OType::EntryPoint, naming_publish)) {
     return -1;
@@ -1185,6 +1184,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
   iface->root_quota = nullptr;
   iface->run = nullptr;
+  iface->tick = nullptr;
 
   // 1. Root node: the whole machine, funded from our own VM quota.
   QuotaSched* root = alloc_node(vm_quota, nullptr, init::SCHED_ROOT_PERIOD_US,
@@ -1222,15 +1222,11 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->root_quota = seal_node(root);
   iface->run = entry(reinterpret_cast<const void*>(&sched_run_entry));
 
-  // 3. Preemption: the kernel's tick is delivered to us from now on.
-  Capability e_tick = entry(reinterpret_cast<const void*>(&sched_tick_entry));
-  using FnTrapBind = decltype(&sys_trap_bind);
-  syscall::call<FnTrapBind>(s_gate_invoke, gate_trap_bind, s_self_comp,
-                            timer_irq_auth, e_tick);
+  // 3. Preemption: `init` installs this as the kernel tick's handler.
+  iface->tick = entry(reinterpret_cast<const void*>(&sched_tick_entry));
 
   print(s_gate_invoke, s_uart,
-        "[sched]    Scheduler online: root quota minted, sched.* published, "
-        "tick bound\n");
+        "[sched]    Scheduler online: root quota minted, sched.* published\n");
   return 0;
 }
 

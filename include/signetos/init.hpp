@@ -30,12 +30,6 @@
 //   1. Creates the `init` compartment funded by `system_quota` and populates
 //      its capability table ONLY with architectural kernel authorities:
 //        - All kernel syscall gates (`syscall::gate(Id)`)
-//        - The hardware interrupt authorities (`trap::irq_authority`). The
-//          software interrupt has none -- it is the kernel's (trap.hpp) --
-//          so its slot holds null.
-//        - 32 exception-authority slots, all null: exceptions are not
-//          bindable (a fault goes to the faulting compartment's own handler,
-//          fault.hpp). The slots are kept so the seed layout is stable.
 //        - `root_quota_thread_mem`
 //   2. Loads `boot/init.bin` into `init`'s own memory, processes its
 //      `__cap_relocs`, and mints `init`'s entry-point sentry.
@@ -231,10 +225,8 @@ struct alignas(16) BootManifest {
 constexpr size_t RW_SLOT_VM_QUOTA =
     compartment::RW_SLOT_SEED_BASE;                  // root QuotaVm (funds init)
 constexpr size_t RW_SLOT_SYSCALL_BASE = RW_SLOT_VM_QUOTA + 1;
-constexpr size_t RW_SLOT_IRQ_BASE =
-    RW_SLOT_SYSCALL_BASE + syscall::kSyscallCount;   // 16 IRQ authorities
 constexpr size_t RW_SLOT_THREAD_QUOTA =
-    RW_SLOT_IRQ_BASE + trap::MAX_INTERRUPT_VECTORS;  // root_quota_thread_mem
+    RW_SLOT_SYSCALL_BASE + syscall::kSyscallCount;   // root_quota_thread_mem
 constexpr size_t RW_SLOT_SEAL_SCHED =
     RW_SLOT_THREAD_QUOTA + 1;                        // OType::QuotaSched authority
 constexpr size_t RW_SLOT_SEAL_DISK =

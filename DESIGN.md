@@ -51,7 +51,7 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 
 | Path | Contents |
 | --- | --- |
-| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`sentry.cpp` + `switch.S`), compartments, quotas, threads, VM and frame allocator, revocation, traps, unwinding. It does not print: it reports through `debug/report.hpp`. |
+| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`sentry.cpp` + `switch.S`), compartments, quotas, threads, VM and frame allocator, revocation, trap dispatch and fault delivery (`trap.cpp`), the two interrupt handlers and each hart's interrupt state (`irq.cpp`), unwinding. It does not print: it reports through `debug/report.hpp`. |
 | `kernel/hw/` | Drivers for the board: the console (`uart.cpp`), timer and cross-hart poke (`clint.cpp`), DTB discovery (`platform.cpp`) |
 | `kernel/debug/` | Diagnostics and checks: everything the kernel prints (`report.cpp`), the outbound capability check (`inspect.cpp`), boot self-tests (`quota_selftest.cpp`) |
 | `kernel/lib/` | Freestanding C library routines (`kstring.cpp`) |
@@ -304,16 +304,40 @@ the quotas its creator passes when it makes and registers it.
 | Exit | `sys_thread_exit` quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
 | Kill | `sys_thread_kill`. A thread that never ran is torn down at once. Otherwise it is marked, and the kernel acts on the mark each time it resumes compartment code on it (return from a call, end of a trap) (`unwind.hpp`, KILLED THREADS). See the table below. `sched.thread_kill` wakes the thread and keeps it from sleeping again, so a kill takes effect within a tick of its CPU time. A stopped thread (§2.6) is put on the killer's node first, so the killer pays for it to run to its end. |
 
-Code about to resume on a killed thread (trap handlers included):
+A kill means **return this thread to its owner**. Code about to resume on a
+killed thread:
 
 | Code | Result |
 | --- | --- |
-| The thread's original compartment (inside no call) | The thread ends. |
-| The kernel, or a compartment trusted to finish | Runs on; the call completes. |
-| Any other compartment | Cut: its frame is skipped and its caller gets `Status::Killed`. |
+| The thread's own compartment, inside no call | The thread ends. |
+| Anything it has called (a compartment, a system call, a trap handler) | Runs on to its return. A kill never cuts a call short. |
 
-* **Trusted to finish**: `sys_compartment_trust_to_finish(comp)` sets `FLAG_TRUSTED_TO_FINISH`. `init` sets it on uart, loader, blk, fs, naming, sched and trap_mgr. The switcher copies it into the call's `ReturnFrame::flags`, and the trap dispatcher into the handler's `TrapFrame::flags` (`ENTRY_FLAG_TRUSTED_TO_FINISH`); kernel entries always get it. Trusted code must never wait forever.
-* **No cleanup runs on a killed thread.** A compartment that is not trusted to finish must cope with a call being cut at any point, e.g. by recording the owner's tid in its locks and repairing state when the owner is found dead.
+**What killing a thread is for.** Of the three things one might want from
+it, kill provides only the last:
+
+| Want | Provided by | Needs kill? |
+| --- | --- | --- |
+| Stop it using CPU | The scheduler: take back its node, and it is not picked again from the next tick. A compartment's PCC has no `AccessSystemRegs`, so it cannot mask the tick. | No |
+| Stop it misbehaving | Containment is the capability model: a compromised compartment can do only what its capabilities allow. Stopping it is the scheduler (above) and destroying its compartment, which takes its code and memory away and unwinds any thread parked in it. | No |
+| Get its memory back | The thread's state page and stack are held until it ends. Kill is what makes it end. | Yes |
+
+So a kill is a request to reclaim one thread's memory, and it is bounded:
+a thread that never comes back costs its creator exactly one stack plus the
+state page, accounted to its `QuotaThreadMem`, and nothing more.
+
+**How a kill plays out**, by where the thread is when it lands:
+
+| Where the thread is | What happens | Guaranteed by |
+| --- | --- | --- |
+| In its own code, spinning or not | Ends at its next resume: the next tick at the latest. | The kernel (`unwind.hpp`, KILLED THREADS). The code may be arbitrary; it cannot prevent this. |
+| Blocked in a service (`sched.block`, `lock_wait`) | The wait fails at once with `SCHED_KILLED`; the service returns an error on its ordinary error path, releasing what it held; the thread comes back up to its own code and ends. | The scheduler, plus the service returning when its wait fails. |
+| Computing in a service | The service finishes and returns; then as above. | The service's work being bounded. |
+| Spinning in a compartment that neither returns nor waits | Nothing. The thread stays; the killer learns it is still there (`sys_thread_tid` is not 0) and knows which compartment has it. | Not guaranteed. A trusted service doing this has a bug; an untrusted compartment is destroyed by its owner, and the thread is unwound past it. |
+
+`killtest spin|sleep|fs|stuck` (shell) exercises the first, second (with
+`fs` and `blk` in the way) and last rows. What a compartment has to do for
+this to work is in §7.
+
 
 ### 2.4 Quotas and allocation authorities
 
@@ -490,16 +514,17 @@ Everything the switcher does *with* an entry is described in §3.4.
 
 Scheduling lives entirely in user space (`external/services/sched.cpp`). The
 kernel keeps **no** scheduling state and never picks a thread. It provides
-`sys_thread_switch`, a timer trap that the scheduler binds, and a host loop
+`sys_thread_switch`, a timer tick delivered to the scheduler, and a host loop
 that re-dispatches the scheduler's thread whenever a thread exits; the
 scheduler also uses `sys_thread_tid` and `sys_thread_kill`, and reads which
 thread is running from `utidc`.
 
 1. **Sealing authority.** The scheduler seals and opens `quota_sched`
    handles.
-2. **Hardware preemption.** The scheduler binds the timer interrupt with
-   `sys_trap_bind`. The kernel owns the tick period (10 ms) and re-arms the
-   timer.
+2. **Hardware preemption.** The scheduler hands its tick handler back to
+   `init` in its handshake, and `init` installs it for the timer interrupt
+   (`sys_trap_install`, §3.6). The kernel owns the tick period (10 ms) and
+   re-arms the timer.
 3. **Thread tables and bandwidth tracking in user memory**, debited with no
    syscalls.
 4. **Ordering.** Priority classes are strict. Within a class the node served
@@ -739,7 +764,7 @@ filesystem; which is which is a build detail.
 | 1 | — | Parse the DTB to find the UART, PLIC and virtio devices. |
 | 2 | `uart` | Its MMIO window. Handshake returns its `read` and IRQ entries; init offers `uart` (print) and `uart.read`. |
 | 3 | `loader` | The syscalls it needs and `uart` printing. It gets no quotas or resources of its own and is used for every later step. |
-| 4 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init**. Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
+| 4 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
 | 5 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
 | 6 | `naming` | Once it is up, init publishes `uart`, `loader` and the `fs.*` entries. |
 | 7 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
@@ -908,22 +933,25 @@ Rough edges:
 
 ### 3.6 Hardware trap and interrupt handling
 
-Interrupts and faults are routed differently. An interrupt goes to whoever
-bound its vector. A synchronous fault goes to **the compartment that raised
-it**, never to a global handler.
+Interrupts and faults are routed differently. Only two interrupts leave
+the kernel, each to one fixed handler. A synchronous fault goes to **the
+compartment that raised it**, never to a global handler.
 
-#### Interrupts
+#### Interrupts (`include/signetos/irq.hpp`)
 
-1. **Authority distribution:** at boot the kernel mints one `OType::Trap`
-   authority per interrupt number into `init`'s table. The kernel keeps its
-   own IPI vector. Exceptions get no authority: their 32 seed slots stay null
-   (§5.8). `init` passes the authorities on according to manifests: the timer
-   to `sched`, and the external interrupt to `trap_mgr`.
-2. **Handler registration:** `sys_trap_bind(comp, auth, EntryPoint)` requires
-   the handler to be owned by `comp`, and refuses exception slots. The kernel
-   keeps a static trap table under a seqlock, and every bind is synchronised
-   to all harts by IPI. Bindings are purged when their compartment is
-   destroyed.
+1. **Two handlers, installed by `init`:** the timer (the kernel tick) goes
+   to the scheduler, and the external interrupt (every PLIC device) to the
+   trap manager. The software interrupt is the kernel's own cross-hart poke,
+   and nothing else can fire. `sched` and `trap_mgr` hand their handler
+   entries back to `init` in their handshakes, and `init` installs each with
+   `sys_trap_install(irq, EntryPoint)`. Nothing else is bindable, and there
+   is no table, no unbind and no rebinding.
+2. **Authority:** the `sys_trap_install` gate itself. `init` is seeded with
+   every syscall gate and hands this one to nobody. Each handler can be
+   installed once (`Busy` afterwards) and is never removed. An install is
+   synchronised to all harts by IPI. If the handler's compartment is
+   destroyed, its entry stops resolving and the interrupt is silenced on
+   each hart where it arrives.
 3. **Delivery:** a trap frame is pushed on the interrupted thread's kernel
    stack. The handler then runs **on the interrupted thread's own, narrowed
    stack**, masked, with `(mcause, mtval, mepc, mtval2)` as arguments. Its
@@ -932,7 +960,6 @@ it**, never to a global handler.
 4. **Resolution:** the handler returns and the thread resumes. The
    scheduler's handler may instead `sys_thread_switch` away, and the thread
    then stays parked in its handler.
-5. **Deregistration:** `sys_trap_unbind` exists, but nothing calls it yet.
 
 #### Per-compartment faults (`include/signetos/fault.hpp`)
 
@@ -945,7 +972,7 @@ faulting compartment's business.
    It is installed with `sys_sentry(comp, code, KIND_HANDLER)`. The handle
    needs `Permit_Store`. The handler can be set once (`Busy` afterwards).
    The record is marked as a fault entry, which the switcher,
-   `sys_thread_create` and `sys_trap_bind` all refuse. Its handle is never
+   `sys_thread_create` and `sys_trap_install` all refuse. Its handle is never
    handed back: `sys_sentry` returns only an untagged `Status`. The loader
    installs it from the image header (§2.8) before the compartment's first
    instruction. A failed install fails the load.
@@ -1015,7 +1042,8 @@ before this path. None exist yet (§3.7).
 
 **The trap manager (`external/services/trap_mgr.cpp`):**
 
-* Owns the PLIC and binds the external interrupt, for the **boot hart only**.
+* Owns the PLIC and handles the external interrupt (`init` installs its
+  handler), for the **boot hart only**.
 * Keeps a small static routing table from sources to driver handlers. `init`
   fills it and the routing entry is not published. There is no unroute.
 * On an interrupt it claims the source, invokes each routed handler, and
@@ -1122,7 +1150,8 @@ The kernel is written with SMP in mind:
 
 * per-hart stacks and CPU state;
 * spinlocks on shared structures;
-* IPI-based synchronisation of trap-table updates;
+* IPI-based synchronisation of each hart's interrupt state when an interrupt
+  handler is installed (`irq.cpp`);
 * atomic claiming of threads in `kill` and dispatch.
 
 **Today, though, every thread runs on the boot hart; the secondary harts are
@@ -1141,7 +1170,7 @@ status.
 
 | Syscall (signature) | Behaviour |
 | --- | --- |
-| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed; **`flags` are ignored for now**. |
+| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. The one flag, `FLAG_DMA`, makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at; any other flag is refused. |
 | `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. Refunds and **quarantines** the memory (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
 | `capability_revoker_t sys_revoke_create(comp, mem_cap)` | Creates a `Revoker` over `mem_cap`'s bounds, which must lie within a range `comp` owns. |
@@ -1171,7 +1200,6 @@ status.
 | `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
 | `Sentry sys_sentry(comp, code, kind)` | §2.5. `KIND_ENTRY` returns the `EntryPoint` handle. `KIND_HANDLER` installs `comp`'s fault handler (needs `Permit_Store`, once) and return only an untagged `Status` (§3.6). |
-| `uint64_t sys_compartment_trust_to_finish(comp)` | §2.3. Permanent. Returns a `Status`. |
 | `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |
 | `capability_type_t sys_type_derive(key, permissions)` | Re-issues `key` with a subset of its unseal (Load) and seal (Store) rights. |
 | `capability_sealed_t sys_seal(key, obj)` | §2.7. Returns the `SealedObject` handle, or NULL. |
@@ -1191,8 +1219,7 @@ status.
 
 | Syscall | Behaviour |
 | --- | --- |
-| `void sys_trap_bind(comp, auth_cap, target)` | `auth_cap` is an interrupt `Trap` authority carrying `Permit_Load` (exceptions have none, and their slots are refused). `target` is an `EntryPoint` owned by `comp`; a kernel entry or a fault entry is refused. Replaces any existing binding for the vector. |
-| `void sys_trap_unbind(comp, auth_cap)` | Not used yet. |
+| `uint64_t sys_trap_install(irq, handler)` | §3.6. Installs `handler`, a compartment `EntryPoint`, for `IRQ_M_TIMER` or `IRQ_M_EXT` (anything else is `InvalidAuthority`). Once each (`Busy` afterwards); a kernel, fault or local entry is `InvalidSentry`. Only `init` holds the gate. Returns a `Status`. |
 
 The kernel's `Status` codes are defined in `types.hpp`. Only the few noted
 above ever reach user space.
@@ -1234,7 +1261,7 @@ from page-granular `sys_vm_allocate` and static arrays.
 | `sched.yield` | Charge the running node and pick again. |
 | `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. A woken thread runs when it is next picked, so not before its node has budget. It may return spuriously, so callers loop. The caller's tid, which `wake` takes, is in `utidc` (`runtime.hpp`, `self_tid`). |
 | `sched.wake` | Wake a tid. Safe to call from interrupt context. **Unprotected**: anyone holding the entry and a tid can wake that thread. |
-| `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping. A stopped thread is put on the caller's node first, so this is called from thread context. |
+| `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping, so a callee waiting on its behalf returns, and the thread ends once back in its own code (§2.3). A stopped thread is put on the caller's node first, so this is called from thread context. |
 | `sched.lock_wait` | Wait for a lock whose word showed it taken, lending the owner this thread's time meanwhile (§2.6). |
 | `sched.lock_wake` | Release a lock that has waiters, handing it to the next of them. |
 | `run` | The scheduler's main loop. Not published; `init` hands it to the kernel (§2.6). |
@@ -1304,8 +1331,7 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | --- | --- |
 | 0 | `init`'s own handle |
 | `RW_SLOT_VM_QUOTA` | The root `QuotaVm` |
-| `RW_SLOT_SYSCALL_BASE` … | One `EntryPoint` per syscall |
-| `RW_SLOT_IRQ_BASE` … | The interrupt `Trap` authorities |
+| `RW_SLOT_SYSCALL_BASE` … | One `EntryPoint` per syscall. `init` passes most on through manifests; `trap_install` it keeps (§3.6) |
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
@@ -1395,3 +1421,51 @@ Properties under investigation:
   its pool of threads.
 
 ---
+
+## 7. When a thread stops inside a compartment
+
+A thread can stop while it is inside a compartment's call:
+
+* **killed:** `sys_thread_kill`. It ends only once it is back in its own
+  code; every call it is inside runs to its return, so a kill never leaves
+  a compartment half-way through anything (§2.3 has what a kill is for and
+  how it plays out);
+* **starved:** its `quota_sched` node is taken back and it is never scheduled
+  again (§2.6). It keeps whatever state the compartment had at that
+  instruction. If it holds a lock someone wants, the waiter lends it time to
+  finish the critical section (`sched.lock_wait`);
+* **a fault:** the compartment's own handler decides, or it is unwound
+  (§3.6). This is the one case in which a compartment's code is abandoned
+  mid-way, and it is that compartment's own code that faulted;
+* **its compartment destroyed:** at its next resume it is unwound past every
+  frame in the destroyed compartment, whose state no longer matters.
+
+The kernel holds one rule for all of this: a killed thread ends when it
+resumes its own code. There is no "trusted to finish" exemption, no cutting
+of callees, and no cleanup handler, because none is needed when nothing is
+cut.
+
+What a compartment must do:
+
+* **Return when a wait fails.** `sched.block` and `sched.lock_wait` return an
+  error for a killed thread, and the compartment returns an error to its
+  caller, releasing what it held on the way. That is its ordinary error
+  path, which it needs for timeouts in any case.
+* **Keep work on a caller's thread bounded.** A compartment that neither
+  returns nor waits holds every thread that calls it, killed or not. For a
+  trusted service that is a bug; an untrusted one is destroyed by whoever
+  owns it, which unwinds the threads parked in it.
+* **Cope with a holder that has ended anyway.** The kernel still ends a
+  thread wherever it is if it has no kernel stack left to take a trap, or
+  if every frame on its kernel stack is in a destroyed compartment. A lock
+  whose owner has ended goes to the next waiter with `SCHED_OWNER_DEAD`;
+  `blk` then drains and catches up its device queue, `fs` warns that its
+  tables may be half-updated. Making `fs`'s updates safe to abandon (ordered
+  writes, or a journal) is future work, and is needed for power loss anyway.
+
+Work that nobody's call asked for -- a packet arriving, a timer, delayed
+writeback -- has no caller's thread to run on and belongs on a thread the
+service owns, woken from its interrupt handler. A future network stack is
+built that way: the interrupt handler acknowledges and wakes, the stack's
+own thread runs the protocols, and callers' threads touch only socket
+buffers, under locks, as above.

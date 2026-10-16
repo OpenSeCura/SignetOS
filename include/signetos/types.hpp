@@ -127,9 +127,6 @@ enum class Status : uint32_t {
     // called through, was destroyed and swept while the call was in progress
     // (unwind.hpp). DESIGN.md's ERR_COMPARTMENT_DESTROYED.
     CompartmentDestroyed,
-    // what a caller gets back in a0 when the thread was killed and the
-    // compartment it called was cut short (unwind.hpp, KILLED THREADS)
-    Killed,
     // what a caller gets back in a0 when the compartment it called, or one it
     // called through, faulted and was unwound -- by its fault handler's
     // verdict, or because it had none (fault.hpp, trap.hpp)
@@ -173,7 +170,6 @@ inline const char* status_name(Status s) {
         case Status::DispatchFailed:          return "DispatchFailed";
         case Status::StackTooSmall:           return "StackTooSmall";
         case Status::CompartmentDestroyed:    return "CompartmentDestroyed";
-        case Status::Killed:                  return "Killed";
         case Status::Faulted:                 return "Faulted";
         case Status::NoKernelStack:           return "NoKernelStack";
     }
