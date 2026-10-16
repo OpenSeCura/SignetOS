@@ -1124,7 +1124,7 @@ usual leak is physical memory held in quarantine until a sweep.
 | --- | --- |
 | 1. Ephemeral borrowing (local capabilities) | A caller lends a buffer by passing a local capability in a register argument. The callee cannot store it outside a stack, and access ends with the call, so no sweep is needed. |
 | 2. Persistent sharing via sealed handles | The owner seals handles under its hardware `OType` (§2.1) or a compartment-minted type (§2.7) and hands out handles that only it can open. Used for `fs` file handles and for both services' quota handles. |
-| 3. Direct global sharing with quarantine + revocation | Raw global capabilities shared across compartments require the memory to be revoked before it is reused. The mechanism is complete, but the **sweep trigger policy is missing** (see below). |
+| 3. Direct global sharing with quarantine + revocation | Raw global capabilities shared across compartments require the memory to be revoked before it is reused. |
 
 **Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):**
 
