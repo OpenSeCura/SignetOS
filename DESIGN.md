@@ -304,13 +304,12 @@ killed thread:
 | The thread's own compartment, inside no call | The thread ends. |
 | Anything it has called (a compartment, a system call, a trap handler) | Runs on to its return. A kill never cuts a call short. |
 
-**What killing a thread is for.** Of the three things one might want from
+**What killing a thread is for.** Of the two things one might want from
 it, kill provides only the last:
 
 | Want | Provided by | Needs kill? |
 | --- | --- | --- |
-| Stop it using CPU | The scheduler: take back its node, and it is not picked again from the next tick. A compartment's PCC has no `AccessSystemRegs`, so it cannot mask the tick. | No |
-| Stop it misbehaving | Containment is the capability model: a compromised compartment can do only what its capabilities allow. Stopping it is the scheduler (above) and destroying its compartment, which takes its code and memory away and unwinds any thread parked in it. | No |
+| Stop it using CPU/misbehaving | The scheduler: take back its node, and it is not picked again from the next tick. A compartment's PCC has no `AccessSystemRegs`, so it cannot mask the tick. | No |
 | Get its memory back | The thread's state page and stack are held until it ends. Kill is what makes it end. | Yes |
 
 So a kill is a request to reclaim one thread's memory, and it is bounded:
