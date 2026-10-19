@@ -22,7 +22,7 @@
 // Hands out 4KB physical frames from all RAM above the kernel image.
 //
 // Frames are physical addresses, not capabilities. A compartment cannot touch
-// a frame until vm::map puts it somewhere in the dynamic space; the kernel
+// a frame until vm::alloc_pages maps it somewhere in the dynamic space; the kernel
 // itself reaches frames through the direct map (vm.hpp, THE DIRECT MAP).
 //
 // WHEN A FRAME MAY BE FREED

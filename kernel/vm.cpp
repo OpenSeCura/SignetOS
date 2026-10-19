@@ -70,28 +70,29 @@ Capability s_dynamic = nullptr;
 // derives from it; the window `init` gets is this span minus `StoreLocal`.
 Capability s_devices = nullptr;
 
-// Lowest address above all current and released reservations.
-uint64_t s_next_va = DYNAMIC_BASE;
-
-// Coalesced, address-sorted list of unmapped virtual address ranges below
-// `s_next_va` that have been reclaimed by a revocation sweep and are ready for
-// reuse.
-struct FreeRange {
-  uint64_t va;
-  size_t pages;
-};
-constexpr size_t MAX_FREE_RANGES = 1024;
-FreeRange s_free_ranges[MAX_FREE_RANGES];
-size_t s_free_range_count = 0;
-size_t s_free_pages = 0;
+// The pool alloc_pages hands addresses out of: the dynamic space below the
+// revocation bitmap. The page tables are the only record of which of its
+// addresses are in use: a page is in use exactly while it is mapped (live or
+// quarantined).
+//
+// Walking the tables to find room would be slow, so each 2MB and each 1GB
+// region of the pool keeps a count of its mapped pages. A search skips any
+// region without enough unmapped pages, and the sweep skips regions with
+// none mapped. The arrays are sized by the address space (about 250KB), not
+// by RAM or by how fragmented the pool gets.
+constexpr size_t PAGES_PER_2M = MEGAPAGE_SIZE / PAGE_SIZE;        // 512
+constexpr size_t REGIONS_PER_1G = GIGAPAGE_SIZE / MEGAPAGE_SIZE;  // 512
+constexpr size_t POOL_2M = (SHADOW_BASE - DYNAMIC_BASE) / MEGAPAGE_SIZE;
+constexpr size_t POOL_1G = (SHADOW_BASE - DYNAMIC_BASE) / GIGAPAGE_SIZE;
+constexpr size_t POOL_PAGES = POOL_2M * PAGES_PER_2M;
+static_assert(DYNAMIC_BASE % GIGAPAGE_SIZE == 0 &&
+              SHADOW_BASE % GIGAPAGE_SIZE == 0);
+uint16_t s_used_2m[POOL_2M];
+uint32_t s_used_1g[POOL_1G];
 
 size_t s_table_pages = 0;        // frames currently held as page tables
 size_t s_alloc_pages = 0;        // pages currently handed out by alloc_pages
 size_t s_quarantined_pages = 0;  // pages freed, still mapped, awaiting a sweep
-
-// Ceiling on s_table_pages. A limit, not a pool: nothing is set aside, and
-// frames below the ceiling are available to everyone until a table needs them.
-size_t s_max_table_pages = DEFAULT_MAX_TABLE_PAGES;
 
 // Bits 9:0 of a PTE are flags; everything above is the physical page number.
 constexpr uint64_t PTE_FLAG_MASK = 0x3FFULL;
@@ -162,11 +163,6 @@ uint64_t* table_view(uint64_t pa) {
 
 // Allocates a frame, zeroes it, and installs it in `entry` as a table.
 bool install_table(uint64_t* entry) {
-  // Checked before the frame is taken, so a refusal costs nothing.
-  if (s_table_pages >= s_max_table_pages) {
-    return false;
-  }
-
   const uint64_t pa = frame::alloc(1);
   if (pa == 0) {
     return false;
@@ -341,9 +337,6 @@ void init(Capability root_data_cap) {
   s_dynamic = nullptr;
   s_direct_top = 0;
   s_boot_reserved_end = 0;
-  s_next_va = DYNAMIC_BASE;
-  s_free_range_count = 0;
-  s_free_pages = 0;
   s_table_pages = 0;
   s_alloc_pages = 0;
   s_quarantined_pages = 0;
@@ -354,6 +347,12 @@ void init(Capability root_data_cap) {
     s_l2_root[i] = 0;
     s_l1_mmio[i] = 0;
     s_l1_kernel[i] = 0;
+  }
+  for (size_t i = 0; i < POOL_2M; ++i) {
+    s_used_2m[i] = 0;
+  }
+  for (size_t i = 0; i < POOL_1G; ++i) {
+    s_used_1g[i] = 0;
   }
 
   // Root entry 0 covers VA 0x00000000..0x3FFFFFFF, where the devices are:
@@ -490,176 +489,123 @@ Capability phys_view(uint64_t pa, size_t len) {
   return capability_is_valid(c) ? c : nullptr;
 }
 
-void set_max_table_pages(size_t pages) {
-  __atomic_store_n(&s_max_table_pages, pages, __ATOMIC_RELAXED);
-}
-
 namespace {
 
-// True if any page in `[va, va + pages * PAGE_SIZE)` is currently mapped.
-bool any_page_mapped(uint64_t va, size_t pages) {
-  uint64_t cur = va;
-  const uint64_t end = va + static_cast<uint64_t>(pages) * PAGE_SIZE;
-  while (cur < end) {
-    const uint64_t l2 = s_l2_root[l2_index(cur)];
-    if (!(l2 & pte::Valid)) {
-      const uint64_t next_l2 = (cur & ~(GIGAPAGE_SIZE - 1)) + GIGAPAGE_SIZE;
-      if (next_l2 <= cur || next_l2 >= end) {
-        break;
-      }
-      cur = next_l2;
-      continue;
-    }
-    if (pte_is_leaf(l2)) {
-      return true;
-    }
-    const uint64_t* l1_table = table_view(pte_addr(l2));
-    if (l1_table == nullptr) {
-      return true;
-    }
-    const uint64_t l1 = l1_table[l1_index(cur)];
-    if (!(l1 & pte::Valid)) {
-      const uint64_t next_l1 = (cur & ~(MEGAPAGE_SIZE - 1)) + MEGAPAGE_SIZE;
-      if (next_l1 <= cur || next_l1 >= end) {
-        break;
-      }
-      cur = next_l1;
-      continue;
-    }
-    if (pte_is_leaf(l1)) {
-      return true;
-    }
-    const uint64_t* l0_table = table_view(pte_addr(l1));
-    if (l0_table == nullptr) {
-      return true;
-    }
-    const size_t start_i0 = l0_index(cur);
-    const uint64_t l1_end = (cur & ~(MEGAPAGE_SIZE - 1)) + MEGAPAGE_SIZE;
-    const uint64_t stop = (end < l1_end) ? end : l1_end;
-    const size_t count = static_cast<size_t>((stop - cur) / PAGE_SIZE);
-    for (size_t i = 0; i < count; ++i) {
-      if ((l0_table[start_i0 + i] & pte::Valid) != 0) {
-        return true;
-      }
-    }
-    cur = stop;
+// Keeps the region counts in step with the page tables: called with +1 for
+// every leaf entry set in the pool and -1 for every one cleared. Bitmap pages
+// (at or above SHADOW_BASE) are not in the pool and are not counted.
+void count_page(uint64_t va, int delta) {
+  if (va < DYNAMIC_BASE || va >= SHADOW_BASE) {
+    return;
   }
-  return false;
+  const size_t m = (va - DYNAMIC_BASE) / MEGAPAGE_SIZE;
+  s_used_2m[m] = static_cast<uint16_t>(s_used_2m[m] + delta);
+  s_used_1g[m / REGIONS_PER_1G] =
+      static_cast<uint32_t>(s_used_1g[m / REGIONS_PER_1G] + delta);
 }
 
-void release_locked(uint64_t va, size_t pages);
-
-// Reserves `pages` of addresses starting on a multiple of `align`, a power of
-// two no smaller than PAGE_SIZE: from the first reclaimed range with room
-// (ascending address order), else from the watermark. Whatever an aligned
-// start skips over is released again at once.
-uint64_t reserve_locked(size_t pages, uint64_t align) {
-  if (pages == 0) {
-    return 0;
-  }
-  const uint64_t bytes = static_cast<uint64_t>(pages) * PAGE_SIZE;
-  auto align_up = [align](uint64_t va) { return (va + align - 1) & ~(align - 1); };
-
-  for (size_t i = 0; i < s_free_range_count; ++i) {
-    const FreeRange r = s_free_ranges[i];
-    const uint64_t end = r.va + static_cast<uint64_t>(r.pages) * PAGE_SIZE;
-    const uint64_t va = align_up(r.va);
-    if (va < end && end - va >= bytes) {
-      // Take the whole range, then give back what lies either side.
-      for (size_t j = i; j + 1 < s_free_range_count; ++j) {
-        s_free_ranges[j] = s_free_ranges[j + 1];
-      }
-      s_free_range_count -= 1;
-      s_free_pages -= r.pages;
-      release_locked(r.va, (va - r.va) / PAGE_SIZE);
-      release_locked(va + bytes, (end - va - bytes) / PAGE_SIZE);
+// `va` if its 2MB region of the pool has anything mapped in it, else the start
+// of the next region that does, else SHADOW_BASE.
+uint64_t next_used(uint64_t va) {
+  while (va < SHADOW_BASE) {
+    const size_t m = (va - DYNAMIC_BASE) / MEGAPAGE_SIZE;
+    const size_t g = m / REGIONS_PER_1G;
+    if (s_used_1g[g] == 0) {
+      va = DYNAMIC_BASE + ((g + 1) * GIGAPAGE_SIZE);
+    } else if (s_used_2m[m] == 0) {
+      va = DYNAMIC_BASE + ((m + 1) * MEGAPAGE_SIZE);
+    } else {
       return va;
     }
   }
-
-  // Written as a subtraction from the top rather than `va + bytes >
-  // SHADOW_BASE`, so a huge request cannot wrap and appear to fit.
-  const uint64_t va = align_up(s_next_va);
-  if (va > SHADOW_BASE || bytes > SHADOW_BASE - va) {
-    return 0;
-  }
-  const uint64_t skipped = s_next_va;
-  s_next_va = va + bytes;
-  release_locked(skipped, (va - skipped) / PAGE_SIZE);
-  return va;
+  return SHADOW_BASE;
 }
 
-void release_locked(uint64_t va, size_t pages) {
-  if (!is_initialized() || pages == 0 || (va % PAGE_SIZE) != 0 ||
-      !range_is_mappable(va, pages)) {
-    return;
+// The L0 table of the 2MB region of the pool at `base`, or null if it has none
+// yet, in which case nothing in the region has ever been mapped. The pool is
+// only ever mapped with 4KB pages, so there is no bigger leaf to stop at.
+const uint64_t* l0_table_of(uint64_t base) {
+  const uint64_t l2 = s_l2_root[l2_index(base)];
+  if (!(l2 & pte::Valid)) {
+    return nullptr;
   }
-  const uint64_t bytes = static_cast<uint64_t>(pages) * PAGE_SIZE;
-  if (va + bytes > s_next_va) {
-    return;
+  const uint64_t* l1_table = table_view(pte_addr(l2));
+  if (l1_table == nullptr) {
+    return nullptr;
   }
-  // Refuse to recycle addresses that are still mapped (live or quarantined).
-  if (any_page_mapped(va, pages)) {
-    return;
+  const uint64_t l1 = l1_table[l1_index(base)];
+  if (!(l1 & pte::Valid)) {
+    return nullptr;
+  }
+  return table_view(pte_addr(l1));
+}
+
+// First index of `pages` consecutive unmapped entries in the 2MB region at
+// `base`, at a multiple of `step` entries, or ENTRIES if there is none.
+size_t free_run_in(uint64_t base, size_t pages, size_t step) {
+  const uint64_t* l0 = l0_table_of(base);
+  if (l0 == nullptr) {
+    return 0;
+  }
+  for (size_t start = 0; start + pages <= ENTRIES;) {
+    size_t k = 0;
+    while (k < pages && !(l0[start + k] & pte::Valid)) {
+      ++k;
+    }
+    if (k == pages) {
+      return start;
+    }
+    // Entry start + k is mapped: no run that includes it can work, so try
+    // the first aligned start past it.
+    start = (start + k + step) / step * step;
+  }
+  return ENTRIES;
+}
+
+// Finds `pages` of unmapped addresses in the pool, starting on a multiple of
+// `align` (a power of two from PAGE_SIZE to MEGAPAGE_SIZE), lowest first.
+// Returns the start, or 0 if there is no such run.
+//
+// Up to 2MB is looked for inside one 2MB region: the counts rule out regions
+// without enough room, and only a region that might have it has its L0 table
+// read. Bigger requests take whole empty 2MB regions. Neither looks for a run
+// that straddles a 2MB boundary without filling the regions it touches, which
+// costs some fragmentation and keeps the search short.
+uint64_t find_room_locked(size_t pages, uint64_t align) {
+  if (pages <= PAGES_PER_2M) {
+    for (size_t g = 0; g < POOL_1G; ++g) {
+      if (PAGES_PER_2M * REGIONS_PER_1G - s_used_1g[g] < pages) {
+        continue;
+      }
+      for (size_t m = g * REGIONS_PER_1G; m < (g + 1) * REGIONS_PER_1G; ++m) {
+        if (PAGES_PER_2M - s_used_2m[m] < pages) {
+          continue;
+        }
+        const uint64_t base = DYNAMIC_BASE + (m * MEGAPAGE_SIZE);
+        const size_t i = free_run_in(base, pages, align / PAGE_SIZE);
+        if (i < ENTRIES) {
+          return base + (i * PAGE_SIZE);
+        }
+      }
+    }
+    return 0;
   }
 
-  size_t idx = 0;
-  while (idx < s_free_range_count && s_free_ranges[idx].va < va) {
-    ++idx;
-  }
-  if (idx > 0) {
-    const uint64_t prev_end =
-        s_free_ranges[idx - 1].va +
-        static_cast<uint64_t>(s_free_ranges[idx - 1].pages) * PAGE_SIZE;
-    if (prev_end > va) {
-      return;
+  const size_t need = (pages + PAGES_PER_2M - 1) / PAGES_PER_2M;
+  size_t run = 0;  // empty 2MB regions just below m
+  for (size_t m = 0; m < POOL_2M;) {
+    if (m % REGIONS_PER_1G == 0 && s_used_1g[m / REGIONS_PER_1G] == 0) {
+      run += REGIONS_PER_1G;
+      m += REGIONS_PER_1G;
+    } else {
+      run = (s_used_2m[m] == 0) ? run + 1 : 0;
+      m += 1;
+    }
+    if (run >= need) {
+      return DYNAMIC_BASE + ((m - run) * MEGAPAGE_SIZE);
     }
   }
-  if (idx < s_free_range_count && va + bytes > s_free_ranges[idx].va) {
-    return;
-  }
-
-  const bool merge_prev =
-      (idx > 0) &&
-      (s_free_ranges[idx - 1].va +
-           static_cast<uint64_t>(s_free_ranges[idx - 1].pages) * PAGE_SIZE ==
-       va);
-  const bool merge_next =
-      (idx < s_free_range_count) && (va + bytes == s_free_ranges[idx].va);
-
-  if (merge_prev && merge_next) {
-    s_free_ranges[idx - 1].pages += pages + s_free_ranges[idx].pages;
-    for (size_t j = idx; j + 1 < s_free_range_count; ++j) {
-      s_free_ranges[j] = s_free_ranges[j + 1];
-    }
-    s_free_range_count -= 1;
-    s_free_pages += pages;
-  } else if (merge_prev) {
-    s_free_ranges[idx - 1].pages += pages;
-    s_free_pages += pages;
-  } else if (merge_next) {
-    s_free_ranges[idx].va = va;
-    s_free_ranges[idx].pages += pages;
-    s_free_pages += pages;
-  } else if (va + bytes == s_next_va) {
-    s_next_va = va;
-  } else if (s_free_range_count < MAX_FREE_RANGES) {
-    for (size_t j = s_free_range_count; j > idx; --j) {
-      s_free_ranges[j] = s_free_ranges[j - 1];
-    }
-    s_free_ranges[idx] = {va, pages};
-    s_free_range_count += 1;
-    s_free_pages += pages;
-  }
-
-  if (s_free_range_count > 0) {
-    const FreeRange& last = s_free_ranges[s_free_range_count - 1];
-    if (last.va + static_cast<uint64_t>(last.pages) * PAGE_SIZE == s_next_va) {
-      s_next_va = last.va;
-      s_free_pages -= last.pages;
-      s_free_range_count -= 1;
-    }
-  }
+  return 0;
 }
 
 bool unmap_locked(uint64_t va, size_t pages) {
@@ -681,6 +627,7 @@ bool unmap_locked(uint64_t va, size_t pages) {
     // Zero clears Valid along with everything else, which is what makes the
     // page unreachable.
     *slot = 0;
+    count_page(page_va, -1);
     // Without this the hardware may keep translating the address from a
     // cached copy of the entry just cleared, and the page stays readable.
     flush(page_va);
@@ -712,8 +659,8 @@ bool map_locked(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
     const uint64_t page_va = va + (i * PAGE_SIZE);
     uint64_t* slot = leaf_slot(page_va, true);
     if (slot == nullptr) {
-      // Out of frames, at the table cap, or the range runs into an
-      // existing megapage. Roll back so a failed map leaves nothing.
+      // Out of frames for a table, or the range runs into an existing
+      // megapage. Roll back so a failed map leaves nothing.
       if (i > 0) {
         unmap_locked(va, i);
       }
@@ -721,6 +668,7 @@ bool map_locked(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
     }
     // Valid is forced on: an entry without it is ignored by the hardware.
     *slot = pte_make(pa + (i * PAGE_SIZE), flags | pte::Valid);
+    count_page(page_va, +1);
     // This address may have been mapped before, so drop any stale entry.
     flush(page_va);
   }
@@ -773,32 +721,6 @@ bool map_shadow_locked(uint64_t va, size_t pages) {
 
 }  // namespace
 
-uint64_t reserve(size_t pages) {
-  Locked hold(s_lock);
-  return reserve_locked(pages, PAGE_SIZE);
-}
-
-void release(uint64_t va, size_t pages) {
-  Locked hold(s_lock);
-  release_locked(va, pages);
-}
-
-size_t reservable_pages() {
-  Locked hold(s_lock);
-  return s_free_pages +
-         static_cast<size_t>((SHADOW_BASE - s_next_va) / PAGE_SIZE);
-}
-
-bool map(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
-  Locked hold(s_lock);
-  return map_locked(va, pa, pages, flags);
-}
-
-bool unmap(uint64_t va, size_t pages) {
-  Locked hold(s_lock);
-  return unmap_locked(va, pages);
-}
-
 uint64_t translate(uint64_t va) {
   const Leaf leaf = find_leaf(va);
   if (leaf.entry == 0) {
@@ -835,66 +757,51 @@ uint64_t leaf_flags(uint64_t va) {
 }
 
 Capability alloc_pages(size_t pages, bool revocable) {
-  if (!is_initialized() || pages == 0) {
+  // The bound keeps `bytes` from wrapping; nothing bigger fits the pool.
+  if (!is_initialized() || pages == 0 || pages > POOL_PAGES) {
     return nullptr;
   }
 
   const size_t bytes = pages * PAGE_SIZE;
+  const uint64_t flags = pte::Permissive | (revocable ? pte::Revocable : 0);
 
-  // Separate resources, taken in order, each undone if a later one fails: an
-  // address range, the frames to back it, the mapping joining the two, and
-  // for a revocable allocation its bitmap pages (REVOCATION BITMAP). Running
-  // out is not a reason to sweep (revoke.hpp, WHEN A SWEEP RUNS).
-  uint64_t va = 0;
+  // Addresses, the frames to back them, the mapping joining the two, and for
+  // a revocable allocation its bitmap pages (REVOCATION BITMAP), each undone
+  // if a later one fails. All under one hold of `s_lock`: addresses are in
+  // use exactly while they are mapped, so the room found must be mapped
+  // before anyone else looks. Running out is not a reason to sweep
+  // (revoke.hpp, WHEN A SWEEP RUNS).
+  Capability c = nullptr;
   {
     Locked hold(s_lock);
-    va = reserve_locked(pages, revocable ? SHADOW_SPAN : PAGE_SIZE);
-  }
-  if (va == 0) {
-    return nullptr;
-  }
-
-  const uint64_t pa = frame::alloc(pages);
-  if (pa == 0) {
-    release(va, pages);
-    return nullptr;
-  }
-
-  const uint64_t flags = pte::Permissive | (revocable ? pte::Revocable : 0);
-  if (!map(va, pa, pages, flags)) {
-    frame::free(pa, pages);
-    release(va, pages);
-    return nullptr;
-  }
-  auto unwind_mapping = [&] {
-    unmap(va, pages);
-    frame::free(pa, pages);
-    release(va, pages);
-  };
-
-  bool shadowed = true;
-  if (revocable) {
-    Locked hold(s_lock);
-    shadowed = map_shadow_locked(va, pages);
-  }
-  if (!shadowed) {
-    unwind_mapping();
-    return nullptr;
-  }
-
-  // Narrow the dynamic authority to exactly this object, so the holder cannot
-  // reach a neighbouring allocation by walking off the end.
-  // TODO what is s_dynamic and which perms does it have?
-  Capability c = capability_set_address(s_dynamic, va);
-  c = capability_set_bounds(c, bytes);
-  if (!capability_is_valid(c) ||
-      (capability_get_perms(c) & (perms::Seal | perms::Unseal)) != 0) {
-    if (revocable) {
-      Locked hold(s_lock);
-      unmap_shadow_locked(va, shadow_pages(pages));
+    const uint64_t va =
+        find_room_locked(pages, revocable ? SHADOW_SPAN : PAGE_SIZE);
+    if (va == 0) {
+      return nullptr;
     }
-    unwind_mapping();
-    return nullptr;
+
+    // Narrow the dynamic authority to exactly this object, so the holder
+    // cannot reach a neighbouring allocation by walking off the end.
+    // TODO what is s_dynamic and which perms does it have?
+    c = dynamic_view(va, bytes);
+    if (!capability_is_valid(c) ||
+        (capability_get_perms(c) & (perms::Seal | perms::Unseal)) != 0) {
+      return nullptr;
+    }
+
+    const uint64_t pa = frame::alloc(pages);
+    if (pa == 0) {
+      return nullptr;
+    }
+    if (!map_locked(va, pa, pages, flags)) {
+      frame::free(pa, pages);
+      return nullptr;
+    }
+    if (revocable && !map_shadow_locked(va, pages)) {
+      unmap_locked(va, pages);
+      frame::free(pa, pages);
+      return nullptr;
+    }
   }
 
   // Frames are handed out dirty, and this is the first moment the memory is
@@ -947,8 +854,8 @@ uint64_t free_pages(Capability object) {
   // sweep clears them they must keep reaching the same data (the accessibility
   // invariant). Once `revoke::sweep()` clears all
   // tags pointing into quarantined memory, `reclaim_quarantined()` unmaps the
-  // pages, frees their physical frames, and returns the virtual addresses to
-  // the reusable pool via `release()`. A revocable range's shadow goes with it.
+  // pages and frees their physical frames, and the addresses are free for
+  // reuse once unmapped. A revocable range's bitmap pages go with it.
   bool revocable = false;
   for (size_t i = 0; i < pages; ++i) {
     uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
@@ -961,17 +868,17 @@ uint64_t free_pages(Capability object) {
   return (pages + (revocable ? shadow_pages(pages) : 0)) * PAGE_SIZE;
 }
 
-// Both passes below walk the used part of the dynamic space, from its base to
-// the watermark, one page at a time. The page tables answer one question
-// only: is this page mapped, and if not, how far to the next place that might
-// be. Pages are read at their own addresses through `s_dynamic`.
+// Both passes below walk the pool one page at a time, skipping every 2MB
+// region with nothing mapped in it (next_used). The page tables answer one
+// question only: is this page mapped, and if not, how far to the next place
+// that might be. Pages are read at their own addresses through `s_dynamic`.
 
 void sweep_live_pages() {
   if (!is_initialized()) {
     return;
   }
   Locked hold(s_lock);
-  for (uint64_t va = DYNAMIC_BASE; va < s_next_va;) {
+  for (uint64_t va = next_used(DYNAMIC_BASE); va < SHADOW_BASE;) {
     const Leaf leaf = find_leaf(va);
     if ((leaf.entry & (pte::Valid | pte::Quarantined)) == pte::Valid) {
       Capability page = capability_set_address(s_dynamic, va);
@@ -983,7 +890,7 @@ void sweep_live_pages() {
         }
       }
     }
-    va = next_after(va, leaf);
+    va = next_used(next_after(va, leaf));
   }
 }
 
@@ -995,14 +902,14 @@ void reclaim_quarantined() {
   if (s_quarantined_pages == 0) {
     return;
   }
-  for (uint64_t va = DYNAMIC_BASE; va < s_next_va;) {
+  for (uint64_t va = next_used(DYNAMIC_BASE); va < SHADOW_BASE;) {
     const Leaf leaf = find_leaf(va);
     uint64_t* slot =
         (leaf.entry & pte::Quarantined) ? leaf_slot(va, false) : nullptr;
     if (slot != nullptr) {
       *slot = 0;  // unmapped: nothing can reach it any more
       frame::free(pte_addr(leaf.entry), 1);
-      release_locked(va, 1);  // merges with neighbouring free ranges
+      count_page(va, -1);  // and so free for reuse
       __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
       // The shadow page for this span goes with the page that starts it.
       if ((leaf.entry & pte::Revocable) != 0 && va % SHADOW_SPAN == 0) {
@@ -1011,7 +918,7 @@ void reclaim_quarantined() {
         *shadow = 0;
       }
     }
-    va = next_after(va, leaf);
+    va = next_used(next_after(va, leaf));
   }
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
@@ -1022,9 +929,6 @@ Capability shadow_view() {
 
 size_t table_pages() {
   return __atomic_load_n(&s_table_pages, __ATOMIC_RELAXED);
-}
-size_t max_table_pages() {
-  return __atomic_load_n(&s_max_table_pages, __ATOMIC_RELAXED);
 }
 size_t allocated_pages() {
   return __atomic_load_n(&s_alloc_pages, __ATOMIC_RELAXED);

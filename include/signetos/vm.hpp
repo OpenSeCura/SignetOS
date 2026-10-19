@@ -33,9 +33,11 @@
 //   0x80000000 .. 0x81000000    kernel image (identity)     megapages, boot
 //   DIRECT_BASE .. + RAM size   the direct map              megapages, boot
 //
-// Everything from DYNAMIC_BASE (the gigabyte after the kernel image) to the top
-// of the lower half is one pool of virtual addresses handed out by `reserve` as they
-// are asked for. There are no per-purpose regions: kernel objects and
+// Everything from DYNAMIC_BASE (the gigabyte after the kernel image) up to the
+// revocation bitmap is one pool of virtual addresses handed out by
+// `alloc_pages` as they are asked for. An address is in use exactly while it
+// is mapped; the page tables are the only record. There are no per-purpose
+// regions: kernel objects and
 // compartment memory come from the same pool and are distinguished by who
 // holds a capability to them, not by where they sit.
 //
@@ -149,18 +151,6 @@ static_assert(shadow_of(SHADOW_BASE) <= DYNAMIC_TOP);
 // The direct map: all of RAM, kernel-only, at the bottom of the upper half.
 constexpr uint64_t DIRECT_BASE = 0xFFFFFFC000000000ULL;
 
-// Ceiling on how many frames may be held as page tables at once.
-//
-// This is a cap, not a reservation: page table frames come from the same pool
-// as everything else and are taken on demand, so capacity left under the cap
-// stays available to compartments. It exists only to stop a pathologically
-// fragmented address space from turning the pool into page tables.
-//
-// One L0 table covers 2MB of addresses and one L1 covers 1GB, so mapping every
-// frame in the pool at once takes 1019 tables. 2048 is a backstop with room to
-// spare, and costs nothing while unused.
-constexpr size_t DEFAULT_MAX_TABLE_PAGES = 2048;
-
 // Sv39 Page Table Entry (PTE) Hardware Flags
 namespace pte {
     constexpr uint64_t Valid    = (1ULL << 0);
@@ -232,43 +222,9 @@ Capability phys_view(uint64_t pa, size_t len);
 // per-device windows it hands to the drivers from it using the DTB.
 Capability device_window(uint64_t pa, size_t len);
 
-// Changes the ceiling on live page table frames. Defaults to
-// DEFAULT_MAX_TABLE_PAGES, so nothing needs to call this; lowering it is how
-// the tests reach the refusal path. Does not free tables already built.
-void set_max_table_pages(size_t pages);
-
 //
-// Virtual address allocation
+// Translation
 //
-
-// Reserves `pages` of contiguous virtual address space. Returns the base, or 0
-// if the address space is exhausted.
-//
-// Freed ranges stay quarantined until `revoke::sweep()` clears every capability
-// reaching them and returns their addresses via `release`, after which
-// `reserve` reuses them before bumping the watermark.
-uint64_t reserve(size_t pages);
-
-// Returns an unmapped reservation `[va, va + pages * PAGE_SIZE)` to the
-// reusable address pool, coalescing adjacent ranges. Ignored if any page in the
-// range is still mapped (including quarantined pages awaiting a sweep).
-void release(uint64_t va, size_t pages);
-
-// How much of the address space is still unreserved, in pages.
-size_t reservable_pages();
-
-// Maps `pages` 4KB pages at `va` onto physical `pa` with `flags`.
-//
-// `va` must be in the dynamic address space; the boot mappings are not
-// reachable through this. `pa` must be real RAM. Intermediate page tables are
-// taken on demand from the frame allocator, so this fails if the pool is empty
-// or the page table cap is reached. Fails without changing anything if any page
-// in the range is already mapped.
-bool map(uint64_t va, uint64_t pa, size_t pages, uint64_t flags);
-
-// Removes `pages` 4KB pages at `va`. Page tables emptied by the removal are not
-// reclaimed. Returns false if any page in the range was not mapped.
-bool unmap(uint64_t va, size_t pages);
 
 // Physical address backing `va`, or 0 if it is not mapped. A quarantined page
 // is still mapped, so it translates.
@@ -285,7 +241,7 @@ uint64_t leaf_flags(uint64_t va);
 //
 // Page allocation
 //
-// Reserves virtual addresses, backs them with frames and maps them. This is how
+// Finds free virtual addresses, backs them with frames and maps them. This is how
 // anything gets usable memory, now that no physical memory is mapped by
 // default. It is page granular: there is no heap and no sub-page allocator.
 //
@@ -295,7 +251,9 @@ constexpr size_t shadow_pages(size_t pages) {
   return (pages * PAGE_SIZE + SHADOW_SPAN - 1) / SHADOW_SPAN;
 }
 
-// Allocates `pages` contiguous pages. Returns a capability bounded to exactly
+// Allocates `pages` contiguous pages at the lowest free addresses that fit
+// (up to 2MB within one 2MB region, larger as whole empty 2MB regions).
+// Page tables are taken from the frame allocator as needed. Returns a capability bounded to exactly
 // that range with DataRw, or null. Contents are zeroed. If `revocable`, the
 // range starts on a SHADOW_SPAN boundary and comes with `shadow_pages(pages)`
 // more frames of revocation bitmap (REVOCATION BITMAP), which the caller pays
@@ -319,8 +277,8 @@ uint64_t free_pages(Capability object);
 // `revoke::should_revoke` returns true. Called by `revoke::sweep()`.
 void sweep_live_pages();
 
-// Unmaps every quarantined page in the dynamic address space, and its shadow,
-// frees their frames, and returns the addresses to the reusable VA pool.
+// Unmaps every quarantined page in the dynamic address space, and its bitmap
+// page, and frees their frames; the addresses are then free for reuse.
 // Called by `revoke::sweep()` after all capability tags pointing into
 // quarantined ranges have been cleared.
 void reclaim_quarantined();
@@ -332,8 +290,7 @@ void reclaim_quarantined();
 Capability shadow_view();
 
 // Diagnostics.
-size_t table_pages();
-size_t max_table_pages();
+size_t table_pages();         // frames held as page tables (never freed)
 size_t allocated_pages();    // pages handed out by alloc_pages and not freed
 size_t quarantined_pages();  // pages freed, still mapped, awaiting the sweep
 

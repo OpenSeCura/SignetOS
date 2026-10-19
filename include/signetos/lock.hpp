@@ -34,8 +34,9 @@
  *                           sweeps.
  *   4. `Tree::owed_lock`    leaf lock protecting a quota tree's owed list
  *                           (quota.hpp, OWED).
- *   5. `vm::s_lock`         protects the virtual address free list and Sv39
- *                           page tables (never held while zeroing pages).
+ *   5. `vm::s_lock`         protects the Sv39 page tables and the per-region
+ *                           mapped-page counts (never held while zeroing an
+ *                           allocation).
  *   6. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
  *   7. `irq::s_lock`        leaf lock serializing the two handler installs
  *                           (`irq::install`).
