@@ -44,6 +44,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <signetos/lock.hpp>
+#include <signetos/sentry.hpp>
 #include <signetos/types.hpp>
 #include <signetos/vm.hpp>
 
@@ -207,17 +208,23 @@ struct alignas(16) Range {
     Capability cap;  // capability to the allocation. Null means the record is free.
 };
 
-// `next` plus `funder`.
-constexpr size_t RANGE_PAGE_HEADER = 2 * CAP_BYTES;
+// The header both kinds of bookkeeping page start with: range pages and entry
+// pages (sentry.hpp, EntryRecord).
+struct PageHeader {
+    Capability next;    // head-inserted chain, null at the end
+    Capability funder;  // the quota that paid for this page
+};
 
 // TODO: the chain only grows. A page emptied by deallocate stays attached and
 // is reused by the next allocation from the same quota, and the whole chain is
 // released when the compartment is destroyed.
 constexpr size_t RANGES_PER_PAGE =
-    (vm::PAGE_SIZE - RANGE_PAGE_HEADER) / sizeof(Range);
+    (vm::PAGE_SIZE - sizeof(PageHeader)) / sizeof(Range);
+constexpr size_t ENTRIES_PER_PAGE =
+    (vm::PAGE_SIZE - sizeof(PageHeader)) / sizeof(sentry::EntryRecord);
 
 static_assert(sizeof(Range) == 16, "a range record must be exactly 16 bytes");
-static_assert(RANGE_PAGE_HEADER + RANGES_PER_PAGE * sizeof(Range) ==
+static_assert(sizeof(PageHeader) + RANGES_PER_PAGE * sizeof(Range) ==
                   vm::PAGE_SIZE,
               "the header plus the records must exactly fill a page");
 

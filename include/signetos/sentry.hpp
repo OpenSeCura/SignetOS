@@ -83,8 +83,8 @@ constexpr uint64_t DEFAULT_MIN_STACK = 2048;
 // An entry on one of a compartment's entry pages. A sentry is a sealed pointer
 // to one of these.
 //
-// Entry pages share the range-page header (`next`, `funder`) and are billed to
-// the compartment's funding quota when no free record remains.
+// Entry pages start with a compartment::PageHeader (`next`, `funder`) and are
+// billed to the compartment's funding quota when no free record remains.
 struct alignas(16) EntryRecord {
   Capability pcc;      // CodeRx entry point, unsealed; null means the record is free
   Capability cgp;      // the owning compartment's writable capability table slice
@@ -99,15 +99,8 @@ struct alignas(16) EntryRecord {
                        // entry runs on exactly this much. 16-byte multiple.
 };
 
-constexpr size_t ENTRY_PAGE_HEADER = 2 * sizeof(Capability);
-constexpr size_t ENTRIES_PER_PAGE =
-    (vm::PAGE_SIZE - ENTRY_PAGE_HEADER) / sizeof(EntryRecord);
-
 static_assert(sizeof(EntryRecord) == 4 * sizeof(Capability),
               "an entry record is exactly four capability slots");
-static_assert(ENTRY_PAGE_HEADER + ENTRIES_PER_PAGE * sizeof(EntryRecord) <=
-                  vm::PAGE_SIZE,
-              "the header plus the entry records must fit in a page");
 
 using Status = signetos::Status;
 using signetos::status_name;

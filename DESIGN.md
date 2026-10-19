@@ -143,7 +143,7 @@ What the kernel genuinely owns is small and fixed:
 * the root vm quotas;
 * per-hart CPU state;
 * the trap table;
-* the shadow region holding the revocation marks, whose pages each
+* the revocation bitmap holding the marks, whose pages each
   revocable allocation pays for (§4.2).
 
 The rest of the design follows the same rule:
@@ -1150,7 +1150,7 @@ usual leak is physical memory held in quarantine until a sweep.
   else can revoke; whoever needs memory revoked asks its owner.
 * **Marks.** `sys_revoke` sets one bit per 16 bytes of its range, so both ends
   must be multiples of 16 bytes; the sweep tests the bit under each
-  capability's base, and clears them all when it ends. The bits are a shadow
+  capability's base, and clears them all when it ends. The bits are a
   bitmap of the virtual address space, at a fixed place in its top 2GB
   (`vm.hpp`, REVOCATION BITMAP), because capabilities name virtual addresses.
   Only revocable allocations have bitmap pages: one page per 512KB of

@@ -30,8 +30,6 @@
 namespace signetos::compartment {
 namespace {
 
-using sentry::ENTRIES_PER_PAGE;
-using sentry::ENTRY_PAGE_HEADER;
 using sentry::EntryRecord;
 
 size_t s_live_count = 0;
@@ -40,23 +38,16 @@ size_t s_live_count = 0;
 // and only ever increases, so a UID is never reused.
 uint64_t s_next_uid = 1;
 
-// A range page starts with its `next` pointer, so the page capability itself
-// addresses that pointer.
-Capability* next_of(Capability range_page) {
-  return reinterpret_cast<Capability*>(range_page);
+// The header of a range or entry page, which starts the page, so the page
+// capability itself addresses it.
+PageHeader* header_of(Capability page) {
+  return reinterpret_cast<PageHeader*>(page);
 }
 
-// The quota that paid for this page, stored 16 bytes in, behind `next`.
-Capability* funder_of(Capability range_page) {
-  Capability f = capability_set_address(
-      range_page, capability_get_base(range_page) + CAP_BYTES);
-  return reinterpret_cast<Capability*>(f);
-}
-
-// The record array, bounded so it cannot reach back over the `next` pointer.
+// The record array, bounded so it cannot reach back over the header.
 Range* records_of(Capability range_page) {
   Capability r = capability_set_address(
-      range_page, capability_get_base(range_page) + RANGE_PAGE_HEADER);
+      range_page, capability_get_base(range_page) + sizeof(PageHeader));
   r = capability_set_bounds(r, RANGES_PER_PAGE * sizeof(Range));
   return reinterpret_cast<Range*>(r);
 }
@@ -86,13 +77,13 @@ Range* find_range(Capability comp_page, uint64_t va, Capability* out_funder) {
     return nullptr;  // 0 is the free marker, never a real allocation
   }
   const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
-  for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->ranges; capability_is_valid(p); p = header_of(p)->next) {
     Range* records = records_of(p);
     for (size_t i = 0; i < RANGES_PER_PAGE; ++i) {
       if (capability_is_valid(records[i].cap) &&
           capability_get_base(records[i].cap) == va) {
         if (out_funder != nullptr) {
-          *out_funder = *funder_of(p);
+          *out_funder = header_of(p)->funder;
         }
         return &records[i];
       }
@@ -111,8 +102,8 @@ Range* find_range(Capability comp_page, uint64_t va, Capability* out_funder) {
 // allocation. A per-quota free list would make it O(1).
 Range* find_free_record(Capability comp_page, Capability mem_quota) {
   const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
-  for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
-    if (!same_quota(*funder_of(p), mem_quota)) {
+  for (Capability p = c->ranges; capability_is_valid(p); p = header_of(p)->next) {
+    if (!same_quota(header_of(p)->funder, mem_quota)) {
       continue;  // somebody else's page
     }
     Range* records = records_of(p);
@@ -131,7 +122,7 @@ Range* find_free_record(Capability comp_page, Capability mem_quota) {
 bool owns(Capability comp_page, uint64_t base, uint64_t len,
           bool interior = false) {
   const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
-  for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->ranges; capability_is_valid(p); p = header_of(p)->next) {
     const Range* records = records_of(p);
     for (size_t i = 0; i < RANGES_PER_PAGE; ++i) {
       if (!capability_is_valid(records[i].cap)) {
@@ -148,11 +139,10 @@ bool owns(Capability comp_page, uint64_t base, uint64_t len,
   return false;
 }
 
-// The entry record array of an entry page. Entry pages share the range page
-// header layout (`next`, `funder`), so next_of and funder_of apply to them.
+// The entry record array of an entry page, bounded like records_of.
 EntryRecord* entries_of(Capability entry_page) {
   Capability r = capability_set_address(
-      entry_page, capability_get_base(entry_page) + ENTRY_PAGE_HEADER);
+      entry_page, capability_get_base(entry_page) + sizeof(PageHeader));
   r = capability_set_bounds(r, ENTRIES_PER_PAGE * sizeof(EntryRecord));
   return reinterpret_cast<EntryRecord*>(r);
 }
@@ -161,7 +151,7 @@ EntryRecord* entries_of(Capability entry_page) {
 // null if every page is full.
 EntryRecord* find_free_entry(Capability comp_page) {
   const Compartment* c = reinterpret_cast<const Compartment*>(comp_page);
-  for (Capability p = c->entries; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->entries; capability_is_valid(p); p = header_of(p)->next) {
     EntryRecord* records = entries_of(p);
     for (size_t i = 0; i < ENTRIES_PER_PAGE; ++i) {
       if (!capability_is_valid(records[i].pcc)) {
@@ -396,8 +386,8 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
       return fail_with(out_status, Status::NoMemory);
     }
 
-    *next_of(fresh) = c->entries;
-    *funder_of(fresh) = funder;
+    header_of(fresh)->next = c->entries;
+    header_of(fresh)->funder = funder;
     c->entries = fresh;
     record = &entries_of(fresh)[0];
   }
@@ -487,7 +477,7 @@ size_t entry_pages(Capability comp) {
     return 0;
   }
   size_t count = 0;
-  for (Capability p = c->entries; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->entries; capability_is_valid(p); p = header_of(p)->next) {
     count += 1;
   }
   return count;
@@ -540,8 +530,8 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
     // Head insertion, O(1). The page arrives zeroed, so every record in it
     // is already free and its own `next` is already null before it is
     // overwritten with the old head.
-    *next_of(fresh) = c->ranges;
-    *funder_of(fresh) = mem_quota;  // so destroy refunds whoever paid
+    header_of(fresh)->next = c->ranges;
+    header_of(fresh)->funder = mem_quota;  // so destroy refunds whoever paid
     c->ranges = fresh;
     record = &records_of(fresh)[0];
   }
@@ -551,7 +541,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   // unseals the handle and requires Permit_Load.
   const bool revocable = (flags & FLAG_REVOCABLE) != 0;
   const uint64_t billed =
-      bytes + (revocable ? vm::shadow_pages(pages) * vm::PAGE_SIZE : 0);
+      bytes + (revocable ? vm::bitmap_pages(pages) * vm::PAGE_SIZE : 0);
   const Status charged = quota::charge(mem_quota, billed);
   if (charged != Status::Ok) {
     return fail_with(out_status, charged);
@@ -736,8 +726,8 @@ Status destroy(Capability handle) {
     for (Capability p = c->ranges; capability_is_valid(p);) {
       // Read before p is freed. The page stays mapped after free_pages, but
       // it is no longer this compartment's and must not be relied on.
-      const Capability next = *next_of(p);
-      const Capability funder = *funder_of(p);
+      const Capability next = header_of(p)->next;
+      const Capability funder = header_of(p)->funder;
 
       // Release every allocation this page still records. They were all
       // funded by `funder` -- that is what sharing a page means.
@@ -759,8 +749,8 @@ Status destroy(Capability handle) {
     // Release the entry chain. Every record is cleared first so a sentry that
     // still names one resolves to nothing, then the page is refunded.
     for (Capability p = c->entries; capability_is_valid(p);) {
-      const Capability next = *next_of(p);
-      const Capability funder = *funder_of(p);
+      const Capability next = header_of(p)->next;
+      const Capability funder = header_of(p)->funder;
       EntryRecord* records = entries_of(p);
       for (size_t i = 0; i < ENTRIES_PER_PAGE; ++i) {
         records[i] = EntryRecord{};
@@ -870,7 +860,7 @@ size_t range_count(Capability comp) {
     return 0;
   }
   size_t used = 0;
-  for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->ranges; capability_is_valid(p); p = header_of(p)->next) {
     const Range* records = records_of(p);
     for (size_t i = 0; i < RANGES_PER_PAGE; ++i) {
       if (capability_is_valid(records[i].cap)) {
@@ -892,7 +882,7 @@ size_t range_pages(Capability comp) {
     return 0;
   }
   size_t count = 0;
-  for (Capability p = c->ranges; capability_is_valid(p); p = *next_of(p)) {
+  for (Capability p = c->ranges; capability_is_valid(p); p = header_of(p)->next) {
     count += 1;
   }
   return count;

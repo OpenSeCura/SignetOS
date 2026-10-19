@@ -77,7 +77,7 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   // the quotas together may ask for more than there is, and an allocation
   // can then fail for want of frames while its quota still has room.
   const Capability system_quota =
-      quota::create_root(vm::SHADOW_BASE - vm::DYNAMIC_BASE);
+      quota::create_root(vm::BITMAP_BASE - vm::DYNAMIC_BASE);
 
   revoke::init();
   sentry::init(root_data_cap);

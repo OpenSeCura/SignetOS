@@ -40,16 +40,16 @@ uint64_t g_completed_epoch = EPOCH_NONE;
 // (vm.hpp, REVOCATION BITMAP), reached through this view of it.
 // `[s_marked_lo, s_marked_hi)` covers the bitmap addresses marked since the
 // last sweep; it is empty if nothing is. Under `s_lock`.
-Capability s_shadow = nullptr;
+Capability s_bitmap = nullptr;
 uint64_t s_marked_lo = ~0ULL;
 uint64_t s_marked_hi = 0;
 
-// The shadow word holding the mark for `va`, which lies in a revocable
+// The bitmap word holding the mark for `va`, which lies in a revocable
 // allocation, and the mark's bit in it: byte (va - DYNAMIC_BASE) / 128 of
-// the shadow, bit ((va - DYNAMIC_BASE) / 16) % 8 of that byte.
+// the bitmap, bit ((va - DYNAMIC_BASE) / 16) % 8 of that byte.
 volatile uint64_t* mark_word(uint64_t va) {
   return reinterpret_cast<volatile uint64_t*>(
-      capability_set_address(s_shadow, vm::shadow_of(va) & ~7ULL));
+      capability_set_address(s_bitmap, vm::bitmap_of(va) & ~7ULL));
 }
 uint64_t mark_bit(uint64_t va) {
   return 1ULL << (((va - vm::DYNAMIC_BASE) / 16) % 64);
@@ -60,8 +60,8 @@ void mark(uint64_t base, uint64_t top) {
   for (uint64_t va = base; va < top; va += 16) {
     *mark_word(va) |= mark_bit(va);
   }
-  const uint64_t lo = vm::shadow_of(base);
-  const uint64_t hi = vm::shadow_of(top - 1) + 1;
+  const uint64_t lo = vm::bitmap_of(base);
+  const uint64_t hi = vm::bitmap_of(top - 1) + 1;
   s_marked_lo = lo < s_marked_lo ? lo : s_marked_lo;
   s_marked_hi = hi > s_marked_hi ? hi : s_marked_hi;
 }
@@ -70,7 +70,7 @@ bool is_marked(uint64_t va) { return (*mark_word(va) & mark_bit(va)) != 0; }
 
 bool any_marked() { return s_marked_lo < s_marked_hi; }
 
-// Clears every mark: zeroes the shadow pages in the marked span that are still
+// Clears every mark: zeroes the bitmap pages in the marked span that are still
 // mapped (those of allocations the sweep has just reclaimed are gone).
 void clear_marks() {
   for (uint64_t page = s_marked_lo & ~(vm::PAGE_SIZE - 1); page < s_marked_hi;
@@ -79,7 +79,7 @@ void clear_marks() {
       continue;
     }
     volatile uint64_t* w = reinterpret_cast<volatile uint64_t*>(
-        capability_set_address(s_shadow, page));
+        capability_set_address(s_bitmap, page));
     for (size_t i = 0; i < vm::PAGE_SIZE / sizeof(uint64_t); ++i) {
       w[i] = 0;
     }
@@ -94,7 +94,7 @@ void init() {
   s_lock = SpinLock{};
   g_pending_epoch = 1;
   g_completed_epoch = EPOCH_NONE;
-  s_shadow = vm::shadow_view();
+  s_bitmap = vm::bitmap_view();
   s_marked_lo = ~0ULL;
   s_marked_hi = 0;
 }
@@ -123,7 +123,7 @@ Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   }
 
   // WHO MAY REVOKE: the owner, for memory strictly inside one of its
-  // allocations, which must be revocable so that it has shadow.
+  // allocations, which must be revocable so that it has bitmap pages.
   Status owned = Status::Ok;
   if (!compartment::owns_inside(comp, mem_base, mem_len, &owned)) {
     return owned;
@@ -140,6 +140,11 @@ Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   return Status::Ok;
 }
 
+namespace {
+
+// THE BASE RULE: true if `cap` is a valid capability whose base lies in a
+// marked range or a quarantined page. Standing kernel authorities (sealing
+// and ASR capabilities, the roots of whole address ranges) are never revoked.
 bool should_revoke(Capability cap) {
   if (!capability_is_valid(cap)) {
     return false;
@@ -169,7 +174,19 @@ bool should_revoke(Capability cap) {
   return (flags & vm::pte::Revocable) != 0 && is_marked(base);
 }
 
-namespace {
+// Clears the tag on every capability in `view` that should_revoke picks.
+void scan(Capability view) {
+  if (!capability_is_valid(view)) {
+    return;
+  }
+  Capability* slots = reinterpret_cast<Capability*>(view);
+  const size_t count = capability_get_length(view) / sizeof(Capability);
+  for (size_t c = 0; c < count; ++c) {
+    if (capability_is_valid(slots[c]) && should_revoke(slots[c])) {
+      slots[c] = capability_clear_tag(slots[c]);
+    }
+  }
+}
 
 #define KERNEL_SYM_ADDR(sym)                     \
   ([]() -> uint64_t {                            \
@@ -198,21 +215,17 @@ void sweep_locked() {
     if (vm::is_initialized()) {
       const uint64_t data_start = KERNEL_SYM_ADDR(_data_start);
       const uint64_t kernel_end = KERNEL_SYM_ADDR(_kernel_end);
-      const Capability view = vm::phys_view(data_start, kernel_end - data_start);
-      Capability* slots = reinterpret_cast<Capability*>(view);
-      const size_t count =
-          capability_is_valid(view) ? (kernel_end - data_start) / sizeof(Capability) : 0;
-      for (size_t c = 0; c < count; ++c) {
-        if (capability_is_valid(slots[c]) && should_revoke(slots[c])) {
-          slots[c] = capability_clear_tag(slots[c]);
-        }
-      }
+      scan(vm::phys_view(data_start, kernel_end - data_start));
     }
 
     // 2. Scan all live mapped pages in the dynamic address space
     //    (compartment capability tables, heap/data/code allocations, thread
     //    stacks, and thread kernel stacks).
-    vm::sweep_live_pages();
+    uint64_t cursor = 0;
+    for (Capability page = vm::next_live_page(&cursor);
+         capability_is_valid(page); page = vm::next_live_page(&cursor)) {
+      scan(page);
+    }
 
     // 3. All capabilities pointing into quarantined pages now have their
     //    hardware tags cleared. Unmap every quarantined page, free its

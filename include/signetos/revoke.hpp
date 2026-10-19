@@ -56,12 +56,12 @@
 //
 // MARKING RANGES
 // --------------
-// `revoke` sets one bit per 16 bytes of the range in the shadow of its
-// allocation (vm.hpp, REVOCATION BITMAP); the sweep tests the bit under each
+// `revoke` sets one bit per 16 bytes of the range in the revocation
+// bitmap (vm.hpp, REVOCATION BITMAP); the sweep tests the bit under each
 // capability's base and clears every bit when it ends. The marks belong to
 // virtual addresses, as capabilities do, so they stay right however pages
 // are backed. Revoking needs no memory: a revocable allocation brings its
-// shadow with it, and only those can be revoked from. Both ends of a range
+// bitmap pages with it, and only those can be revoked from. Both ends of a range
 // must be multiples of 16 bytes, so that the bits set cover exactly the
 // range.
 //
@@ -121,14 +121,8 @@ uint64_t request();
 // way in; nothing reachable from user space calls it.
 //
 // Scans capability-bearing memory and saved register frames, clears the tag on
-// every capability `should_revoke` picks, reclaims quarantined VM pages and
+// every capability THE BASE RULE picks, reclaims quarantined VM pages and
 // frames, clears the marks, and advances the completed epoch.
 void sweep();
-
-// THE BASE RULE: true if `cap` is a valid capability whose base lies in a
-// marked range or a quarantined page. Standing kernel authorities (sealing
-// and ASR capabilities, the roots of whole address ranges) are never revoked.
-// Used by `sweep()`, which holds the revocation lock.
-bool should_revoke(Capability cap);
 
 } // namespace signetos::revoke

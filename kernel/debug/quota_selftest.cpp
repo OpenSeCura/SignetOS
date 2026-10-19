@@ -261,9 +261,9 @@ void run(Capability root) {
     check(capability_is_valid(arena) && capability_is_valid(other),
           "allocate an arena and another page");
     const uint64_t a = capability_get_base(arena);
-    check(a % vm::SHADOW_SPAN == 0, "a revocable allocation starts on a span");
+    check(a % vm::BITMAP_SPAN == 0, "a revocable allocation starts on a span");
     check(available_of(q) == before_arena - 5 * PAGE,
-          "and is charged one page of shadow");
+          "and is charged one bitmap page");
     auto carve = [](Capability from, uint64_t at, uint64_t len) {
       return capability_set_bounds(capability_set_address(from, at), len);
     };

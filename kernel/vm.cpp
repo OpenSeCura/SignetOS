@@ -24,7 +24,6 @@
 #include <signetos/frame.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/hw/platform.hpp>
-#include <signetos/revoke.hpp>
 #include <signetos/vm.hpp>
 
 namespace signetos::vm {
@@ -82,11 +81,11 @@ Capability s_devices = nullptr;
 // by RAM or by how fragmented the pool gets.
 constexpr size_t PAGES_PER_2M = MEGAPAGE_SIZE / PAGE_SIZE;        // 512
 constexpr size_t REGIONS_PER_1G = GIGAPAGE_SIZE / MEGAPAGE_SIZE;  // 512
-constexpr size_t POOL_2M = (SHADOW_BASE - DYNAMIC_BASE) / MEGAPAGE_SIZE;
-constexpr size_t POOL_1G = (SHADOW_BASE - DYNAMIC_BASE) / GIGAPAGE_SIZE;
+constexpr size_t POOL_2M = (BITMAP_BASE - DYNAMIC_BASE) / MEGAPAGE_SIZE;
+constexpr size_t POOL_1G = (BITMAP_BASE - DYNAMIC_BASE) / GIGAPAGE_SIZE;
 constexpr size_t POOL_PAGES = POOL_2M * PAGES_PER_2M;
 static_assert(DYNAMIC_BASE % GIGAPAGE_SIZE == 0 &&
-              SHADOW_BASE % GIGAPAGE_SIZE == 0);
+              BITMAP_BASE % GIGAPAGE_SIZE == 0);
 uint16_t s_used_2m[POOL_2M];
 uint32_t s_used_1g[POOL_1G];
 
@@ -493,9 +492,9 @@ namespace {
 
 // Keeps the region counts in step with the page tables: called with +1 for
 // every leaf entry set in the pool and -1 for every one cleared. Bitmap pages
-// (at or above SHADOW_BASE) are not in the pool and are not counted.
+// (at or above BITMAP_BASE) are not in the pool and are not counted.
 void count_page(uint64_t va, int delta) {
-  if (va < DYNAMIC_BASE || va >= SHADOW_BASE) {
+  if (va < DYNAMIC_BASE || va >= BITMAP_BASE) {
     return;
   }
   const size_t m = (va - DYNAMIC_BASE) / MEGAPAGE_SIZE;
@@ -505,9 +504,9 @@ void count_page(uint64_t va, int delta) {
 }
 
 // `va` if its 2MB region of the pool has anything mapped in it, else the start
-// of the next region that does, else SHADOW_BASE.
+// of the next region that does, else BITMAP_BASE.
 uint64_t next_used(uint64_t va) {
-  while (va < SHADOW_BASE) {
+  while (va < BITMAP_BASE) {
     const size_t m = (va - DYNAMIC_BASE) / MEGAPAGE_SIZE;
     const size_t g = m / REGIONS_PER_1G;
     if (s_used_1g[g] == 0) {
@@ -518,7 +517,7 @@ uint64_t next_used(uint64_t va) {
       return va;
     }
   }
-  return SHADOW_BASE;
+  return BITMAP_BASE;
 }
 
 // The L0 table of the 2MB region of the pool at `base`, or null if it has none
@@ -688,30 +687,30 @@ void zero_page(uint64_t va) {
   }
 }
 
-// Frees the first `count` shadow pages of the revocable range at `va`, which
+// Frees the first `count` bitmap pages of the revocable range at `va`, which
 // nothing has seen. Caller holds `s_lock`.
-void unmap_shadow_locked(uint64_t va, size_t count) {
+void unmap_bitmap_locked(uint64_t va, size_t count) {
   for (size_t i = 0; i < count; ++i) {
-    uint64_t* slot = leaf_slot(shadow_of(va) + (i * PAGE_SIZE), false);
+    uint64_t* slot = leaf_slot(bitmap_of(va) + (i * PAGE_SIZE), false);
     frame::free(pte_addr(*slot), 1);
     *slot = 0;
   }
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
 
-// Maps zeroed shadow for the revocable range of `pages` at `va`, which starts
-// on a SHADOW_SPAN boundary, so its shadow starts on a page. All or nothing.
+// Maps zeroed bitmap pages for the revocable range of `pages` at `va`, which starts
+// on a BITMAP_SPAN boundary, so its bitmap starts on a page. All or nothing.
 // Caller holds `s_lock`.
-bool map_shadow_locked(uint64_t va, size_t pages) {
-  const size_t count = shadow_pages(pages);
+bool map_bitmap_locked(uint64_t va, size_t pages) {
+  const size_t count = bitmap_pages(pages);
   for (size_t i = 0; i < count; ++i) {
-    const uint64_t s = shadow_of(va) + (i * PAGE_SIZE);
+    const uint64_t s = bitmap_of(va) + (i * PAGE_SIZE);
     const uint64_t pa = frame::alloc(1);
     if (pa == 0 || !map_locked(s, pa, 1, pte::KernelData)) {
       if (pa != 0) {
         frame::free(pa, 1);
       }
-      unmap_shadow_locked(va, i);
+      unmap_bitmap_locked(va, i);
       return false;
     }
     zero_page(s);
@@ -775,7 +774,7 @@ Capability alloc_pages(size_t pages, bool revocable) {
   {
     Locked hold(s_lock);
     const uint64_t va =
-        find_room_locked(pages, revocable ? SHADOW_SPAN : PAGE_SIZE);
+        find_room_locked(pages, revocable ? BITMAP_SPAN : PAGE_SIZE);
     if (va == 0) {
       return nullptr;
     }
@@ -797,7 +796,7 @@ Capability alloc_pages(size_t pages, bool revocable) {
       frame::free(pa, pages);
       return nullptr;
     }
-    if (revocable && !map_shadow_locked(va, pages)) {
+    if (revocable && !map_bitmap_locked(va, pages)) {
       unmap_locked(va, pages);
       frame::free(pa, pages);
       return nullptr;
@@ -865,7 +864,7 @@ uint64_t free_pages(Capability object) {
 
   __atomic_fetch_sub(&s_alloc_pages, pages, __ATOMIC_RELAXED);
   __atomic_fetch_add(&s_quarantined_pages, pages, __ATOMIC_RELAXED);
-  return (pages + (revocable ? shadow_pages(pages) : 0)) * PAGE_SIZE;
+  return (pages + (revocable ? bitmap_pages(pages) : 0)) * PAGE_SIZE;
 }
 
 // Both passes below walk the pool one page at a time, skipping every 2MB
@@ -873,25 +872,22 @@ uint64_t free_pages(Capability object) {
 // question only: is this page mapped, and if not, how far to the next place
 // that might be. Pages are read at their own addresses through `s_dynamic`.
 
-void sweep_live_pages() {
+Capability next_live_page(uint64_t* cursor) {
   if (!is_initialized()) {
-    return;
+    return nullptr;
   }
   Locked hold(s_lock);
-  for (uint64_t va = next_used(DYNAMIC_BASE); va < SHADOW_BASE;) {
+  for (uint64_t va = next_used(*cursor < DYNAMIC_BASE ? DYNAMIC_BASE : *cursor);
+       va < BITMAP_BASE;) {
     const Leaf leaf = find_leaf(va);
     if ((leaf.entry & (pte::Valid | pte::Quarantined)) == pte::Valid) {
-      Capability page = capability_set_address(s_dynamic, va);
-      Capability* slots =
-          reinterpret_cast<Capability*>(capability_set_bounds(page, PAGE_SIZE));
-      for (size_t c = 0; c < PAGE_SIZE / sizeof(Capability); ++c) {
-        if (capability_is_valid(slots[c]) && revoke::should_revoke(slots[c])) {
-          slots[c] = capability_clear_tag(slots[c]);
-        }
-      }
+      *cursor = va + PAGE_SIZE;
+      return dynamic_view(va, PAGE_SIZE);
     }
     va = next_used(next_after(va, leaf));
   }
+  *cursor = BITMAP_BASE;
+  return nullptr;
 }
 
 void reclaim_quarantined() {
@@ -902,7 +898,7 @@ void reclaim_quarantined() {
   if (s_quarantined_pages == 0) {
     return;
   }
-  for (uint64_t va = next_used(DYNAMIC_BASE); va < SHADOW_BASE;) {
+  for (uint64_t va = next_used(DYNAMIC_BASE); va < BITMAP_BASE;) {
     const Leaf leaf = find_leaf(va);
     uint64_t* slot =
         (leaf.entry & pte::Quarantined) ? leaf_slot(va, false) : nullptr;
@@ -911,11 +907,11 @@ void reclaim_quarantined() {
       frame::free(pte_addr(leaf.entry), 1);
       count_page(va, -1);  // and so free for reuse
       __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
-      // The shadow page for this span goes with the page that starts it.
-      if ((leaf.entry & pte::Revocable) != 0 && va % SHADOW_SPAN == 0) {
-        uint64_t* shadow = leaf_slot(shadow_of(va), false);
-        frame::free(pte_addr(*shadow), 1);
-        *shadow = 0;
+      // The bitmap page for this span goes with the page that starts it.
+      if ((leaf.entry & pte::Revocable) != 0 && va % BITMAP_SPAN == 0) {
+        uint64_t* bit_page = leaf_slot(bitmap_of(va), false);
+        frame::free(pte_addr(*bit_page), 1);
+        *bit_page = 0;
       }
     }
     va = next_used(next_after(va, leaf));
@@ -923,8 +919,8 @@ void reclaim_quarantined() {
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
 
-Capability shadow_view() {
-  return dynamic_view(SHADOW_BASE, DYNAMIC_TOP - SHADOW_BASE);
+Capability bitmap_view() {
+  return dynamic_view(BITMAP_BASE, DYNAMIC_TOP - BITMAP_BASE);
 }
 
 size_t table_pages() {
