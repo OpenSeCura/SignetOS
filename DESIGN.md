@@ -307,13 +307,12 @@ killed thread:
 | The thread's own compartment, inside no call | The thread ends. |
 | Anything it has called (a compartment, a system call, a trap handler) | Runs on to its return. A kill never cuts a call short. |
 
-**What killing a thread is for.** Of the three things one might want from
+**What killing a thread is for.** Of the two things one might want from
 it, kill provides only the last:
 
 | Want | Provided by | Needs kill? |
 | --- | --- | --- |
-| Stop it using CPU | The scheduler: take back its node, and it is not picked again from the next tick. A compartment's PCC has no `AccessSystemRegs`, so it cannot mask the tick. | No |
-| Stop it misbehaving | Containment is the capability model: a compromised compartment can do only what its capabilities allow. Stopping it is the scheduler (above) and destroying its compartment, which takes its code and memory away and unwinds any thread parked in it. | No |
+| Stop it using CPU/misbehaving | The scheduler: take back its node, and it is not picked again from the next tick. A compartment's PCC has no `AccessSystemRegs`, so it cannot mask the tick. | No |
 | Get its memory back | The thread's state page and stack are held until it ends. Kill is what makes it end. | Yes |
 
 So a kill is a request to reclaim one thread's memory, and it is bounded:
@@ -1182,11 +1181,9 @@ usual leak is physical memory held in quarantine until a sweep.
 | Capabilities are the sole source of authority; the MMU is never used for access control, only for backing, demand paging and CoW write detection | Page permissions are permissive everywhere. Demand paging and CoW write detection do not exist yet, so the MMU currently does *only* backing. |
 | Accessibility invariant: never unmap under a valid capability | Quarantine keeps freed pages mapped until the sweep has cleared every tag. |
 | Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities and service quotas (`QuotaSched`, `QuotaDisk`) use hardware types. Compartment-minted objects use software types (§2.7), whose identity is a hardware tag and cannot be made by writing memory. |
-| Compartment UID permanence | UIDs are never reused, so UID-tagged records can never be misattributed. |
-| Type identity (address of the type record) | Subject to the sweep caveat in §2.7. |
+| Immutable quota partitions | Quotas cannot be increased after derivation (§3.5). |
+| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, revocation backlog pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
 | Deterministic quotas and write guarantees | All memory is backed at allocation time; nothing is lazy, so nothing can fail later. |
-| Immutable quota partitions | Quotas cannot be resized after derivation (§3.5). |
-| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
 
 ### 4.4 Multi-hart status
 
@@ -1393,10 +1390,6 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
-
-These are ordinary seeds: the layout is the kernel's choice as `init`'s
-creator, not something `sys_compartment_create` imposes. `init`'s entry
-argument is the boot manifest.
 
 ---
 
