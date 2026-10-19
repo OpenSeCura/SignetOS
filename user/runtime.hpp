@@ -289,19 +289,17 @@ inline void unlock(Capability invoke_gate, Capability lock_wake,
   }
 }
 
-// Waits until `sys_revoke_query()` reaches `epoch`: asks the kernel to sweep
-// (`sweep_gate`, `sys_revoke_sweep`), and when it says it is too early,
-// sleeps that long in the scheduler (`sched_block`) and looks again.
+// How often `revoke_wait` looks.
+constexpr uint64_t REVOKE_POLL_US = 100'000;
+
+// Waits until the completed epoch reaches `epoch`, looking
+// (`sys_revoke_query`, which sweeps when it may) every REVOKE_POLL_US and
+// sleeping in the scheduler (`sched_block`) in between.
 inline void revoke_wait(Capability invoke_gate, Capability query_gate,
-                        Capability sweep_gate, Capability sched_block,
-                        uint64_t epoch) {
+                        Capability sched_block, uint64_t epoch) {
   while (syscall::call<decltype(&sys_revoke_query)>(invoke_gate, query_gate) <
          epoch) {
-    const uint64_t wait_us =
-        syscall::call<decltype(&sys_revoke_sweep)>(invoke_gate, sweep_gate);
-    if (wait_us != 0) {
-      invoke<int64_t>(invoke_gate, sched_block, wait_us);
-    }
+    invoke<int64_t>(invoke_gate, sched_block, REVOKE_POLL_US);
   }
 }
 

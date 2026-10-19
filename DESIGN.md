@@ -1161,22 +1161,19 @@ usual leak is physical memory held in quarantine until a sweep.
 * **Freed memory stays charged until it is reclaimed.** A quarantined range
   is still the freer's address space: nobody else can be given it until the
   sweep. So whoever frees memory owes it to the quota that paid for it: the
-  bytes stay charged, and the node goes on its tree's owed list. Each sweep
-  takes the owed lists before it reclaims and refunds them after
+  bytes stay charged, counted as owed on the node. After each sweep has
+  reclaimed, it walks the quota trees and refunds every node what it is owed
   (`quota.hpp`, OWED). Freeing in a loop therefore exhausts only the freer's
   own quota.
-* **Quotas are address space, not RAM.** The root VM quota is the whole
-  dynamic address space, so the quotas together can ask for more than the
-  machine has. An allocation can then fail for want of frames while its
-  quota still has room; until there is paging, that is simply `NoMemory`.
-* **When a sweep runs:** when someone asks (`sys_revoke_sweep()`), and at
-  most once per `revoke::SWEEP_INTERVAL_US` whoever asks. A request that
-  comes too early is told how long to wait. A sweep stops the machine while
-  it scans all live memory, so the interval is what bounds the time sweeps
-  take; who asks, and how often, cannot change it. Nothing else starts a
-  sweep: `vm::alloc_pages` just fails when memory runs out. A compartment
-  whose allocation fails because what it freed is still in quarantine waits
-  for the next sweep and tries again (`runtime.hpp`, `revoke_wait`).
+* **When a sweep runs:** nobody can ask for one. `sys_revoke_query()` sweeps
+  before it answers, at most once per `revoke::SWEEP_INTERVAL_US` however
+  many look. A sweep stops the machine while it scans all live memory, so the
+  interval is what bounds the time sweeps take; who looks, and how often,
+  cannot change it. Nothing
+  else starts a sweep: `vm::alloc_pages` just fails when memory runs out. A
+  compartment whose allocation fails because what it freed is still in
+  quarantine waits for the next epoch and tries again (`runtime.hpp`,
+  `revoke_wait`).
 
 ### 4.3 Architectural invariants
 
@@ -1204,6 +1201,21 @@ The kernel is written with SMP in mind:
 **Today, though, every thread runs on the boot hart; the secondary harts are
 brought up and park.**
 
+The revocation sweep (§4.2) relies on that. It runs with interrupts off and
+assumes nothing else runs meanwhile. Once threads run on several harts,
+another hart could, during a sweep:
+
+* hold a revoked capability in a register, where the sweep never looks;
+* copy a capability from a page the sweep has not reached yet into one it
+  has already scanned;
+* free memory after the sweep has scanned the pages that point into it, which
+  the sweep would then reclaim along with the rest.
+
+Sweeping with several harts running is still to be designed. One option is
+to pause every hart briefly at the end of the sweep, to check registers and
+the pages written during it. Another is hardware that checks capabilities as
+they are loaded (CHERIoT's load filter).
+
 ## 5. System Call and Service Interface Reference
 
 A system call is a cross-compartment invocation into the kernel through the
@@ -1221,8 +1233,7 @@ status.
 | `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. **Quarantines** the memory; `mem_quota` is refunded when the sweep reclaims it (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
 | `uint64_t sys_revoke(comp, mem_cap)` | Marks `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s revocable allocations, not including its first byte, and start and end on a multiple of 16 bytes. Returns the current epoch: the range may be reused once `sys_revoke_query` reaches it. 0 if refused. |
-| `uint64_t sys_revoke_query(void)` | How many sweeps have completed (§4.2). |
-| `uint64_t sys_revoke_sweep(void)` | Sweeps and returns 0 if the last sweep ended at least `revoke::SWEEP_INTERVAL_US` ago; otherwise the microseconds to wait before asking again (§4.2). |
+| `uint64_t sys_revoke_query(void)` | How many sweeps have completed, having swept first if `revoke::SWEEP_INTERVAL_US` allows (§4.2). |
 
 ### 5.2 Virtual memory quotas
 

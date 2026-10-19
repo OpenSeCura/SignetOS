@@ -72,10 +72,8 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
 
   // Initialize kernel subsystems
   quota::init();
-  // A VM quota is a budget of address space, so the root is all the address
-  // space there is to hand out (vm.hpp, LAYOUT). It says nothing about RAM:
-  // the quotas together may ask for more than there is, and an allocation
-  // can then fail for want of frames while its quota still has room.
+  // The root VM quota is all the address space alloc_pages hands out
+  // (vm.hpp, LAYOUT).
   const Capability system_quota =
       quota::create_root(vm::BITMAP_BASE - vm::DYNAMIC_BASE);
 

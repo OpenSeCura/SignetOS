@@ -67,13 +67,12 @@
 //
 // WHEN A SWEEP RUNS
 // -----------------
-// When somebody asks (`request`, which is `sys_revoke_sweep`), and at most
-// once per SWEEP_INTERVAL_US; the first one is not held back. A sweep stops
-// the machine for as long as it takes to scan all live memory, so the
-// interval is what bounds the time sweeps take, however many callers ask and
-// however often. A caller that needs its memory back sooner waits. Nothing
-// else starts one: an allocation that fails, for want of quota or of frames,
-// just fails.
+// Nobody can ask for one. A sweep runs when somebody looks at the completed
+// epoch (`query`, which is `sys_revoke_query`), and at most once per
+// SWEEP_INTERVAL_US; the first one is not held back. A sweep stops the
+// machine for as long as it takes to scan all live memory, so the interval is
+// what bounds the time sweeps take, however many look and however often. Nothing else starts one: an allocation that fails, for
+// want of quota or of frames, just fails.
 //
 
 #include <stdint.h>
@@ -101,21 +100,17 @@ void init();
 Status revoke(Capability comp, Capability mem_cap,
               uint64_t* out_epoch = nullptr);
 
-// Core of `sys_revoke_query`. Highest epoch for which the sweep has finished.
+// Highest epoch for which the sweep has finished.
 uint64_t completed_epoch();
-
-// The epoch that ranges marked right now would be assigned to.
-uint64_t pending_epoch();
 
 // The least time between the end of one sweep and the start of the next
 // (WHEN A SWEEP RUNS). Policy, and a guess: a heap must hold this long's
 // worth of freed memory, and the machine stalls once per this long at most.
 constexpr uint64_t SWEEP_INTERVAL_US = 10'000'000;
 
-// Core of `sys_revoke_sweep`. Sweeps and returns 0 if the last sweep ended at
-// least SWEEP_INTERVAL_US ago or there is nothing to scan; otherwise returns
-// the microseconds until a sweep may run.
-uint64_t request();
+// Core of `sys_revoke_query`. Sweeps if the interval allows (WHEN A SWEEP
+// RUNS), then returns the completed epoch.
+uint64_t query();
 
 // Kernel-internal: sweeps now, whatever the interval. The boot self-test's
 // way in; nothing reachable from user space calls it.

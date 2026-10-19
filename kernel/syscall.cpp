@@ -151,11 +151,7 @@ extern "C" uint64_t sys_revoke(capability_compartment_t comp,
 }
 
 extern "C" uint64_t sys_revoke_query(void) {
-  return ::signetos::revoke::completed_epoch();
-}
-
-extern "C" uint64_t sys_revoke_sweep(void) {
-  return ::signetos::revoke::request();
+  return ::signetos::revoke::query();
 }
 
 // --- Virtual memory quotas -------------------------------------------------

@@ -115,15 +115,9 @@ uint64_t sys_revoke(
     capability_t             mem_cap
 );
 
-// How many sweeps have completed (the completed epoch).
+// How many sweeps have completed (the completed epoch), having swept first if
+// the interval allows (revoke.hpp, WHEN A SWEEP RUNS).
 uint64_t sys_revoke_query(void);
-
-// Sweeps, and returns 0, if the last sweep ended at least
-// `revoke::SWEEP_INTERVAL_US` ago or there is nothing to scan; otherwise
-// returns the microseconds to wait before asking again. Anyone may ask, as
-// often as they like: sweeps never come closer together than the interval
-// (revoke.hpp, WHEN A SWEEP RUNS).
-uint64_t sys_revoke_sweep(void);
 
 // --- Virtual memory quotas -------------------------------------------------
 
@@ -309,7 +303,6 @@ namespace signetos::syscall {
   X(cow)                          \
   X(revoke)                       \
   X(revoke_query)                 \
-  X(revoke_sweep)                 \
   X(quota_vm_create_root)         \
   X(quota_vm_derive)              \
   X(quota_vm_destroy)             \

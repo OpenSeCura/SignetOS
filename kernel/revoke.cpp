@@ -102,9 +102,6 @@ void init() {
 uint64_t completed_epoch() {
   return __atomic_load_n(&g_completed_epoch, __ATOMIC_ACQUIRE);
 }
-uint64_t pending_epoch() {
-  return __atomic_load_n(&g_pending_epoch, __ATOMIC_ACQUIRE);
-}
 
 Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   // The range comes from the caller's capability to it.
@@ -247,31 +244,23 @@ void sweep_locked() {
 }
 
 // Sweeps, unless `limited` and a sweep has ended less than SWEEP_INTERVAL_US
-// ago with something to scan. Returns 0 if it swept, otherwise the
-// microseconds to wait.
+// ago with something to scan.
 //
-// What is owed for freed memory (quota.hpp, OWED) is taken before the sweep
-// reclaims, so all of it is reclaimed by this sweep, and refunded after it,
-// once `s_lock` is let go: a refund takes quota node locks, which come before
-// it (lock.hpp). A refund can free a quota node whose last bytes these were;
-// its page is owed in turn and waits for the next sweep.
-__attribute__((noinline)) uint64_t try_sweep(bool limited) {
-  quota::Owed owed;
+// What is owed for freed memory (quota.hpp, OWED) is refunded after the
+// sweep, once `s_lock` is let go: a refund takes quota node locks, which come
+// before it (lock.hpp). A refund can free a quota node whose last bytes these
+// were; its page is owed in turn and waits for the next sweep.
+__attribute__((noinline)) void try_sweep(bool limited) {
   {
     Locked hold(s_lock);
-    if (limited && s_swept && anything_pending()) {
-      const uint64_t ready =
-          s_last_sweep_end + clint::us_to_ticks(SWEEP_INTERVAL_US);
-      const uint64_t now = clint::now();
-      if (now < ready) {
-        return clint::ticks_to_us(ready - now) + 1;  // never 0, never short
-      }
+    if (limited && s_swept && anything_pending() &&
+        clint::now() <
+            s_last_sweep_end + clint::us_to_ticks(SWEEP_INTERVAL_US)) {
+      return;
     }
-    owed = quota::take_owed();
     sweep_locked();
   }
-  quota::settle_owed(owed);
-  return 0;
+  quota::settle_owed();
 }
 
 // Follows every call into a sweep. The clobbers make the caller's prologue
@@ -304,10 +293,10 @@ __attribute__((always_inline)) inline void scrub_registers() {
 
 }  // namespace
 
-uint64_t request() {
-  const uint64_t wait_us = try_sweep(true);
+uint64_t query() {
+  try_sweep(true);
   scrub_registers();
-  return wait_us;
+  return completed_epoch();
 }
 
 void sweep() {

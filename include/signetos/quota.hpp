@@ -71,14 +71,13 @@
 // Freed memory is quarantined until a sweep reclaims it, and until then it is
 // still the freer's address space: nobody else can be given it. So it stays
 // charged. Whoever frees memory tells its quota with `owe`, which counts the
-// bytes in the node's `owed_bytes` and puts the node on its tree's owed list;
-// the bytes stay in `allocated_bytes`. Each sweep takes the owed lists as
-// they stand when it reclaims, and then refunds every node on them what it is
-// owed (`settle_owed`). A node that is owed is not empty, so it cannot be
-// freed while it is on a list. Callers owe after they free, so memory freed
-// while a sweep runs is refunded by the next one. The exception, possible
-// only with several harts: bytes owed to a node that is already on the lists
-// a sweep took are refunded with them, which may be a sweep early.
+// bytes in the node's `owed_bytes`; they stay in `allocated_bytes` too. Once
+// a sweep has reclaimed, it walks every tree and refunds every node what it
+// is owed (`settle_owed`). No list of owed nodes is needed: a node that is
+// owed is not empty, so it is still linked into its tree, closed or not.
+// Nothing runs between the reclaim and the walk (the sweep runs with
+// interrupts masked on the one hart that runs threads; DESIGN.md, Multi-hart
+// status), so everything refunded has been reclaimed.
 //
 // AUTHENTICATION VS ACCESS
 //
@@ -103,11 +102,11 @@
 //     back under the parent's lock, and passes it on the same way if it is
 //     closed too. The parent cannot be freed in between: until it has taken
 //     the bytes back it still counts them as handed out, so it is not empty.
-//   - Destroy walks down the subtree holding the lock of every node on its
-//     path, from the destroyed node to wherever it has got to, so nothing on
-//     that path can be unlinked or freed under it. Outside the subtree it
-//     locks only the ancestors its unused allowance goes up through, one at a
-//     time, like a refund.
+//   - Destroy walks down the subtree, and the sweep down each whole tree,
+//     holding the lock of every node on the path, from the top to wherever
+//     the walk has got to, so nothing on that path can be unlinked or freed
+//     under it. Outside the subtree destroy locks only the ancestors its
+//     unused allowance goes up through, one at a time, like a refund.
 //
 // Two locks are only ever held together parent first, so they cannot
 // deadlock. A node is freed by whichever operation empties it: clearing
@@ -168,7 +167,6 @@ struct QuotaNode {
                               // child as its limit + QUOTA_NODE_COST
     uint64_t owed_bytes;      // part of allocated_bytes freed but not yet
                               // reclaimed by a sweep (OWED above)
-    QuotaNode* next_owed;     // the tree's owed list, under its owed_lock
     uint32_t flags;
     SpinLock lock;
 
@@ -194,8 +192,6 @@ struct Tree {
     QuotaNode root;
     bool root_taken;
     size_t live_nodes;        // updated atomically
-    QuotaNode* owed;          // nodes with owed_bytes > 0 (OWED above)
-    SpinLock owed_lock;       // taken under a node lock, never the reverse
 };
 
 // --- Generic operations on any tree -----------------------------------------
@@ -240,15 +236,10 @@ bool query(Tree& t, Capability handle, QuotaNode* out_copy);
 // of any tree, or null for memory nobody paid for.
 void owe(Capability handle, uint64_t bytes);
 
-// Called by the sweep, holding no lock. `take_owed` detaches every tree's
-// owed list, before the sweep reclaims; `settle_owed` refunds what the nodes
-// on the lists it took are owed, once the sweep has reclaimed it all.
+// Called by the sweep once it has reclaimed, holding no lock: walks every
+// tree and refunds every node what it is owed (OWED above).
 constexpr size_t MAX_TREES = 2;  // VM and thread memory
-struct Owed {
-    QuotaNode* lists[MAX_TREES];
-};
-Owed take_owed();
-void settle_owed(Owed owed);
+void settle_owed();
 
 // --- The VM quota tree (OType::QuotaVm) --------------------------------------
 

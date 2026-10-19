@@ -334,16 +334,18 @@ void run(Capability root) {
   }
 
   // 11. Sweeps come at most once per SWEEP_INTERVAL_US (revoke.hpp, WHEN A
-  //     SWEEP RUNS). One has just ended, so asking for the next epoch is told
-  //     to wait while there is something to scan, and completes at once
-  //     while there is nothing.
+  //     SWEEP RUNS). One has just ended, so looking completes the next
+  //     epoch at once while there is nothing to scan, and does not while
+  //     there is something.
   {
-    check(revoke::request() == 0,
+    uint64_t before = revoke::completed_epoch();
+    check(revoke::query() > before,
           "nothing to scan: the epoch completes at once");
     check(destroy(derive(root, PAGE, RW)) == Status::Ok,
           "free a node page, to have something to scan");
-    check(revoke::request() > 0,
-          "something to scan, too soon after the last sweep: wait");
+    before = revoke::completed_epoch();
+    check(revoke::query() == before,
+          "something to scan, too soon after the last sweep: not yet");
     settle();
   }
   uart::print("[quota]    self-test passed\n");

@@ -25,31 +25,29 @@
  *   1. `Compartment::lock`  per-compartment lock protecting `ranges` and
  *                           `entries` chains (at most one held at a time).
  *   2. `QuotaNode::lock`    per-quota-node lock protecting the node's ledger
- *                           counters, flags and child list. Only
- *                           `quota::destroy`'s walk down a subtree holds more
- *                           than one, each parent's taken before its
- *                           child's (quota.hpp, LOCKING).
+ *                           counters, flags and child list. Only the walks
+ *                           down a tree (`quota::destroy`, and the sweep's
+ *                           refunds) hold more than one, each parent's taken
+ *                           before its child's (quota.hpp, LOCKING).
  *   3. `revoke::s_lock`     protects the revocation marks (revoke.hpp,
  *                           MARKING RANGES) and the epochs, and serializes
  *                           sweeps.
- *   4. `Tree::owed_lock`    leaf lock protecting a quota tree's owed list
- *                           (quota.hpp, OWED).
- *   5. `vm::s_lock`         protects the Sv39 page tables and the per-region
+ *   4. `vm::s_lock`         protects the Sv39 page tables and the per-region
  *                           mapped-page counts (never held while zeroing an
  *                           allocation).
- *   6. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
- *   7. `irq::s_lock`        leaf lock serializing the two handler installs
+ *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
+ *   6. `irq::s_lock`        leaf lock serializing the two handler installs
  *                           (`irq::install`).
- *   8. `uart::s_lock`       leaf lock protecting console line output.
+ *   7. `uart::s_lock`       leaf lock protecting console line output.
  *
  * Locks are acquired strictly in the order listed above (outermost to
  * innermost). Pure capability-derivation and read-only syscalls (`sys_seal`,
- * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_revoke_query`,
- * `sys_thread_tid`) take no lock at all.
+ * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_thread_tid`) take
+ * no lock at all.
  *
  * A revocation sweep refunds what quota nodes are owed after it has let go
- * of `revoke::s_lock`. It runs only when asked for (`sys_revoke_sweep`, or the
- * boot self-test), never inside another kernel call.
+ * of `revoke::s_lock`. It runs only inside `sys_revoke_query` (or the boot
+ * self-test), never inside another kernel call.
  *
  * HOW IT IS SAFE TO HOLD
  * ----------------------

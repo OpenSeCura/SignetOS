@@ -29,7 +29,7 @@ namespace {
 Tree s_vm_tree;
 
 // Every tree, so `owe` can find a handle's tree from its type and the sweep
-// can settle them all (OWED in quota.hpp).
+// can walk them all (OWED in quota.hpp).
 Tree* s_trees[MAX_TREES];
 size_t s_tree_count = 0;
 
@@ -42,7 +42,6 @@ void init_node(QuotaNode* node, uint64_t limit_bytes, uint32_t flags) {
   node->limit_bytes = limit_bytes;
   node->allocated_bytes = 0;
   node->owed_bytes = 0;
-  node->next_owed = nullptr;
   node->flags = flags | FLAG_LIVE | FLAG_EXISTS;
   node->lock = SpinLock{};
 }
@@ -108,20 +107,6 @@ Capability take_back(QuotaNode* parent, QuotaNode* child, uint64_t unused,
   return page;
 }
 
-// Counts `bytes` as owed to `node` (OWED in quota.hpp). Caller holds
-// `node->lock`.
-void owe_locked(Tree& t, QuotaNode* node, uint64_t bytes) {
-  if (bytes == 0) {
-    return;
-  }
-  if (node->owed_bytes == 0) {
-    Locked hold(t.owed_lock);
-    node->next_owed = t.owed;
-    t.owed = node;
-  }
-  node->owed_bytes += bytes;
-}
-
 // Frees the page take_back() returned, if it returned one, and owes it to
 // `parent`, whose lock the caller holds. The page is quarantined, not
 // unmapped: handles held by other compartments keep reaching it until the
@@ -131,7 +116,7 @@ void free_node_page(Tree& t, Capability page, QuotaNode* parent) {
   if (!capability_is_valid(page)) {
     return;
   }
-  owe_locked(t, parent, vm::free_pages(page));
+  parent->owed_bytes += vm::free_pages(page);
   __atomic_fetch_sub(&t.live_nodes, 1, __ATOMIC_RELAXED);
 }
 
@@ -160,48 +145,67 @@ void refund_unused(Tree& t, QuotaNode* node) {
   node->lock.release();
 }
 
-// Call with `top->lock` held and `top` closed; returns with it still held.
-// Closes every node beneath `top`. Coming back up, each node gives its unused
-// allowance to its parent once everything beneath it has done the same, so
-// that all of it ends up with `top`, and nodes left holding nothing are freed
-// on the way.
+// Refunds what `node` is owed (OWED in quota.hpp). Caller holds its lock.
+void settle(QuotaNode* node) {
+  node->allocated_bytes -= node->owed_bytes;
+  node->owed_bytes = 0;
+}
+
+// Call with `top->lock` held; returns with it still held. Visits every node
+// beneath `top`, each on the way down before its children:
+//
+//   closing (destroy): closes it. A node closed already is skipped, along
+//            with everything beneath it, which is closed too and holds no
+//            unused allowance.
+//   otherwise (the sweep): refunds what it is owed. Before its children, so
+//            that a child page freed further down is owed to a node already
+//            settled, and waits for the next sweep, which reclaims it.
+//
+// Coming back up, each closed node gives its unused allowance to its parent
+// once everything beneath it has done the same, so that all of it ends up
+// with the first live node, and nodes left holding nothing are freed on the
+// way.
 //
 // The walk keeps its place with the tree's own links rather than recursing
 // (a syscall body runs on a fixed slice of the caller's stack). It holds the
 // lock of every node from `top` down to where it is, taking each parent's
 // before its child's, so nothing on that path can be unlinked or freed
 // meanwhile: `parent` and `next_sibling` are always safe to follow.
-void close_subtree(Tree& t, QuotaNode* top) {
+void walk(Tree& t, QuotaNode* top, bool closing) {
   QuotaNode* node = top;
   QuotaNode* next = top->first_child;
   for (;;) {
     if (next != nullptr) {
       QuotaNode* child = next;
       child->lock.acquire();
-      if ((child->flags & FLAG_LIVE) != 0) {
-        // Close it and go down into it.
-        child->flags &= ~FLAG_LIVE;
-        node = child;
-        next = child->first_child;
-      } else {
-        // Closed already, as is everything beneath it, and none of it holds
-        // unused allowance. Skip it.
+      if (closing && (child->flags & FLAG_LIVE) == 0) {
         next = child->next_sibling;
         child->lock.release();
+        continue;
       }
+      if (closing) {
+        child->flags &= ~FLAG_LIVE;
+      } else {
+        settle(child);
+      }
+      node = child;
+      next = child->first_child;
       continue;
     }
 
-    // Everything beneath `node` is closed and has given back. Give `node`
-    // back to its parent, then go on to the parent's next child.
+    // Everything beneath `node` is done. Give `node` back to its parent if it
+    // is closed, then go on to the parent's next child.
     if (node == top) {
       return;
     }
     QuotaNode* parent = node->parent;
     next = node->next_sibling;  // read now: take_back() may unlink `node`
-    const uint64_t unused = give_back(node);
-    const bool empty = (node->flags & FLAG_EXISTS) == 0;
-    Capability page = take_back(parent, node, unused, empty);
+    Capability page = nullptr;
+    if ((node->flags & FLAG_LIVE) == 0) {
+      const uint64_t unused = give_back(node);
+      const bool empty = (node->flags & FLAG_EXISTS) == 0;
+      page = take_back(parent, node, unused, empty);
+    }
     node->lock.release();
     free_node_page(t, page, parent);
     node = parent;
@@ -214,8 +218,6 @@ void init(Tree& t, OType type) {
   t.type = type;
   t.root_taken = false;
   t.live_nodes = 0;
-  t.owed = nullptr;
-  t.owed_lock = SpinLock{};
   init_node(&t.root, 0, FLAG_ROOT);
   t.root.flags = 0;
   for (size_t i = 0; i < s_tree_count; ++i) {
@@ -340,7 +342,7 @@ Status destroy(Tree& t, Capability handle) {
   // nothing outstanding is freed on the spot; the rest are freed by refund()
   // when their last allocation comes back.
   node->flags &= ~FLAG_LIVE;
-  close_subtree(t, node);
+  walk(t, node, /*closing=*/true);
   refund_unused(t, node);  // releases node->lock
   return Status::Ok;
 }
@@ -427,35 +429,18 @@ void owe(Capability handle, uint64_t bytes) {
     // What it paid for is still charged, so it cannot have been freed.
     if ((node->flags & FLAG_EXISTS) != 0 &&
         bytes <= node->allocated_bytes - node->owed_bytes) {
-      owe_locked(t, node, bytes);
+      node->owed_bytes += bytes;
     }
     return;
   }
 }
 
-Owed take_owed() {
-  Owed taken{};
-  for (size_t i = 0; i < s_tree_count; ++i) {
-    Locked hold(s_trees[i]->owed_lock);
-    taken.lists[i] = s_trees[i]->owed;
-    s_trees[i]->owed = nullptr;
-  }
-  return taken;
-}
-
-void settle_owed(Owed owed) {
+void settle_owed() {
   for (size_t i = 0; i < s_tree_count; ++i) {
     Tree& t = *s_trees[i];
-    for (QuotaNode* node = owed.lists[i]; node != nullptr;) {
-      // Read the link first: once the node is refunded it may be freed.
-      node->lock.acquire();
-      QuotaNode* next = node->next_owed;
-      node->next_owed = nullptr;
-      node->allocated_bytes -= node->owed_bytes;
-      node->owed_bytes = 0;
-      refund_unused(t, node);  // releases node->lock
-      node = next;
-    }
+    Locked hold(t.root.lock);
+    settle(&t.root);
+    walk(t, &t.root, /*closing=*/false);
   }
 }
 
