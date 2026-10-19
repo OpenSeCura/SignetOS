@@ -64,6 +64,13 @@ using capability_sealed_t           = signetos::Capability;  // OTYPE_SEALED_OBJ
 // does later must leave these allocations where they are.
 constexpr uint32_t FLAG_DMA = (1u << 0);
 
+// FLAG_REVOCABLE: memory its owner will hand out in pieces and take back
+// with `sys_revoke`, such as a heap arena. Only parts of these can be
+// revoked. The kernel keeps one bit per 16 bytes of it, the revocation marks,
+// and charges them to the same quota: one page per 512KB, rounded up, so 4KB
+// for anything up to 512KB.
+constexpr uint32_t FLAG_REVOCABLE = (1u << 1);
+
 extern "C" {
 
 // --- Virtual memory --------------------------------------------------------
@@ -94,27 +101,29 @@ capability_t sys_cow(
     size_t                   len
 );
 
-// Queues `mem_cap`'s range for the next revocation sweep, which revokes every
+// Marks `mem_cap`'s range for the next revocation sweep, which revokes every
 // capability whose BASE lies in it (revoke.hpp, THE BASE RULE): the way an
 // owner takes back part of an allocation it keeps, such as an object its
-// heap is freeing. The range must lie inside one of `comp`'s own allocations
-// and must not include that allocation's first byte, which is where the
-// owner's own capability to the allocation is based. Returns the epoch to
-// wait for (`sys_revoke_query`), or 0 if the range was refused.
-//
-// The backlog is paid for: the range is recorded on a page funded by
-// `mem_quota` (a `QuotaVm` handle with `Permit_Load`). One page holds a few
-// hundred ranges; a new one is charged when the caller's current page is full,
-// and every page is refunded once the sweep has run. A caller that revokes
-// faster than the kernel sweeps exhausts only its own quota.
+// heap is freeing. The range must lie inside one of `comp`'s own
+// FLAG_REVOCABLE allocations, must not include that allocation's first byte,
+// which is where the owner's own capability to the allocation is based, and
+// must start and end on a multiple of 16 bytes. Returns the current epoch, N:
+// the range may be reused once `sys_revoke_query()` reaches N. Returns 0 if
+// the range was refused.
 uint64_t sys_revoke(
     capability_compartment_t comp,
-    capability_t             mem_cap,
-    capability_quota_vm_t    mem_quota
+    capability_t             mem_cap
 );
 
-// The highest epoch whose sweep has finished.
+// How many sweeps have completed (the completed epoch).
 uint64_t sys_revoke_query(void);
+
+// Sweeps, and returns 0, if the last sweep ended at least
+// `revoke::SWEEP_INTERVAL_US` ago or there is nothing to scan; otherwise
+// returns the microseconds to wait before asking again. Anyone may ask, as
+// often as they like: sweeps never come closer together than the interval
+// (revoke.hpp, WHEN A SWEEP RUNS).
+uint64_t sys_revoke_sweep(void);
 
 // --- Virtual memory quotas -------------------------------------------------
 
@@ -300,6 +309,7 @@ namespace signetos::syscall {
   X(cow)                          \
   X(revoke)                       \
   X(revoke_query)                 \
+  X(revoke_sweep)                 \
   X(quota_vm_create_root)         \
   X(quota_vm_derive)              \
   X(quota_vm_destroy)             \

@@ -118,7 +118,7 @@ constexpr uint64_t FOREVER_US = ~0ULL;
 // their long-lived holder, not their user.
 #define SHELL_MANIFEST(X)                                                      \
   M_QUOTA_VM(X, VM_QUOTA)                                                      \
-  M_QUOTA_THREAD(X, THREAD_QUOTA, 160 * 1024)                                  \
+  M_QUOTA_THREAD(X, THREAD_QUOTA, 256ULL * 1024 * 1024)                        \
   M_QUOTA_SCHED(X, SCHED_QUOTA, 50'000, 100'000,                               \
                 ::signetos::init::PRIORITY_INTERACTIVE)                        \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)                                      \
@@ -130,6 +130,8 @@ constexpr uint64_t FOREVER_US = ~0ULL;
   M_SYSCALL(X, SYS_THREAD_CREATE, thread_create)                               \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)                                   \
   M_SYSCALL(X, SYS_SENTRY, sentry)                                             \
+  M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
+  M_SYSCALL(X, SYS_REVOKE_SWEEP, revoke_sweep)                                 \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
   M_SERVICE(X, NAMING_LOOKUP, "naming.lookup")                                 \
@@ -142,11 +144,13 @@ constexpr uint64_t FOREVER_US = ~0ULL;
   M_ROOT_OPT(X, ROOT_THREAD_MEM, ::signetos::init::ROOT_THREAD_MEM)            \
   M_ROOT_OPT(X, ROOT_DISK, ::signetos::init::ROOT_DISK)                        \
   M_ROOT_OPT(X, ROOT_SCHED, ::signetos::init::ROOT_SCHED)
-// 256 KiB: the shell's own image and tables, its workers' and programs'
-// scheduler nodes, and -- `run <file>` -- the buffer a program is read into
-// plus the VM sub-quota its compartment lives on while it runs. A program's
-// thread is paid from THREAD_QUOTA, like the workers'.
-SIGNETOS_MANIFEST(SHELL_MANIFEST, 256 * 1024)
+// 1 GiB of address space: the shell's own image and tables, its workers' and
+// programs' scheduler nodes, and -- `run <file>` -- the buffer a program is
+// read into plus the VM sub-quota its compartment lives on while it runs. A
+// program's thread is paid from THREAD_QUOTA, like the workers'. Both are
+// budgets of address space, not of RAM, and freed memory stays charged until
+// a sweep reclaims it, so they are sized for many programs, not one.
+SIGNETOS_MANIFEST(SHELL_MANIFEST, 1024ULL * 1024 * 1024)
 
 // Demo: 5:3:1 interactive plus a batch hog, 100 us slices, 300 ms.
 constexpr size_t DEMO_WORKERS = 4;
@@ -212,6 +216,8 @@ struct WorkerSet {
 // Console state. One shell thread, so plain globals.
 Capability s_gate_invoke = nullptr;
 Capability s_gate_thread_create = nullptr;
+Capability s_gate_revoke_query = nullptr;
+Capability s_gate_revoke_sweep = nullptr;
 Capability s_uart = nullptr;
 Capability s_uart_read = nullptr;
 Capability s_vm_quota = nullptr;
@@ -261,6 +267,50 @@ void yield() { invoke<int64_t>(s_gate_invoke, s_sched_yield); }
 // Sleeps until `shell_notify_entry` has run (or had already run since the
 // last time: the scheduler remembers a wake that arrives early).
 void block() { invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL); }
+
+// What the shell frees comes back to its quotas only once a sweep has
+// reclaimed it, and sweeps are rate limited (DESIGN.md §4.2). Waits
+// for the sweep that reclaims everything freed so far, so an allocation that
+// failed is worth trying once more afterwards.
+void reclaim() {
+  if (!capability_is_valid(s_gate_revoke_sweep)) {
+    return;
+  }
+  using FnQuery = decltype(&sys_revoke_query);
+  const uint64_t epoch =
+      syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query) + 1;
+  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_gate_revoke_sweep,
+              s_sched_block, epoch);
+}
+
+// A thread paid from the shell's thread quota, or null; retried once after
+// `reclaim` if the quota is held by threads that have ended.
+Capability new_thread(size_t stack, Capability entry, Capability arg) {
+  using FnThreadCreate = decltype(&sys_thread_create);
+  auto create = [&] {
+    return syscall::call<FnThreadCreate>(s_gate_invoke, s_gate_thread_create,
+                                         s_thread_quota, stack, entry, arg);
+  };
+  Capability t = create();
+  if (!sealing::is_sealed_as(OType::Thread, t)) {
+    reclaim();
+    t = create();
+  }
+  return t;
+}
+
+// Derives the scheduler node `req` asks for. Its page is paid from the
+// shell's VM quota, so a refusal for want of memory is retried once after
+// `reclaim`.
+void derive_node(init::SchedDeriveRequest* req) {
+  req->status = init::SCHED_BAD_REQUEST;
+  invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(req));
+  if (req->status == init::SCHED_NO_MEMORY) {
+    reclaim();
+    req->status = init::SCHED_BAD_REQUEST;
+    invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(req));
+  }
+}
 
 // How many threads are registered on the scheduler node `node` and the nodes
 // under it, or a negative SCHED_* status.
@@ -525,7 +575,6 @@ void banner(Capability gate_invoke, Capability uart_sentry,
 // paid for from the shell's VM quota. Stops at the first failure and returns
 // how many workers are running.
 size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
-  using FnThreadCreate = decltype(&sys_thread_create);
 
   Shared& sh = set.shared;
   sh.invoke = s_gate_invoke;
@@ -551,8 +600,7 @@ size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
     dreq.period_us = cfg.period_us;
     dreq.term_us = init::SCHED_REVOCABLE;
     dreq.priority_class = cfg.priority[i];
-    dreq.status = init::SCHED_BAD_REQUEST;
-    invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&dreq));
+    derive_node(&dreq);
     if (dreq.status != init::SCHED_OK) {
       out_dec("[shell]    sched.quota_derive FAILED, status ",
               static_cast<uint64_t>(-dreq.status), "\n");
@@ -564,9 +612,8 @@ size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
     set.args[i].index = i;
     // `args[i]` sits in this compartment's `.bss`, not on a stack, so the
     // initial argument is a global capability the kernel will accept.
-    Capability t = syscall::call<FnThreadCreate>(
-        s_gate_invoke, s_gate_thread_create, s_thread_quota, WORKER_STACK,
-        s_worker_entry, bounded(&set.args[i]));
+    Capability t =
+        new_thread(WORKER_STACK, s_worker_entry, bounded(&set.args[i]));
     if (!sealing::is_sealed_as(OType::Thread, t)) {
       out("[shell]    worker thread_create FAILED\n");
       break;
@@ -1007,8 +1054,7 @@ Capability derive_app_node(const init::Manifest& m) {
   req.period_us = period;
   req.term_us = init::SCHED_REVOCABLE;
   req.priority_class = priority;
-  req.status = init::SCHED_BAD_REQUEST;
-  invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&req));
+  derive_node(&req);
   return req.status == init::SCHED_OK ? req.out_quota : nullptr;
 }
 
@@ -1016,13 +1062,10 @@ Capability derive_app_node(const init::Manifest& m) {
 // `node`. False if it could not be started, in which case nothing of it is
 // left running.
 bool start_app_thread(Capability entry, Capability node) {
-  using FnThreadCreate = decltype(&sys_thread_create);
   using FnThreadKill = decltype(&sys_thread_kill);
   // `s_app_req` sits in `.bss`, not on a stack, so it is a global capability
   // the kernel will take as the initial argument.
-  Capability t = syscall::call<FnThreadCreate>(
-      s_gate_invoke, s_gate_thread_create, s_thread_quota, APP_STACK, entry,
-      bounded(&s_app_req));
+  Capability t = new_thread(APP_STACK, entry, bounded(&s_app_req));
   if (!sealing::is_sealed_as(OType::Thread, t)) {
     out("[shell]    run: no thread memory left for a program\n");
     return false;
@@ -1079,8 +1122,15 @@ Capability read_image(const char* what, const char* name) {
   if (ok) {
     const size_t bytes =
         (static_cast<size_t>(size) + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
-    image = syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc, s_self_comp,
-                                   s_vm_quota, bytes, 0);
+    auto alloc = [&] {
+      return syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc,
+                                    s_self_comp, s_vm_quota, bytes, 0);
+    };
+    image = alloc();
+    if (!capability_is_valid(image)) {
+      reclaim();
+      image = alloc();
+    }
     ok = capability_is_valid(image);
     if (!ok) {
       out("[shell]    ");
@@ -1335,9 +1385,16 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
                           ? APP_VM_DEFAULT
                           : static_cast<size_t>(manifest.vm_bytes);
     if (vm_bytes > APP_VM_MAX) vm_bytes = APP_VM_MAX;
-    quota = syscall::call<FnQuotaDerive>(s_gate_invoke, s_gate_q_derive,
-                                         s_vm_quota, vm_bytes,
-                                         perms::Load | perms::Store);
+    auto derive = [&] {
+      return syscall::call<FnQuotaDerive>(s_gate_invoke, s_gate_q_derive,
+                                          s_vm_quota, vm_bytes,
+                                          perms::Load | perms::Store);
+    };
+    quota = derive();
+    if (!sealing::is_sealed_as(OType::QuotaVm, quota)) {
+      reclaim();
+      quota = derive();
+    }
     ok = sealing::is_sealed_as(OType::QuotaVm, quota);
     if (!ok) {
       out("[shell]    run: no VM quota left for a program\n");
@@ -1981,10 +2038,7 @@ void cmd_killtest(const char* mode) {
   const Capability kill =
       lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
   const Capability node = derive_app_node(init::Manifest{});  // the default share
-  using FnThreadCreate = decltype(&sys_thread_create);
-  const Capability t = syscall::call<FnThreadCreate>(
-      s_gate_invoke, s_gate_thread_create, s_thread_quota, APP_STACK, entry,
-      nullptr);
+  const Capability t = new_thread(APP_STACK, entry, nullptr);
   if (!capability_is_valid(kill) || !capability_is_valid(node) ||
       !sealing::is_sealed_as(OType::Thread, t) ||
       invoke<int64_t>(s_gate_invoke, s_sched_register, t, node) <= 0) {
@@ -2080,8 +2134,7 @@ void cmd_revoketest() {
     req.budget_us = REVOKE_BUDGET_US;
     req.period_us = REVOKE_PERIOD_US;
     req.priority_class = init::PRIORITY_INTERACTIVE;
-    req.status = init::SCHED_BAD_REQUEST;
-    invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(&req));
+    derive_node(&req);
     if (req.status != init::SCHED_OK) {
       out("[revoketest] could not derive the ");
       out(names[i]);
@@ -2090,10 +2143,7 @@ void cmd_revoketest() {
     }
     node[i] = req.out_quota;
     s_revoke[i].printed = 0;
-    using FnThreadCreate = decltype(&sys_thread_create);
-    thread[i] = syscall::call<FnThreadCreate>(
-        s_gate_invoke, s_gate_thread_create, s_thread_quota, WORKER_STACK,
-        entry, bounded(&s_revoke[i]));
+    thread[i] = new_thread(WORKER_STACK, entry, bounded(&s_revoke[i]));
     if (!sealing::is_sealed_as(OType::Thread, thread[i]) ||
         invoke<int64_t>(s_gate_invoke, s_sched_register, thread[i], node[i]) <=
             0) {
@@ -2470,6 +2520,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_q_destroy = gate_q_destroy;
   s_gate_comp_destroy = gate_comp_destroy;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
+  s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
+  s_gate_revoke_sweep = rw[SLOT_SYS_REVOKE_SWEEP];
   s_run_ready = sealing::is_sealed_as(OType::QuotaDisk, s_bin_quota) &&
                 sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&

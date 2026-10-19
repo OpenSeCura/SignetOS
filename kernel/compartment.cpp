@@ -25,7 +25,7 @@
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
-#include <signetos/syscall.hpp>  // FLAG_DMA
+#include <signetos/syscall.hpp>  // FLAG_DMA, FLAG_REVOCABLE
 
 namespace signetos::compartment {
 namespace {
@@ -292,8 +292,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   // encoding asks); checked rather than assumed.
   Capability table = table_slice(page, 0, slots);
   if (!capability_is_valid(table)) {
-    vm::free_pages(page);
-    quota::refund(mem_quota, cost);
+    quota::owe(mem_quota, vm::free_pages(page));
     return fail_with(out_status, Status::InvalidRange);
   }
 
@@ -302,8 +301,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   // reads.
   Capability handle = canonical_handle(page);
   if (!capability_is_valid(handle)) {
-    vm::free_pages(page);
-    quota::refund(mem_quota, cost);
+    quota::owe(mem_quota, vm::free_pages(page));
     return fail_with(out_status, Status::InvalidCapability);
   }
 
@@ -497,7 +495,7 @@ size_t entry_pages(Capability comp) {
 
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status) {
-  if ((flags & ~FLAG_DMA) != 0) {
+  if ((flags & ~(FLAG_DMA | FLAG_REVOCABLE)) != 0) {
     return fail_with(out_status, Status::InvalidSize);
   }
 
@@ -548,17 +546,21 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
     record = &records_of(fresh)[0];
   }
 
-  // Bill the memory itself. charge() also validates mem_quota: it unseals the
-  // handle and requires Permit_Load.
-  const Status charged = quota::charge(mem_quota, bytes);
+  // Bill the memory itself, and for a revocable allocation its bitmap pages
+  // (vm.hpp, REVOCATION BITMAP). charge() also validates mem_quota: it
+  // unseals the handle and requires Permit_Load.
+  const bool revocable = (flags & FLAG_REVOCABLE) != 0;
+  const uint64_t billed =
+      bytes + (revocable ? vm::shadow_pages(pages) * vm::PAGE_SIZE : 0);
+  const Status charged = quota::charge(mem_quota, billed);
   if (charged != Status::Ok) {
     return fail_with(out_status, charged);
   }
 
   // Reserve addresses, take frames, map them. Comes back zeroed.
-  Capability memory = vm::alloc_pages(pages);
+  Capability memory = vm::alloc_pages(pages, revocable);
   if (!capability_is_valid(memory)) {
-    quota::refund(mem_quota, bytes);
+    quota::refund(mem_quota, billed);
     return fail_with(out_status, Status::NoMemory);
   }
 
@@ -571,8 +573,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
       contiguous = vm::translate(va + i * vm::PAGE_SIZE) == pa + i * vm::PAGE_SIZE;
     }
     if (!contiguous) {
-      vm::free_pages(memory);
-      quota::refund(mem_quota, bytes);
+      quota::owe(mem_quota, vm::free_pages(memory));
       return fail_with(out_status, Status::NoMemory);
     }
     *reinterpret_cast<volatile uint64_t*>(memory) = pa;
@@ -627,12 +628,13 @@ Status deallocate(Capability comp, Capability mem_quota,
   // Free through the capability stored in the record so the WHOLE range is
   // released, even if the caller passed a truncated capability.
   Capability whole = range->cap;
-  const uint64_t bytes = capability_get_length(whole);
-  if (!vm::free_pages(whole)) {
+  // The funder pays until the sweep has reclaimed the memory (quota.hpp,
+  // OWED).
+  const uint64_t freed = vm::free_pages(whole);
+  if (freed == 0) {
     return Status::InvalidCapability;
   }
-
-  quota::refund(funder, bytes);
+  quota::owe(funder, freed);
 
   range->cap = nullptr;  // frees the record
   return Status::Ok;
@@ -710,7 +712,6 @@ Status destroy(Capability handle) {
 
   Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Capability funding = nullptr;
-  uint64_t cost = 0;
   {
     Locked hold(c->lock);
     if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
@@ -728,11 +729,8 @@ Status destroy(Capability handle) {
     __atomic_fetch_and(&c->flags, ~FLAG_LIVE, __ATOMIC_RELEASE);
 
     // Copied out now: it lives in the page this function frees last, and a
-    // freed page is not to be read, even though it is still mapped. The
-    // allocation's length is what `create` billed, however many pages the
-    // table spans.
+    // freed page is not to be read, even though it is still mapped.
     funding = c->quota;
-    cost = capability_get_length(comp_page);
 
     // Walk the chain, releasing what each page describes and then the page.
     for (Capability p = c->ranges; capability_is_valid(p);) {
@@ -748,17 +746,12 @@ Status destroy(Capability handle) {
         if (!capability_is_valid(records[i].cap)) {
           continue;  // free slot, nothing to release
         }
-        Capability whole = records[i].cap;
-        const uint64_t bytes = capability_get_length(whole);
-        if (vm::free_pages(whole)) {
-          quota::refund(funder, bytes);
-        }
+        quota::owe(funder, vm::free_pages(records[i].cap));
         records[i].cap = nullptr;
       }
 
       // Now the bookkeeping page itself, refunded to whoever bought it.
-      vm::free_pages(p);
-      quota::refund(funder, vm::PAGE_SIZE);
+      quota::owe(funder, vm::free_pages(p));
       p = next;
     }
     c->ranges = nullptr;
@@ -772,8 +765,7 @@ Status destroy(Capability handle) {
       for (size_t i = 0; i < ENTRIES_PER_PAGE; ++i) {
         records[i] = EntryRecord{};
       }
-      vm::free_pages(p);
-      quota::refund(funder, vm::PAGE_SIZE);
+      quota::owe(funder, vm::free_pages(p));
       p = next;
     }
     c->entries = nullptr;
@@ -790,8 +782,7 @@ Status destroy(Capability handle) {
 
   // Last, because everything above reads through it. The UID is deliberately
   // not reclaimed.
-  vm::free_pages(comp_page);
-  quota::refund(funding, cost);
+  quota::owe(funding, vm::free_pages(comp_page));
   return Status::Ok;
 }
 

@@ -28,6 +28,11 @@ namespace {
 
 Tree s_vm_tree;
 
+// Every tree, so `owe` can find a handle's tree from its type and the sweep
+// can settle them all (OWED in quota.hpp).
+Tree* s_trees[MAX_TREES];
+size_t s_tree_count = 0;
+
 void init_node(QuotaNode* node, uint64_t limit_bytes, uint32_t flags) {
   node->self_page = nullptr;
   node->parent = nullptr;
@@ -36,6 +41,8 @@ void init_node(QuotaNode* node, uint64_t limit_bytes, uint32_t flags) {
   node->prev_sibling = nullptr;
   node->limit_bytes = limit_bytes;
   node->allocated_bytes = 0;
+  node->owed_bytes = 0;
+  node->next_owed = nullptr;
   node->flags = flags | FLAG_LIVE | FLAG_EXISTS;
   node->lock = SpinLock{};
 }
@@ -71,10 +78,9 @@ uint64_t give_back(QuotaNode* node) {
 
 // Call with `parent->lock` held, once `child` has given back `unused`. Takes
 // those bytes off what the parent has handed out. If give_back() emptied the
-// child, it claimed it for this caller: the child is unlinked and the cost of
-// its page comes off too, which completes the refund of the
-// limit + QUOTA_NODE_COST the parent was charged at derive. Returns the
-// child's page for free_node_page() if so, otherwise null.
+// child, it claimed it for this caller: the child is unlinked and its page is
+// returned for free_node_page(), otherwise null. The parent still pays
+// QUOTA_NODE_COST for that page until the sweep reclaims it and refunds it.
 Capability take_back(QuotaNode* parent, QuotaNode* child, uint64_t unused,
                      bool child_empty) {
   parent->allocated_bytes -= unused;
@@ -92,7 +98,6 @@ Capability take_back(QuotaNode* parent, QuotaNode* child, uint64_t unused,
   if (child->next_sibling != nullptr) {
     child->next_sibling->prev_sibling = child->prev_sibling;
   }
-  parent->allocated_bytes -= QUOTA_NODE_COST;
 
   Capability page = child->self_page;
   child->self_page = nullptr;
@@ -103,15 +108,30 @@ Capability take_back(QuotaNode* parent, QuotaNode* child, uint64_t unused,
   return page;
 }
 
-// Frees the page take_back() returned, if it returned one. The page is
-// quarantined, not unmapped: handles held by other compartments keep reaching
-// it until the revocation sweep, and are refused by the cleared flags and
-// self_page, which unseal() checks.
-void free_node_page(Tree& t, Capability page) {
+// Counts `bytes` as owed to `node` (OWED in quota.hpp). Caller holds
+// `node->lock`.
+void owe_locked(Tree& t, QuotaNode* node, uint64_t bytes) {
+  if (bytes == 0) {
+    return;
+  }
+  if (node->owed_bytes == 0) {
+    Locked hold(t.owed_lock);
+    node->next_owed = t.owed;
+    t.owed = node;
+  }
+  node->owed_bytes += bytes;
+}
+
+// Frees the page take_back() returned, if it returned one, and owes it to
+// `parent`, whose lock the caller holds. The page is quarantined, not
+// unmapped: handles held by other compartments keep reaching it until the
+// revocation sweep, and are refused by the cleared flags and self_page, which
+// unseal() checks.
+void free_node_page(Tree& t, Capability page, QuotaNode* parent) {
   if (!capability_is_valid(page)) {
     return;
   }
-  vm::free_pages(page);
+  owe_locked(t, parent, vm::free_pages(page));
   __atomic_fetch_sub(&t.live_nodes, 1, __ATOMIC_RELAXED);
 }
 
@@ -134,7 +154,7 @@ void refund_unused(Tree& t, QuotaNode* node) {
       return;  // nothing to pass on
     }
     parent->lock.acquire();
-    free_node_page(t, take_back(parent, node, unused, empty));
+    free_node_page(t, take_back(parent, node, unused, empty), parent);
     node = parent;
   }
   node->lock.release();
@@ -183,7 +203,7 @@ void close_subtree(Tree& t, QuotaNode* top) {
     const bool empty = (node->flags & FLAG_EXISTS) == 0;
     Capability page = take_back(parent, node, unused, empty);
     node->lock.release();
-    free_node_page(t, page);
+    free_node_page(t, page, parent);
     node = parent;
   }
 }
@@ -194,8 +214,19 @@ void init(Tree& t, OType type) {
   t.type = type;
   t.root_taken = false;
   t.live_nodes = 0;
+  t.owed = nullptr;
+  t.owed_lock = SpinLock{};
   init_node(&t.root, 0, FLAG_ROOT);
   t.root.flags = 0;
+  for (size_t i = 0; i < s_tree_count; ++i) {
+    if (s_trees[i] == &t) {
+      return;
+    }
+  }
+  if (s_tree_count == MAX_TREES) {
+    debug::panic("quota: more trees than MAX_TREES");
+  }
+  s_trees[s_tree_count++] = &t;
 }
 
 // Accepts a closed node that has not been freed yet, so that refunds of what
@@ -244,46 +275,31 @@ Capability derive(Tree& t, Capability parent_handle, uint64_t amount_bytes,
     return fail_with(out_status, Status::OutOfQuota);
   }
 
-  // Refused here first, cheaply, so a request that cannot succeed never makes
-  // the kernel buy a page.
-  {
-    Locked hold(parent->lock);
-    if ((parent->flags & FLAG_LIVE) == 0) {
-      return fail_with(out_status, Status::InvalidCapability);
-    }
-    // The node's own page is billed to the parent alongside the child's
-    // budget, so a subtree can hold at most limit_bytes / QUOTA_NODE_COST
-    // descendants.
-    if (total_cost > parent->available()) {
-      return fail_with(out_status, Status::OutOfQuota);
-    }
+  Locked hold(parent->lock);
+  if ((parent->flags & FLAG_LIVE) == 0) {
+    return fail_with(out_status, Status::InvalidCapability);
+  }
+  // The node's own page is billed to the parent alongside the child's
+  // budget, so a subtree can hold at most limit_bytes / QUOTA_NODE_COST
+  // descendants.
+  if (total_cost > parent->available()) {
+    return fail_with(out_status, Status::OutOfQuota);
   }
 
-  // Bought with the lock released: vm::alloc_pages runs a revocation sweep
-  // when memory is short, and the sweep refunds into this tree.
+  // Bought under the parent's lock: `vm::alloc_pages` takes only locks that
+  // come after it (lock.hpp).
   Capability page = vm::alloc_pages(QUOTA_NODE_PAGES);
   if (!capability_is_valid(page)) {
     return fail_with(out_status, Status::NoMemory);
   }
-
-  // Everything is checked again: the parent may have been charged, closed or
-  // even freed meanwhile, and a sweep may have cleared the tag on `parent`.
-  parent = unseal(t, parent_handle);
-  if (parent == nullptr) {
-    vm::free_pages(page);
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  Locked hold(parent->lock);
-  if ((parent->flags & FLAG_LIVE) == 0) {
-    vm::free_pages(page);
-    return fail_with(out_status, Status::InvalidCapability);
-  }
-  if (total_cost > parent->available()) {
-    vm::free_pages(page);
-    return fail_with(out_status, Status::OutOfQuota);
-  }
-
   QuotaNode* child = reinterpret_cast<QuotaNode*>(page);
+  Capability handle =
+      seal_node(t, child, perms_mask & (perms::Load | perms::Store));
+  if (!capability_is_valid(handle)) {
+    vm::free_pages(page);  // never handed out, never charged
+    return fail_with(out_status, Status::InvalidCapability);
+  }
+
   init_node(child, amount_bytes, 0);
   child->self_page = page;
   child->parent = parent;
@@ -295,19 +311,6 @@ Capability derive(Tree& t, Capability parent_handle, uint64_t amount_bytes,
   }
   parent->first_child = child;
   parent->allocated_bytes += total_cost;
-
-  Capability handle =
-      seal_node(t, child, perms_mask & (perms::Load | perms::Store));
-  if (!capability_is_valid(handle)) {
-    // Unwind rather than leak the page and the debit.
-    parent->first_child = child->next_sibling;
-    if (parent->first_child != nullptr) {
-      parent->first_child->prev_sibling = nullptr;
-    }
-    parent->allocated_bytes -= total_cost;
-    vm::free_pages(page);
-    return fail_with(out_status, Status::InvalidCapability);
-  }
 
   __atomic_fetch_add(&t.live_nodes, 1, __ATOMIC_RELAXED);
   if (out_status != nullptr) {
@@ -408,6 +411,52 @@ bool query(Tree& t, Capability handle, QuotaNode* out_copy) {
     *out_copy = *node;
   }
   return true;
+}
+
+void owe(Capability handle, uint64_t bytes) {
+  for (size_t i = 0; i < s_tree_count; ++i) {
+    Tree& t = *s_trees[i];
+    if (!sealing::is_sealed_as(t.type, handle)) {
+      continue;
+    }
+    QuotaNode* node = unseal(t, handle);
+    if (node == nullptr) {
+      return;
+    }
+    Locked hold(node->lock);
+    // What it paid for is still charged, so it cannot have been freed.
+    if ((node->flags & FLAG_EXISTS) != 0 &&
+        bytes <= node->allocated_bytes - node->owed_bytes) {
+      owe_locked(t, node, bytes);
+    }
+    return;
+  }
+}
+
+Owed take_owed() {
+  Owed taken{};
+  for (size_t i = 0; i < s_tree_count; ++i) {
+    Locked hold(s_trees[i]->owed_lock);
+    taken.lists[i] = s_trees[i]->owed;
+    s_trees[i]->owed = nullptr;
+  }
+  return taken;
+}
+
+void settle_owed(Owed owed) {
+  for (size_t i = 0; i < s_tree_count; ++i) {
+    Tree& t = *s_trees[i];
+    for (QuotaNode* node = owed.lists[i]; node != nullptr;) {
+      // Read the link first: once the node is refunded it may be freed.
+      node->lock.acquire();
+      QuotaNode* next = node->next_owed;
+      node->next_owed = nullptr;
+      node->allocated_bytes -= node->owed_bytes;
+      node->owed_bytes = 0;
+      refund_unused(t, node);  // releases node->lock
+      node = next;
+    }
+  }
 }
 
 // --- VM tree ---------------------------------------------------------------

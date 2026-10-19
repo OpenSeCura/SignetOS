@@ -141,10 +141,9 @@ extern "C" capability_t sys_cow(capability_compartment_t comp,
 }
 
 extern "C" uint64_t sys_revoke(capability_compartment_t comp,
-                               capability_t mem_cap,
-                               capability_quota_vm_t mem_quota) {
+                               capability_t mem_cap) {
   uint64_t epoch = 0;
-  if (::signetos::revoke::revoke(comp, mem_cap, mem_quota, &epoch) !=
+  if (::signetos::revoke::revoke(comp, mem_cap, &epoch) !=
       ::signetos::revoke::Status::Ok) {
     return 0;
   }
@@ -153,6 +152,10 @@ extern "C" uint64_t sys_revoke(capability_compartment_t comp,
 
 extern "C" uint64_t sys_revoke_query(void) {
   return ::signetos::revoke::completed_epoch();
+}
+
+extern "C" uint64_t sys_revoke_sweep(void) {
+  return ::signetos::revoke::request();
 }
 
 // --- Virtual memory quotas -------------------------------------------------

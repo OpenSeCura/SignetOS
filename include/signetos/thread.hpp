@@ -162,8 +162,8 @@ uint64_t this_hart();
 // --- Thread memory quota operations ----------------------------------------
 
 // Boot-only root thread memory quota. Its whole budget is charged to `vm_quota`
-// up front, so thread memory and VM allocations together can never promise
-// more memory than physically exists. Null if a root already exists or
+// up front, so thread memory and VM allocations together never hand out more
+// address space than the VM root has. Null if a root already exists or
 // `vm_quota` cannot cover `total_bytes`.
 Capability create_root_quota(Capability vm_quota, uint64_t total_bytes);
 

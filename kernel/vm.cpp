@@ -547,39 +547,45 @@ bool any_page_mapped(uint64_t va, size_t pages) {
   return false;
 }
 
-uint64_t reserve_locked(size_t pages) {
+void release_locked(uint64_t va, size_t pages);
+
+// Reserves `pages` of addresses starting on a multiple of `align`, a power of
+// two no smaller than PAGE_SIZE: from the first reclaimed range with room
+// (ascending address order), else from the watermark. Whatever an aligned
+// start skips over is released again at once.
+uint64_t reserve_locked(size_t pages, uint64_t align) {
   if (pages == 0) {
     return 0;
   }
   const uint64_t bytes = static_cast<uint64_t>(pages) * PAGE_SIZE;
+  auto align_up = [align](uint64_t va) { return (va + align - 1) & ~(align - 1); };
 
-  // Reuse a reclaimed virtual address range first (first-fit in ascending
-  // address order).
   for (size_t i = 0; i < s_free_range_count; ++i) {
-    if (s_free_ranges[i].pages >= pages) {
-      const uint64_t va = s_free_ranges[i].va;
-      s_free_ranges[i].va += bytes;
-      s_free_ranges[i].pages -= pages;
-      s_free_pages -= pages;
-      if (s_free_ranges[i].pages == 0) {
-        for (size_t j = i; j + 1 < s_free_range_count; ++j) {
-          s_free_ranges[j] = s_free_ranges[j + 1];
-        }
-        s_free_range_count -= 1;
+    const FreeRange r = s_free_ranges[i];
+    const uint64_t end = r.va + static_cast<uint64_t>(r.pages) * PAGE_SIZE;
+    const uint64_t va = align_up(r.va);
+    if (va < end && end - va >= bytes) {
+      // Take the whole range, then give back what lies either side.
+      for (size_t j = i; j + 1 < s_free_range_count; ++j) {
+        s_free_ranges[j] = s_free_ranges[j + 1];
       }
+      s_free_range_count -= 1;
+      s_free_pages -= r.pages;
+      release_locked(r.va, (va - r.va) / PAGE_SIZE);
+      release_locked(va + bytes, (end - va - bytes) / PAGE_SIZE);
       return va;
     }
   }
 
-  // Written as a subtraction from the top rather than `s_next_va + bytes >
-  // DYNAMIC_TOP`, so a huge request cannot wrap and appear to fit.
-  if (bytes > DYNAMIC_TOP - s_next_va) {
+  // Written as a subtraction from the top rather than `va + bytes >
+  // SHADOW_BASE`, so a huge request cannot wrap and appear to fit.
+  const uint64_t va = align_up(s_next_va);
+  if (va > SHADOW_BASE || bytes > SHADOW_BASE - va) {
     return 0;
   }
-
-  // Hand out the current mark and push it past the range just taken.
-  const uint64_t va = s_next_va;
-  s_next_va += bytes;
+  const uint64_t skipped = s_next_va;
+  s_next_va = va + bytes;
+  release_locked(skipped, (va - skipped) / PAGE_SIZE);
   return va;
 }
 
@@ -721,11 +727,55 @@ bool map_locked(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
   return true;
 }
 
+// `bytes` at `va` in the dynamic space, reached through `s_dynamic`.
+Capability dynamic_view(uint64_t va, size_t bytes) {
+  return capability_set_bounds(capability_set_address(s_dynamic, va), bytes);
+}
+
+void zero_page(uint64_t va) {
+  volatile uint64_t* w =
+      reinterpret_cast<volatile uint64_t*>(dynamic_view(va, PAGE_SIZE));
+  for (size_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); ++i) {
+    w[i] = 0;
+  }
+}
+
+// Frees the first `count` shadow pages of the revocable range at `va`, which
+// nothing has seen. Caller holds `s_lock`.
+void unmap_shadow_locked(uint64_t va, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t* slot = leaf_slot(shadow_of(va) + (i * PAGE_SIZE), false);
+    frame::free(pte_addr(*slot), 1);
+    *slot = 0;
+  }
+  __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+}
+
+// Maps zeroed shadow for the revocable range of `pages` at `va`, which starts
+// on a SHADOW_SPAN boundary, so its shadow starts on a page. All or nothing.
+// Caller holds `s_lock`.
+bool map_shadow_locked(uint64_t va, size_t pages) {
+  const size_t count = shadow_pages(pages);
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t s = shadow_of(va) + (i * PAGE_SIZE);
+    const uint64_t pa = frame::alloc(1);
+    if (pa == 0 || !map_locked(s, pa, 1, pte::KernelData)) {
+      if (pa != 0) {
+        frame::free(pa, 1);
+      }
+      unmap_shadow_locked(va, i);
+      return false;
+    }
+    zero_page(s);
+  }
+  return true;
+}
+
 }  // namespace
 
 uint64_t reserve(size_t pages) {
   Locked hold(s_lock);
-  return reserve_locked(pages);
+  return reserve_locked(pages, PAGE_SIZE);
 }
 
 void release(uint64_t va, size_t pages) {
@@ -736,7 +786,7 @@ void release(uint64_t va, size_t pages) {
 size_t reservable_pages() {
   Locked hold(s_lock);
   return s_free_pages +
-         static_cast<size_t>((DYNAMIC_TOP - s_next_va) / PAGE_SIZE);
+         static_cast<size_t>((SHADOW_BASE - s_next_va) / PAGE_SIZE);
 }
 
 bool map(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
@@ -758,10 +808,6 @@ uint64_t translate(uint64_t va) {
   // far into it we are. page_size - 1 is the mask for those low bits, and it
   // is wider for a megapage or gigapage than for a 4KB page.
   return pte_addr(leaf.entry) + (va & (leaf.page_size - 1));
-}
-
-bool is_quarantined(uint64_t va) {
-  return (find_leaf(va).entry & pte::Quarantined) != 0;
 }
 
 bool range_has_quarantined(uint64_t va, size_t len) {
@@ -788,47 +834,51 @@ uint64_t leaf_flags(uint64_t va) {
   return find_leaf(va).entry & PTE_FLAG_MASK;
 }
 
-Capability alloc_pages(size_t pages) {
+Capability alloc_pages(size_t pages, bool revocable) {
   if (!is_initialized() || pages == 0) {
     return nullptr;
   }
 
   const size_t bytes = pages * PAGE_SIZE;
 
-  // Three separate resources, taken in order, each undone if a later one
-  // fails: an address range, the frames to back it, and the mapping joining
-  // the two. If either the virtual address space or the physical frame pool is
-  // exhausted while quarantined memory awaits reclamation, trigger a
-  // revocation sweep and retry once.
-  bool swept = false;
-  uint64_t va = reserve(pages);
-  if (va == 0 && quarantined_pages() > 0) {
-    revoke::sweep();
-    swept = true;
-    va = reserve(pages);
+  // Separate resources, taken in order, each undone if a later one fails: an
+  // address range, the frames to back it, the mapping joining the two, and
+  // for a revocable allocation its bitmap pages (REVOCATION BITMAP). Running
+  // out is not a reason to sweep (revoke.hpp, WHEN A SWEEP RUNS).
+  uint64_t va = 0;
+  {
+    Locked hold(s_lock);
+    va = reserve_locked(pages, revocable ? SHADOW_SPAN : PAGE_SIZE);
   }
   if (va == 0) {
     return nullptr;
   }
 
-  uint64_t pa = frame::alloc(pages);
-  if (pa == 0 && !swept && quarantined_pages() > 0) {
-    release(va, pages);
-    revoke::sweep();
-    va = reserve(pages);
-    if (va == 0) {
-      return nullptr;
-    }
-    pa = frame::alloc(pages);
-  }
+  const uint64_t pa = frame::alloc(pages);
   if (pa == 0) {
     release(va, pages);
     return nullptr;
   }
 
-  if (!map(va, pa, pages, pte::Permissive)) {
+  const uint64_t flags = pte::Permissive | (revocable ? pte::Revocable : 0);
+  if (!map(va, pa, pages, flags)) {
     frame::free(pa, pages);
     release(va, pages);
+    return nullptr;
+  }
+  auto unwind_mapping = [&] {
+    unmap(va, pages);
+    frame::free(pa, pages);
+    release(va, pages);
+  };
+
+  bool shadowed = true;
+  if (revocable) {
+    Locked hold(s_lock);
+    shadowed = map_shadow_locked(va, pages);
+  }
+  if (!shadowed) {
+    unwind_mapping();
     return nullptr;
   }
 
@@ -839,9 +889,11 @@ Capability alloc_pages(size_t pages) {
   c = capability_set_bounds(c, bytes);
   if (!capability_is_valid(c) ||
       (capability_get_perms(c) & (perms::Seal | perms::Unseal)) != 0) {
-    unmap(va, pages);
-    frame::free(pa, pages);
-    release(va, pages);
+    if (revocable) {
+      Locked hold(s_lock);
+      unmap_shadow_locked(va, shadow_pages(pages));
+    }
+    unwind_mapping();
     return nullptr;
   }
 
@@ -858,9 +910,9 @@ Capability alloc_pages(size_t pages) {
   return c;
 }
 
-bool free_pages(Capability object) {
+uint64_t free_pages(Capability object) {
   if (!is_initialized() || !capability_is_valid(object)) {
-    return false;
+    return 0;
   }
 
   // What to free is read from the capability itself: where it starts and how
@@ -868,13 +920,13 @@ bool free_pages(Capability object) {
   const uint64_t va = capability_get_base(object);
   const uint64_t bytes = capability_get_length(object);
   if (bytes == 0 || (va % PAGE_SIZE) != 0) {
-    return false;
+    return 0;
   }
 
   // Round up, so a capability covering part of a page still frees that page.
   const size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
   if (!range_is_mappable(va, pages)) {
-    return false;
+    return 0;
   }
 
   Locked hold(s_lock);
@@ -886,7 +938,7 @@ bool free_pages(Capability object) {
     const uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
     if (slot == nullptr || !(*slot & pte::Valid) ||
         (*slot & pte::Quarantined)) {
-      return false;
+      return 0;
     }
   }
 
@@ -896,15 +948,17 @@ bool free_pages(Capability object) {
   // invariant). Once `revoke::sweep()` clears all
   // tags pointing into quarantined memory, `reclaim_quarantined()` unmaps the
   // pages, frees their physical frames, and returns the virtual addresses to
-  // the reusable pool via `release()`.
+  // the reusable pool via `release()`. A revocable range's shadow goes with it.
+  bool revocable = false;
   for (size_t i = 0; i < pages; ++i) {
     uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
     *slot |= pte::Quarantined;
+    revocable = (*slot & pte::Revocable) != 0;
   }
 
   __atomic_fetch_sub(&s_alloc_pages, pages, __ATOMIC_RELAXED);
   __atomic_fetch_add(&s_quarantined_pages, pages, __ATOMIC_RELAXED);
-  return true;
+  return (pages + (revocable ? shadow_pages(pages) : 0)) * PAGE_SIZE;
 }
 
 // Both passes below walk the used part of the dynamic space, from its base to
@@ -950,10 +1004,20 @@ void reclaim_quarantined() {
       frame::free(pte_addr(leaf.entry), 1);
       release_locked(va, 1);  // merges with neighbouring free ranges
       __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
+      // The shadow page for this span goes with the page that starts it.
+      if ((leaf.entry & pte::Revocable) != 0 && va % SHADOW_SPAN == 0) {
+        uint64_t* shadow = leaf_slot(shadow_of(va), false);
+        frame::free(pte_addr(*shadow), 1);
+        *shadow = 0;
+      }
     }
     va = next_after(va, leaf);
   }
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+}
+
+Capability shadow_view() {
+  return dynamic_view(SHADOW_BASE, DYNAMIC_TOP - SHADOW_BASE);
 }
 
 size_t table_pages() {

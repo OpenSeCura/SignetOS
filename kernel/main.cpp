@@ -72,7 +72,12 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
 
   // Initialize kernel subsystems
   quota::init();
-  const Capability system_quota = quota::create_root(frame::pool_bytes());
+  // A VM quota is a budget of address space, so the root is all the address
+  // space there is to hand out (vm.hpp, LAYOUT). It says nothing about RAM:
+  // the quotas together may ask for more than there is, and an allocation
+  // can then fail for want of frames while its quota still has room.
+  const Capability system_quota =
+      quota::create_root(vm::SHADOW_BASE - vm::DYNAMIC_BASE);
 
   revoke::init();
   sentry::init(root_data_cap);
@@ -84,10 +89,9 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   irq::init_hart();
   thread::bring_up_secondary_harts(root_data_cap, hartid);
 
-  // The thread memory root, paid for out of the VM root so that between them
-  // they never promise more memory than physically exists. How much to set
-  // aside for threads is policy; 16 MiB for now.
-  constexpr uint64_t THREAD_MEMORY_BYTES = 16ULL * 1024 * 1024;
+  // The thread memory root, carved out of the VM root. How much of the
+  // address space to set aside for threads is policy; 1 GiB for now.
+  constexpr uint64_t THREAD_MEMORY_BYTES = 1024ULL * 1024 * 1024;
   const Capability thread_quota =
       thread::create_root_quota(system_quota, THREAD_MEMORY_BYTES);
 

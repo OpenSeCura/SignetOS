@@ -88,7 +88,7 @@ count.
 | **CHERI-enforced isolation** | Bounds, permissions, sealing and tags are the only isolation mechanism. |
 | **Thread migration model**: threads are not owned by compartments and migrate through a domain switcher | `sys_compartment_invoke` is the switcher (§3.4). A thread's kernel stack records the calls and traps it is inside; nothing records which compartments (§2.2, Lifecycle). |
 | **Capability system call interface**: syscalls are cross-compartment invocations into the kernel | Kernel syscalls are entry points (§2.5) invoked through the *same* switcher gate as any other compartment call. That gate is the only hardware sentry the kernel gives a compartment. |
-| **Zero-kernel-heap architecture** | There is no `kmalloc`. Every kernel object (quota node, compartment, thread, entry page, revocation backlog page) is whole pages billed to the requester's quota (§4.3); the only static roots live in `.bss`. |
+| **Zero-kernel-heap architecture** | There is no `kmalloc`. Every kernel object (quota node, compartment, thread, entry page) is whole pages billed to the requester's quota (§4.3); the only static roots live in `.bss`. |
 
 ### 1.2 The system as it runs today
 
@@ -111,8 +111,9 @@ The present build makes these simplifications, each expanded below:
   park (§4.4).
 * **The scheduler is currently round-robin** with per-node budgets,
   lazy replenishment and budgets enforced at the kernel's 10 ms tick (§2.6).
-* **Revocation sweeps run only under memory pressure.** Freed memory is
-  quarantined and stays mapped until a sweep (§4.2).
+* **A revocation sweep runs when someone asks, and at most once per interval.**
+  Freed memory is quarantined, stays mapped and stays charged to whoever paid
+  for it until a sweep reclaims it (§4.2).
 * **A fault is handled by the faulting compartment**, through the fault
   handler it installed, or reported and unwound if it has none: the caller
   gets `Faulted` (§3.6). Only a fault in kernel code halts the machine.
@@ -142,7 +143,8 @@ What the kernel genuinely owns is small and fixed:
 * the root vm quotas;
 * per-hart CPU state;
 * the trap table;
-* the revocation backlog.
+* the shadow region holding the revocation marks, whose pages each
+  revocable allocation pays for (§4.2).
 
 The rest of the design follows the same rule:
 
@@ -269,7 +271,8 @@ chains only grow while the compartment lives.
     and a thread that has not started yet ends at its first instruction.
   * Purges the compartment's trap bindings.
   * Releases every owned range, its entry pages and its own pages by
-    **quarantining** them (§4.2), and refunds the funding quota.
+    **quarantining** them (§4.2). Whoever paid for each is refunded when
+    the sweep reclaims it.
   * The call returns nothing, so failures are silent. A stale handle is
     refused because the compartment is no longer live.
 
@@ -290,10 +293,10 @@ the quotas its creator passes when it makes and registers it.
 | Descriptor | The thread's descriptor (saved registers and bookkeeping, reached through the thread handle) sits at the front of its allocation; the rest is a small **kernel return stack** that holds only switcher and trap frames. Syscall bodies run on a slice of the **caller's own stack**, not on the kernel stack (§3.4). Nesting depth is bounded by this stack; when it runs out, the call is refused with `NoKernelStack`. |
 | Thread stack | Allocated from the same quota and made local (§2.1). When the thread migrates, the switcher narrows the stack so the callee sees only the unused part below the current stack pointer. |
 | TLS | Not implemented yet.|
-| Billing | State and stack are debited from the `QuotaThreadMem` and refunded at teardown. |
+| Billing | State and stack are debited from the `QuotaThreadMem`, and refunded when the sweep after teardown reclaims them. |
 | Identity | A kernel tid, never reused, exposed by `sys_thread_tid`. The scheduler keys its tables by it. A thread can read its own tid from `utidc` (CSR 0x480) without a call: the kernel writes the hart number and the running thread's tid there on every switch, and only the kernel can write it (`runtime.hpp`, `self_tid`). |
 | Hierarchical CPU bandwidth | A parent derives a child `quota_sched`, creates the thread and registers it under that quota (§2.6, §3.3). When the parent destroys the child quota, its bandwidth returns to the parent node and the threads on it stop until they are registered elsewhere (§2.4, §2.6). |
-| Exit | `sys_thread_exit` quarantines its memory, refunds the quota, and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
+| Exit | `sys_thread_exit` quarantines its memory (refunded at the next sweep) and **always returns to the host context**. The host loop then re-dispatches the scheduler (§2.6). |
 | Kill | `sys_thread_kill`. A thread that never ran is torn down at once. Otherwise it is marked, and the kernel acts on the mark each time it resumes compartment code on it (return from a call, end of a trap) (`unwind.hpp`, KILLED THREADS). See the table below. `sched.thread_kill` wakes the thread and keeps it from sleeping again, so a kill takes effect within a tick of its CPU time. A stopped thread (§2.6) is put on the killer's node first, so the killer pays for it to run to its end. |
 
 A kill means **return this thread to its owner**. Code about to resume on a
@@ -373,8 +376,8 @@ and one for children.
 * **Conservation:** handed out ≤ allowance.
 * **Node funding:** deriving a child debits the child's budget *plus the cost
   of the node page itself* from the parent. Runaway derivation is therefore
-  bounded by the parent's budget. Both come back when the node is freed, and
-  its page is quarantined.
+  bounded by the parent's budget. The budget comes back when the node is
+  freed; the page, which is quarantined, when the sweep reclaims it.
 * **Destroy** requires `Permit_Store` and nothing else. It closes the node
   and every node beneath it: no more charges or derives through any of them,
   and every unused byte at every depth is refunded to the parent in the same
@@ -629,8 +632,8 @@ still define its own object types, all sharing the one hardware type
    fewer permissions.
 9. **Lifetime.** A type lives as long as its record. When the record is freed,
    the revocation sweep untags every key and every header copy, so all objects
-   of the type become unopenable at once. Sweeps currently run only under
-   memory pressure (§4.2), so on an idle machine a freed type stays openable.
+   of the type become unopenable at once. A sweep runs only when someone asks
+   for one (§4.2), so until then a freed type stays openable.
 10. **Provisioning at load time.** A creator can mint types for a compartment
     it is building and put the keys in its seeds. It follows that a creator
     can always open its child's sealed objects. **Sealing protects a
@@ -925,8 +928,9 @@ Rough edges:
 
 * The kernel syscalls carry no error channel beyond NULL / -1, so a caller
   cannot tell "out of quota" from "bad handle".
-* Freed pages are quarantined rather than reused. Quota is refunded
-  immediately, but physical memory only comes back after a sweep (§4.2).
+* Freed pages are quarantined rather than reused, and the quota that paid
+  for them is refunded only when a sweep has reclaimed them (§4.2). An owner
+  that needs the memory back sooner waits for one.
 
 ### 3.6 Hardware trap and interrupt handling
 
@@ -1093,7 +1097,7 @@ sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded
 
 | Step | Behaviour |
 | --- | --- |
-| Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages are refunded to its funding quota. |
+| Compartment destruction | Every owned range is **quarantined** (still mapped, never reissued) and reclaimed by the next sweep. The compartment's own pages too. Each funding quota is refunded as the sweep reclaims what it paid for. |
 | Resident threads | Destroy does not wait for them: once the sweep has run, a thread returning into the destroyed compartment is unwound to its nearest live caller, which gets `ERR_COMPARTMENT_DESTROYED` (§2.2). The shell still **waits for exit** before tearing down, by polling `sched.quota_query` until no thread is registered on the program's node: destroying the node earlier would stop the thread, not end it. There is no join or timeout. A running program can be killed (§2.3). |
 | `sys_quota_vm_destroy` | Closes the quota and its whole subtree and refunds every unused byte in it at once. Each node is freed, and the rest refunded, when everything it funded has been released. Fails only for a bad or already-closed handle or missing `Permit_Store`. |
 | `sched.quota_destroy` | Called through the parent's handle. Frees the node and everything derived under it, returns their bandwidth to the parent and their pages to their funding grants. Threads still on them stop (§2.6). Refused only while a fixed term runs. |
@@ -1129,37 +1133,50 @@ usual leak is physical memory held in quarantine until a sweep.
 **Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):**
 
 * **The base rule.** A sweep revokes every capability whose *base* lies in
-  memory being taken back: a quarantined page, or a range queued with
+  memory being taken back: a quarantined page, or a range marked with
   `sys_revoke`. Every capability derived from a range has its base inside it,
   so all of them die; a capability based outside it (the owner's capability
   to the enclosing allocation, the kernel's record of it) was not derived
   from it and survives. This is CHERIoT's rule.
 * **Freeing a whole allocation** (`sys_vm_deallocate`, compartment destroy)
   quarantines it; that is all the registration it needs.
-* **Revoking part of an allocation** (`sys_revoke(comp, mem, quota)`) is for
-  an owner that keeps the allocation and reuses the part, as a heap does with
-  a freed object. The authority is the compartment handle: the range must lie
-  inside one of `comp`'s allocations, and must not include its first byte,
-  where the owner's own capability to it is based. The backlog is billed to
-  `quota`. The owner reuses the memory once `sys_revoke_query` reaches the
-  returned epoch. Nobody else can revoke; whoever needs memory revoked asks
-  its owner.
-* **When a sweep runs:** only when `vm::alloc_pages` runs out of addresses or
-  frames while pages are quarantined. A queued range alone does not start
-  one, so its epoch can wait indefinitely.
-
-TODO: decide who triggers sweeps. The trigger inside `vm::alloc_pages` is
-policy in the kernel, never fires for queued ranges alone, and makes every
-page allocation re-entrant (a sweep refunds quotas, which is behind the
-"never call `alloc_pages` holding a node lock" rule, the unlock/relock in
-`quota::derive` and the two-phase locking in `revoke::revoke`). The direction
-discussed: a `sys_revoke_sweep` gate (sweep if anything is pending, return
-the completed epoch) that `init` hands to one trusted compartment, likely the
-scheduler, which sweeps when idle and at least once per period while
-something is pending; `alloc_pages` then just fails with `NoMemory` and an
-allocator waits for the next epoch. A sweep runs masked and scans all live
-memory, so the gate holder must be trusted for latency until sweeps are made
-incremental.
+* **Revoking part of an allocation** (`sys_revoke(comp, mem)`) is for an
+  owner that keeps the allocation and reuses the part, as a heap does with a
+  freed object. The authority is the compartment handle: the range must lie
+  inside one of `comp`'s revocable allocations (`FLAG_REVOCABLE`), and must
+  not include its first byte, where the owner's own capability to it is
+  based. `sys_revoke` returns the current epoch; the owner reuses the memory
+  once `sys_revoke_query`, the count of completed sweeps, reaches it. Nobody
+  else can revoke; whoever needs memory revoked asks its owner.
+* **Marks.** `sys_revoke` sets one bit per 16 bytes of its range, so both ends
+  must be multiples of 16 bytes; the sweep tests the bit under each
+  capability's base, and clears them all when it ends. The bits are a shadow
+  bitmap of the virtual address space, at a fixed place in its top 2GB
+  (`vm.hpp`, REVOCATION BITMAP), because capabilities name virtual addresses.
+  Only revocable allocations have bitmap pages: one page per 512KB of
+  allocation, rounded up, mapped with it, charged to its quota and freed with
+  it. To keep each bitmap page to one owner, a revocable allocation starts on
+  a 512KB boundary. Revoking itself costs no memory, and the sweep's test
+  costs the same however much is marked.
+* **Freed memory stays charged until it is reclaimed.** A quarantined range
+  is still the freer's address space: nobody else can be given it until the
+  sweep. So whoever frees memory owes it to the quota that paid for it: the
+  bytes stay charged, and the node goes on its tree's owed list. Each sweep
+  takes the owed lists before it reclaims and refunds them after
+  (`quota.hpp`, OWED). Freeing in a loop therefore exhausts only the freer's
+  own quota.
+* **Quotas are address space, not RAM.** The root VM quota is the whole
+  dynamic address space, so the quotas together can ask for more than the
+  machine has. An allocation can then fail for want of frames while its
+  quota still has room; until there is paging, that is simply `NoMemory`.
+* **When a sweep runs:** when someone asks (`sys_revoke_sweep()`), and at
+  most once per `revoke::SWEEP_INTERVAL_US` whoever asks. A request that
+  comes too early is told how long to wait. A sweep stops the machine while
+  it scans all live memory, so the interval is what bounds the time sweeps
+  take; who asks, and how often, cannot change it. Nothing else starts a
+  sweep: `vm::alloc_pages` just fails when memory runs out. A compartment
+  whose allocation fails because what it freed is still in quarantine waits
+  for the next sweep and tries again (`runtime.hpp`, `revoke_wait`).
 
 ### 4.3 Architectural invariants
 
@@ -1172,7 +1189,7 @@ incremental.
 | Type identity (address of the type record) | Subject to the sweep caveat in §2.7. |
 | Deterministic quotas and write guarantees | All memory is backed at allocation time; nothing is lazy, so nothing can fail later. |
 | Immutable quota partitions | Quotas cannot be resized after derivation (§3.5). |
-| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, revocation backlog pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
+| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
 
 ### 4.4 Multi-hart status
 
@@ -1200,11 +1217,12 @@ status.
 
 | Syscall (signature) | Behaviour |
 | --- | --- |
-| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. The one flag, `FLAG_DMA`, makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at; any other flag is refused. |
-| `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. Refunds and **quarantines** the memory (§4.2). |
+| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. `FLAG_DMA` makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at. `FLAG_REVOCABLE` makes it one whose parts can be revoked; it starts on a 512KB boundary and is also charged its revocation marks, one page per 512KB (§4.2). Any other flag is refused. |
+| `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. **Quarantines** the memory; `mem_quota` is refunded when the sweep reclaims it (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
-| `uint64_t sys_revoke(comp, mem_cap, mem_quota)` | Queues `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s allocations, not including its first byte. The backlog is funded by `mem_quota`. Returns the epoch to wait for, or 0 if refused. |
-| `uint64_t sys_revoke_query(void)` | Highest completed epoch (§4.2). |
+| `uint64_t sys_revoke(comp, mem_cap)` | Marks `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s revocable allocations, not including its first byte, and start and end on a multiple of 16 bytes. Returns the current epoch: the range may be reused once `sys_revoke_query` reaches it. 0 if refused. |
+| `uint64_t sys_revoke_query(void)` | How many sweeps have completed (§4.2). |
+| `uint64_t sys_revoke_sweep(void)` | Sweeps and returns 0 if the last sweep ended at least `revoke::SWEEP_INTERVAL_US` ago; otherwise the microseconds to wait before asking again (§4.2). |
 
 ### 5.2 Virtual memory quotas
 

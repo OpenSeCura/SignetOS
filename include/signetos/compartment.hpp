@@ -295,7 +295,9 @@ size_t entry_pages(Capability comp);
 // (syscall.hpp) it must also be one physically contiguous run -- every
 // allocation is today: alloc_pages maps one frame run linearly; the check is
 // still made page by page -- and its physical base is written into its first
-// 8 bytes. Any other flag is refused (InvalidSize).
+// 8 bytes. With FLAG_REVOCABLE it also comes with its revocation bitmap
+// pages (vm.hpp, REVOCATION BITMAP), charged to `mem_quota` with it. Any
+// other flag is refused (InvalidSize).
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status = nullptr);
 

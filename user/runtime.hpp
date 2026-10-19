@@ -289,6 +289,22 @@ inline void unlock(Capability invoke_gate, Capability lock_wake,
   }
 }
 
+// Waits until `sys_revoke_query()` reaches `epoch`: asks the kernel to sweep
+// (`sweep_gate`, `sys_revoke_sweep`), and when it says it is too early,
+// sleeps that long in the scheduler (`sched_block`) and looks again.
+inline void revoke_wait(Capability invoke_gate, Capability query_gate,
+                        Capability sweep_gate, Capability sched_block,
+                        uint64_t epoch) {
+  while (syscall::call<decltype(&sys_revoke_query)>(invoke_gate, query_gate) <
+         epoch) {
+    const uint64_t wait_us =
+        syscall::call<decltype(&sys_revoke_sweep)>(invoke_gate, sweep_gate);
+    if (wait_us != 0) {
+      invoke<int64_t>(invoke_gate, sched_block, wait_us);
+    }
+  }
+}
+
 // Copies a standalone compartment binary image (`img_cap`) into a fresh
 // allocation inside `target_comp` funded by `target_quota`, resolves its
 // internal `__cap_relocs` entries into `.got`, and mints its `OType::EntryPoint`

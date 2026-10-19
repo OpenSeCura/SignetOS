@@ -113,7 +113,6 @@ void teardown_thread(ThreadState* t) {
   Capability state_page = t->self_page;
   Capability stack_cap = t->stack_alloc;
   Capability quota_cap = t->funding_quota;
-  const uint64_t billed = t->total_billed;
 
   // Clear liveness and scrub stored capabilities in the state page.
   t->flags = 0;
@@ -125,16 +124,14 @@ void teardown_thread(ThreadState* t) {
   t->user_sp = nullptr;
   t->kernel_sp = nullptr;
 
-  if (capability_is_valid(stack_cap)) {
-    vm::free_pages(stack_cap);
-  }
-
-  // Through quota.cpp rather than the node itself: the quota may have been
+  // The quota pays for both until the sweep has reclaimed them, and is then
+  // refunded through quota.cpp rather than the node itself: it may have been
   // destroyed while this thread ran, and this may be what empties it.
-  quota::refund(s_quota_tree, quota_cap, billed);
-
+  if (capability_is_valid(stack_cap)) {
+    quota::owe(quota_cap, vm::free_pages(stack_cap));
+  }
   if (capability_is_valid(state_page)) {
-    vm::free_pages(state_page);
+    quota::owe(quota_cap, vm::free_pages(state_page));
   }
 
   __atomic_fetch_sub(&s_live_threads, 1, __ATOMIC_RELAXED);
@@ -330,8 +327,8 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
 
   Capability stack_mem = vm::alloc_pages(stack_pages);
   if (!capability_is_valid(stack_mem)) {
-    vm::free_pages(state_page);
-    refund_q();
+    quota::owe(thread_mem_quota, vm::free_pages(state_page));
+    quota::refund(s_quota_tree, thread_mem_quota, stack_bytes);
     return fail_with(out_status, Status::NoMemory);
   }
 
@@ -415,9 +412,8 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
                                             perms::LoadMutable);
   handle = sealing::seal_as(OType::Thread, handle);
   if (!capability_is_valid(handle)) {
-    vm::free_pages(stack_mem);
-    vm::free_pages(state_page);
-    refund_q();
+    quota::owe(thread_mem_quota, vm::free_pages(stack_mem));
+    quota::owe(thread_mem_quota, vm::free_pages(state_page));
     return fail_with(out_status, Status::InvalidCapability);
   }
 

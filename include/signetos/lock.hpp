@@ -29,24 +29,26 @@
  *                           `quota::destroy`'s walk down a subtree holds more
  *                           than one, each parent's taken before its
  *                           child's (quota.hpp, LOCKING).
- *   3. `revoke::s_lock`     protects the pending revocation backlog
- *                           (`g_pending_pages`) and serializes
- *                           `revoke::sweep()`.
- *   4. `vm::s_lock`         protects the virtual address free list and Sv39
+ *   3. `revoke::s_lock`     protects the revocation marks (revoke.hpp,
+ *                           MARKING RANGES) and the epochs, and serializes
+ *                           sweeps.
+ *   4. `Tree::owed_lock`    leaf lock protecting a quota tree's owed list
+ *                           (quota.hpp, OWED).
+ *   5. `vm::s_lock`         protects the virtual address free list and Sv39
  *                           page tables (never held while zeroing pages).
- *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
- *   6. `irq::s_lock`        leaf lock serializing the two handler installs
+ *   6. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
+ *   7. `irq::s_lock`        leaf lock serializing the two handler installs
  *                           (`irq::install`).
- *   7. `uart::s_lock`       leaf lock protecting console line output.
+ *   8. `uart::s_lock`       leaf lock protecting console line output.
  *
  * Locks are acquired strictly in the order listed above (outermost to
  * innermost). Pure capability-derivation and read-only syscalls (`sys_seal`,
  * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_revoke_query`,
  * `sys_thread_tid`) take no lock at all.
  *
- * `vm::alloc_pages` may run a revocation sweep, which takes `revoke::s_lock`
- * and then refunds into quota nodes. So it is never called with a
- * `QuotaNode::lock` or `revoke::s_lock` held.
+ * A revocation sweep refunds what quota nodes are owed after it has let go
+ * of `revoke::s_lock`. It runs only when asked for (`sys_revoke_sweep`, or the
+ * boot self-test), never inside another kernel call.
  *
  * HOW IT IS SAFE TO HOLD
  * ----------------------

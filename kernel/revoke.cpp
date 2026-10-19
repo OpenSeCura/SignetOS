@@ -19,6 +19,7 @@
  */
 
 #include <signetos/compartment.hpp>
+#include <signetos/hw/clint.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
@@ -31,123 +32,73 @@ namespace {
 
 SpinLock s_lock;
 
-// A range awaiting the next sweep. Every pending range belongs to the current
-// pending epoch, so the epoch is not stored per range.
-struct PendingRange {
-    uint64_t base;
-    uint64_t top;
-};
-
-// One page of the backlog. The header mirrors a compartment range page (`next`
-// at 0, `funder` at 16) and the rule is the same: a range is only recorded on
-// a page bought by the registering caller's own quota, so a caller that keeps
-// registering runs out of its own memory and nobody else's.
-constexpr size_t PENDING_HEADER = 48;
-constexpr size_t RANGES_PER_PENDING_PAGE =
-    (vm::PAGE_SIZE - PENDING_HEADER) / sizeof(PendingRange);
-
-struct PendingPage {
-    Capability next;    // the next page in the chain, or null
-    Capability funder;  // the QuotaVm handle charged for this page
-    uint64_t count;     // ranges in use, from the front
-    uint64_t pad;
-    PendingRange ranges[RANGES_PER_PENDING_PAGE];
-};
-static_assert(offsetof(PendingPage, funder) == compartment::CAP_BYTES);
-static_assert(offsetof(PendingPage, ranges) == PENDING_HEADER);
-static_assert(sizeof(PendingPage) <= vm::PAGE_SIZE);
-
-// Head of the chain of pending pages. Null when the backlog is empty. Lives in
-// `.bss`, which the sweep scans; it survives because nothing registers a range
-// over kernel bookkeeping pages.
-Capability g_pending_pages = nullptr;
-
 // Epoch 0 means "no sweep has ever completed", so the first epoch handed out is 1.
 uint64_t g_pending_epoch   = 1;
 uint64_t g_completed_epoch = EPOCH_NONE;
 
-PendingPage* page_of(Capability page_cap) {
-  return reinterpret_cast<PendingPage*>(page_cap);
+// The marks (revoke.hpp, MARKING RANGES) live in the revocation bitmap
+// (vm.hpp, REVOCATION BITMAP), reached through this view of it.
+// `[s_marked_lo, s_marked_hi)` covers the bitmap addresses marked since the
+// last sweep; it is empty if nothing is. Under `s_lock`.
+Capability s_shadow = nullptr;
+uint64_t s_marked_lo = ~0ULL;
+uint64_t s_marked_hi = 0;
+
+// The shadow word holding the mark for `va`, which lies in a revocable
+// allocation, and the mark's bit in it: byte (va - DYNAMIC_BASE) / 128 of
+// the shadow, bit ((va - DYNAMIC_BASE) / 16) % 8 of that byte.
+volatile uint64_t* mark_word(uint64_t va) {
+  return reinterpret_cast<volatile uint64_t*>(
+      capability_set_address(s_shadow, vm::shadow_of(va) & ~7ULL));
+}
+uint64_t mark_bit(uint64_t va) {
+  return 1ULL << (((va - vm::DYNAMIC_BASE) / 16) % 64);
 }
 
-// True if two quota handles name the same node. Comparing bases rather than
-// whole capabilities means a caller may present any copy of the handle.
-bool same_quota(Capability a, Capability b) {
-  return capability_is_valid(a) && capability_is_valid(b) &&
-         capability_get_base(a) == capability_get_base(b);
+// Marks `[base, top)`, which lies in one revocable allocation.
+void mark(uint64_t base, uint64_t top) {
+  for (uint64_t va = base; va < top; va += 16) {
+    *mark_word(va) |= mark_bit(va);
+  }
+  const uint64_t lo = vm::shadow_of(base);
+  const uint64_t hi = vm::shadow_of(top - 1) + 1;
+  s_marked_lo = lo < s_marked_lo ? lo : s_marked_lo;
+  s_marked_hi = hi > s_marked_hi ? hi : s_marked_hi;
 }
 
-// A page funded by `mem_quota` with a free record, or null. Caller holds
-// `s_lock`. Pages funded by other quotas are skipped even when they have room.
-PendingPage* find_room(Capability mem_quota) {
-  for (Capability p = g_pending_pages; capability_is_valid(p);
-       p = page_of(p)->next) {
-    PendingPage* page = page_of(p);
-    if (page->count < RANGES_PER_PENDING_PAGE &&
-        same_quota(page->funder, mem_quota)) {
-      return page;
+bool is_marked(uint64_t va) { return (*mark_word(va) & mark_bit(va)) != 0; }
+
+bool any_marked() { return s_marked_lo < s_marked_hi; }
+
+// Clears every mark: zeroes the shadow pages in the marked span that are still
+// mapped (those of allocations the sweep has just reclaimed are gone).
+void clear_marks() {
+  for (uint64_t page = s_marked_lo & ~(vm::PAGE_SIZE - 1); page < s_marked_hi;
+       page += vm::PAGE_SIZE) {
+    if (vm::leaf_flags(page) == 0) {
+      continue;
+    }
+    volatile uint64_t* w = reinterpret_cast<volatile uint64_t*>(
+        capability_set_address(s_shadow, page));
+    for (size_t i = 0; i < vm::PAGE_SIZE / sizeof(uint64_t); ++i) {
+      w[i] = 0;
     }
   }
-  return nullptr;
-}
-
-// Detaches the whole backlog and returns its chain of pages. Caller holds
-// `s_lock`.
-Capability take_pages() {
-  Capability p = g_pending_pages;
-  g_pending_pages = nullptr;
-  return p;
-}
-
-// Frees a chain detached by take_pages() back into quarantine and refunds each
-// page's funder. Caller must NOT hold `s_lock`: a refund takes quota node
-// locks, which come before it (lock.hpp). The pages are reclaimed by the sweep
-// after the one that retires them, like any other freed kernel bookkeeping
-// page.
-void release_pages(Capability p) {
-  while (capability_is_valid(p)) {
-    const Capability next = page_of(p)->next;
-    const Capability funder = page_of(p)->funder;
-    vm::free_pages(p);
-    quota::refund(funder, vm::PAGE_SIZE);
-    p = next;
-  }
-}
-
-// True if `address` lies in a range awaiting the sweep. Caller holds
-// `s_lock`.
-bool in_pending_range(uint64_t address) {
-  for (Capability p = g_pending_pages; capability_is_valid(p);
-       p = page_of(p)->next) {
-    const PendingPage* page = page_of(p);
-    for (uint64_t i = 0; i < page->count; ++i) {
-      if (address >= page->ranges[i].base && address < page->ranges[i].top) {
-        return true;
-      }
-    }
-  }
-  return false;
+  s_marked_lo = ~0ULL;
+  s_marked_hi = 0;
 }
 
 } // namespace
 
 void init() {
   s_lock = SpinLock{};
-  // A no-op at boot; the tests re-init with ranges queued.
-  release_pages(take_pages());
   g_pending_epoch = 1;
   g_completed_epoch = EPOCH_NONE;
+  s_shadow = vm::shadow_view();
+  s_marked_lo = ~0ULL;
+  s_marked_hi = 0;
 }
 
-size_t pending_count() {
-  Locked hold(s_lock);
-  size_t n = 0;
-  for (Capability p = g_pending_pages; capability_is_valid(p);
-       p = page_of(p)->next) {
-    n += page_of(p)->count;
-  }
-  return n;
-}
 uint64_t completed_epoch() {
   return __atomic_load_n(&g_completed_epoch, __ATOMIC_ACQUIRE);
 }
@@ -155,8 +106,7 @@ uint64_t pending_epoch() {
   return __atomic_load_n(&g_pending_epoch, __ATOMIC_ACQUIRE);
 }
 
-Status revoke(Capability comp, Capability mem_cap, Capability mem_quota,
-              uint64_t* out_epoch) {
+Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   // The range comes from the caller's capability to it.
   if (!capability_is_valid(mem_cap) || sealing::is_sealed(mem_cap)) {
     return Status::InvalidCapability;
@@ -167,53 +117,23 @@ Status revoke(Capability comp, Capability mem_cap, Capability mem_quota,
   if (mem_len == 0 || mem_top < mem_base) {
     return Status::InvalidRange;
   }
+  // Marked 16 bytes at a time (MARKING RANGES).
+  if ((mem_base | mem_len) % 16 != 0) {
+    return Status::BadAlignment;
+  }
 
   // WHO MAY REVOKE: the owner, for memory strictly inside one of its
-  // allocations.
+  // allocations, which must be revocable so that it has shadow.
   Status owned = Status::Ok;
   if (!compartment::owns_inside(comp, mem_base, mem_len, &owned)) {
     return owned;
   }
-
-  // The backlog is paid for. The record goes on a page funded by
-  // `mem_quota`; a page is bought from it when none of its pages has room.
-  // `quota::charge` is the full check on the handle when a page is bought
-  // (genuine QuotaVm, Permit_Load); the type check here keeps a stray
-  // capability with a matching base from riding on an existing page.
-  if (!sealing::is_sealed_as(OType::QuotaVm, mem_quota)) {
-    return Status::InvalidCapability;
+  if ((vm::leaf_flags(mem_base) & vm::pte::Revocable) == 0) {
+    return Status::NotInRange;
   }
-  {
-    Locked hold(s_lock);
-    if (PendingPage* page = find_room(mem_quota)) {
-      page->ranges[page->count] = PendingRange{mem_base, mem_top};
-      __atomic_store_n(&page->count, page->count + 1, __ATOMIC_RELEASE);
-      if (out_epoch != nullptr) {
-        *out_epoch = g_pending_epoch;
-      }
-      return Status::Ok;
-    }
-  }
-
-  // Bought outside `s_lock`: `vm::alloc_pages` may run a sweep when memory is
-  // short, and the sweep takes `s_lock`.
-  const Status paid = quota::charge(mem_quota, vm::PAGE_SIZE);
-  if (paid != Status::Ok) {
-    return paid;
-  }
-  Capability fresh = vm::alloc_pages(1);  // zeroed, so count starts at 0
-  if (!capability_is_valid(fresh)) {
-    quota::refund(mem_quota, vm::PAGE_SIZE);
-    return Status::NoMemory;
-  }
-  PendingPage* page = page_of(fresh);
-  page->funder = mem_quota;
-  page->ranges[0] = PendingRange{mem_base, mem_top};
-  page->count = 1;
 
   Locked hold(s_lock);
-  page->next = g_pending_pages;
-  g_pending_pages = fresh;
+  mark(mem_base, mem_top);
   if (out_epoch != nullptr) {
     *out_epoch = g_pending_epoch;
   }
@@ -232,20 +152,21 @@ bool should_revoke(Capability cap) {
   }
   const uint64_t base = capability_get_base(cap);
   const uint64_t len = capability_get_length(cap);
-  // Never revoke standing kernel derivation roots (e.g. `vm::s_dynamic`,
-  // `sentry::s_root_code_cap`, `vm::s_direct`), whose base is the base of
-  // the whole dynamic space.
-  if (len >= vm::DYNAMIC_TOP - vm::DYNAMIC_BASE || base >= vm::DIRECT_BASE) {
+  // Only the dynamic space is ever freed or revoked. Never revoke the
+  // standing kernel derivation roots (e.g. `vm::s_dynamic`,
+  // `sentry::s_root_code_cap`), whose base is the base of the whole space.
+  if (base < vm::DYNAMIC_BASE || base >= vm::DYNAMIC_TOP ||
+      len >= vm::DYNAMIC_TOP - vm::DYNAMIC_BASE) {
     return false;
   }
 
-  // THE BASE RULE: a queued range (called by the sweep with `s_lock` held),
-  // or a quarantined page.
-  if (in_pending_range(base)) {
+  // THE BASE RULE: a quarantined page, or a marked granule of a revocable one
+  // (called by the sweep with `s_lock` held).
+  const uint64_t flags = vm::leaf_flags(base);
+  if ((flags & vm::pte::Quarantined) != 0) {
     return true;
   }
-  return vm::quarantined_pages() > 0 && base >= vm::DYNAMIC_BASE &&
-         base < vm::DYNAMIC_TOP && vm::is_quarantined(base);
+  return (flags & vm::pte::Revocable) != 0 && is_marked(base);
 }
 
 namespace {
@@ -257,12 +178,19 @@ namespace {
     return capability_get_address(c);            \
   }())
 
-// The sweep proper, under `s_lock`. Returns the backlog it retired, for the
-// caller to release once the lock is dropped.
-Capability sweep_locked() {
-  Locked hold(s_lock);
-  Capability retired = nullptr;
-  if (capability_is_valid(g_pending_pages) || vm::quarantined_pages() > 0) {
+// When the last sweep ended, in `time` ticks, if there has been one (WHEN A
+// SWEEP RUNS).
+bool s_swept = false;
+uint64_t s_last_sweep_end = 0;
+
+// True if a sweep would have anything to do. Caller holds `s_lock`.
+bool anything_pending() {
+  return any_marked() || vm::quarantined_pages() > 0;
+}
+
+// The sweep proper. Caller holds `s_lock`.
+void sweep_locked() {
+  if (anything_pending()) {
     // 1. Scan kernel `.data`, `.bss.stack`, and `.bss` (`[_data_start,
     //    _kernel_end)`), which includes the boot stack and all static state.
     //    The image is identity-mapped; `phys_view` is the one standing
@@ -292,29 +220,52 @@ Capability sweep_locked() {
     //    reusable pool.
     vm::reclaim_quarantined();
 
-    // 4. The backlog is retired. Its pages are given back and whoever paid is
-    //    refunded by the caller, outside `s_lock`.
-    retired = take_pages();
+    // 4. Every capability based in a marked granule is gone too, so the
+    //    marks have done their job. Not before: a capability scanned late
+    //    may be based in a range whose own page was scanned early.
+    clear_marks();
+    s_swept = true;
+    s_last_sweep_end = clint::now();
   }
 
   const uint64_t swept = g_pending_epoch;
   __atomic_store_n(&g_completed_epoch, swept, __ATOMIC_RELEASE);
   __atomic_store_n(&g_pending_epoch, swept + 1, __ATOMIC_RELEASE);
-  return retired;
 }
 
-__attribute__((noinline)) void do_sweep() {
-  release_pages(sweep_locked());
+// Sweeps, unless `limited` and a sweep has ended less than SWEEP_INTERVAL_US
+// ago with something to scan. Returns 0 if it swept, otherwise the
+// microseconds to wait.
+//
+// What is owed for freed memory (quota.hpp, OWED) is taken before the sweep
+// reclaims, so all of it is reclaimed by this sweep, and refunded after it,
+// once `s_lock` is let go: a refund takes quota node locks, which come before
+// it (lock.hpp). A refund can free a quota node whose last bytes these were;
+// its page is owed in turn and waits for the next sweep.
+__attribute__((noinline)) uint64_t try_sweep(bool limited) {
+  quota::Owed owed;
+  {
+    Locked hold(s_lock);
+    if (limited && s_swept && anything_pending()) {
+      const uint64_t ready =
+          s_last_sweep_end + clint::us_to_ticks(SWEEP_INTERVAL_US);
+      const uint64_t now = clint::now();
+      if (now < ready) {
+        return clint::ticks_to_us(ready - now) + 1;  // never 0, never short
+      }
+    }
+    owed = quota::take_owed();
+    sweep_locked();
+  }
+  quota::settle_owed(owed);
+  return 0;
 }
 
-}  // namespace
-
-void sweep() {
-  // Clobbering `cs0..cs11` forces the compiler to spill all callee-saved
-  // capability registers into this stack frame in the prologue (before
-  // `do_sweep()` scans the stack) and reload them from those swept stack
-  // slots in the epilogue.
-  do_sweep();
+// Follows every call into a sweep. The clobbers make the caller's prologue
+// spill all callee-saved capability registers into its frame, which the
+// sweep scans, and its epilogue reload them from there, so none keeps a
+// capability the sweep revoked; the temporaries are scrubbed.
+__attribute__((always_inline)) inline void scrub_registers() {
   __asm__ volatile(
       "cmv ct0, cnull\n\t"
       "cmv ct1, cnull\n\t"
@@ -336,6 +287,19 @@ void sweep() {
       : "cs0", "cs1", "cs2", "cs3", "cs4", "cs5", "cs6", "cs7", "cs8", "cs9",
         "cs10", "cs11", "ct0", "ct1", "ct2", "ct3", "ct4", "ct5", "ct6", "ca0",
         "ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "memory");
+}
+
+}  // namespace
+
+uint64_t request() {
+  const uint64_t wait_us = try_sweep(true);
+  scrub_registers();
+  return wait_us;
+}
+
+void sweep() {
+  try_sweep(false);
+  scrub_registers();
 }
 
 } // namespace signetos::revoke

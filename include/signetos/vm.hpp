@@ -127,6 +127,25 @@ uint64_t kernel_base();  // KERNEL_BASE, as discovered from the DTB
 constexpr uint64_t DYNAMIC_BASE = 0xC0000000ULL;    // 3GB, next GB above the image
 constexpr uint64_t DYNAMIC_TOP  = 0x4000000000ULL;  // top of the lower half
 
+// REVOCATION BITMAP
+//
+// The top 2GB of the dynamic space is never handed out. It holds the marks
+// `revoke` sets (revoke.hpp, MARKING RANGES): one bit per 16 bytes of
+// everything below it, so the mark for `va` is a bit in the byte at
+// `shadow_of(va)`, and 4KB of bitmap covers SHADOW_SPAN of addresses. This
+// file only lays the region out and maps and unmaps its pages; what the bits
+// mean is revoke's. Only revocable allocations (FLAG_REVOCABLE) have bitmap
+// pages: their pages carry pte::Revocable, they start on a SHADOW_SPAN
+// boundary so that no other revocable allocation shares their bitmap pages,
+// and those are mapped, paid for and freed with them. Everywhere else the
+// region is unmapped and costs nothing.
+constexpr uint64_t SHADOW_BASE = DYNAMIC_TOP - 2 * GIGAPAGE_SIZE;
+constexpr uint64_t SHADOW_SPAN = PAGE_SIZE * 128;
+constexpr uint64_t shadow_of(uint64_t va) {
+  return SHADOW_BASE + (va - DYNAMIC_BASE) / 128;
+}
+static_assert(shadow_of(SHADOW_BASE) <= DYNAMIC_TOP);
+
 // The direct map: all of RAM, kernel-only, at the bottom of the upper half.
 constexpr uint64_t DIRECT_BASE = 0xFFFFFFC000000000ULL;
 
@@ -178,6 +197,10 @@ namespace pte {
     // every page of a freed range, which stays mapped until the revocation
     // sweep. See FREEING AND QUARANTINE above.
     constexpr uint64_t Quarantined = (1ULL << 8);
+
+    // Software bit (RSW, bit 9): the page belongs to a revocable allocation,
+    // so it has revocation bitmap pages (REVOCATION BITMAP).
+    constexpr uint64_t Revocable = (1ULL << 9);
 }
 
 // Builds the boot mappings (devices, direct map), derives the two standing
@@ -251,9 +274,6 @@ bool unmap(uint64_t va, size_t pages);
 // is still mapped, so it translates.
 uint64_t translate(uint64_t va);
 
-// True if `va` is mapped and was freed: quarantined, awaiting the sweep.
-bool is_quarantined(uint64_t va);
-
 // True if any page overlapping `[va, va + len)` is mapped and marked
 // quarantined.
 bool range_has_quarantined(uint64_t va, size_t len);
@@ -270,29 +290,46 @@ uint64_t leaf_flags(uint64_t va);
 // default. It is page granular: there is no heap and no sub-page allocator.
 //
 
+// Pages of shadow a revocable allocation of `pages` pages comes with.
+constexpr size_t shadow_pages(size_t pages) {
+  return (pages * PAGE_SIZE + SHADOW_SPAN - 1) / SHADOW_SPAN;
+}
+
 // Allocates `pages` contiguous pages. Returns a capability bounded to exactly
-// that range with DataRw, or null. Contents are zeroed.
-Capability alloc_pages(size_t pages);
+// that range with DataRw, or null. Contents are zeroed. If `revocable`, the
+// range starts on a SHADOW_SPAN boundary and comes with `shadow_pages(pages)`
+// more frames of revocation bitmap (REVOCATION BITMAP), which the caller pays
+// for too.
+Capability alloc_pages(size_t pages, bool revocable = false);
 
 // Frees an allocation from alloc_pages by quarantining it. Nothing is unmapped
 // and no frame is released: the range stays mapped, with its data, until a
 // revocation sweep has cleared the tags on capabilities that may still cover
 // it. See FREEING AND QUARANTINE above.
 //
-// Returns false if any page is unmapped or already quarantined, so a range
-// cannot be freed twice.
-bool free_pages(Capability object);
+// Returns the bytes quarantined, the shadow of a revocable range included:
+// what its payer goes on paying for until a sweep reclaims it, so the caller
+// owes it rather than refunding it (quota.hpp, OWED). Returns 0, and frees
+// nothing, if any page is unmapped or already quarantined, so a range cannot
+// be freed twice.
+uint64_t free_pages(Capability object);
 
 // Scans every live (non-quarantined) mapped page in the dynamic address space
 // and clears the hardware tag on any capability slot where
 // `revoke::should_revoke` returns true. Called by `revoke::sweep()`.
 void sweep_live_pages();
 
-// Unmaps every quarantined page in the dynamic address space, frees its
-// backing physical frame, and returns its virtual address range to the
-// reusable VA pool. Called by `revoke::sweep()` after all capability tags
-// pointing into quarantined ranges have been cleared.
+// Unmaps every quarantined page in the dynamic address space, and its shadow,
+// frees their frames, and returns the addresses to the reusable VA pool.
+// Called by `revoke::sweep()` after all capability tags pointing into
+// quarantined ranges have been cleared.
 void reclaim_quarantined();
+
+// Kernel-only read/write view of the whole revocation bitmap (REVOCATION
+// BITMAP), for `revoke`, which owns what is in it. Only the pages of
+// revocable allocations are mapped: test `leaf_flags` before touching
+// anything else.
+Capability shadow_view();
 
 // Diagnostics.
 size_t table_pages();

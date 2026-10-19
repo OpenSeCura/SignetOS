@@ -73,6 +73,11 @@ inline uint64_t us_to_ticks(uint64_t us) {
   return us * (platform::timebase_hz() / 1'000'000);
 }
 
+// And back, rounding down.
+inline uint64_t ticks_to_us(uint64_t ticks) {
+  return ticks / (platform::timebase_hz() / 1'000'000);
+}
+
 // Arms the machine timer interrupt on the calling hart for absolute
 // `time == deadline` and clears any pending one.
 void set_timer(uint64_t deadline);

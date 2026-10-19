@@ -59,11 +59,26 @@
 // Each derived node occupies one page, billed to the parent that asked for it.
 // There is no pool, no free list and no slot recycling. A reclaimed node's page
 // is quarantined (vm.hpp): it stays mapped, so its handles still reach it, and
-// they are refused because its flags are clear. The revocation sweep will
-// eventually clear their tags too.
+// they are refused because its flags are clear. The parent goes on paying for
+// the page until the revocation sweep has cleared those handles' tags and
+// reclaimed it (OWED below).
 //
 // Root nodes are the exception. They have no parent to bill, so each tree's
 // single root node lives in .bss.
+//
+// OWED
+//
+// Freed memory is quarantined until a sweep reclaims it, and until then it is
+// still the freer's address space: nobody else can be given it. So it stays
+// charged. Whoever frees memory tells its quota with `owe`, which counts the
+// bytes in the node's `owed_bytes` and puts the node on its tree's owed list;
+// the bytes stay in `allocated_bytes`. Each sweep takes the owed lists as
+// they stand when it reclaims, and then refunds every node on them what it is
+// owed (`settle_owed`). A node that is owed is not empty, so it cannot be
+// freed while it is on a list. Callers owe after they free, so memory freed
+// while a sweep runs is refunded by the next one. The exception, possible
+// only with several harts: bytes owed to a node that is already on the lists
+// a sweep took are refunded with them, which may be a sweep early.
 //
 // AUTHENTICATION VS ACCESS
 //
@@ -104,9 +119,6 @@
 // apart from bytes that a refund or destroy running on another hart has
 // already picked up and is still carrying; those arrive before that
 // operation returns.
-//
-// `vm::alloc_pages` is never called with a node lock held: it can run a
-// revocation sweep, which refunds into the tree.
 //
 
 #include <stdint.h>
@@ -154,6 +166,9 @@ struct QuotaNode {
                               // closed node refunds what it is not using
     uint64_t allocated_bytes; // handed out: allocations, threads, and each
                               // child as its limit + QUOTA_NODE_COST
+    uint64_t owed_bytes;      // part of allocated_bytes freed but not yet
+                              // reclaimed by a sweep (OWED above)
+    QuotaNode* next_owed;     // the tree's owed list, under its owed_lock
     uint32_t flags;
     SpinLock lock;
 
@@ -179,6 +194,8 @@ struct Tree {
     QuotaNode root;
     bool root_taken;
     size_t live_nodes;        // updated atomically
+    QuotaNode* owed;          // nodes with owed_bytes > 0 (OWED above)
+    SpinLock owed_lock;       // taken under a node lock, never the reverse
 };
 
 // --- Generic operations on any tree -----------------------------------------
@@ -217,6 +234,21 @@ Status refund(Tree& t, Capability handle, uint64_t bytes);
 
 // Kernel-internal introspection. False if the handle is not genuine.
 bool query(Tree& t, Capability handle, QuotaNode* out_copy);
+
+// OWED above. `bytes` of what `handle` paid for have been freed and await the
+// sweep: they stay charged until `settle_owed` refunds them. `handle` may be
+// of any tree, or null for memory nobody paid for.
+void owe(Capability handle, uint64_t bytes);
+
+// Called by the sweep, holding no lock. `take_owed` detaches every tree's
+// owed list, before the sweep reclaims; `settle_owed` refunds what the nodes
+// on the lists it took are owed, once the sweep has reclaimed it all.
+constexpr size_t MAX_TREES = 2;  // VM and thread memory
+struct Owed {
+    QuotaNode* lists[MAX_TREES];
+};
+Owed take_owed();
+void settle_owed(Owed owed);
 
 // --- The VM quota tree (OType::QuotaVm) --------------------------------------
 
