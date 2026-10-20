@@ -169,6 +169,7 @@ CXX_SRCS = kernel/vm.cpp \
            kernel/sentry.cpp \
            kernel/switcher.cpp \
            kernel/thread.cpp \
+           kernel/smp.cpp \
            kernel/unwind.cpp \
            kernel/syscall.cpp \
            kernel/init.cpp \

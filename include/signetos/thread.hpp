@@ -147,15 +147,6 @@ void init();
 constexpr size_t MAX_HARTS = platform::MAX_HARTS;
 void init_hart(uint64_t hartid);
 
-// Brings up every secondary hart present in the DTB (`platform::hart_present`),
-// carving each hart's 64 KiB host stack (`csp`) and 16 KiB kernel entry stack
-// (`mscratchc`) from the identity-mapped kernel region above `_kernel_end` and
-// waiting until each hart has completed `init_hart` and `irq::init_hart`.
-void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart);
-
-// Number of harts that have completed `init_hart`.
-size_t online_harts();
-
 // The number of the hart this is running on (the one `init_hart` was given).
 uint64_t this_hart();
 

@@ -18,14 +18,12 @@
  * thread.cpp - SignetOS Thread Memory Quotas and Thread Execution State
  */
 
-#include <signetos/hw/clint.hpp>
 #include <signetos/debug/inspect.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>
-#include <signetos/irq.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
@@ -39,26 +37,8 @@ extern "C" void __thread_exit_to_host(signetos::thread::ThreadState* t,
 extern "C" void __thread_start(void);
 extern "C" signetos::Capability __thread_start_link(void);
 
-extern "C" void secondary_hart_init(uint64_t hartid) {
-  signetos::thread::init_hart(hartid);
-  signetos::irq::init_hart();
-}
-
 namespace signetos::thread {
 namespace {
-
-// Per-hart boot handoff slot in `_hart_boot_table` (linker.ld, 64 bytes/hart).
-// Offsets are matched by `.Lsecondary_wait_loop` / `.Lsecondary_start` in
-// `kernel/boot.S`.
-struct alignas(64) HartBootSlot {
-  Capability sp;      // +0:  64 KiB host stack (cursor at top)
-  Capability ksp;     // +16: 16 KiB kernel entry stack (cursor at top)
-  uint64_t satp;      // +32: Sv39 satp value
-  uint64_t state;     // +40: 0 = waiting, 1 = go, 2 = online
-  Capability msip;    // +48: this hart's CLINT `msip`, which the parked hart
-                      //      writes to clear each poke (clint.hpp)
-};
-static_assert(sizeof(HartBootSlot) == 64);
 
 // The thread-memory quota tree (OType::QuotaThreadMem). Same implementation
 // as the VM tree; see quota.hpp.
@@ -66,7 +46,6 @@ quota::Tree s_quota_tree;
 
 uint64_t s_next_tid = 0;
 size_t s_live_threads = 0;
-size_t s_online_harts = 0;
 
 // Per-hart state. "Which thread is running" and "where is the host frame" are
 // facts about a hart, not about the kernel, so each hart has its own block.
@@ -143,7 +122,6 @@ void init() {
   quota::init(s_quota_tree, OType::QuotaThreadMem);
   s_next_tid = 0;
   s_live_threads = 0;
-  s_online_harts = 0;
 }
 
 void init_hart(uint64_t hartid) {
@@ -154,78 +132,6 @@ void init_hart(uint64_t hartid) {
   *c = Cpu{};
   c->hart_id = hartid;
   set_utidc(hartid, 0);
-  __atomic_fetch_add(&s_online_harts, 1, __ATOMIC_SEQ_CST);
-}
-
-void bring_up_secondary_harts(Capability root_data_cap, uint64_t boot_hart) {
-  if (!capability_is_valid(root_data_cap)) {
-    return;
-  }
-
-  uint64_t table_pa = 0;
-  uint64_t kend_pa = 0;
-  {
-    Capability c;
-    __asm__ volatile("llc %0, _hart_boot_table" : "=C"(c));
-    table_pa = capability_get_address(c);
-    __asm__ volatile("llc %0, _kernel_end" : "=C"(c));
-    kend_pa = capability_get_address(c);
-  }
-
-  Capability table_cap = capability_set_address(root_data_cap, table_pa);
-  table_cap =
-      capability_set_bounds(table_cap, MAX_HARTS * sizeof(HartBootSlot));
-  table_cap = capability_and_perms(table_cap, perms::DataRw);
-  auto* table = reinterpret_cast<HartBootSlot*>(table_cap);
-
-  uint64_t satp_val = 0;
-  __asm__ volatile("csrr %0, satp" : "=r"(satp_val));
-
-  constexpr uint64_t HOST_STACK_BYTES = 65536ULL;
-  constexpr uint64_t KSP_STACK_BYTES  = 16384ULL;
-  uint64_t cursor =
-      (kend_pa + (HOST_STACK_BYTES - 1)) & ~(HOST_STACK_BYTES - 1);
-  const uint64_t limit = vm::kernel_base() + vm::KERNEL_SIZE;
-
-  for (uint64_t h = 0; h < MAX_HARTS; ++h) {
-    if (h == boot_hart || !platform::hart_present(h)) {
-      continue;
-    }
-    if (cursor + HOST_STACK_BYTES + KSP_STACK_BYTES > limit) {
-      debug::panic("thread: out of boot region for secondary hart stacks");
-    }
-
-    Capability sp = capability_set_address(root_data_cap, cursor);
-    sp = capability_set_bounds(sp, HOST_STACK_BYTES);
-    sp = capability_and_perms(sp, perms::DataRw);
-    sp = capability_set_address(sp, cursor + HOST_STACK_BYTES);
-
-    const uint64_t ksp_base = cursor + HOST_STACK_BYTES;
-    Capability ksp = capability_set_address(root_data_cap, ksp_base);
-    ksp = capability_set_bounds(ksp, KSP_STACK_BYTES);
-    ksp = capability_and_perms(ksp, perms::DataRw);
-    ksp = capability_set_address(ksp, ksp_base + KSP_STACK_BYTES);
-
-    cursor = (ksp_base + KSP_STACK_BYTES + (HOST_STACK_BYTES - 1)) &
-             ~(HOST_STACK_BYTES - 1);
-
-    table[h].sp = sp;
-    table[h].ksp = ksp;
-    table[h].satp = satp_val;
-    table[h].msip = clint::msip_register(h);
-    __atomic_store_n(&table[h].state, 1ULL, __ATOMIC_RELEASE);
-
-    clint::send_ipi(1ULL << h);
-
-    while (__atomic_load_n(&table[h].state, __ATOMIC_ACQUIRE) != 2ULL) {
-    }
-  }
-
-  debug::harts_online(online_harts(), platform::hart_count(), boot_hart);
-}
-
-size_t online_harts() {
-  return __atomic_load_n(&s_online_harts, __ATOMIC_ACQUIRE);
 }
 
 uint64_t this_hart() { return cpu()->hart_id; }
