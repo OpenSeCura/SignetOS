@@ -117,7 +117,7 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 #     `trap_mgr`, `shell`) that `init` reads from `fs` out of `/` and loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell reaches
 #     through a read-only disk quota rooted there and can `run`.
-BOOT_COMPS = init fs uart blk
+BOOT_COMPS = init fs uart dma blk
 BOOT_SRCS  = $(patsubst %,boot/%.cpp,$(BOOT_COMPS))
 BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))

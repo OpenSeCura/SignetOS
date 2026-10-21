@@ -37,14 +37,16 @@
  *   0. Receives a read-only `BootManifest*` in `arg` (`ca0`) carrying a copy
  *      of the device tree, one capability over the whole device MMIO range,
  *      and read-only capabilities to the boot-set images packaged in the
- *      kernel: `uart`, `blk` and `fs` -- what it takes to reach the disk, and
- *      nothing more. Reads the board out of the device tree (`hw.hpp`) and
+ *      kernel: `uart`, `dma`, `blk` and `fs` -- what it takes to reach the
+ *      disk, and nothing more. Reads the board out of the device tree (`hw.hpp`) and
  *      carves one MMIO window per device.
  *   1. Starts `uart`: the console, and the one-shot handshake that mints
  *      `uart.read`.
- *   3. `blk`: its manifest asks for the virtio window and a DMA arena, which
- *      `init` allocates with FLAG_DMA (which reports its physical address;
- *      the handshake tells the driver).
+ *   2. `dma`: its manifest asks for the virtio window and a DMA arena, which
+ *      `init` allocates with FLAG_DMA. Run once: it sets up the device on a
+ *      fixed descriptor table and returns views for `blk` that cannot reach
+ *      a physical address.
+ *   3. `blk`: gets those views in its handshake.
  *   4. `fs`: asks for `blk.read`/`blk.write`; its VM quota is sized to the
  *      disk; its handshake returns the root `quota_disk` handle and its entry
  *      points. From here on every image is a file read off the disk.
@@ -160,7 +162,6 @@ struct Launcher {
 
   // The DMA arena, made for the first DMA entry; one per system.
   Capability dma_window;
-  uint64_t dma_phys;
 
   // Entry points by name: what `init` was handed in handshakes, offered to
   // SERVICE entries. Once `naming` is up, anything published is found too.
@@ -263,9 +264,9 @@ struct Launcher {
 
   // DMA: an allocation of `init`'s own with FLAG_DMA, so it is one
   // contiguous run and arrives with its physical base in its first word,
-  // which is read and cleared before the arena goes to the driver. One arena
-  // per system, sized by the first image to ask; none on a board without a
-  // device window to DMA for.
+  // which is for `dma` to read. One arena per system, sized by the first
+  // image to ask; none on a board without a device window to DMA for, and
+  // none once `dma` has run (step 2).
   Capability dma_arena(uint64_t bytes) {
     if (capability_is_valid(dma_window)) {
       return dma_window;
@@ -280,9 +281,6 @@ struct Launcher {
     if (!capability_is_valid(dma)) {
       return nullptr;
     }
-    auto* first = reinterpret_cast<volatile uint64_t*>(dma);
-    dma_phys = *first;
-    *first = 0;
     dma_window = dma;
     return dma;
   }
@@ -714,23 +712,43 @@ extern "C" int64_t compartment_main(Capability arg) {
   say("[init]     UART compartment online; bootstrapping core services...\n");
 
   // =========================================================================
-  // 3. `blk`: the block driver
+  // 2. `dma`: the only compartment that knows a physical address
   // =========================================================================
   // Its manifest is the only one that asks for the virtio window and a DMA
-  // arena, so `blk` is the only compartment that sees either. There is no
-  // scheduler for it to sleep in yet (that is a file on its own disk): it
-  // polls until step 6 hands it the scheduler's entries, and its interrupt
-  // entry is routed to it by `trap_mgr` in step 7.
+  // arena, so `dma` is the only compartment that sees either. Run once: it
+  // sets up the device on a fixed descriptor table in the arena and returns
+  // what `blk` may hold -- the rest of the arena and the notify registers --
+  // and it is never entered again (dma.cpp).
+  const Started dma = L.start("dma", manifest->dma_img, 0);
+  init::DmaInterface dma_if{};
+  dma_if.virtio_slot_bytes = board.virtio_slot_bytes;
+  dma_if.virtio_count = static_cast<uint32_t>(board.virtio_count);
+  dma_if.status = init::BLK_NO_DEVICE;
+  if (capability_is_valid(dma.sentry)) {
+    comp_invoke(dma.sentry, bounded(&dma_if));
+  }
+  // Nobody after `dma` gets the device window or the arena: every image from
+  // here on is read off the disk `blk` serves, so it is only as trustworthy
+  // as `blk`, and either would let it point the device anywhere.
+  L.virtio_mmio = nullptr;
+  L.dma_window = nullptr;
+
+  // =========================================================================
+  // 3. `blk`: the block driver
+  // =========================================================================
+  // There is no scheduler for it to sleep in yet (that is a file on its own
+  // disk): it polls until step 6 hands it the scheduler's entries, and its
+  // interrupt entry is routed to it by `trap_mgr` in step 7.
   const Started blk = L.start("blk", manifest->blk_img, 0);
-  // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what it
-  // cannot learn from its capabilities -- the arena's physical address and
-  // the slot geometry -- and hands back `read`, `write` and `irq`.
+  // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what `dma`
+  // set up for it and hands back `read`, `write` and `irq`.
   init::BlkInterface blk_if{};
-  blk_if.dma_phys = L.dma_phys;
-  blk_if.virtio_slot_bytes = board.virtio_slot_bytes;
-  blk_if.virtio_count = static_cast<uint32_t>(board.virtio_count);
+  blk_if.buf = dma_if.buf;
+  blk_if.notify = dma_if.notify;
+  blk_if.capacity_sectors = dma_if.capacity_sectors;
+  blk_if.slot = dma_if.slot;
   blk_if.status = init::BLK_NO_DEVICE;
-  if (capability_is_valid(blk.sentry)) {
+  if (dma_if.status == init::BLK_OK && capability_is_valid(blk.sentry)) {
     comp_invoke(blk.sentry, bounded(&blk_if));
   }
   if (blk_if.status != init::BLK_OK) {

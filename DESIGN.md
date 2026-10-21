@@ -758,7 +758,8 @@ filesystem; which is which is a build detail.
 | --- | --- | --- |
 | 1 | — | Parse the DTB to find the UART, PLIC and virtio devices. |
 | 2 | `uart` | Its MMIO window. Handshake returns its `read` and IRQ entries; init offers `uart` (print) and `uart.read`. |
-| 3 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
+| 3 | `dma` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Run once: it sets up the device on a fixed descriptor table in the arena's first page and returns, for `blk`, the rest of the arena and a window onto the notify/interrupt registers. Never entered again. |
+| 3b | `blk` | What `dma` returned. Handshake returns `read`/`write`/IRQ entries. |
 | 4 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
 | 5 | `naming` | Once it is up, init publishes `uart` and the `fs.*` entries. |
 | 6 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
@@ -1355,14 +1356,16 @@ their parent; there are no directory-entry blocks.
 | Compartment | Role | Notes |
 | --- | --- | --- |
 | `uart` | Console output (`uart`) and non-blocking input (`uart.read`) | Input is buffered in a small ring that drops data when full. A reader passes a wake entry point, which the driver invokes **from interrupt context** when bytes arrive; the shell's wake entry then calls `sched.wake`. |
-| `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one request at a time** through a bounce buffer in the init-owned DMA arena. Completion arrives as an interrupt that wakes the caller, which waits in `sched.block` with a timeout and falls back to polling. |
+| `dma` | Device setup, once | The only compartment that knows a physical address. Writes queue 0's addresses and a fixed four-entry descriptor table (one 4 KiB read chain, one 4 KiB write chain), negotiates `VERSION_1` only, and keeps status, features, queue select/ready and the queue addresses out of `blk`'s reach. |
+| `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one 4 KiB request at a time** through a bounce buffer in the DMA arena, starting one of `dma`'s two chains. It never sees a physical address and cannot point the device outside the arena. Completion arrives as an interrupt that wakes the caller, which waits in `sched.block` with a timeout and falls back to polling. |
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
 | `trap_mgr` | External-interrupt routing | §3.6. |
 | `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
 
-TODO: isolate DMA access. `blk` writes physical addresses into the device's
-registers and descriptors, and nothing checks them, so it can point the
-device at any memory. Today it is effectively part of the TCB.
+DMA is isolated by `dma` (`boot/dma.cpp`): every address the device can use
+is written once, at boot, into memory and registers only `dma` can reach, so
+`blk` is not part of the TCB for memory safety. `dma` is, and the kernel
+adds nothing beyond `FLAG_DMA`.
 
 The shell's `run` policy decides what a `/bin` program can get from its
 manifest:

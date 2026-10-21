@@ -17,12 +17,12 @@
 /*
  * blk.cpp - SignetOS virtio-blk Driver Compartment
  *
- * Holds two capabilities nobody else has: the virtio-mmio slot window
- * (`BootManifest::virtio_mmio`, QEMU `virt`: eight 4 KiB slots from
- * 0x10001000) and the DMA arena the kernel set aside at boot
- * (`BootManifest::dma_window`, physically contiguous, its physical base
- * handed over in the `BlkInterface` handshake). Drives one virtio-blk device
- * over the modern (version 2) MMIO transport.
+ * Drives one virtio-blk device, which `dma` has already set up (dma.cpp):
+ * queue 0 runs on a fixed descriptor table only `dma` can write. `blk` holds
+ * the rest of the DMA arena -- rings, request header, data, status -- and a
+ * window onto three device registers (notify, interrupt status and
+ * acknowledge), handed over in the `BlkInterface` handshake. It never sees or
+ * writes a physical address, and cannot point the device outside the arena.
  *
  * Three entry points (see `BlkInterface` in abi.hpp), minted once on the
  * first invocation of `compartment_main`, exactly like `uart`:
@@ -36,13 +36,11 @@
  *                                        interrupt context.
  *
  * WHY A BOUNCE BUFFER
- *   The device only ever sees physical addresses inside the arena: the
- *   virtqueue rings, a request header, a status byte, and one 4 KiB data
- *   buffer. A caller's buffer is copied in or out, so no caller memory is
- *   ever exposed to the device, and the driver never needs to know a
- *   physical address for anything but the arena. That is what makes the
- *   kernel side a one-time boot-time allocation instead of a translation
- *   syscall.
+ *   The device only ever sees the addresses in `dma`'s table, all inside the
+ *   arena: one request header, one 4 KiB data buffer and one status byte. A
+ *   caller's buffer is copied in or out, so no caller memory is ever exposed
+ *   to the device. That is what lets the descriptors be fixed at boot, and
+ *   it is also why every request is exactly one 4 KiB page.
  *
  * ONE REQUEST AT A TIME
  *   Every request holds `s_lock`, the scheduler's lock (runtime.hpp, `lock`),
@@ -56,7 +54,7 @@
  *   to finish everything submitted and catches the used ring up. Before there
  *   is a scheduler (`init` alone) the lock is taken without waiting.
  *
- *   A request is a three-descriptor chain (header, data, status) placed in
+ *   A request is one of `dma`'s two fixed chains (read or write) placed in
  *   the available ring, then a notify. Completion is a new entry in the used
  *   ring. While it is in flight the calling thread sleeps in `sched.block`;
  *   `blk_irq_entry` wakes it by tid. The wait loop re-checks the used ring
@@ -92,14 +90,11 @@ namespace signetos::user {
 namespace {
 
 // --- What `blk` asks `init` for (user/manifest.hpp) ---------------------------
-// The virtio slot window and a DMA arena are optional: on a machine without
-// them the driver still comes up and reports BLK_NO_DEVICE, and the file
-// system reports itself unmounted. 64 KiB of arena is far more than the rings,
-// one request and one 4 KiB bounce buffer need (ARENA_MIN below); the rest is
-// room to grow the queue.
+// No device window and no DMA arena: those are `dma`'s, and what `blk` gets
+// of them arrives in the handshake (abi.hpp, BlkInterface). Without a device
+// the driver still comes up and reports BLK_NO_DEVICE, and the file system
+// reports itself unmounted.
 #define BLK_MANIFEST(X)                                  \
-  M_MMIO_OPT(X, VIRTIO_MMIO, "virtio")                   \
-  M_DMA_OPT(X, DMA_WINDOW, 64 * 1024)                    \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
   M_SERVICE(X, UART_SENTRY, "uart")
@@ -109,60 +104,20 @@ constexpr size_t SLOT_READ_ENTRY  = compartment::RW_SLOT_SEED_BASE + MANIFEST_CO
 constexpr size_t SLOT_WRITE_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 1;
 constexpr size_t SLOT_IRQ_ENTRY   = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
 
-// --- virtio-mmio (modern) register offsets, in bytes ---------------------------
-constexpr size_t R_MAGIC               = 0x000;
-constexpr size_t R_VERSION             = 0x004;
-constexpr size_t R_DEVICE_ID           = 0x008;
-constexpr size_t R_DEVICE_FEATURES     = 0x010;
-constexpr size_t R_DEVICE_FEATURES_SEL = 0x014;
-constexpr size_t R_DRIVER_FEATURES     = 0x020;
-constexpr size_t R_DRIVER_FEATURES_SEL = 0x024;
-constexpr size_t R_QUEUE_SEL           = 0x030;
-constexpr size_t R_QUEUE_NUM_MAX       = 0x034;
-constexpr size_t R_QUEUE_NUM           = 0x038;
-constexpr size_t R_QUEUE_READY         = 0x044;
-constexpr size_t R_QUEUE_NOTIFY        = 0x050;
-constexpr size_t R_INTERRUPT_STATUS    = 0x060;
-constexpr size_t R_INTERRUPT_ACK       = 0x064;
-constexpr size_t R_STATUS              = 0x070;
-constexpr size_t R_QUEUE_DESC_LOW      = 0x080;
-constexpr size_t R_QUEUE_DESC_HIGH     = 0x084;
-constexpr size_t R_QUEUE_DRIVER_LOW    = 0x090;
-constexpr size_t R_QUEUE_DRIVER_HIGH   = 0x094;
-constexpr size_t R_QUEUE_DEVICE_LOW    = 0x0a0;
-constexpr size_t R_QUEUE_DEVICE_HIGH   = 0x0a4;
-constexpr size_t R_CONFIG              = 0x100;  // virtio_blk_config: capacity le64
-constexpr size_t SLOT_MIN_BYTES        = R_CONFIG + 8;
-
-constexpr uint32_t MAGIC_VIRT     = 0x74726976;  // "virt"
-constexpr uint32_t VERSION_MODERN = 2;
-constexpr uint32_t DEVICE_ID_BLK  = 2;
-
-constexpr uint32_t STATUS_ACKNOWLEDGE = 1;
-constexpr uint32_t STATUS_DRIVER      = 2;
-constexpr uint32_t STATUS_DRIVER_OK   = 4;
-constexpr uint32_t STATUS_FEATURES_OK = 8;
-constexpr uint32_t STATUS_FAILED      = 128;
-
-// Feature bit 32 (VIRTIO_F_VERSION_1) is bit 0 of the high selector word.
-constexpr uint32_t FEATURE_HI_VERSION_1 = 1u << 0;
+// --- The device, as `dma` left it (dma.cpp) ------------------------------------
+// The registers `blk` may write, as offsets into `s_notify`.
+constexpr size_t R_QUEUE_NOTIFY     = init::DMA_NOTIFY_QUEUE;
+constexpr size_t R_INTERRUPT_STATUS = init::DMA_NOTIFY_IRQ_STATUS;
+constexpr size_t R_INTERRUPT_ACK    = init::DMA_NOTIFY_IRQ_ACK;
 
 // --- split virtqueue ------------------------------------------------------------
-constexpr uint16_t QUEUE_SIZE = 8;  // power of two; a request uses three
-constexpr uint16_t DESC_F_NEXT  = 1;
-constexpr uint16_t DESC_F_WRITE = 2;  // device writes this buffer
+constexpr uint16_t QUEUE_SIZE = init::DMA_QUEUE_SIZE;
 
 constexpr uint32_t BLK_T_IN  = 0;  // device -> memory (read)
 constexpr uint32_t BLK_T_OUT = 1;  // memory -> device (write)
 constexpr uint8_t  BLK_S_OK  = 0;
 constexpr uint8_t  STATUS_POISON = 0xff;
 
-struct VirtqDesc {
-  uint64_t addr;
-  uint32_t len;
-  uint16_t flags;
-  uint16_t next;
-};
 struct VirtqAvail {
   uint16_t flags;
   uint16_t idx;
@@ -184,20 +139,12 @@ struct BlkReqHeader {
   uint32_t reserved;
   uint64_t sector;
 };
-static_assert(sizeof(VirtqDesc) == 16);
 static_assert(sizeof(BlkReqHeader) == 16);
+static_assert(init::DMA_BUF_AVAIL + sizeof(VirtqAvail) <= init::DMA_BUF_USED);
+static_assert(init::DMA_BUF_USED + sizeof(VirtqUsed) <= init::DMA_BUF_HEADER);
 
-// Layout of the DMA arena. Everything the device touches lives here.
-constexpr size_t OFF_DESC   = 0x000;  // 16 * QUEUE_SIZE bytes, 16-aligned
-constexpr size_t OFF_AVAIL  = 0x100;  // 6 + 2 * QUEUE_SIZE bytes, 2-aligned
-constexpr size_t OFF_USED   = 0x200;  // 6 + 8 * QUEUE_SIZE bytes, 4-aligned
-constexpr size_t OFF_HEADER = 0x300;
-constexpr size_t OFF_STATUS = 0x310;
-constexpr size_t OFF_DATA   = 0x1000;
-constexpr size_t ARENA_MIN  = OFF_DATA + init::BLK_MAX_XFER_BYTES;
-static_assert(OFF_DESC + sizeof(VirtqDesc) * QUEUE_SIZE <= OFF_AVAIL);
-static_assert(OFF_AVAIL + sizeof(VirtqAvail) <= OFF_USED);
-static_assert(OFF_USED + sizeof(VirtqUsed) <= OFF_HEADER);
+// What `buf` must cover: up to the status byte.
+constexpr size_t BUF_MIN = init::DMA_BUF_STATUS + 1;
 
 // --- state -----------------------------------------------------------------------
 Capability s_gate_invoke = nullptr;
@@ -207,10 +154,9 @@ Capability s_sched_wake = nullptr;
 Capability s_lock_wait = nullptr;
 Capability s_lock_wake = nullptr;
 
-volatile uint32_t* s_regs = nullptr;  // the chosen slot's registers
-uint8_t* s_dma = nullptr;             // the arena, as the driver sees it
-uint64_t s_dma_phys = 0;              // ... and as the device sees it
-uint64_t s_capacity = 0;              // sectors
+volatile uint32_t* s_notify = nullptr;  // QUEUE_NOTIFY .. INTERRUPT_ACK
+uint8_t* s_buf = nullptr;               // the arena past its descriptor page
+uint64_t s_capacity = 0;                // sectors
 uint32_t s_slot = 0;
 bool s_present = false;
 uint64_t s_lock = 0;                  // ONE REQUEST AT A TIME
@@ -234,8 +180,8 @@ constexpr uint64_t WAIT_TIMEOUT_US = 10'000;
 
 inline void fence() { __asm__ volatile("fence rw, rw" ::: "memory"); }
 
-inline uint32_t reg_read(size_t off) { return s_regs[off / 4]; }
-inline void reg_write(size_t off, uint32_t v) { s_regs[off / 4] = v; }
+inline uint32_t reg_read(size_t off) { return s_notify[off / 4]; }
+inline void reg_write(size_t off, uint32_t v) { s_notify[off / 4] = v; }
 
 template <typename T>
 Capability bounded(T* p) {
@@ -247,122 +193,17 @@ void out_dec(const char* p, uint64_t v, const char* s) {
   print_dec(s_gate_invoke, s_uart, p, v, s);
 }
 
-inline uint64_t arena_phys(size_t off) { return s_dma_phys + off; }
-
-volatile VirtqDesc* descs() {
-  return reinterpret_cast<volatile VirtqDesc*>(s_dma + OFF_DESC);
-}
 volatile VirtqAvail* avail() {
-  return reinterpret_cast<volatile VirtqAvail*>(s_dma + OFF_AVAIL);
+  return reinterpret_cast<volatile VirtqAvail*>(s_buf + init::DMA_BUF_AVAIL);
 }
 volatile VirtqUsed* used() {
-  return reinterpret_cast<volatile VirtqUsed*>(s_dma + OFF_USED);
+  return reinterpret_cast<volatile VirtqUsed*>(s_buf + init::DMA_BUF_USED);
 }
 volatile BlkReqHeader* header() {
-  return reinterpret_cast<volatile BlkReqHeader*>(s_dma + OFF_HEADER);
+  return reinterpret_cast<volatile BlkReqHeader*>(s_buf + init::DMA_BUF_HEADER);
 }
-volatile uint8_t* status_byte() { return s_dma + OFF_STATUS; }
-uint8_t* data() { return s_dma + OFF_DATA; }
-
-// Finds the first slot in `window` holding a modern virtio-blk device.
-// Returns false (and leaves `s_regs` null) if there is none.
-bool probe(Capability window, uint64_t slot_bytes, uint32_t count) {
-  if (!capability_is_valid(window) || slot_bytes < SLOT_MIN_BYTES) {
-    return false;
-  }
-  const uint64_t base = capability_get_base(window);
-  const uint64_t len = capability_get_length(window);
-  bool saw_legacy = false;
-  for (uint32_t slot = 0; slot < count; ++slot) {
-    const uint64_t off = static_cast<uint64_t>(slot) * slot_bytes;
-    if (off + slot_bytes > len) {
-      break;
-    }
-    Capability c = capability_set_address(window, base + off);
-    c = capability_set_bounds(c, slot_bytes);
-    if (!capability_is_valid(c)) {
-      break;
-    }
-    auto* regs = reinterpret_cast<volatile uint32_t*>(c);
-    if (regs[R_MAGIC / 4] != MAGIC_VIRT) {
-      continue;
-    }
-    if (regs[R_DEVICE_ID / 4] != DEVICE_ID_BLK) {
-      continue;  // empty slot (0) or some other device
-    }
-    if (regs[R_VERSION / 4] != VERSION_MODERN) {
-      saw_legacy = true;
-      continue;
-    }
-    s_regs = regs;
-    s_slot = slot;
-    return true;
-  }
-  if (saw_legacy) {
-    out("[blk]      virtio-blk found with the legacy transport only; run QEMU "
-        "with -global virtio-mmio.force-legacy=false\n");
-  }
-  return false;
-}
-
-// virtio 1.x initialisation with VIRTIO_F_VERSION_1 as the only
-// feature, then one split queue in the arena. Returns false if the device
-// refuses at any step; the device is then left FAILED.
-bool init_device() {
-  reg_write(R_STATUS, 0);  // reset
-  reg_write(R_STATUS, STATUS_ACKNOWLEDGE);
-  reg_write(R_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-
-  reg_write(R_DEVICE_FEATURES_SEL, 1);
-  const uint32_t features_hi = reg_read(R_DEVICE_FEATURES);
-  if ((features_hi & FEATURE_HI_VERSION_1) == 0) {
-    reg_write(R_STATUS, STATUS_FAILED);
-    return false;
-  }
-  reg_write(R_DRIVER_FEATURES_SEL, 0);
-  reg_write(R_DRIVER_FEATURES, 0);
-  reg_write(R_DRIVER_FEATURES_SEL, 1);
-  reg_write(R_DRIVER_FEATURES, FEATURE_HI_VERSION_1);
-
-  reg_write(R_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-  if ((reg_read(R_STATUS) & STATUS_FEATURES_OK) == 0) {
-    reg_write(R_STATUS, STATUS_FAILED);
-    return false;
-  }
-
-  // Queue 0: rings zeroed (the arena came zeroed, but a re-handshake must
-  // not inherit stale indices), then their physical addresses programmed.
-  for (size_t i = 0; i < OFF_HEADER; ++i) {
-    s_dma[i] = 0;
-  }
-  s_last_used = 0;
-  reg_write(R_QUEUE_SEL, 0);
-  const uint32_t num_max = reg_read(R_QUEUE_NUM_MAX);
-  if (num_max == 0 || num_max < QUEUE_SIZE || reg_read(R_QUEUE_READY) != 0) {
-    reg_write(R_STATUS, STATUS_FAILED);
-    return false;
-  }
-  reg_write(R_QUEUE_NUM, QUEUE_SIZE);
-  const uint64_t desc_pa = arena_phys(OFF_DESC);
-  const uint64_t avail_pa = arena_phys(OFF_AVAIL);
-  const uint64_t used_pa = arena_phys(OFF_USED);
-  reg_write(R_QUEUE_DESC_LOW, static_cast<uint32_t>(desc_pa));
-  reg_write(R_QUEUE_DESC_HIGH, static_cast<uint32_t>(desc_pa >> 32));
-  reg_write(R_QUEUE_DRIVER_LOW, static_cast<uint32_t>(avail_pa));
-  reg_write(R_QUEUE_DRIVER_HIGH, static_cast<uint32_t>(avail_pa >> 32));
-  reg_write(R_QUEUE_DEVICE_LOW, static_cast<uint32_t>(used_pa));
-  reg_write(R_QUEUE_DEVICE_HIGH, static_cast<uint32_t>(used_pa >> 32));
-  fence();
-  reg_write(R_QUEUE_READY, 1);
-
-  reg_write(R_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK |
-                          STATUS_DRIVER_OK);
-
-  const uint64_t cap_lo = reg_read(R_CONFIG + 0);
-  const uint64_t cap_hi = reg_read(R_CONFIG + 4);
-  s_capacity = cap_lo | (cap_hi << 32);
-  return true;
-}
+volatile uint8_t* status_byte() { return s_buf + init::DMA_BUF_STATUS; }
+uint8_t* data() { return s_buf + init::DMA_BUF_DATA; }
 
 // Sleeps until woken or WAIT_TIMEOUT_US, whichever is first. False if the
 // scheduler does not run the calling thread (`init`, before the dispatcher
@@ -373,36 +214,25 @@ bool block() {
 }
 
 // Submits one request and waits for it. `type` is BLK_T_IN or BLK_T_OUT; the
-// data goes through the arena's data buffer, which the caller has filled
-// (OUT) or will drain (IN). Returns BLK_OK or BLK_IO_ERROR.
-int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
+// data -- always BLK_XFER_BYTES -- goes through the arena's data buffer, which
+// the caller has filled (OUT) or will drain (IN). Returns BLK_OK or
+// BLK_IO_ERROR.
+int64_t transfer(uint32_t type, uint64_t sector) {
   volatile BlkReqHeader* h = header();
   h->type = type;
   h->reserved = 0;
   h->sector = sector;
   *status_byte() = STATUS_POISON;
 
-  volatile VirtqDesc* d = descs();
-  d[0].addr = arena_phys(OFF_HEADER);
-  d[0].len = sizeof(BlkReqHeader);
-  d[0].flags = DESC_F_NEXT;
-  d[0].next = 1;
-  d[1].addr = arena_phys(OFF_DATA);
-  d[1].len = bytes;
-  d[1].flags = static_cast<uint16_t>(DESC_F_NEXT |
-                                     (type == BLK_T_IN ? DESC_F_WRITE : 0));
-  d[1].next = 2;
-  d[2].addr = arena_phys(OFF_STATUS);
-  d[2].len = 1;
-  d[2].flags = DESC_F_WRITE;
-  d[2].next = 0;
-
   // Whom to wake, recorded before the device can possibly complete.
   s_waiter_tid = self_tid();
 
   volatile VirtqAvail* av = avail();
   const uint16_t idx = av->idx;
-  av->ring[idx % QUEUE_SIZE] = 0;  // the chain starts at descriptor 0
+  // The descriptors are `dma`'s, fixed: we only say which chain (dma.cpp).
+  const uint16_t chain =
+      type == BLK_T_IN ? init::DMA_CHAIN_READ : init::DMA_CHAIN_WRITE;
+  av->ring[idx % QUEUE_SIZE] = chain;
   fence();
   av->idx = static_cast<uint16_t>(idx + 1);
   fence();
@@ -438,7 +268,7 @@ int64_t transfer(uint32_t type, uint64_t sector, uint32_t bytes) {
                               us->ring[s_last_used % QUEUE_SIZE].len};
   s_last_used = static_cast<uint16_t>(s_last_used + 1);
   fence();
-  if (done.id != 0 || *status_byte() != BLK_S_OK) {
+  if (done.id != chain || *status_byte() != BLK_S_OK) {
     return init::BLK_IO_ERROR;
   }
   return init::BLK_OK;
@@ -472,9 +302,9 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
   if (!s_present) {
     return init::BLK_NO_DEVICE;
   }
-  const uint64_t bytes = count * init::BLK_SECTOR_BYTES;
-  if (count == 0 || bytes > init::BLK_MAX_XFER_BYTES) {
-    return init::BLK_BAD_REQUEST;
+  const uint64_t bytes = init::BLK_XFER_BYTES;
+  if (count * init::BLK_SECTOR_BYTES != bytes) {
+    return init::BLK_BAD_REQUEST;  // one page, always (abi.hpp)
   }
   if (sector >= s_capacity || count > s_capacity - sector) {
     return init::BLK_OUT_OF_RANGE;
@@ -503,7 +333,7 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
       bounce[i] = user[i];
     }
   }
-  const int64_t status = transfer(type, sector, static_cast<uint32_t>(bytes));
+  const int64_t status = transfer(type, sector);
   if (type == BLK_T_IN && status == init::BLK_OK) {
     for (uint64_t i = 0; i < bytes; ++i) {
       user[i] = bounce[i];
@@ -520,7 +350,7 @@ SIGNETOS_DEFAULT_FAULT_HANDLER("blk")
 // Interrupt context (see trap_mgr.cpp): acknowledge, wake the waiter, return.
 extern "C" uint64_t blk_irq_entry(uint64_t source) {
   (void)source;  // the only source routed here is ours
-  if (s_regs == nullptr) {
+  if (s_notify == nullptr) {
     return 0;
   }
   const uint32_t pending = reg_read(R_INTERRUPT_STATUS);
@@ -595,35 +425,29 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   iface->read = nullptr;
   iface->write = nullptr;
   iface->irq = nullptr;
-  iface->capacity_sectors = 0;
-  iface->slot = 0;
   iface->status = init::BLK_NO_DEVICE;
 
-  Capability window = rw[SLOT_VIRTIO_MMIO];
-  Capability dma = rw[SLOT_DMA_WINDOW];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   Capability self = rw[compartment::SLOT_SELF];
 
-  if (!capability_is_valid(dma) ||
-      !capability_has_perms(dma, perms::Load | perms::Store) ||
-      capability_get_length(dma) < ARENA_MIN || iface->dma_phys == 0 ||
-      (iface->dma_phys & (vm::PAGE_SIZE - 1)) != 0) {
-    out("[blk]      no usable DMA arena; block device disabled\n");
+  // What `dma` set up (abi.hpp, DmaInterface), passed on by `init`.
+  Capability buf = iface->buf;
+  Capability notify = iface->notify;
+  if (!capability_is_valid(buf) ||
+      !capability_has_perms(buf, perms::Load | perms::Store) ||
+      capability_get_length(buf) < BUF_MIN || !capability_is_valid(notify) ||
+      !capability_has_perms(notify, perms::Load | perms::Store) ||
+      capability_get_length(notify) < init::DMA_NOTIFY_BYTES ||
+      iface->capacity_sectors == 0) {
+    out("[blk]      no device from `dma`; block device disabled\n");
     return iface->status;
   }
-  s_dma = reinterpret_cast<uint8_t*>(
-      capability_set_address(dma, capability_get_base(dma)));
-  s_dma_phys = iface->dma_phys;
-
-  if (!probe(window, iface->virtio_slot_bytes, iface->virtio_count)) {
-    out("[blk]      no virtio-blk device found; block device disabled\n");
-    return iface->status;
-  }
-  if (!init_device()) {
-    out("[blk]      virtio-blk refused initialisation; block device disabled\n");
-    s_regs = nullptr;
-    return iface->status;
-  }
+  s_buf = reinterpret_cast<uint8_t*>(
+      capability_set_address(buf, capability_get_base(buf)));
+  s_notify = reinterpret_cast<volatile uint32_t*>(
+      capability_set_address(notify, capability_get_base(notify)));
+  s_capacity = iface->capacity_sectors;
+  s_slot = iface->slot;
   s_present = true;
 
   // How we sleep while a request is in flight arrives later (`bind_sched`):
@@ -642,8 +466,6 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   iface->read = e_read;
   iface->write = e_write;
   iface->irq = e_irq;
-  iface->capacity_sectors = s_capacity;
-  iface->slot = s_slot;
   iface->status = init::BLK_OK;
 
   out_dec("[blk]      virtio-blk online in slot ", s_slot, ": ");

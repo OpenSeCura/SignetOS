@@ -215,6 +215,44 @@ struct alignas(16) SchedInterface {
 };
 
 // ----------------------------------------------------------------------------
+// DMA (`boot/dma.cpp`)
+// ----------------------------------------------------------------------------
+//   int64_t  dma(DmaInterface* iface) -> BLK_* [once, from `init`]
+//
+// The only compartment that knows a physical address. Run once, before
+// `blk`: it sets up the virtio-blk device on a fixed descriptor table in the
+// DMA arena and returns, for `blk`, views that cannot reach that table or the
+// device's queue registers (dma.cpp, WHY THIS IS ENOUGH).
+//
+// The arena, as `blk` sees it (`buf`, which starts one page into the arena):
+constexpr size_t   DMA_ARENA_BYTES = 4 * 4096;  // descriptor page + `buf`
+constexpr size_t   DMA_BUF_AVAIL   = 0x0000;    // avail ring (DMA_QUEUE_SIZE)
+constexpr size_t   DMA_BUF_USED    = 0x0100;    // used ring (DMA_QUEUE_SIZE)
+constexpr size_t   DMA_BUF_HEADER  = 0x0ff0;    // request header, 16 B
+constexpr size_t   DMA_BUF_DATA    = 0x1000;    // data, BLK_XFER_BYTES
+constexpr size_t   DMA_BUF_STATUS  = 0x2000;    // status, 1 B
+constexpr uint16_t DMA_QUEUE_SIZE  = 4;
+// Descriptor chains: what `blk` puts in the avail ring to start a request.
+constexpr uint16_t DMA_CHAIN_READ  = 0;
+constexpr uint16_t DMA_CHAIN_WRITE = 2;
+// `notify` covers these device registers, offsets from its base.
+constexpr size_t   DMA_NOTIFY_BASE        = 0x050;  // in the device's slot
+constexpr size_t   DMA_NOTIFY_BYTES       = 0x018;
+constexpr size_t   DMA_NOTIFY_QUEUE       = 0x050 - DMA_NOTIFY_BASE;
+constexpr size_t   DMA_NOTIFY_IRQ_STATUS  = 0x060 - DMA_NOTIFY_BASE;
+constexpr size_t   DMA_NOTIFY_IRQ_ACK     = 0x064 - DMA_NOTIFY_BASE;
+
+struct alignas(16) DmaInterface {
+  Capability buf;           // out: read/write, the arena past its first page
+  Capability notify;        // out: read/write [DMA_NOTIFY_BASE, + BYTES)
+  uint64_t virtio_slot_bytes;  // in: stride between slots in the window
+  uint64_t capacity_sectors;   // out: device size
+  uint32_t virtio_count;    // in: slots in the window
+  uint32_t slot;            // out: the slot the device was found in
+  int64_t status;           // out: BLK_OK or BLK_NO_DEVICE
+};
+
+// ----------------------------------------------------------------------------
 // Block device driver (`boot/blk.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  blk.read(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
@@ -222,27 +260,28 @@ struct alignas(16) SchedInterface {
 //   uint64_t blk.irq(uint64_t source)
 //   int64_t  blk(Capability block, Capability wake, Capability lock_wait,
 //                Capability lock_wake) [2nd call]
-constexpr uint64_t BLK_SECTOR_BYTES   = 512;
-constexpr uint64_t BLK_MAX_XFER_BYTES = 4096;  // per request: the bounce buffer
+// Every request is exactly BLK_XFER_BYTES: `count` must be
+// BLK_XFER_BYTES / BLK_SECTOR_BYTES (the descriptor chains are fixed, dma.cpp).
+constexpr uint64_t BLK_SECTOR_BYTES = 512;
+constexpr uint64_t BLK_XFER_BYTES   = 4096;  // per request: the bounce buffer
 
 constexpr int64_t BLK_OK           = 0;
-constexpr int64_t BLK_BAD_REQUEST  = -1;  // bad buffer, count 0 or too large
+constexpr int64_t BLK_BAD_REQUEST  = -1;  // bad buffer, or count not one page
 constexpr int64_t BLK_NO_DEVICE    = -2;  // no virtio-blk device was found
 constexpr int64_t BLK_OUT_OF_RANGE = -3;  // past the end of the device
 constexpr int64_t BLK_IO_ERROR     = -4;  // the device reported an error
 constexpr int64_t BLK_BUSY         = -5;  // a request is already in flight
 
+// `init` passes on what `dma` returned (DmaInterface).
 struct alignas(16) BlkInterface {
   Capability read;          // out: OType::EntryPoint -> blk_read_entry
   Capability write;         // out: OType::EntryPoint -> blk_write_entry
   Capability irq;           // out: OType::EntryPoint -> blk_irq_entry
-  uint64_t dma_phys;        // in: physical address of the DMA window's base
-  uint64_t virtio_slot_bytes;  // in: stride between slots in the window
-  uint64_t capacity_sectors;   // out: device size
-  uint32_t virtio_count;    // in: slots in the window
-  uint32_t slot;            // out: the slot the device was found in
+  Capability buf;           // in: DmaInterface::buf
+  Capability notify;        // in: DmaInterface::notify
+  uint64_t capacity_sectors;   // in: device size
+  uint32_t slot;            // in: the device's slot, for the console
   int64_t status;           // out: BLK_OK or BLK_NO_DEVICE
-  uint64_t pad_;
 };
 
 // ----------------------------------------------------------------------------

@@ -213,6 +213,7 @@ struct alignas(16) BootManifest {
   Capability mmio;          // read/write window over [0, GIGAPAGE_SIZE): the
                             // whole device range the kernel maps
   Capability uart_img;      // `boot/uart.bin`
+  Capability dma_img;       // `boot/dma.bin`
   Capability blk_img;       // `boot/blk.bin`
   Capability fs_img;        // `boot/fs.bin`
 };
