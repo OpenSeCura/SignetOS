@@ -231,11 +231,12 @@ inline uint64_t self_tid() {
 // it protects, 0 when free (abi.hpp, scheduler). `lock_wait` and `lock_wake`
 // are the scheduler's `sched.lock_wait` and `sched.lock_wake`.
 
-// `word` as the scheduler takes it: its eight bytes, Load|Store.
+// `word` as the scheduler takes it: its eight bytes, read-only (Load).
+// The scheduler never writes to a compartment's lock word.
 inline Capability lock_word_cap(uint64_t* word) {
   Capability cap = capability_set_bounds(reinterpret_cast<Capability>(word),
                                          sizeof(uint64_t));
-  return capability_and_perms(cap, perms::Load | perms::Store);
+  return capability_and_perms(cap, perms::Load);
 }
 
 // Takes the lock at `word`, sleeping in the scheduler while another thread
@@ -269,9 +270,27 @@ inline int64_t lock(Capability invoke_gate, Capability lock_wait,
     }
     const int64_t st =
         invoke<int64_t>(invoke_gate, lock_wait, lock_word_cap(word), seen);
-    if ((__atomic_load_n(word, __ATOMIC_SEQ_CST) & ~init::LOCK_WAITERS) == me) {
-      return st == init::SCHED_OWNER_DEAD ? st : init::SCHED_OK;
+    if (st > 0) {
+      // The scheduler handed the lock to us. The word may still name the
+      // owner that handed it over, whose write of our tid can come after
+      // this, so it is made to name us now whatever it says: until we let go
+      // nobody else can own it, and that late write, which expects the old
+      // owner, then fails. Were it left to the late write, our release could
+      // come first and be refused (the word names someone else), and the
+      // late write would then name us as owner of a lock we had let go.
+      __atomic_store_n(word, me | init::LOCK_WAITERS, __ATOMIC_SEQ_CST);
+      return init::SCHED_OK;
     }
+    if (st == init::SCHED_OWNER_DEAD) {
+      uint64_t expected = seen;
+      if (__atomic_compare_exchange_n(word, &expected, me | init::LOCK_WAITERS,
+                                      false, __ATOMIC_SEQ_CST,
+                                      __ATOMIC_SEQ_CST)) {
+        return init::SCHED_OWNER_DEAD;
+      }
+      continue;
+    }
+    // SCHED_OK: the word changed; look again.
     if (st != init::SCHED_OK) {
       return st;
     }
@@ -279,13 +298,24 @@ inline int64_t lock(Capability invoke_gate, Capability lock_wait,
 }
 
 // Releases the lock at `word`, which the caller holds. If anyone is waiting
-// for it, the scheduler hands it to the next of them.
+// for it, asks the scheduler which waiter goes next and hands the word to it.
 inline void unlock(Capability invoke_gate, Capability lock_wake,
                    uint64_t* word) {
-  uint64_t expected = self_tid();
-  if (!__atomic_compare_exchange_n(word, &expected, 0, false, __ATOMIC_SEQ_CST,
-                                   __ATOMIC_SEQ_CST)) {
-    invoke<int64_t>(invoke_gate, lock_wake, lock_word_cap(word));
+  const uint64_t me = self_tid();
+  uint64_t expected = me;
+  if (__atomic_compare_exchange_n(word, &expected, 0, false, __ATOMIC_SEQ_CST,
+                                  __ATOMIC_SEQ_CST)) {
+    return;
+  }
+  const int64_t next =
+      invoke<int64_t>(invoke_gate, lock_wake, lock_word_cap(word));
+  if (next == 0) {
+    __atomic_store_n(word, 0ULL, __ATOMIC_SEQ_CST);
+  } else if (next > 0) {
+    expected = me | init::LOCK_WAITERS;
+    __atomic_compare_exchange_n(
+        word, &expected, static_cast<uint64_t>(next) | init::LOCK_WAITERS,
+        false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
   }
 }
 

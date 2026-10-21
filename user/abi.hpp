@@ -140,10 +140,11 @@ struct alignas(16) TrapMgrInterface {
 // someone waits for it (runtime.hpp, `lock` and `unlock`). A thread that finds
 // it taken sets LOCK_WAITERS and calls `lock_wait` with the value it saw; while
 // it waits, its node's turns run the owner instead. The owner, seeing
-// LOCK_WAITERS as it releases the lock, calls `lock_wake`, which writes the
-// next waiter's tid into the word and wakes it. If the owner ended holding the
-// lock, the next waiter gets it with SCHED_OWNER_DEAD. `word` is an unsealed
-// Load|Store capability to the 8-byte word.
+// LOCK_WAITERS as it releases the lock, calls `lock_wake`, which wakes the next
+// waiter and returns its tid (> 0) for the caller to store into the word (or 0
+// if no waiter remains). If the owner ended holding the lock, the next waiter
+// gets it with SCHED_OWNER_DEAD. `word` is an unsealed Load capability to the
+// 8-byte word; the scheduler never writes to it.
 
 constexpr uint8_t PRIORITY_RT          = 0;
 constexpr uint8_t PRIORITY_INTERACTIVE = 1;

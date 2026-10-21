@@ -706,10 +706,10 @@ void reschedule(ThreadRec* cur, uint64_t now, bool can_idle) {
 }
 
 // The lock word `word` points at, or nullptr: it must be an unsealed
-// Load|Store capability to eight aligned bytes.
-uint64_t* open_lock_word(Capability word) {
+// Load capability to eight aligned bytes. The scheduler only reads it.
+const uint64_t* open_lock_word(Capability word) {
   if (!capability_is_valid(word) || sealing::is_sealed(word) ||
-      !capability_has_perms(word, perms::Load | perms::Store)) {
+      !capability_has_perms(word, perms::Load)) {
     return nullptr;
   }
   const uint64_t addr = capability_get_address(word);
@@ -718,7 +718,7 @@ uint64_t* open_lock_word(Capability word) {
       addr + sizeof(uint64_t) > base + capability_get_length(word)) {
     return nullptr;
   }
-  return reinterpret_cast<uint64_t*>(word);
+  return reinterpret_cast<const uint64_t*>(word);
 }
 
 // Whether `t` is `target`, or is waiting for it through a chain of lock
@@ -749,21 +749,16 @@ bool goes_first(const ThreadRec* a, const ThreadRec* b) {
   return a->lock_since_us < b->lock_since_us;
 }
 
-// Makes `to` the owner of the lock at `word`: writes its tid there, with
-// LOCK_WAITERS if anyone else is still waiting, and points those waiters at
-// it.
-void set_owner(uint64_t* word, const ThreadRec* to) {
-  const uint64_t addr =
-      capability_get_address(reinterpret_cast<Capability>(word));
-  bool others = false;
+// Makes `to` the owner of the lock at `addr` in the waiter records: points
+// remaining waiters at `to` and marks `to` as holding the lock in flight.
+// The lock word itself is updated by the caller's compartment (runtime.hpp).
+void set_owner(uint64_t addr, ThreadRec* to) {
   for (ThreadRec& w : s_threads) {
     if (&w != to && w.state == T_LOCK_WAIT && w.lock_word == addr) {
       w.lock_owner = to->tid;
-      others = true;
     }
   }
-  __atomic_store_n(word, to->tid | (others ? init::LOCK_WAITERS : 0),
-                   __ATOMIC_SEQ_CST);
+  to->lock_owner = to->tid;
 }
 
 }  // namespace
@@ -1038,51 +1033,66 @@ extern "C" int64_t sched_thread_kill_entry(Capability thread) {
 
 // Called by a thread that found the lock at `word` taken, with the value it
 // saw there, LOCK_WAITERS set. Sleeps until the lock is handed to it (LOCKS
-// in the header). Returns SCHED_OK at once if the word holds something else
-// by now: the caller looks again.
+// in the header), returning its own tid (> 0) once granted, SCHED_OWNER_DEAD
+// if the owner ended holding it, or SCHED_OK (0) if the word changed before
+// the sleep so the caller looks again.
 extern "C" int64_t sched_lock_wait_entry(Capability word_cap, uint64_t seen) {
   ThreadRec* cur = caller();
   if (cur == nullptr) {
     return init::SCHED_INVALID_THREAD;
   }
-  uint64_t* word = open_lock_word(word_cap);
+  const uint64_t* word = open_lock_word(word_cap);
   if (word == nullptr) {
     return init::SCHED_BAD_REQUEST;
   }
+  const uint64_t addr = capability_get_address(word_cap);
   busy_begin();
   int64_t status = init::SCHED_OK;
   ThreadRec* owner = nullptr;
   if ((seen & init::LOCK_WAITERS) == 0 ||
       __atomic_load_n(word, __ATOMIC_SEQ_CST) != seen) {
     // It changed meanwhile: the caller looks again.
-  } else if ((owner = find_registered(seen & ~init::LOCK_WAITERS)) == nullptr) {
-    set_owner(word, cur);  // it ended holding the lock
-    status = init::SCHED_OWNER_DEAD;
-  } else if (waits_on(owner, cur)) {
-    status = init::SCHED_DEADLOCK;
   } else {
-    const uint64_t now = now_us();
-    charge_running(now);
-    cur->lock_word = capability_get_address(word_cap);
-    cur->lock_owner = owner->tid;
-    cur->lock_since_us = now;
-    cur->state = T_LOCK_WAIT;
-    reschedule(cur, now, true);  // until the lock is handed to us
-    return init::SCHED_OK;
+    owner = find_registered(seen & ~init::LOCK_WAITERS);
+    for (ThreadRec& w : s_threads) {
+      if (w.state == T_READY && w.lock_word == addr && w.lock_owner == w.tid) {
+        owner = &w;  // handoff in flight to `w`
+        break;
+      }
+    }
+    if (owner == nullptr) {
+      set_owner(addr, cur);  // it ended holding the lock
+      cur->lock_owner = 0;
+      status = init::SCHED_OWNER_DEAD;
+    } else if (waits_on(owner, cur)) {
+      status = init::SCHED_DEADLOCK;
+    } else {
+      const uint64_t now = now_us();
+      charge_running(now);
+      cur->lock_word = addr;
+      cur->lock_owner = owner->tid;
+      cur->lock_since_us = now;
+      cur->state = T_LOCK_WAIT;
+      reschedule(cur, now, true);  // until the lock is handed to us
+      const bool granted = (cur->lock_owner == cur->tid);
+      cur->lock_word = 0;
+      cur->lock_owner = 0;
+      return granted ? static_cast<int64_t>(cur->tid) : init::SCHED_OK;
+    }
   }
   busy_end();
   return status;
 }
 
 // Called by the owner of the lock at `word` as it releases it, having seen
-// LOCK_WAITERS: hands the lock to the waiter that goes first and wakes it, or
-// frees it if nobody is waiting any more.
+// LOCK_WAITERS: wakes the waiter that goes first and returns its tid (> 0) for
+// the caller to write into `word`, or 0 (SCHED_OK) if nobody is waiting.
 extern "C" int64_t sched_lock_wake_entry(Capability word_cap) {
   ThreadRec* cur = caller();
   if (cur == nullptr) {
     return init::SCHED_INVALID_THREAD;
   }
-  uint64_t* word = open_lock_word(word_cap);
+  const uint64_t* word = open_lock_word(word_cap);
   if (word == nullptr) {
     return init::SCHED_BAD_REQUEST;
   }
@@ -1100,12 +1110,11 @@ extern "C" int64_t sched_lock_wake_entry(Capability word_cap) {
     }
   }
   if (next == nullptr) {
-    __atomic_store_n(word, 0ULL, __ATOMIC_SEQ_CST);
     return init::SCHED_OK;
   }
-  set_owner(word, next);
+  set_owner(addr, next);
   next->state = T_READY;
-  return init::SCHED_OK;
+  return static_cast<int64_t>(next->tid);
 }
 
 // IRQ_M_TIMER handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
