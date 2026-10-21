@@ -207,14 +207,13 @@ inline void image_install(Capability code_mem, Capability img_cap,
 //
 // Only the boot set is packaged: what `init` needs to reach the disk. Every
 // other service (`naming`, `sched`, `trap_mgr`, `shell`) is a file on the
-// disk, read through `fs` and loaded by `loader`.
+// disk, read through `fs` and loaded by `init`.
 struct alignas(16) BootManifest {
   Capability dtb;           // read-only copy of the flattened device tree
   Capability mmio;          // read/write window over [0, GIGAPAGE_SIZE): the
                             // whole device range the kernel maps
   Capability uart_img;      // `boot/uart.bin`
   Capability blk_img;       // `boot/blk.bin`
-  Capability loader_img;    // `boot/loader.bin`
   Capability fs_img;        // `boot/fs.bin`
 };
 

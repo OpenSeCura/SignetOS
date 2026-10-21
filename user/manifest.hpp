@@ -40,10 +40,9 @@
 // WHO READS IT
 //   The launcher (the shell's `run`, `init` for the services) interprets it
 //   and builds the seed array, entry i into seed slot RW_SLOT_SEED_BASE + i.
-//   `loader`, which every creation goes through, holds nothing to give and
-//   interprets nothing; it checks that the manifest is well formed and that
-//   the seed array it is handed has exactly `count` entries, so that an image
-//   can rely on slot i being its entry i, whoever launched it.
+//   `user::create_compartment` checks that the manifest is well formed and
+//   that the seed array has `count` entries, so that an image can rely on
+//   slot i being its entry i.
 //
 // DECLARING ONE
 //   An image lists what it needs once, as an X-macro; `SIGNETOS_MANIFEST`

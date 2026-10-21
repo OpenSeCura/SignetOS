@@ -367,6 +367,48 @@ inline Capability load_compartment_image(Capability invoke_gate,
   return entry;
 }
 
+// Creates a compartment funded by `vm_quota` with `seeds` (matching `img_cap`'s
+// manifest count), loads `img_cap` into it, and mints its entry sentry. Rolls
+// back via `destroy_gate` if loading fails.
+inline bool create_compartment(Capability invoke_gate, Capability create_gate,
+                               Capability destroy_gate, Capability alloc_gate,
+                               Capability sentry_gate, Capability fault_gate,
+                               Capability vm_quota, Capability seeds,
+                               Capability img_cap, Capability* out_comp,
+                               Capability* out_entry) {
+  *out_comp = nullptr;
+  *out_entry = nullptr;
+  const init::CompartmentImageHeader* hdr = init::image_header(img_cap);
+  init::Manifest manifest;
+  if (hdr == nullptr || !init::manifest_of(img_cap, hdr, &manifest)) {
+    return false;
+  }
+  const size_t seeds_len =
+      capability_is_valid(seeds) ? capability_get_length(seeds) : 0;
+  if (seeds_len != static_cast<size_t>(manifest.count) * sizeof(Capability)) {
+    return false;
+  }
+
+  using FnCompCreate = decltype(&sys_compartment_create);
+  const Capability comp =
+      syscall::call<FnCompCreate>(invoke_gate, create_gate, vm_quota, seeds);
+  if (!capability_is_valid(comp)) {
+    return false;
+  }
+
+  Capability entry =
+      load_compartment_image(invoke_gate, alloc_gate, sentry_gate, fault_gate,
+                             comp, vm_quota, img_cap);
+  if (!capability_is_valid(entry)) {
+    using FnCompDestroy = decltype(&sys_compartment_destroy);
+    syscall::call<FnCompDestroy>(invoke_gate, destroy_gate, comp);
+    return false;
+  }
+  *out_comp = comp;
+  *out_entry = entry;
+  return true;
+}
+
 // --- Fault handlers (signetos/fault.hpp) -------------------------------------
 //
 // An image may define `compartment_error_handler(fault::ErrorState*)`

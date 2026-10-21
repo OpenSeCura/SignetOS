@@ -108,7 +108,7 @@ kernel/      the microkernel (boot, VM, traps, threads, sealing, syscalls), with
              and lib/ (kstring) around it
 include/     kernel headers and a minimal freestanding libc
 user/        runtime and linker script shared by all user compartments
-boot/        compartments embedded in the kernel: init, loader, fs, uart, blk
+boot/        compartments embedded in the kernel: init, fs, uart, blk
 external/    compartments loaded from disk.img: services/ (naming, sched,
              trap_mgr, shell) and apps/ (programs the shell can `run`)
 tools/       signetfs.py, which writes disk.img

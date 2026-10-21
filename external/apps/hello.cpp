@@ -20,7 +20,7 @@
  * Not part of the system. `external/apps/hello.bin` is written to `/bin` on
  * the disk image (`tools/signetfs.py put --dir bin`, see the Makefile); the shell
  * holds a read-only disk quota rooted there, and its `run hello.bin [args]`
- * reads the file through it, has `loader` make a compartment of it, invokes
+ * reads the file through it, makes a compartment of it, invokes
  * `compartment_main` once with an `AppRequest` (abi.hpp, "Applications") and
  * destroys the compartment when it returns.
  *

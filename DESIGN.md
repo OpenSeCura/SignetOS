@@ -95,7 +95,7 @@ count.
 ```
  hardware  ──►  kernel (M-mode, ASR)  ──►  init (embedded)
                                              │  creates the core services
-                                             │  (drivers, loader, fs, naming,
+                                             │  (drivers, fs, naming,
                                              │   sched, trap_mgr, shell)
                                              │  publishes sched.run, exits
                                              ▼
@@ -706,17 +706,20 @@ file. The launcher (`init` for services, the shell's `run` for programs)
 applies its own policy to every entry and derives every grant from what it
 holds itself.
 
-#### The loader (`boot/loader.cpp`)
+#### The loader (`user::create_compartment` in `user/runtime.hpp`)
 
-Every compartment creation goes through the loader, which holds no authority
-of its own. Given a VM quota, a seed array and an image, it:
+Compartment construction is a library helper linked into any launcher (`init`
+or `shell`) that holds the required syscall gates (`compartment_create`,
+`compartment_destroy`, `vm_allocate`, `sentry`, `fault_install`). Given a VM
+quota, a seed array and an image, `user::create_compartment`:
 
 1. checks the manifest is well formed and matches the seeds;
 2. creates the compartment;
 3. installs the image into memory allocated from the same quota;
 4. mints the entry point and installs the image's fault handler, if any
-   (`user::load_compartment_image`; a failed install fails the load);
-5. writes the handles back into the request.
+   (`user::load_compartment_image`; a failed install destroys the compartment
+   and fails the load);
+5. returns the compartment and entry-point handles.
 
 Failures are silent (null outputs). Dependency resolution, such as looking
 services up in `naming`, is the launcher's job when it builds the seeds.
@@ -755,35 +758,32 @@ filesystem; which is which is a build detail.
 | --- | --- | --- |
 | 1 | — | Parse the DTB to find the UART, PLIC and virtio devices. |
 | 2 | `uart` | Its MMIO window. Handshake returns its `read` and IRQ entries; init offers `uart` (print) and `uart.read`. |
-| 3 | `loader` | The syscalls it needs and `uart` printing. It gets no quotas or resources of its own and is used for every later step. |
-| 4 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
-| 5 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
-| 6 | `naming` | Once it is up, init publishes `uart`, `loader` and the `fs.*` entries. |
-| 7 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
-| 8 | `trap_mgr` | The PLIC window and the external-interrupt authority. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
-| 9 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
-| 10 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
+| 3 | `blk` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Handshake passes the arena's physical address and returns `read`/`write`/IRQ entries. |
+| 4 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
+| 5 | `naming` | Once it is up, init publishes `uart` and the `fs.*` entries. |
+| 6 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
+| 7 | `trap_mgr` | The PLIC window and the external-interrupt authority. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
+| 8 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
+| 9 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
 ### 3.2 Creating and loading a new compartment
 
-The `loader` compartment parses binaries and constructs compartments; the
-launcher decides what the new compartment gets.
+The launcher decides what the new compartment gets and calls
+`user::create_compartment` directly:
 
 ```
-Launcher (init / shell)                 Loader                              Kernel
-  |-- read image, parse .manifest         |                                   |
-  |-- build seeds[] by policy             |                                   |
-  |   (sys_quota_vm_derive, fs.quota_derive, naming.lookup, ...)              |
-  |-- sys_compartment_invoke(loader, LoadRequest{vm_quota, seeds, image}) -->|
-  |                                       |-- sys_compartment_create(q, seeds)->|
-  |                                       |<-- comp ---------------------------|
-  |                                       |-- sys_vm_allocate(comp, q, size)-->|
-  |                                       |<-- zeroed RW memory --------------|
-  |                                       |   [copy image, resolve cap_relocs,|
-  |                                       |    derive PCC view: W^X]          |
-  |                                       |-- sys_sentry(comp, pcc) --------->|
-  |                                       |<-- EntryPoint --------------------|
-  |<-- (out_comp, out_sentry in request)--|                                   |
+Launcher (init / shell)                                                 Kernel
+  |-- read image, parse .manifest                                         |
+  |-- build seeds[] by policy                                             |
+  |   (sys_quota_vm_derive, fs.quota_derive, naming.lookup, ...)          |
+  |-- user::create_compartment(...)                                       |
+  |     |-- sys_compartment_create(q, seeds) ---------------------------->|
+  |     |<-- comp --------------------------------------------------------|
+  |     |-- sys_vm_allocate(comp, q, size) ------------------------------>|
+  |     |<-- zeroed RW memory --------------------------------------------|
+  |     |   [copy image, resolve cap_relocs, derive PCC view: W^X]        |
+  |     |-- sys_sentry(comp, pcc) --------------------------------------->|
+  |     |<-- EntryPoint --------------------------------------------------|
 ```
 
 1. **Derive the VM quota.** The launcher derives a quota from its own for the
@@ -791,15 +791,14 @@ Launcher (init / shell)                 Loader                              Kern
 2. **Build the seeds.** For each manifest entry the launcher derives or looks
    up the grant (sub-quotas, disk nodes, service entry points) or leaves a
    null.
-3. **Request loading.** The launcher invokes the loader.
-4. **Create the compartment.** The compartment's pages are billed to the new
+3. **Create the compartment.** `user::create_compartment` invokes
+   `sys_compartment_create`; the compartment's pages are billed to the new
    quota (§2.2).
-5. **Allocate and install.** The loader allocates zeroed memory owned by the
-   new compartment, copies the image, resolves relocations and derives the
-   W^X views (§2.8).
-6. **Mint the entry.** `sys_sentry` returns the `EntryPoint`.
-7. **Return.** The handles come back in the request struct. The switcher
-   scrubs the loader's temporaries from the stack on return.
+4. **Allocate and install.** It allocates zeroed memory owned by the new
+   compartment, copies the image, resolves relocations and derives the W^X
+   views (§2.8).
+5. **Mint the entry.** `sys_sentry` returns the `EntryPoint` (and
+   `sys_fault_install` installs any image fault handler).
 
 ### 3.3 Executing a compartment and thread scheduling
 
@@ -1359,7 +1358,6 @@ their parent; there are no directory-entry blocks.
 | `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one request at a time** through a bounce buffer in the init-owned DMA arena. Completion arrives as an interrupt that wakes the caller, which waits in `sched.block` with a timeout and falls back to polling. |
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
 | `trap_mgr` | External-interrupt routing | §3.6. |
-| `loader` | Compartment construction | §2.8. |
 | `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
 
 TODO: isolate DMA access. `blk` writes physical addresses into the device's

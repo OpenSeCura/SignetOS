@@ -85,8 +85,8 @@ bool s_first_call_done = false;
 
 // --- What `uart` asks `init` for (user/manifest.hpp) --------------------------
 // The device window, the switcher, and `sentry` to mint `read` and `irq` in
-// the handshake above. `init` loads the console itself, before anything else
-// exists; it is the only compartment the loader does not load.
+// the handshake above. `init` loads the console first, before anything else
+// exists.
 #define UART_MANIFEST(X)                                 \
   M_MMIO(X, UART_MMIO, "uart")                           \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \

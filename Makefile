@@ -109,16 +109,15 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 # flat binaries using the shared runtime in `user/`.
 #
 # `boot/` (`BOOT_COMPS`): embedded into the kernel via `kernel/boot_images.S`
-# -- `init` and what it needs to reach the disk (`uart`, `blk`, `loader`, `fs`).
+# -- `init` and what it needs to reach the disk (`uart`, `blk`, `fs`).
 #
 # `external/` (`EXT_SERVICES` and `EXT_APPS`): written into `disk.img` at build
 # time by `tools/signetfs.py` (never linked into the kernel image).
 #   - `external/services/`: root-owned system services (`naming`, `sched`,
-#     `trap_mgr`, `shell`) that `init` reads from `fs` out of `/` and loads
-#     via `loader`.
+#     `trap_mgr`, `shell`) that `init` reads from `fs` out of `/` and loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell reaches
 #     through a read-only disk quota rooted there and can `run`.
-BOOT_COMPS = init loader fs uart blk
+BOOT_COMPS = init fs uart blk
 BOOT_SRCS  = $(patsubst %,boot/%.cpp,$(BOOT_COMPS))
 BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))

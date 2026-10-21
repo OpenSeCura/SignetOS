@@ -98,7 +98,7 @@
  *   `fs` is part of the boot set (`kernel/boot_images.S`): it comes up before
  *   `naming`, `sched`, `trap_mgr` and the shell, because `init` reads those
  *   out of this file system (`tools/signetfs.py` writes them into the disk
- *   image at build time) and loads them through `loader`. Two things follow.
+ *   image at build time) and loads them. Two things follow.
  *   The entry points below are handed back to `init` in the `FsInterface`
  *   handshake rather than published here, since there is nothing to publish
  *   them with yet; `init` publishes them as "fs.*" once `naming` is running.

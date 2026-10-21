@@ -23,7 +23,7 @@
 // `ca0..ca4` (caller `ca1..ca5`) and return a single register result in `ca0`
 // (`a0`). Operations whose inputs and outputs fit in registers take them
 // directly; operations with wider parameter blocks or multiple outputs
-// (`loader`, `quota_derive`, `fs.quota_query`, and one-shot `*Interface` boot
+// (`quota_derive`, `fs.quota_query`, and one-shot `*Interface` boot
 // handshakes) pass a bounded capability to a struct defined below.
 //
 // Entries that return a `Capability` on success (`naming.lookup`, `fs.create`,
@@ -48,16 +48,6 @@ __attribute__((always_inline)) inline int64_t cap_error(
   const int64_t s = static_cast<int64_t>(capability_get_address(cap));
   return s < 0 ? s : fallback;
 }
-
-// Request block passed by a launcher (`init` or the shell) to the `loader`
-// compartment in `ca0` (`int64_t loader(LoadRequest*)`).
-struct alignas(16) LoadRequest {
-  Capability vm_quota;      // in: child QuotaVm funding the new compartment
-  Capability seeds;         // in: bounded capability to initial seed array
-  Capability image;         // in: read-only capability to compartment `.bin`
-  Capability out_comp;      // out: created `OType::Compartment` handle
-  Capability out_sentry;    // out: minted `OType::EntryPoint` (CT = 18) sentry
-};
 
 // ----------------------------------------------------------------------------
 // Naming service (`external/services/naming.cpp`)
@@ -381,36 +371,33 @@ constexpr size_t RW_SLOT_PROVISIONED_BASE    = RW_SLOT_SCHED_RUN + 1;
 constexpr size_t RW_SLOT_UART_QUOTA          = RW_SLOT_PROVISIONED_BASE + 0;
 constexpr size_t RW_SLOT_UART_COMP           = RW_SLOT_PROVISIONED_BASE + 1;
 constexpr size_t RW_SLOT_UART_SENTRY         = RW_SLOT_PROVISIONED_BASE + 2;
-constexpr size_t RW_SLOT_LOADER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 3;
-constexpr size_t RW_SLOT_LOADER_COMP         = RW_SLOT_PROVISIONED_BASE + 4;
-constexpr size_t RW_SLOT_LOADER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 5;
-constexpr size_t RW_SLOT_NAMING_QUOTA        = RW_SLOT_PROVISIONED_BASE + 6;
-constexpr size_t RW_SLOT_NAMING_COMP         = RW_SLOT_PROVISIONED_BASE + 7;
-constexpr size_t RW_SLOT_NAMING_SENTRY       = RW_SLOT_PROVISIONED_BASE + 8;
-constexpr size_t RW_SLOT_SCHED_QUOTA         = RW_SLOT_PROVISIONED_BASE + 9;
-constexpr size_t RW_SLOT_SCHED_COMP          = RW_SLOT_PROVISIONED_BASE + 10;
-constexpr size_t RW_SLOT_SCHED_SENTRY        = RW_SLOT_PROVISIONED_BASE + 11;
-constexpr size_t RW_SLOT_TRAP_MGR_QUOTA      = RW_SLOT_PROVISIONED_BASE + 12;
-constexpr size_t RW_SLOT_TRAP_MGR_COMP       = RW_SLOT_PROVISIONED_BASE + 13;
-constexpr size_t RW_SLOT_TRAP_MGR_SENTRY     = RW_SLOT_PROVISIONED_BASE + 14;
-constexpr size_t RW_SLOT_FS_QUOTA            = RW_SLOT_PROVISIONED_BASE + 15;
-constexpr size_t RW_SLOT_FS_COMP             = RW_SLOT_PROVISIONED_BASE + 16;
-constexpr size_t RW_SLOT_FS_SENTRY           = RW_SLOT_PROVISIONED_BASE + 17;
-constexpr size_t RW_SLOT_SHELL_VM_QUOTA      = RW_SLOT_PROVISIONED_BASE + 18;
-constexpr size_t RW_SLOT_SHELL_T_QUOTA       = RW_SLOT_PROVISIONED_BASE + 19;
-constexpr size_t RW_SLOT_SHELL_COMP          = RW_SLOT_PROVISIONED_BASE + 20;
-constexpr size_t RW_SLOT_SHELL_SENTRY        = RW_SLOT_PROVISIONED_BASE + 21;
-constexpr size_t RW_SLOT_SHELL_THREAD        = RW_SLOT_PROVISIONED_BASE + 22;
-constexpr size_t RW_SLOT_NAMING_PUBLISH      = RW_SLOT_PROVISIONED_BASE + 23;
-constexpr size_t RW_SLOT_NAMING_LOOKUP       = RW_SLOT_PROVISIONED_BASE + 24;
-constexpr size_t RW_SLOT_NAMING_PROOF        = RW_SLOT_PROVISIONED_BASE + 25;
-constexpr size_t RW_SLOT_SCHED_NODE_FUNDING  = RW_SLOT_PROVISIONED_BASE + 26;
-constexpr size_t RW_SLOT_SHELL_SCHED_QUOTA   = RW_SLOT_PROVISIONED_BASE + 27;
-constexpr size_t RW_SLOT_BLK_QUOTA           = RW_SLOT_PROVISIONED_BASE + 28;
-constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 29;
-constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 30;
-constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 31;
-constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 32;
+constexpr size_t RW_SLOT_NAMING_QUOTA        = RW_SLOT_PROVISIONED_BASE + 3;
+constexpr size_t RW_SLOT_NAMING_COMP         = RW_SLOT_PROVISIONED_BASE + 4;
+constexpr size_t RW_SLOT_NAMING_SENTRY       = RW_SLOT_PROVISIONED_BASE + 5;
+constexpr size_t RW_SLOT_SCHED_QUOTA         = RW_SLOT_PROVISIONED_BASE + 6;
+constexpr size_t RW_SLOT_SCHED_COMP          = RW_SLOT_PROVISIONED_BASE + 7;
+constexpr size_t RW_SLOT_SCHED_SENTRY        = RW_SLOT_PROVISIONED_BASE + 8;
+constexpr size_t RW_SLOT_TRAP_MGR_QUOTA      = RW_SLOT_PROVISIONED_BASE + 9;
+constexpr size_t RW_SLOT_TRAP_MGR_COMP       = RW_SLOT_PROVISIONED_BASE + 10;
+constexpr size_t RW_SLOT_TRAP_MGR_SENTRY     = RW_SLOT_PROVISIONED_BASE + 11;
+constexpr size_t RW_SLOT_FS_QUOTA            = RW_SLOT_PROVISIONED_BASE + 12;
+constexpr size_t RW_SLOT_FS_COMP             = RW_SLOT_PROVISIONED_BASE + 13;
+constexpr size_t RW_SLOT_FS_SENTRY           = RW_SLOT_PROVISIONED_BASE + 14;
+constexpr size_t RW_SLOT_SHELL_VM_QUOTA      = RW_SLOT_PROVISIONED_BASE + 15;
+constexpr size_t RW_SLOT_SHELL_T_QUOTA       = RW_SLOT_PROVISIONED_BASE + 16;
+constexpr size_t RW_SLOT_SHELL_COMP          = RW_SLOT_PROVISIONED_BASE + 17;
+constexpr size_t RW_SLOT_SHELL_SENTRY        = RW_SLOT_PROVISIONED_BASE + 18;
+constexpr size_t RW_SLOT_SHELL_THREAD        = RW_SLOT_PROVISIONED_BASE + 19;
+constexpr size_t RW_SLOT_NAMING_PUBLISH      = RW_SLOT_PROVISIONED_BASE + 20;
+constexpr size_t RW_SLOT_NAMING_LOOKUP       = RW_SLOT_PROVISIONED_BASE + 21;
+constexpr size_t RW_SLOT_NAMING_PROOF        = RW_SLOT_PROVISIONED_BASE + 22;
+constexpr size_t RW_SLOT_SCHED_NODE_FUNDING  = RW_SLOT_PROVISIONED_BASE + 23;
+constexpr size_t RW_SLOT_SHELL_SCHED_QUOTA   = RW_SLOT_PROVISIONED_BASE + 24;
+constexpr size_t RW_SLOT_BLK_QUOTA           = RW_SLOT_PROVISIONED_BASE + 25;
+constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 26;
+constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 27;
+constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 28;
+constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 29;
 
 __attribute__((always_inline)) inline constexpr size_t syscall_slot(
     syscall::Id id) {

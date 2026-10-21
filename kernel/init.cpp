@@ -37,7 +37,6 @@ extern "C" {
 extern const uint8_t _boot_img_init[];
 extern const uint8_t _boot_img_uart[];
 extern const uint8_t _boot_img_blk[];
-extern const uint8_t _boot_img_loader[];
 extern const uint8_t _boot_img_fs[];
 }
 
@@ -203,7 +202,6 @@ Status launch(Capability system_quota, Capability thread_quota,
   manifest.mmio = vm::device_window(0, vm::GIGAPAGE_SIZE);
   manifest.uart_img = boot_image_cap(_boot_img_uart);
   manifest.blk_img = boot_image_cap(_boot_img_blk);
-  manifest.loader_img = boot_image_cap(_boot_img_loader);
   manifest.fs_img = boot_image_cap(_boot_img_fs);
 
   {

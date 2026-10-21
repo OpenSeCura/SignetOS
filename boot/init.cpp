@@ -37,19 +37,18 @@
  *   0. Receives a read-only `BootManifest*` in `arg` (`ca0`) carrying a copy
  *      of the device tree, one capability over the whole device MMIO range,
  *      and read-only capabilities to the boot-set images packaged in the
- *      kernel: `uart`, `loader`, `blk` and `fs` -- what it takes to reach the
- *      disk, and nothing more. Reads the board out of the device tree
- *      (`hw.hpp`) and carves one MMIO window per device.
- *   1. Starts `uart` directly (there is no loader yet): the console, and the
- *      one-shot handshake that mints `uart.read`.
- *   2. Starts `loader` directly; everything after goes through it.
+ *      kernel: `uart`, `blk` and `fs` -- what it takes to reach the disk, and
+ *      nothing more. Reads the board out of the device tree (`hw.hpp`) and
+ *      carves one MMIO window per device.
+ *   1. Starts `uart`: the console, and the one-shot handshake that mints
+ *      `uart.read`.
  *   3. `blk`: its manifest asks for the virtio window and a DMA arena, which
  *      `init` allocates with FLAG_DMA (which reports its physical address;
  *      the handshake tells the driver).
  *   4. `fs`: asks for `blk.read`/`blk.write`; its VM quota is sized to the
  *      disk; its handshake returns the root `quota_disk` handle and its entry
  *      points. From here on every image is a file read off the disk.
- *   5. `naming`: `init` publishes `uart`, `loader` and `fs.*` on their behalf.
+ *   5. `naming`: `init` publishes `uart` and `fs.*` on their behalf.
  *   6. `sched`: hands `blk` the scheduler's entries (the disk is polled until
  *      then).
  *   7. `trap_mgr`: routes the UART's and the block device's PLIC sources to
@@ -150,9 +149,9 @@ struct Launcher {
   Capability gate_vm_alloc;
   Capability gate_vm_dealloc;
   Capability gate_comp_create;
+  Capability gate_comp_destroy;
   Capability gate_sentry;
   Capability gate_fault_install;
-  Capability loader;       // `loader`'s entry, once it is up
 
   // Device windows (step 0), one per MMIO name a manifest can use.
   Capability uart_mmio;
@@ -493,11 +492,10 @@ struct Launcher {
 
   // Starts the compartment image `image` (`who` for the console): reads its
   // manifest, funds it with the VM it asks for plus `extra_vm`, grants it,
-  // creates and loads it -- through `loader`, or directly while there is none
-  // (`direct`). An image that is not one, whose manifest is malformed, or
-  // that requires what `init` cannot give is not started.
-  Started start(const char* who, Capability image, size_t extra_vm,
-                bool direct) {
+  // and creates and loads it via `create_compartment`. An image that is not
+  // one, whose manifest is malformed, or that requires what `init` cannot
+  // give is not started.
+  Started start(const char* who, Capability image, size_t extra_vm) {
     Started r{};
     const init::CompartmentImageHeader* hdr = init::image_header(image);
     init::Manifest m;
@@ -525,25 +523,9 @@ struct Launcher {
                      : capability_set_bounds(
                            reinterpret_cast<Capability>(&s_seeds[0]),
                            static_cast<size_t>(m.count) * sizeof(Capability));
-    if (direct) {
-      using FnCompCreate = decltype(&sys_compartment_create);
-      r.comp = syscall::call<FnCompCreate>(invoke, gate_comp_create, r.quota,
-                                           seeds);
-      r.sentry =
-          load_compartment_image(invoke, gate_vm_alloc, gate_sentry,
-                                 gate_fault_install, r.comp, r.quota, image);
-    } else {
-      init::LoadRequest req{};
-      req.vm_quota = r.quota;
-      req.seeds = seeds;
-      req.image = image;
-      req.out_comp = nullptr;
-      req.out_sentry = nullptr;
-      reinterpret_cast<FnInvoke>(invoke)(loader, bounded(&req));
-      r.comp = req.out_comp;
-      r.sentry = req.out_sentry;
-    }
-    if (!capability_is_valid(r.comp) || !capability_is_valid(r.sentry)) {
+    if (!create_compartment(invoke, gate_comp_create, gate_comp_destroy,
+                            gate_vm_alloc, gate_sentry, gate_fault_install,
+                            r.quota, seeds, image, &r.comp, &r.sentry)) {
       warn(who, "could not be loaded");
     }
     return r;
@@ -602,7 +584,7 @@ struct Launcher {
     if (!capability_is_valid(buf)) {
       return Started{};
     }
-    Started r = start(name, buf, 0, false);
+    Started r = start(name, buf, 0);
     release(buf);
     return r;
   }
@@ -635,6 +617,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   L.gate_vm_alloc = rw[init::syscall_slot(syscall::Id::vm_allocate)];
   L.gate_vm_dealloc = rw[init::syscall_slot(syscall::Id::vm_deallocate)];
   L.gate_comp_create = rw[init::syscall_slot(syscall::Id::compartment_create)];
+  L.gate_comp_destroy = rw[init::syscall_slot(syscall::Id::compartment_destroy)];
   L.gate_sentry = rw[init::syscall_slot(syscall::Id::sentry)];
   L.gate_fault_install = rw[init::syscall_slot(syscall::Id::fault_install)];
   Capability gate_thread_create =
@@ -708,13 +691,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   assert(capability_is_valid(L.plic_mmio));
 
   // =========================================================================
-  // 1. `uart`: the console (direct load, before there is a loader)
+  // 1. `uart`: the console
   // =========================================================================
   // Its manifest asks for the UART window, `sentry` and the switcher: it
   // drives the device and nothing else. Its interrupt entry is routed to it
   // by `trap_mgr` (step 7), and `compartment_invoke` is how it notifies
   // whoever is waiting for input.
-  const Started uart = L.start("uart", manifest->uart_img, 0, true);
+  const Started uart = L.start("uart", manifest->uart_img, 0);
   // The first word to `uart` must be the console-input handshake: it mints
   // `uart.read` and `uart.irq` for whoever calls first and never again
   // (abi.hpp, `UartInterface`), and only the shell's manifest asks for
@@ -731,16 +714,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   say("[init]     UART compartment online; bootstrapping core services...\n");
 
   // =========================================================================
-  // 2. `loader` (direct load, then used for everything else)
-  // =========================================================================
-  const Started loader = L.start("loader", manifest->loader_img, 0, true);
-  L.loader = loader.sentry;
-  L.offer("loader", loader.sentry);
-  if (capability_is_valid(loader.sentry)) {
-    comp_invoke(loader.sentry, nullptr);
-  }
-
-  // =========================================================================
   // 3. `blk`: the block driver
   // =========================================================================
   // Its manifest is the only one that asks for the virtio window and a DMA
@@ -748,7 +721,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   // scheduler for it to sleep in yet (that is a file on its own disk): it
   // polls until step 6 hands it the scheduler's entries, and its interrupt
   // entry is routed to it by `trap_mgr` in step 7.
-  const Started blk = L.start("blk", manifest->blk_img, 0, false);
+  const Started blk = L.start("blk", manifest->blk_img, 0);
   // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what it
   // cannot learn from its capabilities -- the arena's physical address and
   // the slot geometry -- and hands back `read`, `write` and `irq`.
@@ -790,7 +763,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   const size_t fs_table_bytes =
       static_cast<size_t>(bitmap_blocks + inode_blocks + owner_blocks) *
       init::FS_BLOCK_BYTES;
-  const Started fs = L.start("fs", manifest->fs_img, fs_table_bytes, false);
+  const Started fs = L.start("fs", manifest->fs_img, fs_table_bytes);
   // `fs` mounts (formatting a blank disk) and hands back the root
   // `quota_disk` handle -- the authority over the whole disk -- together with
   // its operation entry points, which `init` publishes once `naming` is up.
@@ -852,7 +825,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   };
 
   publish("uart", uart.sentry);
-  publish("loader", loader.sentry);
   // `fs` came up before `naming` existed, so its entry points are published
   // on its behalf, under the names its clients (the shell, the programs the
   // shell runs) ask for.
@@ -1043,9 +1015,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[init::RW_SLOT_UART_QUOTA] = uart.quota;
   rw[init::RW_SLOT_UART_COMP] = uart.comp;
   rw[init::RW_SLOT_UART_SENTRY] = uart.sentry;
-  rw[init::RW_SLOT_LOADER_QUOTA] = loader.quota;
-  rw[init::RW_SLOT_LOADER_COMP] = loader.comp;
-  rw[init::RW_SLOT_LOADER_SENTRY] = loader.sentry;
   rw[init::RW_SLOT_NAMING_QUOTA] = naming.quota;
   rw[init::RW_SLOT_NAMING_COMP] = naming.comp;
   rw[init::RW_SLOT_NAMING_SENTRY] = naming.sentry;

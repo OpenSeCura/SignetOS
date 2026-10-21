@@ -126,15 +126,16 @@ constexpr uint64_t FOREVER_US = ~0ULL;
   M_SYSCALL(X, SYS_QUOTA_VM_DERIVE, quota_vm_derive)                           \
   M_SYSCALL(X, SYS_QUOTA_VM_DESTROY, quota_vm_destroy)                         \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)                            \
+  M_SYSCALL(X, SYS_COMP_CREATE, compartment_create)                            \
   M_SYSCALL(X, SYS_COMP_DESTROY, compartment_destroy)                          \
   M_SYSCALL(X, SYS_THREAD_CREATE, thread_create)                               \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)                                   \
   M_SYSCALL(X, SYS_SENTRY, sentry)                                             \
+  M_SYSCALL(X, SYS_FAULT_INSTALL, fault_install)                               \
   M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
   M_SERVICE(X, NAMING_LOOKUP, "naming.lookup")                                 \
-  M_SERVICE(X, LOADER_SENTRY, "loader")                                        \
   M_DISK(X, DISK_QUOTA, 0, perms::Load | perms::Store,                         \
          ::signetos::init::MANIFEST_ALL, ::signetos::init::MANIFEST_ALL_INODES, \
          "home")                                                               \
@@ -905,8 +906,8 @@ void cmd_df() {
 // happens after it:
 //   1. fs.open and fs.read the file -- through `s_bin_quota`, the read-only
 //      handle on `/bin` -- into a page-granular, zeroed allocation of the
-//      shell's: the same shape as a packaged image, so `loader` can take it
-//      as one (see `DiskImages` in init.cpp, which does the same);
+//      shell's: the same shape as a packaged image, so it loads as one (see
+//      `DiskImages` in init.cpp, which does the same);
 //   2. read its manifest (user/manifest.hpp) and make the program its own
 //      quotas: a VM sub-quota of the shell's for it to live on, as large as
 //      the manifest asks within APP_VM_MAX, and a `quota_sched` node of the
@@ -914,9 +915,10 @@ void cmd_df() {
 //   3. grant the manifest, entry by entry, by the policy below -- this is the
 //      shell acting as a launcher, and the whole of what the program will be
 //      able to reach is decided here;
-//   4. `loader`: compartment, code, entry sentry -- seeded with `s_app_seeds`,
-//      entry i in slot RW_SLOT_SEED_BASE + i. There is no directory to ask: a
-//      program holds what its creator put in its table and nothing else;
+//   4. `create_compartment`: compartment, code, entry sentry -- seeded with
+//      `s_app_seeds`, entry i in slot RW_SLOT_SEED_BASE + i. There is no
+//      directory to ask: a program holds what its creator put in its table
+//      and nothing else;
 //   5. start its thread -- entry: the program's entry point, argument: an
 //      `AppRequest` carrying the arguments -- on its node, and sleep until
 //      the thread has ended; its status comes back in the block;
@@ -937,7 +939,7 @@ void cmd_df() {
 //            Not `fs.quota_derive`/`quota_destroy`: a node a program derived
 //            would be paid for from its VM quota, and could keep that quota
 //            -- and its directory -- from being destroyed when it returns.
-//            Not `naming.lookup`, `loader`, `sched`, `uart.read`: nothing it
+//            Not `naming.lookup`, `sched`, `uart.read`: nothing it
 //            could reach further with.
 //   disk     a directory of its own under `/home`: `/home/<prog>` (the file
 //            name without `.bin`), or `/home/<prog>/<name>` if the entry
@@ -1003,12 +1005,14 @@ alignas(16) Capability s_app_files[init::MANIFEST_MAX];  // FILE: the open file
 alignas(16) init::AppRequest s_app_req;
 bool s_run_ready = false;
 Capability s_self_comp = nullptr;
-Capability s_loader = nullptr;
 Capability s_gate_vm_alloc = nullptr;
 Capability s_gate_vm_dealloc = nullptr;
 Capability s_gate_q_derive = nullptr;
 Capability s_gate_q_destroy = nullptr;
+Capability s_gate_comp_create = nullptr;
 Capability s_gate_comp_destroy = nullptr;
+Capability s_gate_sentry = nullptr;
+Capability s_gate_fault_install = nullptr;
 Capability s_gate_thread_kill = nullptr;
 
 // Sleeps until `us` have passed, or until something wakes the shell first
@@ -1322,25 +1326,19 @@ void revoke_manifest(uint32_t count) {
   }
 }
 
-// `loader`: a compartment on `quota` from `image`, seeded with the first
-// `count` of `s_app_seeds` (none at all for a manifest with no entries, which
-// is what the loader expects then). True with both handles filled in.
+// Creates a compartment on `quota` from `image`, seeded with the first
+// `count` of `s_app_seeds`. True with both handles filled in.
 bool load_image(Capability quota, uint32_t count, Capability image,
                 Capability* out_comp, Capability* out_entry) {
-  init::LoadRequest req{};
-  req.vm_quota = quota;
-  req.seeds = count == 0 ? nullptr
-                         : capability_set_bounds(
-                               reinterpret_cast<Capability>(&s_app_seeds[0]),
-                               static_cast<size_t>(count) * sizeof(Capability));
-  req.image = image;
-  req.out_comp = nullptr;
-  req.out_sentry = nullptr;
-  invoke<int64_t>(s_gate_invoke, s_loader, bounded(&req));
-  *out_comp = req.out_comp;
-  *out_entry = req.out_sentry;
-  return sealing::is_sealed_as(OType::Compartment, req.out_comp) &&
-         sealing::is_sealed_as(OType::EntryPoint, req.out_sentry);
+  const Capability seeds =
+      count == 0 ? nullptr
+                 : capability_set_bounds(
+                       reinterpret_cast<Capability>(&s_app_seeds[0]),
+                       static_cast<size_t>(count) * sizeof(Capability));
+  return create_compartment(s_gate_invoke, s_gate_comp_create,
+                            s_gate_comp_destroy, s_gate_vm_alloc,
+                            s_gate_sentry, s_gate_fault_install, quota, seeds,
+                            image, out_comp, out_entry);
 }
 
 bool cmd_run(const char* name, const char* args, int64_t* out_status) {
@@ -1419,7 +1417,7 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
   if (ok) {
     ok = load_image(quota, manifest.count, image, &comp, &entry);
     if (!ok) {
-      out("[shell]    run: not a program (the loader refused the image)\n");
+      out("[shell]    run: not a program (the image was refused)\n");
     }
   }
 
@@ -2405,16 +2403,17 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability gate_thread_create = rw[SLOT_SYS_THREAD_CREATE];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
+  Capability gate_fault_install = rw[SLOT_SYS_FAULT_INSTALL];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
   Capability naming_lookup = rw[SLOT_NAMING_LOOKUP];
-  Capability loader_sentry = rw[SLOT_LOADER_SENTRY];
   Capability uart_read = rw[SLOT_UART_READ];
   // For `run`: memory for the image, a sub-quota for the program's
-  // compartment, and the means to take the compartment down again.
+  // compartment, and the means to create and take down the compartment.
   Capability gate_vm_alloc = rw[SLOT_SYS_VM_ALLOC];
   Capability gate_vm_dealloc = rw[SLOT_SYS_VM_DEALLOC];
   Capability gate_q_derive = rw[SLOT_SYS_QUOTA_VM_DERIVE];
   Capability gate_q_destroy = rw[SLOT_SYS_QUOTA_VM_DESTROY];
+  Capability gate_comp_create = rw[SLOT_SYS_COMP_CREATE];
   Capability gate_comp_destroy = rw[SLOT_SYS_COMP_DESTROY];
   // CPU bandwidth: the compartment's own node, which every worker's and
   // program's node is derived under.
@@ -2425,8 +2424,7 @@ extern "C" int64_t compartment_main(Capability arg) {
       !sealing::is_sealed_as(OType::QuotaThreadMem, thread_quota) ||
       !sealing::is_sealed_as(OType::QuotaSched, sched_quota) ||
       !sealing::is_sealed_as(OType::EntryPoint, uart_sentry) ||
-      !sealing::is_sealed_as(OType::EntryPoint, naming_lookup) ||
-      !sealing::is_sealed_as(OType::EntryPoint, loader_sentry)) {
+      !sealing::is_sealed_as(OType::EntryPoint, naming_lookup)) {
     return -1;
   }
 
@@ -2507,12 +2505,14 @@ extern "C" int64_t compartment_main(Capability arg) {
   // of these. The manifest asks `init` for every one; a system that will not
   // give them just loses the command.
   s_self_comp = self_comp;
-  s_loader = loader_sentry;
   s_gate_vm_alloc = gate_vm_alloc;
   s_gate_vm_dealloc = gate_vm_dealloc;
   s_gate_q_derive = gate_q_derive;
   s_gate_q_destroy = gate_q_destroy;
+  s_gate_comp_create = gate_comp_create;
   s_gate_comp_destroy = gate_comp_destroy;
+  s_gate_sentry = gate_sentry;
+  s_gate_fault_install = gate_fault_install;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
   s_run_ready = sealing::is_sealed_as(OType::QuotaDisk, s_bin_quota) &&
@@ -2526,7 +2526,10 @@ extern "C" int64_t compartment_main(Capability arg) {
                 sealing::is_sealed_as(OType::EntryPoint, gate_vm_dealloc) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_q_derive) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_q_destroy) &&
-                sealing::is_sealed_as(OType::EntryPoint, gate_comp_destroy);
+                sealing::is_sealed_as(OType::EntryPoint, gate_comp_create) &&
+                sealing::is_sealed_as(OType::EntryPoint, gate_comp_destroy) &&
+                sealing::is_sealed_as(OType::EntryPoint, gate_sentry) &&
+                sealing::is_sealed_as(OType::EntryPoint, gate_fault_install);
   if (!s_run_ready) {
     out("[shell]    WARNING: the /bin view or a kernel entry `run` needs is "
         "missing; programs disabled\n");
