@@ -134,6 +134,15 @@ struct Job {
   uint64_t frame;  // JOB_IN: the frame it comes in on
 };
 
+// A thread waiting for a page (FAULTS), until the pager wakes it. tid 0:
+// unused. More waiters than this are not noted: each wakes when the block
+// it was put in times out, and tries again.
+constexpr size_t MAX_WAITERS = 32;
+struct Waiter {
+  uint64_t va;
+  uint64_t tid;
+};
+
 struct Paging {
   SlotInfo* slots;     // one per slot
   uint64_t* resident;  // a bit per slot: may be resident (the clock's hint)
@@ -141,7 +150,8 @@ struct Paging {
   uint64_t hand;       // the slot the clock looks at next
   uint64_t recent[RECENT];
   size_t recent_next;
-  uint64_t wanted;      // the page a thread waits for, or 0 (FAULTS)
+  Waiter waiters[MAX_WAITERS];
+  uint64_t pager;       // the pager's tid, once it has asked for a job
   Job job;
   uint64_t check_next;  // the slot the checks look at next; none: the end
 #if defined(SIGNETOS_PAGE_TEST)
@@ -1039,34 +1049,69 @@ uint64_t next_check_locked(uint64_t from) {
   return s_region_pages;
 }
 
+// Whether a thread waiting for page `va` still has to: it is in use, and not
+// in RAM (FAULTS).
+bool still_waited_for_locked(uint64_t va) {
+  const uint64_t* slot = leaf_slot(va, false);
+  const uint64_t kind = slot != nullptr ? pte_kind(*slot) : 0;
+  return kind == pte::KindFresh || kind == pte::KindSwapped;
+}
+
+// Notes thread `tid` as waiting for page `va` (FAULTS).
+void add_waiter_locked(uint64_t va, uint64_t tid) {
+  Waiter* unused = nullptr;
+  for (Waiter& w : s_paging.waiters) {
+    if (w.tid == tid) {
+      w.va = va;
+      return;
+    }
+    if (w.tid == 0 && unused == nullptr) {
+      unused = &w;
+    }
+  }
+  if (unused != nullptr) {
+    *unused = Waiter{va, tid};
+  }
+}
+
 // THE PAGER: the job to do next, most urgent first.
 uint64_t next_job_locked(Capability buf) {
   Job& j = s_paging.job;
   if (j.op != JOB_NONE) {  // not done yet: the same again
     return request(slot_of(j.va), j.op == JOB_OUT ? PAGE_WRITE : PAGE_READ);
   }
-  // The page a thread waits for: read in, or zeroed, if there is a frame
-  // for it; else a page goes out first.
-  if (s_paging.wanted != 0) {
-    const uint64_t va = s_paging.wanted;
-    uint64_t* slot = leaf_slot(va, false);
-    const uint64_t kind = slot != nullptr ? pte_kind(*slot) : 0;
-    if (kind != pte::KindFresh && kind != pte::KindSwapped) {
-      s_paging.wanted = 0;  // in already, or freed
-    } else if (room() <= 0) {
+  // A thread whose page is in, or gone: woken, to run the access again.
+  for (Waiter& w : s_paging.waiters) {
+    if (w.tid != 0 && !still_waited_for_locked(w.va)) {
+      const uint64_t tid = w.tid;
+      w = Waiter{};
+      return request(tid, PAGE_WAKE);
+    }
+  }
+  // A page a thread waits for: read in, or zeroed, if there is a frame for
+  // it; else a page goes out first.
+  for (const Waiter& w : s_paging.waiters) {
+    if (w.tid == 0) {
+      continue;
+    }
+    if (room() <= 0) {
       const uint64_t victim = pick_victim_locked();
       if (victim != 0) {
         return send_out_locked(victim, buf);
       }
-    } else if (const uint64_t pa = frame::alloc(1); pa != 0) {
-      s_paging.wanted = 0;
-      if (kind == pte::KindFresh) {
-        bring_in_locked(va, slot, pa, nullptr);
-      } else {
-        j = Job{JOB_IN, va, pa};
-        return request(slot_of(va), PAGE_READ);
-      }
+      break;
     }
+    const uint64_t pa = frame::alloc(1);
+    if (pa == 0) {
+      break;
+    }
+    uint64_t* slot = leaf_slot(w.va, false);
+    if (pte_kind(*slot) == pte::KindFresh) {
+      bring_in_locked(w.va, slot, pa, nullptr);
+      return next_job_locked(buf);  // which wakes its thread
+    }
+    j = Job{JOB_IN, w.va, pa};
+    return request(slot_of(w.va), PAGE_READ);
   }
   // The reserve (FRAMES).
   if (room() < 0) {
@@ -1527,7 +1572,7 @@ Capability alloc_pageable_pages(size_t pages, bool revocable) {
   return c;
 }
 
-Fault fault(uint64_t addr, bool can_wait) {
+Fault fault(uint64_t addr, bool can_wait, uint64_t tid) {
   if (!paging_on()) {
     return Fault::No;
   }
@@ -1564,17 +1609,24 @@ Fault fault(uint64_t addr, bool can_wait) {
     if (!can_wait) {
       return Fault::No;
     }
-    s_paging.wanted = va;
+    add_waiter_locked(va, tid);
     return Fault::Wait;
   }
   // Every page it touches is in by now: run it again.
   return Fault::Retry;
 }
 
-uint64_t page_next(Capability buf) {
+uint64_t page_next(Capability buf, uint64_t tid) {
   Locked hold(s_lock);
-  return paging_on() && is_pager_buffer_locked(buf) ? next_job_locked(buf)
-                                                    : PAGE_NONE;
+  if (!paging_on() || !is_pager_buffer_locked(buf)) {
+    return PAGE_NONE;
+  }
+  __atomic_store_n(&s_paging.pager, tid, __ATOMIC_RELAXED);
+  return next_job_locked(buf);
+}
+
+uint64_t pager_tid() {
+  return __atomic_load_n(&s_paging.pager, __ATOMIC_RELAXED);
 }
 
 void page_done(Capability buf) {

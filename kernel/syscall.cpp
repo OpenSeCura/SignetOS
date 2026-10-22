@@ -300,7 +300,7 @@ extern "C" uint64_t sys_page_setup(size_t slots) {
 }
 
 extern "C" uint64_t sys_page_next(capability_data_t buf) {
-  return ::signetos::vm::page_next(buf);
+  return ::signetos::vm::page_next(buf, ::signetos::thread::current_tid());
 }
 
 extern "C" void sys_page_done(capability_data_t buf) {

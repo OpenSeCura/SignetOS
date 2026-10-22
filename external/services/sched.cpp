@@ -108,6 +108,13 @@
  *   A thread that keeps the CPU without yielding still gets ticked, and the
  *   tick picks, so a timeout is late by at most a tick.
  *
+ *   A thread that waits for a page is blocked the same way, by the tick
+ *   handler: the kernel delivers it with PAGE_WAIT for a cause (trap.hpp),
+ *   and the pager's tid, which it wakes. The pager wakes the thread with
+ *   `wake` once the page is in; the timeout, PAGE_WAIT_MAX_US, only covers a
+ *   thread the kernel could not note. Should nothing else be able to run,
+ *   the thread runs on, faults again, and is blocked again.
+ *
  * KILLING
  *   `thread_kill` asks the kernel to end a thread (`sys_thread_kill`, see
  *   unwind.hpp): it ends when it is next back in its own code, inside no
@@ -1117,16 +1124,20 @@ extern "C" int64_t sched_lock_wake_entry(Capability word_cap) {
   return static_cast<int64_t>(next->tid);
 }
 
+// The longest a thread waiting for a page sleeps before it tries again
+// (BLOCKING).
+constexpr uint64_t PAGE_WAIT_MAX_US = 10'000;
+
 // IRQ_M_TIMER handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
 // ca4 = this compartment's table slice). Runs masked on the interrupted
-// thread's stack; `cgp` is our table, so globals resolve as usual.
+// thread's stack; `cgp` is our table, so globals resolve as usual. With
+// PAGE_WAIT for `mcause`, the thread waits for a page and `mtval2` is the
+// pager's tid (BLOCKING).
 extern "C" uint64_t sched_tick_entry(uint64_t mcause, uint64_t mtval,
                                      uint64_t mepc, uint64_t mtval2,
                                      Capability cap_table_rw) {
-  (void)mcause;
   (void)mtval;
   (void)mepc;
-  (void)mtval2;
   (void)cap_table_rw;
   // Nothing to do while scheduler state is mid-update on the interrupted
   // thread, or if that thread is not `s_running` (`caller`).
@@ -1137,10 +1148,27 @@ extern "C" uint64_t sched_tick_entry(uint64_t mcause, uint64_t mtval,
   busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
+  const bool page_wait = mcause == irq::PAGE_WAIT &&
+                         !__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST);
+  if (page_wait) {
+    if (mtval2 != 0) {
+      sched_wake_entry(mtval2);  // the pager
+    }
+    cur->timed_out = false;
+    cur->wake_at_us = now + PAGE_WAIT_MAX_US;
+    __atomic_store_n(&cur->state, T_BLOCKED, __ATOMIC_SEQ_CST);
+  }
   // If someone else should run, this switches from inside the handler: `cur`
   // stays parked here, masked, until someone switches back to it; then this
   // returns and `mret` resumes it.
   reschedule(cur, now, false);
+  if (page_wait) {
+    // Back: woken, or nothing else could run and it runs on regardless.
+    uint32_t expected = T_BLOCKED;
+    __atomic_compare_exchange_n(&cur->state, &expected, T_READY, false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    cur->wake_at_us = 0;
+  }
   return 0;
 }
 

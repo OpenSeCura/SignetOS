@@ -110,6 +110,12 @@ constexpr uint64_t IRQ_M_SOFT  = INTERRUPT_BIT | 3;
 constexpr uint64_t IRQ_M_TIMER = INTERRUPT_BIT | 7;
 constexpr uint64_t IRQ_M_EXT   = INTERRUPT_BIT | 11;
 
+// Not a hardware cause: what the IRQ_M_TIMER handler gets as its cause when
+// the running thread waits for a page (vm.hpp, PAGING, FAULTS). It is to
+// block that thread and wake the pager, whose tid it gets in a3 (0: none);
+// the pager wakes it once the page is in.
+constexpr uint64_t PAGE_WAIT = INTERRUPT_BIT | 0x100;
+
 using Status = signetos::Status;
 using signetos::status_name;
 

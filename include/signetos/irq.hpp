@@ -88,6 +88,7 @@ namespace signetos::irq {
 using trap::IRQ_M_EXT;
 using trap::IRQ_M_SOFT;
 using trap::IRQ_M_TIMER;
+using trap::PAGE_WAIT;
 
 // Period of the kernel tick delivered to the `IRQ_M_TIMER` handler.
 constexpr uint64_t TICK_US = 10'000;

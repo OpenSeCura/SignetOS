@@ -367,6 +367,10 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
                                                TrapFrame* frame) {
   const bool async = (mcause & INTERRUPT_BIT) != 0;
   const uint64_t mepc = capability_get_address(frame->mepcc);
+  // What an interrupt handler gets as its cause and a3: the trap's own,
+  // unless a thread waits for a page (below).
+  uint64_t handler_cause = mcause;
+  uint64_t handler_a3 = mtval2;
   frame->flags = 0;
   frame->fault_status = 0;
   frame->handler_comp = nullptr;
@@ -410,7 +414,8 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     const vm::Fault paging =
         (mcause == EXC_INST_PAGE_FAULT || mcause == EXC_LOAD_PAGE_FAULT ||
          mcause == EXC_STORE_PAGE_FAULT)
-            ? vm::fault(mtval, (mstatus & MSTATUS_MPIE) != 0)
+            ? vm::fault(mtval, (mstatus & MSTATUS_MPIE) != 0,
+                        thread::current_tid())
             : vm::Fault::No;
     if (paging == vm::Fault::No) {
       return dispatch_fault(mcause, mtval, mtval2, frame);
@@ -418,9 +423,12 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     if (paging == vm::Fault::Retry) {
       return nullptr;
     }
-    // Waiting for the pager: the rest of the thread's slice goes, as at a
-    // tick, so that the pager can run; the access runs again after.
+    // Waiting for a page: the scheduler's tick handler is told so
+    // (PAGE_WAIT), blocks the thread and wakes the pager, which wakes the
+    // thread again once the page is in; the access then runs again.
     mcause = IRQ_M_TIMER;
+    handler_cause = PAGE_WAIT;
+    handler_a3 = vm::pager_tid();
   }
 
   // The installed handler, if it still resolves: `resolve` refuses an entry
@@ -458,8 +466,8 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
       }
       return deliver(
           frame, entry, h_sp, 0,
-          reinterpret_cast<Capability>(static_cast<uintptr_t>(mcause)), mtval2,
-          true);
+          reinterpret_cast<Capability>(static_cast<uintptr_t>(handler_cause)),
+          handler_a3, true);
     }
   }
 

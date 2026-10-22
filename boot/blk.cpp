@@ -91,12 +91,15 @@
  *   cannot do is wait for the disk. So a thread `init` lends runs
  *   `blk_paging_entry`: it asks the kernel for a job (`sys_page_next`), does
  *   the read or write of that slot straight through the bounce buffer, which
- *   the kernel fills or drains, says it is done (`sys_page_done`), and sleeps
- *   PAGER_IDLE_US whenever there is no job. A job holds `s_lock` from asking
- *   to done, since its page is in the bounce buffer. A caller's buffer, which
- *   `handle` copies holding `s_lock`, must therefore never be pageable, or
- *   the copy would wait for the pager, which waits for `s_lock`: `fs`'s are
- *   not, since `fs` starts before paging does.
+ *   the kernel fills or drains, and says it is done (`sys_page_done`); or,
+ *   for a wake job, wakes the thread that waited for a page (`sched.wake`).
+ *   With no job it sleeps until a fault wakes it (vm.hpp, FAULTS), or for
+ *   PAGER_IDLE_US at most, for the jobs nobody waits for. A job holds
+ *   `s_lock` from asking to done, since its page is in the bounce buffer.
+ *   A caller's buffer, which `handle` copies holding `s_lock`, must
+ *   therefore never be pageable, or the copy would wait for the pager, which
+ *   waits for `s_lock`: `fs`'s are not, since `fs` starts before paging
+ *   does.
  *
  * BEFORE THERE IS A SCHEDULER
  *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
@@ -208,9 +211,9 @@ uint32_t s_wakes_reported = 0;
 // lost.
 constexpr uint64_t WAIT_TIMEOUT_US = 10'000;
 
-// PAGING: how long the pager sleeps when the kernel has no job for it, and
-// whether it is to end (blk_paging_stop_entry).
-constexpr uint64_t PAGER_IDLE_US = 1'000;
+// PAGING: how long the pager sleeps at most when the kernel has no job for
+// it, and whether it is to end (blk_paging_stop_entry).
+constexpr uint64_t PAGER_IDLE_US = 10'000;
 constexpr uint64_t SECTORS_PER_PAGE = init::BLK_XFER_BYTES / init::BLK_SECTOR_BYTES;
 static_assert(vm::PAGE_SIZE == init::BLK_XFER_BYTES);
 bool s_paging_stop = false;
@@ -435,8 +438,11 @@ extern "C" uint64_t blk_paging_entry(Capability) {
           syscall::call<FnNext>(s_gate_invoke, rw_table()[SLOT_SYS_PAGE_NEXT], buf);
       const uint64_t op = job & vm::PAGE_OP_MASK;
       const uint64_t slot = job >> vm::PAGE_SLOT_SHIFT;
-      worked = op != vm::PAGE_NONE && slot < s_swap_pages;
-      if (worked) {
+      if (op == vm::PAGE_WAKE) {
+        worked = true;  // `slot` is the tid of a thread whose page is in
+        invoke<int64_t>(s_gate_invoke, s_sched_wake, slot);
+      } else if (op != vm::PAGE_NONE && slot < s_swap_pages) {
+        worked = true;
         // Until it works: a page going out is in `buf` and nowhere else.
         while (transfer(op == vm::PAGE_READ ? BLK_T_IN : BLK_T_OUT,
                         s_swap_base + (slot * SECTORS_PER_PAGE)) !=

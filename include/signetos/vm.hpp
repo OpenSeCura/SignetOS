@@ -328,18 +328,19 @@ Capability bitmap_view();
 // runs.
 //
 // FAULTS. On a fault on a pageable page that is not resident, a Fresh page is
-// zero-filled at once if a frame is free. Otherwise the page is noted as
-// wanted, and the thread gives up the rest of its slice, as at a tick, so
-// that the pager can run; then the access runs again, faulting again until
-// the page is in. A thread that faulted with interrupts off cannot wait like
-// that, and its fault is an ordinary one.
+// zero-filled at once if a frame is free. Otherwise the thread is noted as
+// waiting for the page, and the scheduler is told to block it and wake the
+// pager (trap.hpp, PAGE_WAIT); once the page is in, the pager wakes it, and
+// the access runs again. A thread that faulted with interrupts off cannot
+// wait like that, and its fault is an ordinary one.
 //
 // THE PAGER. One thread of `blk`'s asks for a job (`page_next`), does its
 // 4 KiB transfer to or from its slot, and says so (`page_done`), one job at a
-// time. The jobs, most urgent first: bring in the wanted page, writing one out
-// first if there is no frame for it; write pages out until the reserve is
-// back (FRAMES); write out the pages a test asked for; read a page back for a
-// check (REVOCATION). A page goes out by a clock over the resident pages that
+// time, and sleeps when there is none. The jobs, most urgent first: wake a
+// thread whose page is in (or gone); bring in a page a thread waits for,
+// writing one out first if there is no frame for it; write pages out until
+// the reserve is back (FRAMES); write out the pages a test asked for; read a
+// page back for a check (REVOCATION). A page goes out by a clock over the resident pages that
 // passes over the last few brought in: its entry becomes Swapped, its bytes
 // are copied into `blk`'s buffer, and its frame is freed at once.
 //
@@ -394,22 +395,28 @@ size_t round_up_pageable_pages(size_t pages);
 // round_up_pageable_pages.
 Capability alloc_pageable_pages(size_t pages, bool revocable = false);
 
-// FAULTS: a page fault at `addr`. No: not paging's, an ordinary fault.
-// Retry: every page the access touches is in now. Wait: one is wanted, and
-// the thread, which can wait (`can_wait`), is to let the pager run first.
+// FAULTS: a page fault at `addr` by thread `tid`. No: not paging's, an
+// ordinary fault. Retry: every page the access touches is in now. Wait: the
+// thread, which can wait (`can_wait`), waits for one, and is to block until
+// the pager wakes it; `pager_tid` is the pager's thread, or 0.
 enum class Fault { No, Retry, Wait };
-Fault fault(uint64_t addr, bool can_wait);
+Fault fault(uint64_t addr, bool can_wait, uint64_t tid);
+uint64_t pager_tid();
 
-// THE PAGER. What `page_next` returns: PAGE_NONE, or PAGE_READ or PAGE_WRITE
-// in the low byte with the slot above it. `buf` is `blk`'s page for the
-// transfer: writable, 4 KiB from its address, aligned, and never pageable.
-// `page_next` hands out the same job again until `page_done` says it is done.
+// THE PAGER. What `page_next` returns: PAGE_NONE; PAGE_READ or PAGE_WRITE in
+// the low byte with the slot above it; or PAGE_WAKE with the tid of a thread
+// to wake above it. `buf` is `blk`'s page for the transfer: writable, 4 KiB
+// from its address, aligned, and never pageable. `page_next` hands out a
+// read or write again until `page_done` says it is done; a wake is handed
+// out once, and needs no `page_done`. `tid` is the caller's, which faults
+// then wake (FAULTS).
 constexpr uint64_t PAGE_NONE = 0;
 constexpr uint64_t PAGE_READ = 1;
 constexpr uint64_t PAGE_WRITE = 2;
+constexpr uint64_t PAGE_WAKE = 3;
 constexpr uint64_t PAGE_OP_MASK = 0xFF;
 constexpr unsigned PAGE_SLOT_SHIFT = 8;
-uint64_t page_next(Capability buf);
+uint64_t page_next(Capability buf, uint64_t tid);
 void page_done(Capability buf);
 
 // REVOCATION, for `revoke`. `start_checks` begins the checks a sweep needs
