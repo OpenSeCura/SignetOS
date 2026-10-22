@@ -111,6 +111,10 @@ constexpr size_t RW_SLOT_SEED_BASE = 1;  // first seed slot in the table
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
 
+// Set at creation if paging was not on yet, and never changed: none of the
+// compartment's memory ever leaves RAM (vm.hpp, PAGING).
+constexpr uint32_t FLAG_PINNED = (1u << 1);
+
 using Status = signetos::Status;
 using signetos::status_name;
 
@@ -298,7 +302,8 @@ size_t entry_pages(Capability comp);
 // `mem_quota`. That is the only variable cost, and it is paid by the caller
 // that made the chain grow.
 //
-// Every allocation is zeroed and at fresh addresses. With FLAG_DMA
+// Every allocation is zeroed and at fresh addresses, and pageable (vm.hpp,
+// PAGING) unless it has FLAG_DMA or `comp` is pinned (FLAG_PINNED). With FLAG_DMA
 // (syscall.hpp) it must also be one physically contiguous run -- every
 // allocation is today: alloc_pages maps one frame run linearly; the check is
 // still made page by page -- and its physical base is written into its first

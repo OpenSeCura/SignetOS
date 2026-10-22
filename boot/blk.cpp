@@ -24,7 +24,7 @@
  * acknowledge), handed over in the `BlkInterface` handshake. It never sees or
  * writes a physical address, and cannot point the device outside the arena.
  *
- * Three entry points (see `BlkInterface` in abi.hpp), minted once on the
+ * Its entry points (see `BlkInterface` in abi.hpp), minted once on the
  * first invocation of `compartment_main`, exactly like `uart`:
  *   blk_read_entry(buf, sector, count)   copies `count` sectors from the
  *                                        device into `buf`.
@@ -34,6 +34,9 @@
  *                                        thread is waiting for its request.
  *                                        `trap_mgr` invokes this from
  *                                        interrupt context.
+ *   blk_paging_entry                     the pager's thread (PAGING).
+ *   blk_paging_stop_entry                ends it, for the shell's
+ *                                        `shutdown`.
  *
  * WHY A BOUNCE BUFFER
  *   The device only ever sees the addresses in `dma`'s table, all inside the
@@ -75,6 +78,26 @@
  *   SCHED_INVALID_THREAD -- the loop polls instead, so a missing interrupt
  *   route degrades to polling rather than a hang.
  *
+ * SWAP
+ *   The disk's last sector may describe a swap region after the file system
+ *   (abi.hpp, SwapTrailer). The handshake reads it and keeps the region to
+ *   itself: `read` and `write` serve only the sectors below it -- what
+ *   `capacity_sectors` reports back -- so `fs`, and whoever else has them,
+ *   cannot reach a page of swap. `init` tells the kernel how many pages it
+ *   holds; slot s is the page at `s_swap_base + s * SECTORS_PER_PAGE`.
+ *
+ * PAGING
+ *   The kernel decides what goes to swap and back (vm.hpp, PAGING); all it
+ *   cannot do is wait for the disk. So a thread `init` lends runs
+ *   `blk_paging_entry`: it asks the kernel for a job (`sys_page_next`), does
+ *   the read or write of that slot straight through the bounce buffer, which
+ *   the kernel fills or drains, says it is done (`sys_page_done`), and sleeps
+ *   PAGER_IDLE_US whenever there is no job. A job holds `s_lock` from asking
+ *   to done, since its page is in the bounce buffer. A caller's buffer, which
+ *   `handle` copies holding `s_lock`, must therefore never be pageable, or
+ *   the copy would wait for the pager, which waits for `s_lock`: `fs`'s are
+ *   not, since `fs` starts before paging does.
+ *
  * BEFORE THERE IS A SCHEDULER
  *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
  *   serves, so at its handshake there is nothing to look up and no interrupt
@@ -93,16 +116,21 @@ namespace {
 // No device window and no DMA arena: those are `dma`'s, and what `blk` gets
 // of them arrives in the handshake (abi.hpp, BlkInterface). Without a device
 // the driver still comes up and reports BLK_NO_DEVICE, and the file system
-// reports itself unmounted.
+// reports itself unmounted. `page_next` and `page_done` are the pager's
+// (PAGING); `init` grants them to nobody else.
 #define BLK_MANIFEST(X)                                  \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
+  M_SYSCALL(X, SYS_PAGE_NEXT, page_next)                 \
+  M_SYSCALL(X, SYS_PAGE_DONE, page_done)                 \
   M_SERVICE(X, UART_SENTRY, "uart")
 SIGNETOS_MANIFEST(BLK_MANIFEST, 64 * 1024)
-// Runtime slots: the three entry points minted in the handshake.
+// Runtime slots: the entry points minted in the handshake.
 constexpr size_t SLOT_READ_ENTRY  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 0;
 constexpr size_t SLOT_WRITE_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 1;
 constexpr size_t SLOT_IRQ_ENTRY   = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
+constexpr size_t SLOT_PAGING_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 3;
+constexpr size_t SLOT_PAGING_STOP  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 4;
 
 // --- The device, as `dma` left it (dma.cpp) ------------------------------------
 // The registers `blk` may write, as offsets into `s_notify`.
@@ -156,7 +184,9 @@ Capability s_lock_wake = nullptr;
 
 volatile uint32_t* s_notify = nullptr;  // QUEUE_NOTIFY .. INTERRUPT_ACK
 uint8_t* s_buf = nullptr;               // the arena past its descriptor page
-uint64_t s_capacity = 0;                // sectors
+uint64_t s_capacity = 0;                // sectors `read` and `write` serve
+uint64_t s_swap_base = 0;               // swap's first sector (SWAP)
+uint64_t s_swap_pages = 0;              // its slots; 0: no swap
 uint32_t s_slot = 0;
 bool s_present = false;
 uint64_t s_lock = 0;                  // ONE REQUEST AT A TIME
@@ -177,6 +207,13 @@ uint32_t s_wakes_reported = 0;
 // request completes in well under this, so it only matters when a wake was
 // lost.
 constexpr uint64_t WAIT_TIMEOUT_US = 10'000;
+
+// PAGING: how long the pager sleeps when the kernel has no job for it, and
+// whether it is to end (blk_paging_stop_entry).
+constexpr uint64_t PAGER_IDLE_US = 1'000;
+constexpr uint64_t SECTORS_PER_PAGE = init::BLK_XFER_BYTES / init::BLK_SECTOR_BYTES;
+static_assert(vm::PAGE_SIZE == init::BLK_XFER_BYTES);
+bool s_paging_stop = false;
 
 inline void fence() { __asm__ volatile("fence rw, rw" ::: "memory"); }
 
@@ -380,6 +417,48 @@ extern "C" int64_t blk_write_entry(Capability buf, uint64_t sector,
   return handle(buf, sector, count, BLK_T_OUT);
 }
 
+// PAGING: the pager's thread, until blk_paging_stop_entry.
+extern "C" uint64_t blk_paging_entry(Capability) {
+  using FnNext = decltype(&sys_page_next);
+  using FnDone = decltype(&sys_page_done);
+  const Capability buf = capability_set_bounds(
+      reinterpret_cast<Capability>(data()), init::BLK_XFER_BYTES);
+  while (s_swap_pages != 0 &&
+         !__atomic_load_n(&s_paging_stop, __ATOMIC_ACQUIRE)) {
+    const int64_t taken = lock(s_gate_invoke, s_lock_wait, &s_lock);
+    if (taken == init::SCHED_OWNER_DEAD) {
+      recover();
+    }
+    bool worked = false;
+    if (taken == init::SCHED_OK || taken == init::SCHED_OWNER_DEAD) {
+      const uint64_t job =
+          syscall::call<FnNext>(s_gate_invoke, rw_table()[SLOT_SYS_PAGE_NEXT], buf);
+      const uint64_t op = job & vm::PAGE_OP_MASK;
+      const uint64_t slot = job >> vm::PAGE_SLOT_SHIFT;
+      worked = op != vm::PAGE_NONE && slot < s_swap_pages;
+      if (worked) {
+        // Until it works: a page going out is in `buf` and nowhere else.
+        while (transfer(op == vm::PAGE_READ ? BLK_T_IN : BLK_T_OUT,
+                        s_swap_base + (slot * SECTORS_PER_PAGE)) !=
+               init::BLK_OK) {
+        }
+        syscall::call<FnDone>(s_gate_invoke, rw_table()[SLOT_SYS_PAGE_DONE], buf);
+      }
+      unlock(s_gate_invoke, s_lock_wake, &s_lock);
+    }
+    if (!worked && invoke<int64_t>(s_gate_invoke, s_sched_block,
+                                   PAGER_IDLE_US) == init::SCHED_KILLED) {
+      break;
+    }
+  }
+  return 0;  // the thread ends
+}
+
+extern "C" int64_t blk_paging_stop_entry() {
+  __atomic_store_n(&s_paging_stop, true, __ATOMIC_RELEASE);
+  return init::BLK_OK;
+}
+
 namespace {
 
 // A later call from `init` (abi.hpp): the scheduler's entries (`block`,
@@ -399,6 +478,27 @@ int64_t bind_sched(Capability block_ep, Capability wake_ep,
   s_lock_wait = lock_wait_ep;
   s_lock_wake = lock_wake_ep;
   return init::BLK_OK;
+}
+
+// SWAP, at the handshake (nothing else can call us yet, so no lock): the last
+// page of the disk, whose last sector may describe a swap region.
+void setup_swap() {
+  if (s_capacity <= SECTORS_PER_PAGE ||
+      transfer(BLK_T_IN, s_capacity - SECTORS_PER_PAGE) != init::BLK_OK) {
+    return;
+  }
+  const auto* t = reinterpret_cast<const init::SwapTrailer*>(
+      data() + init::BLK_XFER_BYTES - init::BLK_SECTOR_BYTES);
+  if (t->magic != init::SWAP_MAGIC || t->version != init::SWAP_VERSION ||
+      t->sector_bytes != init::BLK_SECTOR_BYTES ||
+      t->base_sector % SECTORS_PER_PAGE != 0 ||
+      t->sectors % SECTORS_PER_PAGE != 0 || t->base_sector >= s_capacity ||
+      t->sectors != s_capacity - 1 - t->base_sector) {
+    return;
+  }
+  s_swap_base = t->base_sector;
+  s_swap_pages = t->sectors / SECTORS_PER_PAGE;
+  s_capacity = t->base_sector;
 }
 
 }  // namespace
@@ -425,6 +525,9 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   iface->read = nullptr;
   iface->write = nullptr;
   iface->irq = nullptr;
+  iface->paging = nullptr;
+  iface->paging_stop = nullptr;
+  iface->swap_pages = 0;
   iface->status = init::BLK_NO_DEVICE;
 
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
@@ -449,6 +552,7 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   s_capacity = iface->capacity_sectors;
   s_slot = iface->slot;
   s_present = true;
+  setup_swap();
 
   // How we sleep while a request is in flight arrives later (`bind_sched`):
   // there is no scheduler yet, it is on the disk we are about to serve.
@@ -460,16 +564,29 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
                                   reinterpret_cast<const void*>(&blk_write_entry));
   Capability e_irq = mint_entry(s_gate_invoke, gate_sentry, self,
                                 reinterpret_cast<const void*>(&blk_irq_entry));
+  Capability e_paging = mint_entry(
+      s_gate_invoke, gate_sentry, self,
+      reinterpret_cast<const void*>(&blk_paging_entry));
+  Capability e_paging_stop = mint_entry(
+      s_gate_invoke, gate_sentry, self,
+      reinterpret_cast<const void*>(&blk_paging_stop_entry));
   rw[SLOT_READ_ENTRY] = e_read;
   rw[SLOT_WRITE_ENTRY] = e_write;
   rw[SLOT_IRQ_ENTRY] = e_irq;
+  rw[SLOT_PAGING_ENTRY] = e_paging;
+  rw[SLOT_PAGING_STOP] = e_paging_stop;
   iface->read = e_read;
   iface->write = e_write;
   iface->irq = e_irq;
+  iface->paging = e_paging;
+  iface->paging_stop = e_paging_stop;
+  iface->capacity_sectors = s_capacity;
+  iface->swap_pages = s_swap_pages;
   iface->status = init::BLK_OK;
 
   out_dec("[blk]      virtio-blk online in slot ", s_slot, ": ");
-  out_dec("", s_capacity * init::BLK_SECTOR_BYTES / 1024, " KiB, 4 KiB per request\n");
+  out_dec("", s_capacity * init::BLK_SECTOR_BYTES / 1024, " KiB, 4 KiB per request");
+  out_dec(", and ", s_swap_pages * init::BLK_XFER_BYTES / 1024, " KiB of swap\n");
   return iface->status;
 }
 

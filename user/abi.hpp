@@ -214,6 +214,21 @@ struct alignas(16) SchedInterface {
   uint64_t pad_;
 };
 
+// The last sector of a disk with a swap region (`tools/signetfs.py swap`):
+// the region runs from the end of the file system, `base_sector`, up to this
+// sector. Only `blk` reads it (blk.cpp, SWAP): it keeps the region to itself
+// and says only how many pages of swap there are.
+constexpr uint64_t SWAP_MAGIC = 0x5349474E53574150ULL;  // "SIGNSWAP"
+constexpr uint32_t SWAP_VERSION = 1;
+
+struct SwapTrailer {
+  uint64_t magic;           // SWAP_MAGIC
+  uint32_t version;         // SWAP_VERSION
+  uint32_t sector_bytes;    // BLK_SECTOR_BYTES
+  uint64_t base_sector;     // the region's first sector
+  uint64_t sectors;         // its length, a whole number of pages
+};
+
 // ----------------------------------------------------------------------------
 // DMA (`boot/dma.cpp`)
 // ----------------------------------------------------------------------------
@@ -258,6 +273,8 @@ struct alignas(16) DmaInterface {
 //   int64_t  blk.read(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   int64_t  blk.write(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   uint64_t blk.irq(uint64_t source)
+//   uint64_t blk_paging(Capability)        the pager's thread (blk.cpp, PAGING)
+//   int64_t  blk.paging_stop() -> BLK_OK   the pager's thread ends
 //   int64_t  blk(Capability block, Capability wake, Capability lock_wait,
 //                Capability lock_wake) [2nd call]
 // Every request is exactly BLK_XFER_BYTES: `count` must be
@@ -277,9 +294,13 @@ struct alignas(16) BlkInterface {
   Capability read;          // out: OType::EntryPoint -> blk_read_entry
   Capability write;         // out: OType::EntryPoint -> blk_write_entry
   Capability irq;           // out: OType::EntryPoint -> blk_irq_entry
+  Capability paging;        // out: OType::EntryPoint -> blk_paging_entry
+  Capability paging_stop;   // out: OType::EntryPoint -> blk_paging_stop_entry
   Capability buf;           // in: DmaInterface::buf
   Capability notify;        // in: DmaInterface::notify
-  uint64_t capacity_sectors;   // in: device size
+  uint64_t capacity_sectors;   // in: device size; out: what `read` and
+                               //      `write` serve, less any swap region
+  uint64_t swap_pages;      // out: pages of swap; 0: none
   uint32_t slot;            // in: the device's slot, for the console
   int64_t status;           // out: BLK_OK or BLK_NO_DEVICE
 };

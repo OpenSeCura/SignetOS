@@ -191,6 +191,24 @@ namespace pte {
     // Software bit (RSW, bit 9): the page belongs to a revocable allocation,
     // so it has revocation bitmap pages (REVOCATION BITMAP).
     constexpr uint64_t Revocable = (1ULL << 9);
+
+    // NON-RESIDENT ENTRIES. The hardware ignores a leaf entry whose Valid bit
+    // is clear, so its other bits are software's. Zero is a free address; any
+    // other entry with Valid clear is an address in use with no frame: one of
+    // the kinds below (PAGING). `Quarantined` and `Revocable` keep their
+    // meaning.
+    constexpr uint64_t KindMask    = 3ULL << 1;
+    constexpr uint64_t KindFresh   = 1ULL << 1;  // never touched
+    constexpr uint64_t KindSwapped = 2ULL << 1;  // its contents are on disk
+    constexpr uint64_t KindHeld    = 3ULL << 1;  // reclaimed, not reusable yet
+}
+
+// An address is in use while its leaf entry is non-zero; resident while it is
+// mapped on a frame. The kind of a non-resident entry, or 0.
+constexpr bool pte_in_use(uint64_t e) { return e != 0; }
+constexpr bool pte_resident(uint64_t e) { return (e & pte::Valid) != 0; }
+constexpr uint64_t pte_kind(uint64_t e) {
+  return pte_resident(e) ? 0 : (e & pte::KindMask);
 }
 
 // Builds the boot mappings (devices, direct map), derives the two standing
@@ -282,14 +300,168 @@ Capability next_live_page(uint64_t* cursor);
 // Unmaps every quarantined page in the dynamic address space, and its bitmap
 // page, and frees their frames; the addresses are then free for reuse.
 // Called by `revoke::sweep()` after all capability tags pointing into
-// quarantined ranges have been cleared.
-void reclaim_quarantined();
+// quarantined ranges have been cleared. If `hold`, the sweep is waiting for
+// checks of swap (PAGING, REVOCATION), and the addresses are left Held until
+// `release_held`.
+void reclaim_quarantined(bool hold);
 
 // Kernel-only read/write view of the whole revocation bitmap (REVOCATION
 // BITMAP), for `revoke`, which owns what is in it. Only the pages of
 // revocable allocations are mapped: test `leaf_flags` before touching
 // anything else.
 Capability bitmap_view();
+
+// PAGING
+//
+// What compartments allocate can move to disk and back. The kernel decides
+// everything -- which pages go out, when, and where they come back -- and
+// `blk` moves the bytes, because only a thread can wait for the disk. A
+// page's state is in its leaf entry: Fresh, resident, Swapped, or Held
+// (NON-RESIDENT ENTRIES).
+//
+// THE PAGEABLE REGION. Pageable memory comes from a region at the top of the
+// pool, one page per slot of swap, so a page's slot is fixed by its address;
+// where the slots are on the disk is `blk`'s business. Memory is pageable
+// unless it is the kernel's own, DMA memory, or a compartment's that was
+// created before paging started -- and `init` starts paging after everything
+// it starts (WHAT MUST NOT WAIT), so what pages is the programs the shell
+// runs.
+//
+// FAULTS. On a fault on a pageable page that is not resident, a Fresh page is
+// zero-filled at once if a frame is free. Otherwise the page is noted as
+// wanted, and the thread gives up the rest of its slice, as at a tick, so
+// that the pager can run; then the access runs again, faulting again until
+// the page is in. A thread that faulted with interrupts off cannot wait like
+// that, and its fault is an ordinary one.
+//
+// THE PAGER. One thread of `blk`'s asks for a job (`page_next`), does its
+// 4 KiB transfer to or from its slot, and says so (`page_done`), one job at a
+// time. The jobs, most urgent first: bring in the wanted page, writing one out
+// first if there is no frame for it; write pages out until the reserve is
+// back (FRAMES); write out the pages a test asked for; read a page back for a
+// check (REVOCATION). A page goes out by a clock over the resident pages that
+// passes over the last few brought in: its entry becomes Swapped, its bytes
+// are copied into `blk`'s buffer, and its frame is freed at once.
+//
+// ONE HART. Like the sweep, paging relies on every thread running on the
+// boot hart (DESIGN.md §4.4): the kernel's own `sfence.vma` is all a page
+// needs as it leaves, and nothing pages while a sweep runs.
+//
+// FRAMES. A pageable page never takes one of the last free frames, a share of
+// RAM kept for what cannot wait: page tables, kernel objects, pinned memory.
+//
+// CAPABILITIES. A page that goes out leaves, beside its slot, a bitmap of the
+// 16-byte granules that held capabilities. When it comes back, each is built
+// again from the kernel's root (`set_retag_root`), unless it has been revoked.
+// With SWAP_HASH (the default) the kernel also keeps a BLAKE2b-256 digest of
+// the page and refuses a copy that does not match -- `blk` then reads it
+// again -- so `blk` cannot change a page, or have a capability built that was
+// not there. Without it, `blk` is trusted with those.
+//
+// REVOCATION. A sweep cannot see capabilities on disk. If there are any, it
+// asks for them to be checked (`start_checks`): the pager reads each such page
+// back, and every capability the sweep revokes is cleared from its bitmap, so
+// it is never built again. Until that is done the sweep is not complete: what
+// it reclaimed is Held (frame freed, address not reused) and its marks stay.
+// A page that comes in meanwhile is checked the same way as it comes in.
+//
+// KERNEL ACCESS. The kernel never takes a fault on pageable memory. To read
+// or write a compartment's memory it takes a ResidentHold, which fails if a
+// page is not in RAM; the caller touches the memory and calls again.
+//
+// WHAT MUST NOT WAIT. Nor may anything the pager needs wait for a page: `blk`
+// holding its lock, the scheduler holding its own, or code running with
+// interrupts masked (an interrupt handler, and what it calls: the console
+// calls the shell). That is why everything `init` starts stays in RAM. It is
+// a rule, not a check: the programs the shell runs reach those services
+// only through `fs` and the console, which touch a program's memory only
+// while holding nothing the pager needs.
+
+// Sets paging up, once, for `slots` pages of swap. NotInitialized without a
+// root to build capabilities from (set_retag_root); Busy if it is set up
+// already or the region's addresses are in use; InvalidSize if it does not
+// fit; NoMemory without the memory for the slots' bitmaps.
+Status setup_paging(size_t slots);
+bool paging_on();
+
+// `pages` rounded up to a length a pageable allocation can be bounded to
+// exactly, or 0 if there can be no such allocation.
+size_t round_up_pageable_pages(size_t pages);
+
+// Reserves `pages` of the pageable region, all Fresh, and returns a capability
+// bounded to exactly them, like alloc_pages. Takes no frames, but for a
+// revocable allocation its bitmap pages. Null unless `pages` is its own
+// round_up_pageable_pages.
+Capability alloc_pageable_pages(size_t pages, bool revocable = false);
+
+// FAULTS: a page fault at `addr`. No: not paging's, an ordinary fault.
+// Retry: every page the access touches is in now. Wait: one is wanted, and
+// the thread, which can wait (`can_wait`), is to let the pager run first.
+enum class Fault { No, Retry, Wait };
+Fault fault(uint64_t addr, bool can_wait);
+
+// THE PAGER. What `page_next` returns: PAGE_NONE, or PAGE_READ or PAGE_WRITE
+// in the low byte with the slot above it. `buf` is `blk`'s page for the
+// transfer: writable, 4 KiB from its address, aligned, and never pageable.
+// `page_next` hands out the same job again until `page_done` says it is done.
+constexpr uint64_t PAGE_NONE = 0;
+constexpr uint64_t PAGE_READ = 1;
+constexpr uint64_t PAGE_WRITE = 2;
+constexpr uint64_t PAGE_OP_MASK = 0xFF;
+constexpr unsigned PAGE_SLOT_SHIFT = 8;
+uint64_t page_next(Capability buf);
+void page_done(Capability buf);
+
+// REVOCATION, for `revoke`. `start_checks` begins the checks a sweep needs
+// and says whether there are any; `checks_pending` whether they are still
+// going on; `release_held` frees what the sweep left Held, once they are done.
+bool start_checks();
+bool checks_pending();
+void release_held();
+
+// KERNEL ACCESS. Holds the VM lock, and so keeps every page of
+// `[va, va + len)` in RAM, while it lives; `ok()` false, holding nothing, if
+// any of them is not in RAM. Nothing that takes a lock listed before the VM
+// lock (lock.hpp) may be taken while it is held.
+bool hold_resident(uint64_t va, size_t len);
+void release_resident();
+class ResidentHold {
+ public:
+  ResidentHold(uint64_t va, size_t len) : held_(hold_resident(va, len)) {}
+  ~ResidentHold() {
+    if (held_) {
+      release_resident();
+    }
+  }
+  ResidentHold(const ResidentHold&) = delete;
+  ResidentHold& operator=(const ResidentHold&) = delete;
+  bool ok() const { return held_; }
+
+ private:
+  bool held_;
+};
+
+// Keeps `root`, the boot root, to build capabilities again (CAPABILITIES),
+// once it has found where a capability's type sits in its bits. Called once
+// at boot. False if it cannot: paging then stays off.
+bool set_retag_root(Capability root);
+
+// sys_page_test, for the shell's `pagetest`, built in only with PAGE_TEST=1
+// (Makefile): STATS writes a PagingStats at `cap`; EVICT sends the resident
+// pages of `cap`'s range out. ~0 if refused, and always without PAGE_TEST.
+struct alignas(16) PagingStats {
+  uint64_t slots;          // pages of swap
+  uint64_t free_frames;    // free frames now
+  uint64_t reserve;        // of them, the reserve (FRAMES)
+  uint64_t reads;          // pages read back for faults
+  uint64_t writes;         // pages written out
+  uint64_t checks;         // pages read back for checks
+  uint64_t digest_errors;  // copies refused (SWAP_HASH)
+  uint64_t evicting;       // pages EVICT still has to send out
+};
+constexpr uint64_t PAGE_TEST_STATS = 0;
+constexpr uint64_t PAGE_TEST_EVICT = 1;
+uint64_t page_test(uint64_t op, Capability cap);
 
 // Diagnostics.
 size_t table_pages();         // frames held as page tables (never freed)

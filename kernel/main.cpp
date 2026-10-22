@@ -65,6 +65,13 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
     debug::panic("vm: boot mappings could not be built");
   }
 
+  // The VM system keeps the root, and only it, to build again the
+  // capabilities that come back from disk (vm.hpp, PAGING).
+  if (!vm::set_retag_root(root_data_cap)) {
+    uart::print("[vm] capabilities cannot be rebuilt on this hart; paging "
+                "stays off\n");
+  }
+
   // Physical frame allocator, bitmap reached through the direct map.
   frame::init();
   if (!frame::is_initialized()) {

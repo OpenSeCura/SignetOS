@@ -44,6 +44,12 @@ nothing but the root quota is rooted; the programs the shell can `run` go in
       system wrote on earlier boots survives a rebuild.
   signetfs.py ls <image>
   signetfs.py format <image> [--size BYTES]
+  signetfs.py swap <image> --size BYTES
+      Gives `image` a swap region of BYTES (0: none) after its file system,
+      and a last sector describing it -- magic "SIGNSWAP", version, sector
+      size, first sector, sectors -- which `blk` reads (user/abi.hpp,
+      SwapTrailer): the kernel pages memory out there. The region is sparse,
+      and whatever it held before is dropped.
 """
 
 import argparse
@@ -74,6 +80,13 @@ INODE = struct.Struct("<IIQ32s16III8s")
 assert INODE.size == 128
 INODES_PER_BLOCK = BLOCK // INODE.size
 INDIRECT_FMT = struct.Struct("<%dI" % INDIRECT_SLOTS)
+
+# The last sector of an image with a swap region: u64 magic; u32 version,
+# sector_bytes; u64 base_sector, sectors (user/abi.hpp, SwapTrailer).
+SECTOR = 512
+SWAP_MAGIC = 0x5349474E53574150  # "SIGNSWAP"
+SWAP_VERSION = 1
+SWAP_TRAILER = struct.Struct("<QIIQQ")
 
 
 def default_geometry(total_blocks):
@@ -310,6 +323,21 @@ def format_image(path, size):
         f.write(b"\0" * (inode_table_blocks * BLOCK))
 
 
+def set_swap(path, size):
+    """Gives the image at `path` a swap region of `size` bytes, in whole
+    pages, between its file system and a last sector describing it; for 0,
+    none. The file system is left as it is."""
+    with open(path, "r+b") as f:
+        fs_bytes = Disk(f).total_blocks * BLOCK
+        size -= size % BLOCK
+        f.truncate(fs_bytes)  # any old region, and its sector, go
+        if size > 0:
+            f.truncate(fs_bytes + size + SECTOR)
+            f.seek(fs_bytes + size)
+            f.write(SWAP_TRAILER.pack(SWAP_MAGIC, SWAP_VERSION, SECTOR,
+                                      fs_bytes // SECTOR, size // SECTOR))
+
+
 def parse_size(text):
     units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
     if text and text[-1].upper() in units:
@@ -366,7 +394,17 @@ def main(argv):
     p = sub.add_parser("format", help="write a blank file system")
     p.add_argument("image")
     p.add_argument("--size", default="32M")
+    p = sub.add_parser("swap", help="give the image a swap region")
+    p.add_argument("image")
+    p.add_argument("--size", required=True, help="bytes of swap; 0 for none")
     args = ap.parse_args(argv)
+
+    if args.cmd == "swap":
+        size = parse_size(args.size)
+        set_swap(args.image, size)
+        print("%s: %s" % (args.image, "%d KiB of swap" % (size // 1024)
+                          if size >= BLOCK else "no swap"))
+        return 0
 
     if args.cmd == "format":
         format_image(args.image, parse_size(args.size))

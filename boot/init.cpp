@@ -46,7 +46,9 @@
  *      `init` allocates with FLAG_DMA. Run once: it sets up the device on a
  *      fixed descriptor table and returns views for `blk` that cannot reach
  *      a physical address.
- *   3. `blk`: gets those views in its handshake.
+ *   3. `blk`: gets those views in its handshake, and keeps any swap region
+ *      at the end of the disk to itself (blk.cpp, SWAP). Only `blk` gets the
+ *      pager's system calls.
  *   4. `fs`: asks for `blk.read`/`blk.write`; its VM quota is sized to the
  *      disk; its handshake returns the root `quota_disk` handle and its entry
  *      points. From here on every image is a file read off the disk.
@@ -58,7 +60,9 @@
  *   8. `shell`: its manifest asks for its own quotas (VM, thread memory, a
  *      `quota_sched` node), `/home` and `/bin`, and the system's root quotas,
  *      which it holds from then on; its thread is made from those quotas and
- *      registered with the scheduler.
+ *      registered with the scheduler. Then, if `blk` found swap, the pager's
+ *      thread, and paging on. Last, so that every compartment `init` started
+ *      stays in RAM (vm.hpp, PAGING): what pages is what the shell runs.
  *   9. Records every handle in its own table for the kernel's tests, then
  *  10. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
@@ -411,7 +415,6 @@ struct Launcher {
               static_cast<uint64_t>(-req.status), "\n");
       return nullptr;
     }
-    shell_sched_quota = req.out_quota;
     return req.out_quota;
   }
 
@@ -442,8 +445,13 @@ struct Launcher {
         }
         return q;
       }
-      case init::MANIFEST_QUOTA_SCHED:
-        return sched_node(e);
+      case init::MANIFEST_QUOTA_SCHED: {
+        Capability q = sched_node(e);
+        if (capability_is_valid(q)) {
+          shell_sched_quota = q;
+        }
+        return q;
+      }
       case init::MANIFEST_ROOT:
         switch (e.count) {
           case init::ROOT_VM: return mem_quota;
@@ -625,6 +633,12 @@ extern "C" int64_t compartment_main(Capability arg) {
   // (irq.hpp, INTERRUPT HANDLERS). Only `init` holds this gate.
   const Capability gate_trap_install =
       rw[init::syscall_slot(syscall::Id::trap_install)];
+  // Turns paging on, once the shell is up. Out of the table at once, so that
+  // no image can ask for it and turn paging on before what must stay in RAM
+  // is up.
+  const Capability gate_page_setup =
+      rw[init::syscall_slot(syscall::Id::page_setup)];
+  rw[init::syscall_slot(syscall::Id::page_setup)] = nullptr;
   auto install_irq = [&](uint64_t irq, Capability handler) -> bool {
     using Fn = decltype(&sys_trap_install);
     return sealing::is_sealed_as(OType::EntryPoint, handler) &&
@@ -740,9 +754,15 @@ extern "C" int64_t compartment_main(Capability arg) {
   // disk): it polls until step 6 hands it the scheduler's entries, and its
   // interrupt entry is routed to it by `trap_mgr` in step 7.
   const Started blk = L.start("blk", manifest->blk_img, 0);
+  // Nobody after `blk` gets the pager's calls: with them, whoever holds them
+  // reads every page that goes to swap, and says what comes back.
+  rw[init::syscall_slot(syscall::Id::page_next)] = nullptr;
+  rw[init::syscall_slot(syscall::Id::page_done)] = nullptr;
   // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what `dma`
-  // set up for it and hands back `read`, `write` and `irq`.
-  init::BlkInterface blk_if{};
+  // set up for it and hands back `read`, `write` and `irq`, the pager's
+  // entries, and how much of the disk is swap.
+  init::BlkInterface blk_if;
+  zero_bytes(&blk_if, sizeof(blk_if));  // too big for `{}` (zero_bytes)
   blk_if.buf = dma_if.buf;
   blk_if.notify = dma_if.notify;
   blk_if.capacity_sectors = dma_if.capacity_sectors;
@@ -760,6 +780,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   // reachable through `quota_disk` handles and through nothing else.
   L.offer("blk.read", blk_if.read);
   L.offer("blk.write", blk_if.write);
+  // For the shell's `shutdown`: the machine stops once no thread is left.
+  L.offer("blk.paging_stop", blk_if.paging_stop);
 
   // =========================================================================
   // 4. `fs`: the file system
@@ -1025,6 +1047,48 @@ extern "C" int64_t compartment_main(Capability arg) {
     say("[init]     WARNING: no shell thread or no scheduler; nothing to "
         "dispatch\n");
     sched_run = nullptr;  // nothing to dispatch: let the kernel return
+  }
+
+  // -------------------------------------------------------------------------
+  // Paging
+  // -------------------------------------------------------------------------
+  // If `blk` found swap: the pager's thread, on a node of its own (blk.cpp,
+  // PAGING), then paging on. Last, so that everything started above stays
+  // in RAM (vm.hpp, PAGING, WHAT MUST NOT WAIT).
+  if (blk_if.swap_pages != 0) {
+    init::ManifestEntry node;
+    zero_bytes(&node, sizeof(node));
+    node.kind = init::MANIFEST_QUOTA_SCHED;
+    node.amount = 25'000;  // budget, us
+    node.count = 100'000;  // period, us
+    node.param = init::PRIORITY_INTERACTIVE;
+    const Capability pager_quota = L.tmem_quota(64 * 1024);
+    const Capability pager_node = L.sched_node(node);
+    const Capability pager =
+        capability_is_valid(pager_quota)
+            ? thread_create(pager_quota, 16 * 1024, blk_if.paging, nullptr)
+            : nullptr;
+    const bool running =
+        capability_is_valid(pager) && capability_is_valid(pager_node) &&
+        capability_is_valid(sched_thread_register) &&
+        ::signetos::user::invoke<int64_t>(invoke, sched_thread_register, pager,
+                                          pager_node) > 0;
+    using FnSetup = decltype(&sys_page_setup);
+    const bool on =
+        running &&
+        syscall::call<FnSetup>(invoke, gate_page_setup,
+                               static_cast<size_t>(blk_if.swap_pages)) ==
+            static_cast<uint64_t>(Status::Ok);
+    if (on) {
+      L.say_dec("[init]     Paging on: ",
+                blk_if.swap_pages * vm::PAGE_SIZE / (1024 * 1024),
+                " MiB of swap\n");
+    } else {
+      if (running) {
+        ::signetos::user::invoke<int64_t>(invoke, blk_if.paging_stop);
+      }
+      say("[init]     WARNING: paging is off; all memory stays in RAM\n");
+    }
   }
 
   // =========================================================================

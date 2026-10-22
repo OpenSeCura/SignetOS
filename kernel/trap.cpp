@@ -398,10 +398,29 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   }
 
   // A synchronous exception raised by compartment code is that compartment's
-  // fault, for its own handler (fault.hpp). The per-vector table holds only
+  // fault, for its own handler (fault.hpp) -- unless it is a page fault on
+  // pageable memory, which is paging's: the access runs again, once the page
+  // is in (vm.hpp, PAGING, FAULTS). The per-vector table holds only
   // interrupts.
   if (!async) {
-    return dispatch_fault(mcause, mtval, mtval2, frame);
+    // MPIE is the MIE the faulting code had: only code that can be
+    // interrupted can wait for a page.
+    uint64_t mstatus = 0;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
+    const vm::Fault paging =
+        (mcause == EXC_INST_PAGE_FAULT || mcause == EXC_LOAD_PAGE_FAULT ||
+         mcause == EXC_STORE_PAGE_FAULT)
+            ? vm::fault(mtval, (mstatus & MSTATUS_MPIE) != 0)
+            : vm::Fault::No;
+    if (paging == vm::Fault::No) {
+      return dispatch_fault(mcause, mtval, mtval2, frame);
+    }
+    if (paging == vm::Fault::Retry) {
+      return nullptr;
+    }
+    // Waiting for the pager: the rest of the thread's slice goes, as at a
+    // tick, so that the pager can run; the access runs again after.
+    mcause = IRQ_M_TIMER;
   }
 
   // The installed handler, if it still resolves: `resolve` refuses an entry
@@ -431,7 +450,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
         end_interrupted_thread("its stack cannot host the handler", status,
                                mcause, mtval, mtval2, frame);
       }
-      if (mcause == IRQ_M_TIMER) {
+      if (async && mcause == IRQ_M_TIMER) {
         // Re-arm before the handler runs: this clears MTIP, so a handler
         // that simply returns is safe, and the period does not drift with
         // the handler's running time.
@@ -446,8 +465,11 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
 
   // An interrupt with no handler that resolves: silence it on this hart and
   // return to the interrupted PC. This is a hart whose poke has not arrived
-  // yet, or a handler whose compartment has been destroyed.
-  irq::silence(mcause);
+  // yet, or a handler whose compartment has been destroyed. A thread waiting
+  // for a page with no tick to give way to just runs again.
+  if (async) {
+    irq::silence(mcause);
+  }
   (void)mepc;
   return nullptr;
 }

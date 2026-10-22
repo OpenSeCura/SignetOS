@@ -53,9 +53,11 @@
  *                manifest asks for and this shell's policy allows, and
  *                invoked once on this thread (see "Programs" below and
  *                abi.hpp, "Applications")
- *     shutdown   stop the workers, free their quotas and exit. Nothing is
- *                registered after that, so the dispatcher exits too and the
- *                kernel powers the machine off.
+ *     pagetest [fill <MiB>]
+ *                paging self-test (PAGE TEST below)
+ *     shutdown   stop the workers and the pager, free their quotas and exit.
+ *                Nothing is registered after that, so the dispatcher exits
+ *                too and the kernel powers the machine off.
  *   In a build where `init` could not seed `uart.read` nobody is at the
  *   keyboard: the shell then runs the demos and exits by itself.
  *
@@ -133,7 +135,9 @@ constexpr uint64_t FOREVER_US = ~0ULL;
   M_SYSCALL(X, SYS_SENTRY, sentry)                                             \
   M_SYSCALL(X, SYS_FAULT_INSTALL, fault_install)                               \
   M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
+  M_SYSCALL(X, SYS_PAGE_TEST, page_test)                                       \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
+  M_SERVICE_OPT(X, PAGING_STOP, "blk.paging_stop")                             \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
   M_SERVICE(X, NAMING_LOOKUP, "naming.lookup")                                 \
   M_DISK(X, DISK_QUOTA, 0, perms::Load | perms::Store,                         \
@@ -1967,6 +1971,7 @@ void print_help() {
       "  df         the shell's disk quota: used, delegated, limit\n"
       "  run <f> [args]     load a program from /bin into a compartment "
       "of its own and run it\n"
+      "  pagetest [fill <MiB>]  paging self-test\n"
       "  shutdown   stop the workers and power the machine off\n");
 }
 
@@ -2247,6 +2252,283 @@ void cmd_faulttest() {
                                                   : " -- expected Faulted\n");
 }
 
+// --- PAGE TEST (vm.hpp, PAGING) ----------------------------------------------
+// The shell stays in RAM, as does what it allocates for itself: it was
+// started before paging was. What pages is what a compartment started since
+// allocates, so the test makes one, empty, and allocates for it.
+//   pagetest             16 pages of data and capabilities go to swap and
+//                        come back; then a capability on disk to memory that
+//                        is freed is not built again when its page comes
+//                        back, and one to live memory is.
+//   pagetest fill <MiB>  writes MiB of memory and reads it all back: with
+//                        less free RAM than that it pages for real
+//                        (`make term MEM=128M PAGE_TEST=1`, then
+//                        `pagetest fill 112`). Needs PAGE_TEST=1 (Makefile).
+Capability s_gate_page_test = nullptr;
+
+struct PageArena {
+  Capability quota = nullptr;
+  Capability comp = nullptr;
+};
+
+bool arena_open(PageArena* a, size_t bytes) {
+  using FnQuotaDerive = decltype(&sys_quota_vm_derive);
+  using FnCompCreate = decltype(&sys_compartment_create);
+  a->quota = with_reclaim(
+      [&] {
+        return syscall::call<FnQuotaDerive>(s_gate_invoke, s_gate_q_derive,
+                                            s_vm_quota, bytes,
+                                            perms::Load | perms::Store);
+      },
+      [](Capability q) { return sealing::is_sealed_as(OType::QuotaVm, q); });
+  if (sealing::is_sealed_as(OType::QuotaVm, a->quota)) {
+    a->comp = syscall::call<FnCompCreate>(s_gate_invoke, s_gate_comp_create,
+                                          a->quota, nullptr);
+  }
+  if (!capability_is_valid(a->comp)) {
+    out("[pagetest] no compartment to allocate for\n");
+    return false;
+  }
+  return true;
+}
+
+// Retried after a sweep: what an earlier test freed holds its addresses
+// until one.
+Capability arena_alloc(const PageArena& a, size_t bytes) {
+  using FnAlloc = decltype(&sys_vm_allocate);
+  return with_reclaim(
+      [&] {
+        return syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc, a.comp,
+                                      a.quota, bytes, 0u);
+      },
+      [](Capability m) { return capability_is_valid(m); });
+}
+
+void arena_close(PageArena* a) {
+  using FnCompDestroy = decltype(&sys_compartment_destroy);
+  using FnQuotaDestroy = decltype(&sys_quota_vm_destroy);
+  if (capability_is_valid(a->comp)) {
+    syscall::call<FnCompDestroy>(s_gate_invoke, s_gate_comp_destroy, a->comp);
+  }
+  if (capability_is_valid(a->quota)) {
+    syscall::call<FnQuotaDestroy>(s_gate_invoke, s_gate_q_destroy, a->quota);
+  }
+}
+
+vm::PagingStats page_stats() {
+  using Fn = decltype(&sys_page_test);
+  vm::PagingStats st{};
+  syscall::call<Fn>(s_gate_invoke, s_gate_page_test, vm::PAGE_TEST_STATS,
+                    bounded(&st));
+  return st;
+}
+
+// Sends `mem`'s pages to swap and waits, up to 5 s, until they are there.
+bool evict(Capability mem) {
+  using Fn = decltype(&sys_page_test);
+  if (syscall::call<Fn>(s_gate_invoke, s_gate_page_test, vm::PAGE_TEST_EVICT,
+                        mem) == ~0ULL) {
+    return false;
+  }
+  for (int i = 0; i < 5000 && page_stats().evicting != 0; ++i) {
+    sleep_us(1000);
+  }
+  return page_stats().evicting == 0;
+}
+
+// Touches each page of `mem`, for pages brought in after the ones a test
+// sends out: the last few brought in never go (vm.cpp, RECENT).
+void touch(Capability mem) {
+  auto* w = reinterpret_cast<volatile uint64_t*>(mem);
+  for (size_t off = 0; off < capability_get_length(mem); off += vm::PAGE_SIZE) {
+    w[off / 8] = 1;
+  }
+}
+
+constexpr size_t PT_WORDS = vm::PAGE_SIZE / sizeof(uint64_t);
+
+void pagetest_basic() {
+  constexpr size_t PAGES = 16;
+  PageArena a;
+  if (!arena_open(&a, (PAGES + 8) * vm::PAGE_SIZE + 64 * 1024)) {
+    arena_close(&a);
+    return;
+  }
+  const Capability mem = arena_alloc(a, PAGES * vm::PAGE_SIZE);
+  const Capability spacer = arena_alloc(a, 4 * vm::PAGE_SIZE);
+  if (!capability_is_valid(mem) || !capability_is_valid(spacer)) {
+    out("[pagetest] could not allocate\n");
+    arena_close(&a);
+    return;
+  }
+  // Each page: a capability to its own middle in its first granule, and
+  // every other word its page and place.
+  auto* w = reinterpret_cast<volatile uint64_t*>(mem);
+  auto* c = reinterpret_cast<volatile Capability*>(mem);
+  auto middle = [&](size_t p) {
+    return capability_set_address(
+        mem, capability_get_base(mem) + (p * vm::PAGE_SIZE) + 2048);
+  };
+  for (size_t p = 0; p < PAGES; ++p) {
+    c[p * PT_WORDS / 2] = middle(p);
+    for (size_t i = 2; i < PT_WORDS; ++i) {
+      w[(p * PT_WORDS) + i] = (p << 32) | i;
+    }
+  }
+  touch(spacer);
+  const vm::PagingStats before = page_stats();
+  if (!evict(mem)) {
+    out("[pagetest] the pages did not go out\n");
+    arena_close(&a);
+    return;
+  }
+  const vm::PagingStats out_st = page_stats();
+  size_t wrong = 0;
+  for (size_t p = 0; p < PAGES; ++p) {
+    const Capability got = c[p * PT_WORDS / 2];
+    wrong += (capability_is_valid(got) &&
+              __builtin_cheri_equal_exact(got, middle(p)))
+                 ? 0
+                 : 1;
+    for (size_t i = 2; i < PT_WORDS; ++i) {
+      wrong += (w[(p * PT_WORDS) + i] == ((p << 32) | i)) ? 0 : 1;
+    }
+  }
+  const vm::PagingStats after = page_stats();
+  const uint64_t went = out_st.writes - before.writes;
+  const uint64_t came = after.reads - out_st.reads;
+  out_dec("[pagetest] out and back: ", went, " pages out, ");
+  out_dec("", came, " back in, ");
+  out_dec("", wrong, " words or capabilities wrong");
+  out(went >= PAGES && came >= PAGES && wrong == 0 ? " -- OK\n"
+                                                    : " -- FAILED\n");
+  arena_close(&a);
+}
+
+void pagetest_revoke() {
+  PageArena a;
+  if (!arena_open(&a, 8 * vm::PAGE_SIZE + 64 * 1024)) {
+    arena_close(&a);
+    return;
+  }
+  const Capability target = arena_alloc(a, vm::PAGE_SIZE);
+  const Capability holder = arena_alloc(a, vm::PAGE_SIZE);
+  const Capability spacer = arena_alloc(a, 4 * vm::PAGE_SIZE);
+  if (!capability_is_valid(target) || !capability_is_valid(holder) ||
+      !capability_is_valid(spacer)) {
+    out("[pagetest] could not allocate\n");
+    arena_close(&a);
+    return;
+  }
+  auto* h = reinterpret_cast<volatile Capability*>(holder);
+  h[0] = target;  // freed while the holder is on disk
+  h[1] = spacer;  // live throughout
+  touch(spacer);
+  const vm::PagingStats before = page_stats();
+  if (!evict(holder)) {
+    out("[pagetest] the holder did not go out\n");
+    arena_close(&a);
+    return;
+  }
+  // Freed, then two sweeps: the first that starts after the free reclaims
+  // it, once the holder has been read back and checked.
+  using FnDealloc = decltype(&sys_vm_deallocate);
+  using FnQuery = decltype(&sys_revoke_query);
+  syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, a.comp, a.quota,
+                           target);
+  const uint64_t seen =
+      syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
+  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 2);
+  const vm::PagingStats after = page_stats();
+  const bool gone = !capability_is_valid(h[0]);  // the holder comes back here
+  const bool kept = capability_is_valid(h[1]);
+  out_dec("[pagetest] revocation: ", after.checks - before.checks,
+          " pages checked on disk; ");
+  out(gone ? "the freed one's capability stayed gone, "
+           : "the freed one's capability CAME BACK, ");
+  out(kept ? "the live one's came back" : "the live one's was LOST");
+  out(after.checks > before.checks && gone && kept ? " -- OK\n"
+                                                   : " -- FAILED\n");
+  arena_close(&a);
+}
+
+void pagetest_fill(const char* arg) {
+  constexpr size_t CHUNK = 4 * 1024 * 1024;
+  constexpr size_t MAX_CHUNKS = 64;
+  size_t mib = 0;
+  for (; *arg >= '0' && *arg <= '9'; ++arg) {
+    mib = (mib * 10) + static_cast<size_t>(*arg - '0');
+  }
+  const size_t chunks = (mib * 1024 * 1024 + CHUNK - 1) / CHUNK;
+  if (chunks == 0 || chunks > MAX_CHUNKS) {
+    out_dec("[pagetest] usage: pagetest fill <MiB>, 1 to ",
+            MAX_CHUNKS * CHUNK / (1024 * 1024), "\n");
+    return;
+  }
+  PageArena a;
+  if (!arena_open(&a, (chunks * CHUNK) + (1024 * 1024))) {
+    arena_close(&a);
+    return;
+  }
+  Capability mem[MAX_CHUNKS];  // the first `chunks`, set below
+  for (size_t k = 0; k < chunks; ++k) {
+    mem[k] = arena_alloc(a, CHUNK);
+    if (!capability_is_valid(mem[k])) {
+      out("[pagetest] could not allocate\n");
+      arena_close(&a);
+      return;
+    }
+  }
+  constexpr size_t PAGES = CHUNK / vm::PAGE_SIZE;
+  auto mark = [](size_t k, size_t p) {
+    return ((k << 32) | p) ^ 0x5A5A5A5A00000000ULL;
+  };
+  // One phase, writing or reading back: its time, and what paged meanwhile.
+  vm::PagingStats st = page_stats();
+  out_dec("[pagetest] fill: ", chunks * PAGES, " pages, with ");
+  out_dec("", (st.free_frames - st.reserve) * vm::PAGE_SIZE / (1024 * 1024),
+          " MiB of RAM free for them\n");
+  size_t wrong = 0;
+  for (int phase = 0; phase < 2; ++phase) {
+    const uint64_t t0 = now_us();
+    for (size_t k = 0; k < chunks; ++k) {
+      auto* w = reinterpret_cast<volatile uint64_t*>(mem[k]);
+      for (size_t p = 0; p < PAGES; ++p) {
+        if (phase == 0) {
+          w[p * PT_WORDS] = mark(k, p);
+        } else {
+          wrong += w[p * PT_WORDS] == mark(k, p) ? 0 : 1;
+        }
+      }
+    }
+    const vm::PagingStats now = page_stats();
+    out(phase == 0 ? "[pagetest]   written" : "[pagetest]   read back");
+    out_dec(" in ", (now_us() - t0) / 1000, " ms: ");
+    out_dec("", now.writes - st.writes, " pages out, ");
+    out_dec("", now.reads - st.reads, " in\n");
+    st = now;
+  }
+  out_dec("[pagetest] fill: ", wrong, " wrong");
+  out(wrong == 0 ? " -- OK\n" : " -- FAILED\n");
+  arena_close(&a);
+}
+
+void cmd_pagetest(char* args) {
+  if (!capability_is_valid(s_gate_page_test) || page_stats().slots == 0) {
+    out("[pagetest] paging is off, or the kernel was built without "
+        "PAGE_TEST=1\n");
+    return;
+  }
+  char* rest = nullptr;
+  const char* sub = first_word(args, &rest);
+  if (str_eq(sub, "fill")) {
+    pagetest_fill(rest);
+  } else {
+    pagetest_basic();
+    pagetest_revoke();
+  }
+}
+
 // Runs one command line (edited in place to split off arguments). False means
 // the console should end.
 bool execute(char* line) {
@@ -2285,6 +2567,8 @@ bool execute(char* line) {
     cmd_revoketest();
   } else if (str_eq(cmd, "faulttest")) {
     cmd_faulttest();
+  } else if (str_eq(cmd, "pagetest")) {
+    cmd_pagetest(rest);
   } else if (str_eq(cmd, "shutdown")) {
     return false;
   } else {
@@ -2515,6 +2799,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_fault_install = gate_fault_install;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
+  s_gate_page_test = rw[SLOT_SYS_PAGE_TEST];
   s_run_ready = sealing::is_sealed_as(OType::QuotaDisk, s_bin_quota) &&
                 sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&
@@ -2584,6 +2869,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   stop_workers(s_background);
   const size_t destroyed = destroy_workers(s_background);
   out_dec("[shell]    Destroyed ", destroyed, " worker quotas; shell exiting\n");
+  // The pager's thread too, or the machine would never stop (blk.cpp, PAGING).
+  if (capability_is_valid(rw[SLOT_PAGING_STOP])) {
+    invoke<int64_t>(gate_invoke, rw[SLOT_PAGING_STOP]);
+  }
   // Returning exits the shell thread. With nothing left registered, the
   // scheduler's dispatcher exits too and the kernel's host loop returns.
   return 0;

@@ -65,6 +65,16 @@
 // must be multiples of 16 bytes, so that the bits set cover exactly the
 // range.
 //
+// SWAP
+// ----
+// A sweep scans memory, and pages on disk are not in it (vm.hpp, PAGING). If
+// any of them holds capabilities, the sweep does everything else and then
+// waits while the pager reads each such page back and clears from its
+// bitmap every capability this rule picks, so that none is built again: what
+// the sweep reclaimed stays Held meanwhile, its marks stay, and its epoch
+// completes, on a later `query`, once the checks are done. `revoke` is
+// refused (Busy) while it waits, so that no new mark is cleared with its own.
+//
 // WHEN A SWEEP RUNS
 // -----------------
 // Nobody can ask for one. A sweep runs when somebody looks at the completed
@@ -117,7 +127,8 @@ uint64_t query();
 //
 // Scans capability-bearing memory and saved register frames, clears the tag on
 // every capability THE BASE RULE picks, reclaims quarantined VM pages and
-// frames, clears the marks, and advances the completed epoch.
+// frames, clears the marks, and advances the completed epoch -- or, with
+// capabilities on disk, waits for them to be checked first (SWAP).
 void sweep();
 
 } // namespace signetos::revoke

@@ -307,7 +307,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   c->fault_handler = nullptr;  // none until the loader installs one
   c->uid = uid;
   c->table_slots = slots;
-  c->flags = FLAG_LIVE;
+  c->flags = FLAG_LIVE | (vm::paging_on() ? 0 : FLAG_PINNED);
   c->lock = SpinLock{};
 
   // The table is filled through the same view the compartment itself gets
@@ -321,12 +321,26 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   Capability* slot = reinterpret_cast<Capability*>(user_view(table));
   slot[SLOT_SELF] = handle;  // so code inside can name its own domain
 
-  const Capability* seeds =
-      reinterpret_cast<const Capability*>(initial_capabilities);
-  for (size_t i = 0; i < seed_count; ++i) {
-    const Capability seed = seeds[i];
-    slot[RW_SLOT_SEED_BASE + i] =
-        inspect::is_user_code(seed) ? capability_clear_tag(seed) : seed;
+  if (seed_count != 0) {
+    // Read here, so in RAM while they are (vm.hpp, PAGING, KERNEL ACCESS); if
+    // they are not, the creator touches them and calls again. From the base,
+    // which is what was counted and held.
+    const vm::ResidentHold hold(capability_get_base(initial_capabilities),
+                                seed_count * CAP_BYTES);
+    if (!hold.ok()) {
+      c->flags = 0;
+      c->self_page = nullptr;
+      quota::owe(mem_quota, vm::free_pages(page));
+      return fail_with(out_status, Status::NotInRange);
+    }
+    const Capability* seeds = reinterpret_cast<const Capability*>(
+        capability_set_address(initial_capabilities,
+                               capability_get_base(initial_capabilities)));
+    for (size_t i = 0; i < seed_count; ++i) {
+      const Capability seed = seeds[i];
+      slot[RW_SLOT_SEED_BASE + i] =
+          inspect::is_user_code(seed) ? capability_clear_tag(seed) : seed;
+    }
   }
 
   __atomic_fetch_add(&s_live_count, 1, __ATOMIC_RELAXED);
@@ -502,10 +516,19 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   if (size == 0 || size > MAX_REQUEST) {
     return fail_with(out_status, Status::InvalidSize);
   }
-  const size_t pages = (size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
+  Compartment* c = reinterpret_cast<Compartment*>(comp_page);
+  const bool pageable =
+      (flags & FLAG_DMA) == 0 &&
+      (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_PINNED) == 0;
+  size_t pages = (size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
+  if (pageable) {
+    pages = vm::round_up_pageable_pages(pages);  // and charged as such
+    if (pages == 0) {
+      return fail_with(out_status, Status::InvalidSize);
+    }
+  }
   const uint64_t bytes = pages * vm::PAGE_SIZE;
 
-  Compartment* c = reinterpret_cast<Compartment*>(comp_page);
   Locked hold(c->lock);
   if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
     return fail_with(out_status, Status::InvalidCapability);
@@ -548,7 +571,8 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   }
 
   // Reserve addresses, take frames, map them. Comes back zeroed.
-  Capability memory = vm::alloc_pages(pages, revocable);
+  Capability memory = pageable ? vm::alloc_pageable_pages(pages, revocable)
+                               : vm::alloc_pages(pages, revocable);
   if (!capability_is_valid(memory)) {
     quota::refund(mem_quota, billed);
     return fail_with(out_status, Status::NoMemory);

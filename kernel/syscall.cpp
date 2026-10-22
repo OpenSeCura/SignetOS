@@ -37,6 +37,7 @@
 #include <signetos/irq.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
+#include <signetos/vm.hpp>
 #include <signetos/debug/report.hpp>
 
 namespace signetos::syscall {
@@ -235,6 +236,13 @@ extern "C" capability_type_t sys_type_derive(capability_type_t key,
 
 extern "C" capability_sealed_t sys_seal(capability_type_t key,
                                         capability_data_t obj) {
+  // The header, at `obj`'s address, is written here, so it must be in RAM
+  // (vm.hpp, PAGING, KERNEL ACCESS).
+  const ::signetos::vm::ResidentHold hold(
+      ::signetos::capability_get_address(obj), sizeof(::signetos::Capability));
+  if (!hold.ok()) {
+    return nullptr;
+  }
   capability_sealed_t out = ::signetos::sealing::user_seal(key, obj);
   if (::signetos::capability_is_valid(out)) {
     ::signetos::Capability hdr_key =
@@ -247,6 +255,14 @@ extern "C" capability_sealed_t sys_seal(capability_type_t key,
 
 extern "C" capability_data_t sys_unseal(capability_type_t key,
                                         capability_sealed_t handle) {
+  // The header, just below the payload, is read here (as for sys_seal).
+  const ::signetos::vm::ResidentHold hold(
+      ::signetos::capability_get_address(handle) -
+          sizeof(::signetos::Capability),
+      sizeof(::signetos::Capability));
+  if (!hold.ok()) {
+    return nullptr;
+  }
   return ::signetos::sealing::user_unseal(key, handle);
 }
 
@@ -275,4 +291,23 @@ extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {
 
 extern "C" uint64_t sys_trap_install(uint64_t irq, Sentry handler) {
   return static_cast<uint64_t>(::signetos::irq::install(irq, handler));
+}
+
+// --- Paging ------------------------------------------------------------------
+
+extern "C" uint64_t sys_page_setup(size_t slots) {
+  return static_cast<uint64_t>(::signetos::vm::setup_paging(slots));
+}
+
+extern "C" uint64_t sys_page_next(capability_data_t buf) {
+  return ::signetos::vm::page_next(buf);
+}
+
+extern "C" void sys_page_done(capability_data_t buf) {
+  ::signetos::vm::page_done(buf);
+  SIGNETOS_CLEAR_RETURN();
+}
+
+extern "C" uint64_t sys_page_test(uint64_t op, capability_t cap) {
+  return ::signetos::vm::page_test(op, cap);
 }

@@ -24,7 +24,11 @@
 #include <signetos/frame.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/hw/platform.hpp>
+#include <signetos/sealing.hpp>
 #include <signetos/vm.hpp>
+#if defined(SIGNETOS_SWAP_HASH)
+#include <signetos/lib/blake2b.hpp>
+#endif
 
 namespace signetos::vm {
 namespace {
@@ -92,6 +96,67 @@ uint32_t s_used_1g[POOL_1G];
 size_t s_table_pages = 0;        // frames currently held as page tables
 size_t s_alloc_pages = 0;        // pages currently handed out by alloc_pages
 size_t s_quarantined_pages = 0;  // pages freed, still mapped, awaiting a sweep
+size_t s_held_pages = 0;         // reclaimed, Held until checks are done
+
+// The pageable region (vm.hpp, PAGING): its first address, set last and
+// once, and its size in pages. 0: paging is off.
+uint64_t s_region_base = 0;
+size_t s_region_pages = 0;
+
+// The top of the part of the pool alloc_pages hands out: the pageable region
+// is alloc_pageable_pages's.
+uint64_t pinned_pool_top() {
+  const uint64_t base = __atomic_load_n(&s_region_base, __ATOMIC_ACQUIRE);
+  return base != 0 ? base : BITMAP_BASE;
+}
+
+// The paging engine (vm.hpp, PAGING), under `s_lock`.
+constexpr size_t CAPS_PER_PAGE = PAGE_SIZE / sizeof(Capability);
+constexpr size_t TAG_BYTES = CAPS_PER_PAGE / 8;
+
+// The pages brought in last, which the clock passes over: as many as one
+// instruction can touch, rounded up.
+constexpr size_t RECENT = 4;
+
+// What the kernel keeps beside each slot (CAPABILITIES).
+struct SlotInfo {
+  uint8_t tags[TAG_BYTES];  // a bit per granule that held a capability
+#if defined(SIGNETOS_SWAP_HASH)
+  uint8_t digest[blake2b::DIGEST_BYTES];
+#endif
+};
+
+// The job handed out to the pager (THE PAGER), until it says it is done.
+enum : uint64_t { JOB_NONE, JOB_IN, JOB_OUT, JOB_CHECK };
+struct Job {
+  uint64_t op;     // JOB_*
+  uint64_t va;     // the page read or written
+  uint64_t frame;  // JOB_IN: the frame it comes in on
+};
+
+struct Paging {
+  SlotInfo* slots;     // one per slot
+  uint64_t* resident;  // a bit per slot: may be resident (the clock's hint)
+  Capability scratch;  // a page of the kernel's, where a check's copy goes
+  uint64_t hand;       // the slot the clock looks at next
+  uint64_t recent[RECENT];
+  size_t recent_next;
+  uint64_t wanted;      // the page a thread waits for, or 0 (FAULTS)
+  Job job;
+  uint64_t check_next;  // the slot the checks look at next; none: the end
+#if defined(SIGNETOS_PAGE_TEST)
+  uint64_t evict_next;  // PAGE_TEST_EVICT: the pages still to send out
+  uint64_t evict_end;
+#endif
+  uint64_t reads, writes, checks, digest_errors;  // PagingStats
+};
+Paging s_paging;
+
+// The boot root, kept by set_retag_root to build capabilities again, and
+// where the CT field sits in the upper word of a capability's bits.
+Capability s_retag_root = nullptr;
+uint64_t s_ct_shift = 0;
+constexpr uint64_t CT_MASK = 0x1F;
 
 // Bits 9:0 of a PTE are flags; everything above is the physical page number.
 constexpr uint64_t PTE_FLAG_MASK = 0x3FFULL;
@@ -318,7 +383,7 @@ Leaf find_leaf(uint64_t va) {
   }
   // Last level: either a 4KB page or nothing.
   const uint64_t l0 = __atomic_load_n(&l0_table[l0_index(va)], __ATOMIC_RELAXED);
-  return {(l0 & pte::Valid) ? l0 : 0, PAGE_SIZE};
+  return {l0, PAGE_SIZE};  // mapped, in use with no frame (PAGING), or 0
 }
 
 // The address just past the page or hole that `find_leaf(va)` reported.
@@ -339,6 +404,11 @@ void init(Capability root_data_cap) {
   s_table_pages = 0;
   s_alloc_pages = 0;
   s_quarantined_pages = 0;
+  s_held_pages = 0;
+  s_region_base = 0;
+  s_region_pages = 0;
+  s_paging = Paging{};
+  s_retag_root = nullptr;
 
   // .bss is not guaranteed zeroed this early, and a stray set Valid bit would
   // send the hardware walking into nonsense.
@@ -548,7 +618,7 @@ size_t free_run_in(uint64_t base, size_t pages, size_t step) {
   }
   for (size_t start = 0; start + pages <= ENTRIES;) {
     size_t k = 0;
-    while (k < pages && !(l0[start + k] & pte::Valid)) {
+    while (k < pages && !pte_in_use(l0[start + k])) {
       ++k;
     }
     if (k == pages) {
@@ -571,8 +641,9 @@ size_t free_run_in(uint64_t base, size_t pages, size_t step) {
 // that straddles a 2MB boundary without filling the regions it touches, which
 // costs some fragmentation and keeps the search short.
 uint64_t find_room_locked(size_t pages, uint64_t align) {
+  const size_t pool_1g = (pinned_pool_top() - DYNAMIC_BASE) / GIGAPAGE_SIZE;
   if (pages <= PAGES_PER_2M) {
-    for (size_t g = 0; g < POOL_1G; ++g) {
+    for (size_t g = 0; g < pool_1g; ++g) {
       if (PAGES_PER_2M * REGIONS_PER_1G - s_used_1g[g] < pages) {
         continue;
       }
@@ -592,7 +663,7 @@ uint64_t find_room_locked(size_t pages, uint64_t align) {
 
   const size_t need = (pages + PAGES_PER_2M - 1) / PAGES_PER_2M;
   size_t run = 0;  // empty 2MB regions just below m
-  for (size_t m = 0; m < POOL_2M;) {
+  for (size_t m = 0; m < pool_1g * REGIONS_PER_1G;) {
     if (m % REGIONS_PER_1G == 0 && s_used_1g[m / REGIONS_PER_1G] == 0) {
       run += REGIONS_PER_1G;
       m += REGIONS_PER_1G;
@@ -619,7 +690,7 @@ bool unmap_locked(uint64_t va, size_t pages) {
   for (size_t i = 0; i < pages; ++i) {
     const uint64_t page_va = va + (i * PAGE_SIZE);
     uint64_t* slot = leaf_slot(page_va, false);
-    if (slot == nullptr || !(*slot & pte::Valid)) {
+    if (slot == nullptr || !pte_in_use(*slot)) {
       all_present = false;
       continue;
     }
@@ -648,7 +719,7 @@ bool map_locked(uint64_t va, uint64_t pa, size_t pages, uint64_t flags) {
   // halfway through the second pass.
   for (size_t i = 0; i < pages; ++i) {
     const uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
-    if (slot != nullptr && (*slot & pte::Valid)) {
+    if (slot != nullptr && pte_in_use(*slot)) {
       return false;
     }
   }
@@ -718,11 +789,443 @@ bool map_bitmap_locked(uint64_t va, size_t pages) {
   return true;
 }
 
+// --- Paging (vm.hpp, PAGING) -------------------------------------------------
+// Everything here runs under `s_lock`.
+
+bool is_pageable_address(uint64_t va) {
+  const uint64_t base = __atomic_load_n(&s_region_base, __ATOMIC_ACQUIRE);
+  return base != 0 && va >= base && va - base < s_region_pages * PAGE_SIZE;
+}
+uint64_t slot_of(uint64_t va) { return (va - s_region_base) / PAGE_SIZE; }
+uint64_t va_of(uint64_t slot) { return s_region_base + (slot * PAGE_SIZE); }
+uint64_t request(uint64_t slot, uint64_t op) {
+  return (slot << PAGE_SLOT_SHIFT) | op;
+}
+
+volatile uint64_t* frame_words(uint64_t pa) {
+  return reinterpret_cast<volatile uint64_t*>(phys_view(pa, PAGE_SIZE));
+}
+volatile Capability* frame_caps(uint64_t pa) {
+  return reinterpret_cast<volatile Capability*>(phys_view(pa, PAGE_SIZE));
+}
+
+void set_bit(uint64_t* bits, uint64_t i, bool on) {
+  const uint64_t m = 1ULL << (i % 64);
+  bits[i / 64] = on ? (bits[i / 64] | m) : (bits[i / 64] & ~m);
+}
+bool has_tag(const SlotInfo& info, size_t i) {
+  return ((info.tags[i / 8] >> (i % 8)) & 1) != 0;
+}
+bool has_tags(const SlotInfo& info) {
+  for (const uint8_t b : info.tags) {
+    if (b != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Free frames a pageable page may still take: those above the reserve, a
+// sixty-fourth of RAM (FRAMES). Negative below it.
+int64_t room() {
+  return static_cast<int64_t>(frame::free_pages()) -
+         static_cast<int64_t>(frame::pool_pages() / 64);
+}
+
+#if defined(SIGNETOS_SWAP_HASH)
+// DIGESTS: of a page's bytes, never of `blk`'s buffer, which it could change
+// while they are hashed.
+void digest_page(const volatile uint64_t* w, uint8_t* out) {
+  blake2b::hash256(const_cast<const uint64_t*>(w), PAGE_SIZE, out);
+}
+bool digest_matches(const SlotInfo& info, const volatile uint64_t* w) {
+  uint8_t now[blake2b::DIGEST_BYTES];
+  digest_page(w, now);
+  uint8_t differ = 0;
+  for (size_t i = 0; i < blake2b::DIGEST_BYTES; ++i) {
+    differ = static_cast<uint8_t>(differ | (now[i] ^ info.digest[i]));
+  }
+  return differ == 0;
+}
+#endif
+
+// THE BASE RULE (revoke.hpp) for a capability on its way between disk and
+// memory, tagged or not: revoked if based in a quarantined or Held page, or
+// in a marked granule -- early, for one freed since the last sweep, which
+// would revoke it anyway. The standing authorities a sweep passes over are
+// passed over here too (revoke.cpp, `should_revoke`). The marks are revoke's,
+// read without its lock: one set or cleared meanwhile is one no sweep relies
+// on yet, or any more.
+bool is_revoked_locked(Capability cap) {
+  if ((capability_get_perms(cap) &
+       (perms::AccessSystemRegs | perms::Seal | perms::Unseal)) != 0) {
+    return false;
+  }
+  const uint64_t base = capability_get_base(cap);
+  if (base < DYNAMIC_BASE || base >= BITMAP_BASE ||
+      capability_get_length(cap) >= DYNAMIC_TOP - DYNAMIC_BASE) {
+    return false;
+  }
+  const uint64_t e = find_leaf(base).entry;
+  if ((e & pte::Quarantined) != 0 || pte_kind(e) == pte::KindHeld) {
+    return true;
+  }
+  if ((e & pte::Revocable) == 0) {
+    return false;  // no marks: its bitmap pages are not even mapped
+  }
+  const auto* b = reinterpret_cast<const volatile uint8_t*>(
+      dynamic_view(bitmap_of(base), 1));
+  return ((*b >> (((base - DYNAMIC_BASE) / 16) % 8)) & 1) != 0;
+}
+
+// Builds again the capability whose bits, without their tag, are the 16
+// bytes at `w` (as two words) and `c` (as a capability slot): from the root,
+// unsealed, then sealed as it was -- CT 1 as a sentry, a kernel type with its
+// authority. It stays plain bytes if it is revoked, if it is local (pageable
+// memory never holds one), or if what comes out is not exactly what went out.
+void rebuild_locked(volatile uint64_t* w, volatile Capability* c) {
+  const uint64_t lo = w[0];
+  const uint64_t hi = w[1];
+  const Capability bits = *c;
+  if (is_revoked_locked(bits) ||
+      (capability_get_perms(bits) & perms::Global) == 0) {
+    return;
+  }
+  const uint64_t ct = (hi >> s_ct_shift) & CT_MASK;
+  w[1] = hi & ~(CT_MASK << s_ct_shift);
+  const Capability open = *c;
+  Capability built = __builtin_cheri_cap_build(s_retag_root, (__uintcap_t)open);
+  if (ct == static_cast<uint64_t>(OType::Sentry)) {
+    built = __builtin_cheri_seal_entry(built);
+  } else if (ct != 0) {
+    // Null for the types below kOTypeMin, which no page can hold.
+    built = sealing::seal_with(sealing::authority_for(static_cast<OType>(ct)),
+                               built);
+  }
+  *c = built;
+  if (!capability_is_valid(*c) || w[0] != lo || w[1] != hi) {
+    w[0] = lo;  // not what went out: plain bytes again
+    w[1] = hi;
+  }
+}
+
+// Makes pageable page `va`, whose entry is at `slot`, resident on frame `pa`:
+// zeroed if it is Fresh; if it is Swapped, `src` copied in, checked against
+// its digest, and its capabilities built again. False, with nothing mapped,
+// if the copy is not the page that went out.
+bool bring_in_locked(uint64_t va, uint64_t* slot, uint64_t pa, Capability src) {
+  const uint64_t e = *slot;
+  volatile uint64_t* w = frame_words(pa);
+  if (pte_kind(e) == pte::KindFresh) {
+    for (size_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); ++i) {
+      w[i] = 0;
+    }
+  } else {
+    const auto* from = reinterpret_cast<const volatile uint64_t*>(src);
+    for (size_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); ++i) {
+      w[i] = from[i];
+    }
+    const SlotInfo& info = s_paging.slots[slot_of(va)];
+#if defined(SIGNETOS_SWAP_HASH)
+    if (!digest_matches(info, w)) {
+      s_paging.digest_errors += 1;
+      return false;
+    }
+#endif
+    volatile Capability* c = frame_caps(pa);
+    for (size_t i = 0; i < CAPS_PER_PAGE; ++i) {
+      if (has_tag(info, i)) {
+        rebuild_locked(&w[2 * i], &c[i]);
+      }
+    }
+    s_paging.reads += 1;
+  }
+  *slot = pte_make(pa, pte::Permissive |
+                           (e & (pte::Quarantined | pte::Revocable)));
+  flush(va);
+  __asm__ volatile("fence.i" ::: "memory");  // it may be code
+  set_bit(s_paging.resident, slot_of(va), true);
+  s_paging.recent[s_paging.recent_next] = va;
+  s_paging.recent_next = (s_paging.recent_next + 1) % RECENT;
+  return true;
+}
+
+// Whether page `va` may go out now: it is resident, and not one of the last
+// brought in.
+bool can_evict_locked(uint64_t va) {
+  const uint64_t* slot = leaf_slot(va, false);
+  if (slot == nullptr || !pte_resident(*slot)) {
+    set_bit(s_paging.resident, slot_of(va), false);  // a stale hint
+    return false;
+  }
+  for (const uint64_t r : s_paging.recent) {
+    if (r == va) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The next page the clock hand comes to that may go out, or 0 if a whole
+// turn finds none. The resident bits let it skip 64 slots at a time.
+uint64_t pick_victim_locked() {
+  const uint64_t pages = s_region_pages;
+  for (uint64_t looked = 0; looked < pages + 64;) {
+    if (s_paging.hand >= pages) {
+      s_paging.hand = 0;
+    }
+    const uint64_t rest =
+        s_paging.resident[s_paging.hand / 64] >> (s_paging.hand % 64);
+    if (rest == 0) {
+      looked += 64 - (s_paging.hand % 64);
+      s_paging.hand += 64 - (s_paging.hand % 64);
+      continue;
+    }
+    const uint64_t step = static_cast<uint64_t>(__builtin_ctzll(rest));
+    const uint64_t va = va_of(s_paging.hand + step);
+    s_paging.hand += step + 1;
+    looked += step + 1;
+    if (can_evict_locked(va)) {
+      return va;
+    }
+  }
+  return 0;
+}
+
+// Sends resident page `va` out: unmapped -- every thread runs on this hart
+// (vm.hpp, PAGING), so the local flush is all it takes -- copied into `buf`,
+// its tag bitmap and digest kept beside its slot, and its frame freed at
+// once. Returns the write for the pager.
+uint64_t send_out_locked(uint64_t va, Capability buf) {
+  uint64_t* slot = leaf_slot(va, false);
+  const uint64_t e = *slot;
+  const uint64_t pa = pte_addr(e);
+  const uint64_t s = slot_of(va);
+  *slot = pte::KindSwapped | (e & (pte::Quarantined | pte::Revocable));
+  flush(va);
+  const volatile uint64_t* w = frame_words(pa);
+  const volatile Capability* c = frame_caps(pa);
+  auto* to = reinterpret_cast<volatile uint64_t*>(buf);
+  for (size_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); ++i) {
+    to[i] = w[i];
+  }
+  SlotInfo& info = s_paging.slots[s];
+  for (size_t i = 0; i < CAPS_PER_PAGE; ++i) {
+    const uint8_t m = static_cast<uint8_t>(1u << (i % 8));
+    info.tags[i / 8] = capability_is_valid(c[i])
+                           ? static_cast<uint8_t>(info.tags[i / 8] | m)
+                           : static_cast<uint8_t>(info.tags[i / 8] & ~m);
+  }
+#if defined(SIGNETOS_SWAP_HASH)
+  digest_page(w, info.digest);
+#endif
+  frame::free(pa, 1);
+  set_bit(s_paging.resident, s, false);
+  s_paging.writes += 1;
+  s_paging.job = Job{JOB_OUT, va, 0};
+  return request(s, PAGE_WRITE);
+}
+
+// The first slot from `from` on whose page is on disk holding capabilities,
+// or the region's size if there is none (REVOCATION).
+uint64_t next_check_locked(uint64_t from) {
+  for (uint64_t s = from; s < s_region_pages; ++s) {
+    const uint64_t* slot =
+        has_tags(s_paging.slots[s]) ? leaf_slot(va_of(s), false) : nullptr;
+    if (slot != nullptr && pte_kind(*slot) == pte::KindSwapped) {
+      return s;
+    }
+  }
+  return s_region_pages;
+}
+
+// THE PAGER: the job to do next, most urgent first.
+uint64_t next_job_locked(Capability buf) {
+  Job& j = s_paging.job;
+  if (j.op != JOB_NONE) {  // not done yet: the same again
+    return request(slot_of(j.va), j.op == JOB_OUT ? PAGE_WRITE : PAGE_READ);
+  }
+  // The page a thread waits for: read in, or zeroed, if there is a frame
+  // for it; else a page goes out first.
+  if (s_paging.wanted != 0) {
+    const uint64_t va = s_paging.wanted;
+    uint64_t* slot = leaf_slot(va, false);
+    const uint64_t kind = slot != nullptr ? pte_kind(*slot) : 0;
+    if (kind != pte::KindFresh && kind != pte::KindSwapped) {
+      s_paging.wanted = 0;  // in already, or freed
+    } else if (room() <= 0) {
+      const uint64_t victim = pick_victim_locked();
+      if (victim != 0) {
+        return send_out_locked(victim, buf);
+      }
+    } else if (const uint64_t pa = frame::alloc(1); pa != 0) {
+      s_paging.wanted = 0;
+      if (kind == pte::KindFresh) {
+        bring_in_locked(va, slot, pa, nullptr);
+      } else {
+        j = Job{JOB_IN, va, pa};
+        return request(slot_of(va), PAGE_READ);
+      }
+    }
+  }
+  // The reserve (FRAMES).
+  if (room() < 0) {
+    const uint64_t victim = pick_victim_locked();
+    if (victim != 0) {
+      return send_out_locked(victim, buf);
+    }
+  }
+#if defined(SIGNETOS_PAGE_TEST)
+  // What a test asked to send out.
+  while (s_paging.evict_next < s_paging.evict_end) {
+    const uint64_t va = s_paging.evict_next;
+    s_paging.evict_next += PAGE_SIZE;
+    if (can_evict_locked(va)) {
+      return send_out_locked(va, buf);
+    }
+  }
+#endif
+  // The checks a sweep waits for (REVOCATION).
+  if (s_paging.check_next < s_region_pages) {
+    const uint64_t s = next_check_locked(s_paging.check_next);
+    s_paging.check_next = s < s_region_pages ? s + 1 : s_region_pages;
+    if (s < s_region_pages) {
+      j = Job{JOB_CHECK, va_of(s), 0};
+      return request(s, PAGE_READ);
+    }
+  }
+  return PAGE_NONE;
+}
+
+// THE PAGER: the job handed out is done; `buf` holds what a read read. A
+// read whose copy is not the page that went out stays to be done again.
+void finish_job_locked(Capability buf) {
+  const Job j = s_paging.job;
+  uint64_t* slot = j.op != JOB_NONE ? leaf_slot(j.va, false) : nullptr;
+  const bool swapped = slot != nullptr && pte_kind(*slot) == pte::KindSwapped;
+  if (j.op == JOB_IN) {
+    if (!swapped) {
+      frame::free(j.frame, 1);  // freed and reclaimed meanwhile
+    } else if (!bring_in_locked(j.va, slot, j.frame, buf)) {
+      return;
+    }
+  } else if (j.op == JOB_CHECK && swapped) {
+    // Into the kernel's own page first: what is checked is what is decoded.
+    volatile uint64_t* w = reinterpret_cast<volatile uint64_t*>(s_paging.scratch);
+    const auto* from = reinterpret_cast<const volatile uint64_t*>(buf);
+    for (size_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); ++i) {
+      w[i] = from[i];
+    }
+    SlotInfo& info = s_paging.slots[slot_of(j.va)];
+#if defined(SIGNETOS_SWAP_HASH)
+    if (!digest_matches(info, w)) {
+      s_paging.digest_errors += 1;
+      return;
+    }
+#endif
+    const auto* c = reinterpret_cast<const volatile Capability*>(w);
+    for (size_t i = 0; i < CAPS_PER_PAGE; ++i) {
+      if (has_tag(info, i) && is_revoked_locked(c[i])) {
+        info.tags[i / 8] = static_cast<uint8_t>(info.tags[i / 8] & ~(1u << (i % 8)));
+      }
+    }
+    s_paging.checks += 1;
+  }
+  s_paging.job = Job{};
+}
+
+// `blk`'s page for a transfer (THE PAGER): writable, 4 KiB from its address,
+// aligned, below the pageable region, and resident.
+bool is_pager_buffer_locked(Capability c) {
+  if (!capability_is_valid(c) || __builtin_cheri_type_get(c) != 0) {
+    return false;
+  }
+  const uint64_t base = capability_get_base(c);
+  const uint64_t addr = capability_get_address(c);
+  return capability_has_perms(c, perms::Load | perms::Store) &&
+         addr % PAGE_SIZE == 0 && addr >= base &&
+         base + capability_get_length(c) - addr >= PAGE_SIZE &&
+         addr >= DYNAMIC_BASE && addr + PAGE_SIZE <= pinned_pool_top() &&
+         pte_resident(find_leaf(addr).entry);
+}
+
+// Places the pageable region: `slots` pages from a gigabyte boundary, up to
+// the revocation bitmap, never leaving the pool below less room than there is
+// RAM, and only where nothing is in use yet.
+Status place_region_locked(size_t slots) {
+  constexpr uint64_t POOL = BITMAP_BASE - DYNAMIC_BASE;
+  const uint64_t ram =
+      (frame::ram_bytes() + GIGAPAGE_SIZE - 1) & ~(GIGAPAGE_SIZE - 1);
+  const uint64_t span =
+      ((slots * PAGE_SIZE) + GIGAPAGE_SIZE - 1) & ~(GIGAPAGE_SIZE - 1);
+  if (ram >= POOL || span > POOL - ram) {
+    return Status::InvalidSize;
+  }
+  const uint64_t base = BITMAP_BASE - span;
+  if (s_region_base != 0) {
+    return Status::Busy;
+  }
+  for (size_t g = (base - DYNAMIC_BASE) / GIGAPAGE_SIZE; g < POOL_1G; ++g) {
+    if (s_used_1g[g] != 0) {
+      return Status::Busy;
+    }
+  }
+  s_region_pages = slots;
+  s_paging.check_next = slots;
+  __atomic_store_n(&s_region_base, base, __ATOMIC_RELEASE);
+  return Status::Ok;
+}
+
+// The lowest run of `pages` free addresses in the pageable region, starting
+// on a multiple of `align`, or 0.
+uint64_t find_pageable_room_locked(size_t pages, uint64_t align) {
+  const uint64_t base = s_region_base;
+  const uint64_t top = base + (s_region_pages * PAGE_SIZE);
+  const uint64_t need = pages * PAGE_SIZE;
+  for (uint64_t start = base; need <= top - base && start <= top - need;) {
+    // The first page in use in [start, start + need), skipping whole empty
+    // 2MB regions.
+    uint64_t va = start;
+    while (va < start + need) {
+      const size_t m = (va - DYNAMIC_BASE) / MEGAPAGE_SIZE;
+      if (va % MEGAPAGE_SIZE == 0 && s_used_2m[m] == 0) {
+        va += MEGAPAGE_SIZE;
+        continue;
+      }
+      const uint64_t* slot = leaf_slot(va, false);
+      if (slot != nullptr && pte_in_use(*slot)) {
+        break;
+      }
+      va += PAGE_SIZE;
+    }
+    if (va >= start + need) {
+      return start;
+    }
+    start = (va + PAGE_SIZE + align - 1) & ~(align - 1);
+  }
+  return 0;
+}
+
+// True if every page of `[va, va + len)` is resident.
+bool resident_locked(uint64_t va, size_t len) {
+  if (va + len < va) {
+    return false;
+  }
+  for (uint64_t cur = va & ~(PAGE_SIZE - 1); cur < va + len;) {
+    const Leaf leaf = find_leaf(cur);
+    if (!pte_resident(leaf.entry)) {
+      return false;
+    }
+    cur = next_after(cur, leaf);
+  }
+  return true;
+}
+
 }  // namespace
 
 uint64_t translate(uint64_t va) {
   const Leaf leaf = find_leaf(va);
-  if (leaf.entry == 0) {
+  if (!pte_resident(leaf.entry)) {
     return 0;
   }
   // The entry names the start of a page; the low bits of the address say how
@@ -837,13 +1340,14 @@ uint64_t free_pages(Capability object) {
 
   Locked hold(s_lock);
 
-  // Every page must be mapped and not already quarantined. All of them are
-  // checked before any is changed, so a refused free leaves the range exactly
-  // as it was. This is also what refuses freeing the same range twice.
+  // Every page must be in use (a pageable one may have no frame), not Held,
+  // and not already quarantined. All of them are checked before any is
+  // changed, so a refused free leaves the range exactly as it was. This is
+  // also what refuses freeing the same range twice.
   for (size_t i = 0; i < pages; ++i) {
     const uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
-    if (slot == nullptr || !(*slot & pte::Valid) ||
-        (*slot & pte::Quarantined)) {
+    if (slot == nullptr || !pte_in_use(*slot) ||
+        pte_kind(*slot) == pte::KindHeld || (*slot & pte::Quarantined)) {
       return 0;
     }
   }
@@ -890,11 +1394,11 @@ Capability next_live_page(uint64_t* cursor) {
   return nullptr;
 }
 
-void reclaim_quarantined() {
+void reclaim_quarantined(bool hold) {
   if (!is_initialized() || quarantined_pages() == 0) {
     return;
   }
-  Locked hold(s_lock);
+  Locked lock(s_lock);
   if (s_quarantined_pages == 0) {
     return;
   }
@@ -903,9 +1407,18 @@ void reclaim_quarantined() {
     uint64_t* slot =
         (leaf.entry & pte::Quarantined) ? leaf_slot(va, false) : nullptr;
     if (slot != nullptr) {
-      *slot = 0;  // unmapped: nothing can reach it any more
-      frame::free(pte_addr(leaf.entry), 1);
-      count_page(va, -1);  // and so free for reuse
+      // Its frame, if it has one (a pageable page may not), goes back to the
+      // frame allocator.
+      if (pte_resident(leaf.entry)) {
+        frame::free(pte_addr(leaf.entry), 1);
+      }
+      if (hold) {
+        *slot = pte::KindHeld;  // unmapped, but not free until release_held
+        s_held_pages += 1;
+      } else {
+        *slot = 0;  // unmapped: nothing can reach it any more
+        count_page(va, -1);  // and so free for reuse
+      }
       __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
       // The bitmap page for this span goes with the page that starts it.
       if ((leaf.entry & pte::Revocable) != 0 && va % BITMAP_SPAN == 0) {
@@ -918,6 +1431,274 @@ void reclaim_quarantined() {
   }
   __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
+
+// --- Paging (vm.hpp, PAGING) -------------------------------------------------
+
+Status setup_paging(size_t slots) {
+  if (!is_initialized() || !capability_is_valid(s_retag_root)) {
+    return Status::NotInitialized;
+  }
+  if (slots == 0 || slots > (BITMAP_BASE - DYNAMIC_BASE) / PAGE_SIZE) {
+    return Status::InvalidSize;
+  }
+  // The kernel's memory for paging, zeroed, from the pool below the region:
+  // a scratch page, a bit per slot for the clock, and a SlotInfo per slot.
+  const size_t bit_bytes = ((slots + 63) / 64) * sizeof(uint64_t);
+  const size_t bytes = PAGE_SIZE + bit_bytes + (slots * sizeof(SlotInfo));
+  const Capability mem = alloc_pages((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+  if (!capability_is_valid(mem)) {
+    return Status::NoMemory;
+  }
+  Status st;
+  {
+    Locked hold(s_lock);
+    auto* p = reinterpret_cast<uint8_t*>(mem);
+    s_paging.scratch = capability_set_bounds(mem, PAGE_SIZE);
+    s_paging.resident = reinterpret_cast<uint64_t*>(p + PAGE_SIZE);
+    s_paging.slots = reinterpret_cast<SlotInfo*>(p + PAGE_SIZE + bit_bytes);
+    st = place_region_locked(slots);
+  }
+  if (st != Status::Ok) {
+    free_pages(mem);
+  }
+  return st;
+}
+
+bool paging_on() {
+  return __atomic_load_n(&s_region_base, __ATOMIC_ACQUIRE) != 0;
+}
+
+size_t round_up_pageable_pages(size_t pages) {
+  const size_t region_pages = paging_on() ? s_region_pages : 0;
+  if (pages == 0 || pages > region_pages) {
+    return 0;
+  }
+  const size_t rounded =
+      __builtin_cheri_round_representable_length(pages * PAGE_SIZE) /
+      PAGE_SIZE;
+  return rounded <= region_pages ? rounded : 0;
+}
+
+Capability alloc_pageable_pages(size_t pages, bool revocable) {
+  if (pages == 0 || round_up_pageable_pages(pages) != pages) {
+    return nullptr;
+  }
+  // The capability covers exactly the allocation, never a neighbour: the
+  // length is representable (above), and the base is aligned as CHERI needs
+  // for it -- and, if revocable, on a BITMAP_SPAN boundary.
+  const uint64_t bytes = pages * PAGE_SIZE;
+  uint64_t align = ~__builtin_cheri_representable_alignment_mask(bytes) + 1;
+  const uint64_t least = revocable ? BITMAP_SPAN : PAGE_SIZE;
+  align = align < least ? least : align;
+  Capability c = nullptr;
+  {
+    Locked hold(s_lock);
+    const uint64_t va = find_pageable_room_locked(pages, align);
+    c = va != 0 ? dynamic_view(va, bytes) : nullptr;
+    if (!capability_is_valid(c) || capability_get_base(c) != va ||
+        capability_get_length(c) != bytes ||
+        (capability_get_perms(c) & (perms::Seal | perms::Unseal)) != 0) {
+      return nullptr;
+    }
+    // Fresh: in use, no frame. Nothing to flush: a free address has no
+    // translation cached anywhere.
+    auto undo = [&](size_t set) {
+      for (size_t j = 0; j < set; ++j) {
+        *leaf_slot(va + (j * PAGE_SIZE), false) = 0;
+        count_page(va + (j * PAGE_SIZE), -1);
+      }
+    };
+    const uint64_t fresh = pte::KindFresh | (revocable ? pte::Revocable : 0);
+    for (size_t i = 0; i < pages; ++i) {
+      uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), true);
+      if (slot == nullptr) {
+        undo(i);  // out of frames for a table
+        return nullptr;
+      }
+      *slot = fresh;
+      count_page(va + (i * PAGE_SIZE), +1);
+    }
+    if (revocable && !map_bitmap_locked(va, pages)) {
+      undo(pages);
+      return nullptr;
+    }
+  }
+  __atomic_fetch_add(&s_alloc_pages, pages, __ATOMIC_RELAXED);
+  return c;
+}
+
+Fault fault(uint64_t addr, bool can_wait) {
+  if (!paging_on()) {
+    return Fault::No;
+  }
+  // Only a fault in the region is paging's: no allocation runs into it from
+  // below, so an access that starts outside it is an ordinary fault, even
+  // if the next page is pageable.
+  if (!is_pageable_address(addr & ~(PAGE_SIZE - 1))) {
+    return Fault::No;
+  }
+  Locked hold(s_lock);
+  // The access may run onto the next page: either may be the one.
+  const uint64_t touched[] = {addr, addr + sizeof(Capability) - 1};
+  for (const uint64_t a : touched) {
+    const uint64_t va = a & ~(PAGE_SIZE - 1);
+    if (!is_pageable_address(va)) {
+      continue;  // past the region's end: nothing allocated runs into it
+    }
+    uint64_t* slot = leaf_slot(va, false);
+    const uint64_t e = slot != nullptr ? *slot : 0;
+    const uint64_t kind = pte_kind(e);
+    if (pte_resident(e)) {
+      continue;  // in already
+    }
+    if (kind != pte::KindFresh && kind != pte::KindSwapped) {
+      return Fault::No;  // not in use: an ordinary fault
+    }
+    if (kind == pte::KindFresh && room() > 0) {
+      const uint64_t pa = frame::alloc(1);
+      if (pa != 0) {
+        bring_in_locked(va, slot, pa, nullptr);
+        return Fault::Retry;
+      }
+    }
+    if (!can_wait) {
+      return Fault::No;
+    }
+    s_paging.wanted = va;
+    return Fault::Wait;
+  }
+  // Every page it touches is in by now: run it again.
+  return Fault::Retry;
+}
+
+uint64_t page_next(Capability buf) {
+  Locked hold(s_lock);
+  return paging_on() && is_pager_buffer_locked(buf) ? next_job_locked(buf)
+                                                    : PAGE_NONE;
+}
+
+void page_done(Capability buf) {
+  Locked hold(s_lock);
+  if (paging_on() && is_pager_buffer_locked(buf)) {
+    finish_job_locked(buf);
+  }
+}
+
+bool start_checks() {
+  if (!paging_on()) {
+    return false;
+  }
+  Locked hold(s_lock);
+  s_paging.check_next = next_check_locked(0);
+  return s_paging.check_next < s_region_pages;
+}
+
+bool checks_pending() {
+  Locked hold(s_lock);
+  return paging_on() && (s_paging.check_next < s_region_pages ||
+                         s_paging.job.op == JOB_CHECK);
+}
+
+void release_held() {
+  Locked hold(s_lock);
+  for (uint64_t va = next_used(DYNAMIC_BASE);
+       s_held_pages != 0 && va < BITMAP_BASE;) {
+    const Leaf leaf = find_leaf(va);
+    if (pte_kind(leaf.entry) == pte::KindHeld) {
+      *leaf_slot(va, false) = 0;  // not mapped since its reclaim's flush
+      count_page(va, -1);
+      s_held_pages -= 1;
+    }
+    va = next_used(next_after(va, leaf));
+  }
+}
+
+bool hold_resident(uint64_t va, size_t len) {
+  if (!is_initialized()) {
+    return false;
+  }
+  s_lock.acquire();
+  if (!resident_locked(va, len)) {
+    s_lock.release();
+    return false;
+  }
+  return true;
+}
+
+void release_resident() { s_lock.release(); }
+
+bool set_retag_root(Capability root) {
+  s_retag_root = nullptr;
+  if (!capability_is_valid(root) ||
+      !capability_is_valid(sealing::g_type_root)) {
+    return false;
+  }
+  // Where CT sits in the upper word of a capability's bits: sealing with the
+  // type whose bits are all ones changes exactly those bits, all zero while
+  // unsealed. Anything else that does not come back exactly is caught as
+  // each capability is built (rebuild_locked).
+  alignas(16) static Capability probe;
+  volatile Capability* slot = &probe;
+  const auto* w = reinterpret_cast<const volatile uint64_t*>(slot);
+  const Capability data = capability_and_perms(
+      capability_set_bounds(capability_set_address(root, DYNAMIC_BASE), 0x40),
+      perms::DataRw);
+  *slot = data;
+  const uint64_t plain = w[1];
+  *slot = sealing::seal_with(
+      sealing::authority_for(static_cast<OType>(kOTypeMax)), data);
+  const uint64_t diff = plain ^ w[1];
+  *slot = nullptr;
+  if (diff == 0 || (plain & diff) != 0 ||
+      diff != (CT_MASK << __builtin_ctzll(diff))) {
+    return false;
+  }
+  s_ct_shift = static_cast<uint64_t>(__builtin_ctzll(diff));
+  s_retag_root = root;
+  return true;
+}
+
+#if defined(SIGNETOS_PAGE_TEST)
+uint64_t page_test(uint64_t op, Capability cap) {
+  const bool usable = paging_on() && capability_is_valid(cap) &&
+                      __builtin_cheri_type_get(cap) == 0;
+  const uint64_t addr = usable ? capability_get_address(cap) : 0;
+  const uint64_t top =
+      usable ? capability_get_base(cap) + capability_get_length(cap) : 0;
+  if (op == PAGE_TEST_STATS && usable && capability_has_perms(cap, perms::Store) &&
+      addr <= top && top - addr >= sizeof(PagingStats)) {
+    PagingStats st{};
+    {
+      Locked hold(s_lock);
+      st.slots = s_region_pages;
+      st.free_frames = frame::free_pages();
+      st.reserve = frame::pool_pages() / 64;
+      st.reads = s_paging.reads;
+      st.writes = s_paging.writes;
+      st.checks = s_paging.checks;
+      st.digest_errors = s_paging.digest_errors;
+      st.evicting = ((s_paging.evict_end - s_paging.evict_next) / PAGE_SIZE) +
+                    (s_paging.job.op == JOB_OUT ? 1 : 0);
+    }
+    const ResidentHold resident(addr, sizeof(PagingStats));  // KERNEL ACCESS
+    if (!resident.ok()) {
+      return ~0ULL;
+    }
+    *reinterpret_cast<PagingStats*>(cap) = st;
+    return 0;
+  }
+  if (op == PAGE_TEST_EVICT && usable && addr < top &&
+      is_pageable_address(addr) && is_pageable_address(top - 1)) {
+    Locked hold(s_lock);
+    s_paging.evict_next = addr & ~(PAGE_SIZE - 1);
+    s_paging.evict_end = (top + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    return (s_paging.evict_end - s_paging.evict_next) / PAGE_SIZE;
+  }
+  return ~0ULL;
+}
+#else
+uint64_t page_test(uint64_t, Capability) { return ~0ULL; }  // not built in
+#endif
 
 Capability bitmap_view() {
   return dynamic_view(BITMAP_BASE, DYNAMIC_TOP - BITMAP_BASE);

@@ -290,6 +290,30 @@ uint64_t sys_trap_install(
     Sentry   handler
 );
 
+// --- Paging (vm.hpp, PAGING) -------------------------------------------------
+
+// Turns paging on, once, for `slots` pages of swap. `init` calls it after it
+// has started what paging depends on. A `Status` (vm::setup_paging).
+uint64_t sys_page_setup(
+    size_t slots
+);
+
+// The pager's (`blk`'s): the next job, vm::PAGE_NONE or a read or write of a
+// slot (vm::page_next), with `buf` its 4 KiB page for the transfer; and that
+// the job is done (vm::page_done).
+uint64_t sys_page_next(
+    capability_data_t buf
+);
+void sys_page_done(
+    capability_data_t buf
+);
+
+// For the shell's `pagetest`: vm::page_test.
+uint64_t sys_page_test(
+    uint64_t     op,
+    capability_t cap
+);
+
 } // extern "C"
 
 namespace signetos::syscall {
@@ -323,7 +347,11 @@ namespace signetos::syscall {
   X(thread_kill)                  \
   X(thread_switch)                \
   X(thread_tid)                   \
-  X(trap_install)
+  X(trap_install)                 \
+  X(page_setup)                   \
+  X(page_next)                    \
+  X(page_done)                    \
+  X(page_test)
 
 enum class Id : uint32_t {
 #define SIGNETOS_SYSCALL_ID(n) n,

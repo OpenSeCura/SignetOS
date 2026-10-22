@@ -90,13 +90,37 @@ else
 TEST_DEFS =
 endif
 
+# SWAP_HASH=1 (the default): the kernel keeps a BLAKE2b-256 digest of every
+# page it sends to disk and refuses a copy that comes back different, so
+# `blk` cannot change a page or have a capability built that was not there
+# (vm.hpp, PAGING). SWAP_HASH=0 drops it, and trusts `blk` with those.
+SWAP_HASH ?= 1
+ifeq ($(SWAP_HASH),1)
+SWAP_HASH_DEFS = -DSIGNETOS_SWAP_HASH
+SWAP_HASH_SRCS = kernel/lib/blake2b.cpp
+else
+SWAP_HASH_DEFS =
+SWAP_HASH_SRCS =
+endif
+
+# PAGE_TEST=1 builds in sys_page_test, which the shell's `pagetest` needs:
+# the kernel's paging counters, and sending chosen pages to swap. Off by
+# default; without it the call refuses everything.
+PAGE_TEST ?= 0
+ifeq ($(PAGE_TEST),1)
+PAGE_TEST_DEFS = -DSIGNETOS_PAGE_TEST
+else
+PAGE_TEST_DEFS =
+endif
+
 CXXFLAGS = -target riscv64-unknown-freebsd -march=$(MARCH) -mabi=l64pc128d \
            -std=c++20 -ffreestanding -nostdlib -nostdinc++ -nostdinc -U__FreeBSD__ \
            -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables \
            -fno-threadsafe-statics -fno-use-cxa-atexit -fno-common -fno-jump-tables \
            -mcmodel=medany $(OPT) -Wall -Wextra \
            -Wno-cheri-capability-misuse -Wno-cheri-implicit-conversion -Wno-cheri-pointer-conversion \
-           -Iinclude -Iinclude/libc -g $(TRACE_DEFS) $(TEST_DEFS)
+           -Iinclude -Iinclude/libc -g $(TRACE_DEFS) $(TEST_DEFS) $(SWAP_HASH_DEFS) \
+           $(PAGE_TEST_DEFS)
 
 ASFLAGS  = -target riscv64-unknown-freebsd -march=$(MARCH) -mabi=l64pc128d \
            -mcmodel=medany -ffreestanding -nostdlib -nostdinc -U__FreeBSD__ \
@@ -145,6 +169,13 @@ COMP_BINS = $(BOOT_BINS) $(EXT_SERVICE_BINS) $(EXT_APP_BINS)
 # system wrote on earlier boots survives a rebuild; delete it to start fresh.
 DISK_IMG   = disk.img
 DISK_BYTES = 32M
+
+# Swap: a region at the end of disk.img, after the file system, described by
+# the image's last sector (`tools/signetfs.py swap`). Pageable memory goes
+# there once RAM is full (vm.hpp, PAGING). SWAP_BYTES=0: no swap, no paging.
+# With less RAM than swap (MEM, below) memory really pages:
+# `make term MEM=128M PAGE_TEST=1`, then `pagetest fill 112` in the shell.
+SWAP_BYTES ?= 256M
 SIGNETFS   = python3 tools/signetfs.py
 QEMU_DISK  = -global virtio-mmio.force-legacy=false \
              -drive file=$(DISK_IMG),if=none,format=raw,id=hd0,file.locking=off \
@@ -179,7 +210,8 @@ CXX_SRCS = kernel/vm.cpp \
            kernel/debug/report.cpp \
            kernel/debug/inspect.cpp \
            kernel/debug/quota_selftest.cpp \
-           kernel/lib/kstring.cpp
+           kernel/lib/kstring.cpp \
+           $(SWAP_HASH_SRCS)
 
 OBJS = $(patsubst %.S,%.o,$(ASM_SRCS)) $(patsubst %.cpp,%.o,$(CXX_SRCS))
 DEPS = $(OBJS:.o=.d) $(COMP_OBJS:.o=.d)
@@ -240,14 +272,16 @@ signetos.elf: $(OBJS)
 $(DISK_IMG): $(EXT_SERVICE_BINS) $(EXT_APP_BINS) tools/signetfs.py
 	$(SIGNETFS) put $@ --size $(DISK_BYTES) $(EXT_SERVICE_BINS)
 	$(SIGNETFS) put $@ --dir bin $(EXT_APP_BINS)
+	$(SIGNETFS) swap $@ --size $(SWAP_BYTES)
 
 SMP ?= 4
+MEM ?= 2G
 
 # Interactive console: the production image with the serial port on this
 # terminal, same as run_signetos_terminal.sh. Ctrl+A then X quits QEMU.
 # Combine with TRACE_SWITCH=1 to watch the scheduler at the `SignetOS>` prompt.
 term: signetos.elf $(DISK_IMG)
-	$(QEMU) -bios none -machine virt -smp $(SMP) -m 2G -cpu $(QEMU_CPU) \
+	$(QEMU) -bios none -machine virt -smp $(SMP) -m $(MEM) -cpu $(QEMU_CPU) \
 	  $(QEMU_DISK) \
 	  -kernel signetos.elf -nographic -serial mon:stdio
 
@@ -267,12 +301,15 @@ clean:
 # (Re)write the disk image on its own.
 disk: $(DISK_IMG)
 
-# Objects whose contents depend on TRACE_SWITCH or QUOTA_SELFTEST are rebuilt
-# whenever a flag flips, via a stamp file that only changes when a value does.
+# Objects whose contents depend on TRACE_SWITCH, QUOTA_SELFTEST, SWAP_HASH or
+# PAGE_TEST, and the disk image on SWAP_BYTES, are rebuilt whenever a flag
+# flips, via a stamp file that only changes when a value does.
 FLAGS_STAMP = .build_flags
-FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST)
+FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST) $(SWAP_HASH) $(SWAP_BYTES) \
+              $(PAGE_TEST)
 $(FLAGS_STAMP): FORCE
 	@echo $(FLAG_VALUES) | cmp -s - $@ 2>/dev/null || echo $(FLAG_VALUES) > $@
-kernel/thread.o kernel/main.o kernel/debug/report.o: $(FLAGS_STAMP)
+kernel/thread.o kernel/main.o kernel/debug/report.o kernel/vm.o: $(FLAGS_STAMP)
+$(DISK_IMG): $(FLAGS_STAMP)
 FORCE:
 .PHONY: FORCE

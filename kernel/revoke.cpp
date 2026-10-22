@@ -32,6 +32,9 @@ namespace {
 
 SpinLock s_lock;
 
+// True while a sweep waits for its checks of swap (SWAP).
+bool s_waiting = false;
+
 // Epoch 0 means "no sweep has ever completed", so the first epoch handed out is 1.
 uint64_t g_pending_epoch   = 1;
 uint64_t g_completed_epoch = EPOCH_NONE;
@@ -92,6 +95,7 @@ void clear_marks() {
 
 void init() {
   s_lock = SpinLock{};
+  s_waiting = false;
   g_pending_epoch = 1;
   g_completed_epoch = EPOCH_NONE;
   s_bitmap = vm::bitmap_view();
@@ -130,6 +134,9 @@ Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   }
 
   Locked hold(s_lock);
+  if (s_waiting) {
+    return Status::Busy;  // a sweep is waiting for its checks (SWAP)
+  }
   mark(mem_base, mem_top);
   if (out_epoch != nullptr) {
     *out_epoch = g_pending_epoch;
@@ -202,6 +209,14 @@ bool anything_pending() {
   return any_marked() || vm::quarantined_pages() > 0;
 }
 
+// Ends the sweep, its marks having done their job. Caller holds `s_lock`.
+void complete_locked() {
+  clear_marks();
+  const uint64_t swept = g_pending_epoch;
+  __atomic_store_n(&g_completed_epoch, swept, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_pending_epoch, swept + 1, __ATOMIC_RELEASE);
+}
+
 // The sweep proper. Caller holds `s_lock`.
 void sweep_locked() {
   if (anything_pending()) {
@@ -224,23 +239,25 @@ void sweep_locked() {
       scan(page);
     }
 
-    // 3. All capabilities pointing into quarantined pages now have their
+    // 3. Capabilities on disk have not been seen (SWAP): if there are any,
+    //    the pager reads them back to be checked, and the sweep waits.
+    s_waiting = vm::start_checks();
+
+    // 4. All capabilities pointing into quarantined pages now have their
     //    hardware tags cleared. Unmap every quarantined page, free its
     //    physical frame, and return its virtual address range to the
-    //    reusable pool.
-    vm::reclaim_quarantined();
-
-    // 4. Every capability based in a marked granule is gone too, so the
-    //    marks have done their job. Not before: a capability scanned late
-    //    may be based in a range whose own page was scanned early.
-    clear_marks();
+    //    reusable pool -- or, while the sweep waits, leave it Held.
+    vm::reclaim_quarantined(s_waiting);
     s_swept = true;
     s_last_sweep_end = clint::now();
   }
 
-  const uint64_t swept = g_pending_epoch;
-  __atomic_store_n(&g_completed_epoch, swept, __ATOMIC_RELEASE);
-  __atomic_store_n(&g_pending_epoch, swept + 1, __ATOMIC_RELEASE);
+  // 5. Every capability based in a marked granule is gone too, so the marks
+  //    have done their job. Not before: a capability scanned late may be
+  //    based in a range whose own page was scanned early.
+  if (!s_waiting) {
+    complete_locked();
+  }
 }
 
 // Sweeps, unless `limited` and a sweep has ended less than SWEEP_INTERVAL_US
@@ -253,6 +270,15 @@ void sweep_locked() {
 __attribute__((noinline)) void try_sweep(bool limited) {
   {
     Locked hold(s_lock);
+    // A sweep waiting for its checks completes once they are done (SWAP).
+    if (s_waiting) {
+      if (!vm::checks_pending()) {
+        vm::release_held();
+        s_waiting = false;
+        complete_locked();
+      }
+      return;
+    }
     if (limited && s_swept && anything_pending() &&
         clint::now() <
             s_last_sweep_end + clint::us_to_ticks(SWEEP_INTERVAL_US)) {
