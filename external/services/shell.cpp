@@ -55,6 +55,8 @@
  *                abi.hpp, "Applications")
  *     pagetest [fill <MiB>]
  *                paging self-test (PAGE TEST below)
+ *     sealtest   compartment-minted sealing self-test: the sealer service,
+ *                from the shell and from a program (`run sealtest.bin`)
  *     shutdown   stop the workers and the pager, free their quotas and exit.
  *                Nothing is registered after that, so the dispatcher exits
  *                too and the kernel powers the machine off.
@@ -354,6 +356,15 @@ Capability s_fs_write = nullptr;
 Capability s_fs_unlink = nullptr;
 Capability s_fs_list = nullptr;
 bool s_fs_ready = false;
+
+// The sealer's entry points (abi.hpp, "Sealing service"), resolved by name:
+// what a program that asks for `seal.*` is granted, and what `sealtest`
+// uses. Null if the sealer did not come up; programs that require them are
+// then not started.
+Capability s_seal_mint = nullptr;
+Capability s_seal_derive = nullptr;
+Capability s_seal_seal = nullptr;
+Capability s_seal_unseal = nullptr;
 
 // Buffers that cross into `fs` live here rather than on the (narrowed) stack.
 constexpr size_t LIST_MAX = 16;
@@ -1158,7 +1169,8 @@ Capability read_image(const char* what, const char* name) {
   return image;
 }
 
-// The file-system entry points a program may ask for by name, or null.
+// The file-system and sealing entry points a program may ask for by name, or
+// null.
 Capability program_service(const char* name) {
   if (str_eq(name, "uart")) return s_uart;
   if (str_eq(name, "fs.open")) return s_fs_open;
@@ -1170,6 +1182,10 @@ Capability program_service(const char* name) {
   if (str_eq(name, "fs.unlink")) return s_fs_unlink;
   if (str_eq(name, "fs.list")) return s_fs_list;
   if (str_eq(name, "fs.quota_query")) return s_fs_query;
+  if (str_eq(name, "seal.mint")) return s_seal_mint;
+  if (str_eq(name, "seal.derive")) return s_seal_derive;
+  if (str_eq(name, "seal.seal")) return s_seal_seal;
+  if (str_eq(name, "seal.unseal")) return s_seal_unseal;
   return nullptr;
 }
 
@@ -1972,6 +1988,7 @@ void print_help() {
       "  run <f> [args]     load a program from /bin into a compartment "
       "of its own and run it\n"
       "  pagetest [fill <MiB>]  paging self-test\n"
+      "  sealtest   compartment-minted sealing self-test (the sealer service)\n"
       "  shutdown   stop the workers and power the machine off\n");
 }
 
@@ -2250,6 +2267,96 @@ void cmd_faulttest() {
           "");
   out(st == static_cast<int64_t>(Status::Faulted) ? " (Faulted) -- OK\n"
                                                   : " -- expected Faulted\n");
+}
+
+// sealtest: compartment-minted sealing types (abi.hpp, "Sealing service";
+// CORE_DESIGN.md §2.3), not part of the shell. `run sealtest.bin` checks
+// keys, handles, derived rights and refusals as any client sees them; what a
+// program cannot check is a type's LIFETIME, since it cannot free memory.
+// This does: a page of the shell's own holds a type's record and an object
+// of the type; the page is freed and, once a sweep has reclaimed it, the key
+// and the handle -- both based in it -- have lost their tags and open
+// nothing. The key and the handle are kept in `.bss`, which the sweep scans,
+// and read back from there. Then the program half runs.
+Capability s_sealtest_key = nullptr;
+Capability s_sealtest_handle = nullptr;
+
+void cmd_sealtest() {
+  if (!capability_is_valid(s_seal_mint) || !capability_is_valid(s_seal_seal) ||
+      !capability_is_valid(s_seal_unseal)) {
+    out("[sealtest] the sealer's entry points were not found by name\n");
+    return;
+  }
+  if (!capability_is_valid(s_gate_revoke_query) || !s_run_ready) {
+    out("[sealtest] needs revoke_query and `run`\n");
+    return;
+  }
+  using FnAlloc = decltype(&sys_vm_allocate);
+  using FnDealloc = decltype(&sys_vm_deallocate);
+  using FnQuery = decltype(&sys_revoke_query);
+  const Capability page = with_reclaim(
+      [&] {
+        return syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc,
+                                      s_self_comp, s_vm_quota, vm::PAGE_SIZE,
+                                      0);
+      },
+      [](Capability c) { return capability_is_valid(c); });
+  if (!capability_is_valid(page)) {
+    out("[sealtest] could not allocate a page\n");
+    return;
+  }
+  const uint64_t base = capability_get_base(page);
+  // The record at the start of the page, the object 64 bytes in.
+  const Capability record = capability_set_bounds(page, sizeof(Capability));
+  const Capability object =
+      capability_set_bounds(capability_set_address(page, base + 64), 64);
+  s_sealtest_key = invoke<Capability>(s_gate_invoke, s_seal_mint, record);
+  s_sealtest_handle =
+      invoke<Capability>(s_gate_invoke, s_seal_seal, s_sealtest_key, object);
+  const Capability payload = invoke<Capability>(
+      s_gate_invoke, s_seal_unseal, s_sealtest_key, s_sealtest_handle);
+  bool ok = sealing::is_sealed_as(OType::TypeKey, s_sealtest_key) &&
+            sealing::is_sealed_as(OType::SealedObject, s_sealtest_handle) &&
+            capability_is_valid(payload) &&
+            capability_get_base(payload) == base + 64 + sizeof(Capability);
+  out(ok ? "[sealtest] a type on a page of the shell's: key, object, payload OK\n"
+         : "[sealtest] FAILED: could not mint, seal and unseal on the page\n");
+
+  // Free the page. Until a sweep reclaims it the type still works (the page
+  // is quarantined, not unmapped); after one, nothing based in it is tagged.
+  const uint64_t seen =
+      syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
+  syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, s_self_comp,
+                           s_vm_quota, page);
+  out("[sealtest] record freed; waiting for a sweep...\n");
+  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 1);
+
+  const Capability key_after =
+      *reinterpret_cast<volatile Capability*>(&s_sealtest_key);
+  const Capability handle_after =
+      *reinterpret_cast<volatile Capability*>(&s_sealtest_handle);
+  const bool key_dead = !capability_is_valid(key_after);
+  const bool handle_dead = !capability_is_valid(handle_after);
+  const bool opens_nothing = !capability_is_valid(
+      invoke<Capability>(s_gate_invoke, s_seal_unseal, key_after, handle_after));
+  out(key_dead ? "[sealtest] after the sweep the key is untagged\n"
+               : "[sealtest] FAILED: the key survived the sweep\n");
+  out(handle_dead ? "[sealtest] after the sweep the handle is untagged\n"
+                  : "[sealtest] FAILED: the handle survived the sweep\n");
+  out(opens_nothing ? "[sealtest] the dead type opens nothing\n"
+                    : "[sealtest] FAILED: the dead type still opens objects\n");
+  ok = ok && key_dead && handle_dead && opens_nothing;
+  s_sealtest_key = nullptr;
+  s_sealtest_handle = nullptr;
+  out(ok ? "[sealtest] lifetime OK; now the program\n"
+         : "[sealtest] lifetime FAILED; now the program\n");
+
+  int64_t status = RUN_NOT_RUN;
+  if (!cmd_run("sealtest.bin", "", &status) || status != 0) {
+    out("[sealtest] FAILED: run sealtest.bin did not pass\n");
+    ok = false;
+  }
+  out(ok ? "[sealtest] OK\n" : "[sealtest] FAILED\n");
 }
 
 // --- PAGE TEST (vm.hpp, PAGING) ----------------------------------------------
@@ -2567,6 +2674,8 @@ bool execute(char* line) {
     cmd_revoketest();
   } else if (str_eq(cmd, "faulttest")) {
     cmd_faulttest();
+  } else if (str_eq(cmd, "sealtest")) {
+    cmd_sealtest();
   } else if (str_eq(cmd, "pagetest")) {
     cmd_pagetest(rest);
   } else if (str_eq(cmd, "shutdown")) {
@@ -2784,6 +2893,18 @@ extern "C" int64_t compartment_main(Capability arg) {
           ? "[shell]    fs.* resolved by name; quota at /home received\n"
           : "[shell]    WARNING: no file system (fs.* or the /home quota is "
             "missing); file commands disabled\n");
+
+  // The sealer: granted to programs that ask, and used by `sealtest`. Not
+  // having it costs nothing else.
+  s_seal_mint = lookup_name(gate_invoke, naming_lookup, "seal.mint");
+  s_seal_derive = lookup_name(gate_invoke, naming_lookup, "seal.derive");
+  s_seal_seal = lookup_name(gate_invoke, naming_lookup, "seal.seal");
+  s_seal_unseal = lookup_name(gate_invoke, naming_lookup, "seal.unseal");
+  if (!capability_is_valid(s_seal_mint) || !capability_is_valid(s_seal_derive) ||
+      !capability_is_valid(s_seal_seal) || !capability_is_valid(s_seal_unseal)) {
+    out("[shell]    WARNING: seal.* not found by name; programs cannot be "
+        "granted sealing\n");
+  }
 
   // Programs: `run` needs the file system above, the view of `/bin`, and all
   // of these. The manifest asks `init` for every one; a system that will not

@@ -54,6 +54,11 @@ enum class OType : uint64_t {
     QuotaDisk        = 12,
     Compartment      = 13,
     Thread           = 14,
+
+    // Compartment-minted sealing types (CORE_DESIGN.md §2.3). Like QuotaSched
+    // and QuotaDisk these are managed in user space: the kernel mints the two
+    // authorities for `init` at boot and never seals with them itself; `init`
+    // delegates them to the `sealer` service (user/vseal.hpp).
     TypeKey          = 16,
     SealedObject     = 17,
 

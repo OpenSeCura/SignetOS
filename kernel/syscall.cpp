@@ -28,7 +28,6 @@
  */
 
 #include <signetos/compartment.hpp>
-#include <signetos/debug/inspect.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
@@ -197,7 +196,7 @@ extern "C" int sys_quota_thread_mem_destroy(
              : -1;
 }
 
-// --- Compartments, entry points and types ----------------------------------
+// --- Compartments and entry points -----------------------------------------
 
 // Marshalling only. This call has no status channel, so the detailed
 // reason is discarded and the caller sees NULL.
@@ -223,47 +222,6 @@ extern "C" uint64_t sys_fault_install(capability_compartment_t comp,
                                       capability_exec_t code) {
   return static_cast<uint64_t>(
       ::signetos::compartment::install_fault_handler(comp, code));
-}
-
-extern "C" capability_type_t sys_type_mint(capability_t record) {
-  return ::signetos::sealing::type_mint(record);
-}
-
-extern "C" capability_type_t sys_type_derive(capability_type_t key,
-                                             uint32_t permissions) {
-  return ::signetos::sealing::type_derive(key, permissions);
-}
-
-extern "C" capability_sealed_t sys_seal(capability_type_t key,
-                                        capability_data_t obj) {
-  // The header, at `obj`'s address, is written here, so it must be in RAM
-  // (vm.hpp, PAGING, KERNEL ACCESS).
-  const ::signetos::vm::ResidentHold hold(
-      ::signetos::capability_get_address(obj), sizeof(::signetos::Capability));
-  if (!hold.ok()) {
-    return nullptr;
-  }
-  capability_sealed_t out = ::signetos::sealing::user_seal(key, obj);
-  if (::signetos::capability_is_valid(out)) {
-    ::signetos::Capability hdr_key =
-        *reinterpret_cast<const ::signetos::Capability*>(obj);
-    ::signetos::inspect::assert_user_capability(hdr_key,
-                                                "sys_seal:header_key");
-  }
-  return out;
-}
-
-extern "C" capability_data_t sys_unseal(capability_type_t key,
-                                        capability_sealed_t handle) {
-  // The header, just below the payload, is read here (as for sys_seal).
-  const ::signetos::vm::ResidentHold hold(
-      ::signetos::capability_get_address(handle) -
-          sizeof(::signetos::Capability),
-      sizeof(::signetos::Capability));
-  if (!hold.ok()) {
-    return nullptr;
-  }
-  return ::signetos::sealing::user_unseal(key, handle);
 }
 
 // --- Threads ---------------------------------------------------------------

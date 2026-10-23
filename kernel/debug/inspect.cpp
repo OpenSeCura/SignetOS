@@ -114,11 +114,14 @@ void assert_user_capability(Capability cap, const char* site) {
   const uint64_t ct = sealing::type_of(cap);
   const bool sealed = sealing::is_sealed(cap);
 
-  // 1. Hardware sealing authority. Compartment-minted types (`sys_type_mint`)
-  //    are `OType::TypeKey` handles, not raw `Permit_Seal`/`Unseal`.
+  // 1. Hardware sealing authority. Compartment-minted types are `OType::TypeKey`
+  //    handles, not raw `Permit_Seal`/`Unseal`; the kernel never hands one of
+  //    those out except as the authorities below.
   //    Delegated raw Zyseal authorities must be unsealed, carry no
-  //    memory/execute/ASR permission, and cover only `QuotaSched`, `QuotaDisk`,
-  //    or spare OTypes above `OType::Trap`.
+  //    memory/execute/ASR permission, and cover only one of the user-managed
+  //    OTypes -- `QuotaSched`, `QuotaDisk`, `TypeKey`, `SealedObject` -- or
+  //    spare OTypes above `OType::Trap`. Never one the kernel authenticates
+  //    its own objects with.
   if ((perms & (perms::Seal | perms::Unseal)) != 0) {
     constexpr uint64_t kFirstUserOType = static_cast<uint64_t>(OType::Trap) + 1;
     constexpr uint64_t kForbidden = perms::Load | perms::Store | perms::Execute |
@@ -127,6 +130,8 @@ void assert_user_capability(Capability cap, const char* site) {
     const bool user_otype =
         (base == static_cast<uint64_t>(OType::QuotaSched) && len == 1) ||
         (base == static_cast<uint64_t>(OType::QuotaDisk) && len == 1) ||
+        (base == static_cast<uint64_t>(OType::TypeKey) && len == 1) ||
+        (base == static_cast<uint64_t>(OType::SealedObject) && len == 1) ||
         base >= kFirstUserOType;
     if (sealed || (perms & kForbidden) != 0 || len == 0 || !user_otype ||
         len > (kOTypeMax + 1 - base)) {
@@ -201,8 +206,8 @@ void assert_user_capability(Capability cap, const char* site) {
     return;
   }
 
-  // 7. Unsealed and user-sealed memory (`sys_unseal` turns the latter back into
-  //    a plain pointer) must lie inside the user allowlist: dynamic compartment
+  // 7. Unsealed and user-sealed memory (the sealer's `seal.unseal` turns the
+  //    latter back into a plain pointer) must lie inside the user allowlist: dynamic compartment
   //    memory, the device gigabyte (`vm::device_window`: `init` gets one window
   //    over it and carves the drivers' windows from the DTB), or a read-only
   //    slice of `.rodata` (embedded boot images). The direct map and the

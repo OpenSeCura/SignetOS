@@ -41,9 +41,8 @@
  *   7. `uart::s_lock`       leaf lock protecting console line output.
  *
  * Locks are acquired strictly in the order listed above (outermost to
- * innermost). Pure capability-derivation and read-only syscalls (`sys_seal`,
- * `sys_unseal`, `sys_type_mint`, `sys_type_derive`, `sys_thread_tid`) take
- * no lock at all.
+ * innermost). Pure capability-derivation and read-only syscalls
+ * (`sys_thread_tid`) take no lock at all.
  *
  * A revocation sweep refunds what quota nodes are owed after it has let go
  * of `revoke::s_lock`. It runs only inside `sys_revoke_query` (or the boot

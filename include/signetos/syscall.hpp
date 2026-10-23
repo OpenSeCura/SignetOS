@@ -47,8 +47,6 @@ using capability_compartment_t      = signetos::Capability;  // OTYPE_COMPARTMEN
 using capability_thread_t           = signetos::Capability;  // OTYPE_THREAD
 using Sentry                       = signetos::Sentry;
 using capability_sentry_t           = Sentry;                // OTYPE_SENTRY
-using capability_type_t             = signetos::Capability;  // OTYPE_TYPE_KEY
-using capability_sealed_t           = signetos::Capability;  // OTYPE_SEALED_OBJECT
 
 // --- sys_vm_allocate flags -------------------------------------------------
 
@@ -159,7 +157,7 @@ int sys_quota_thread_mem_destroy(
     capability_quota_thread_mem_t quota
 );
 
-// --- Compartments, entry points and types ----------------------------------
+// --- Compartments and entry points -----------------------------------------
 
 // Creates a protection domain funded from `mem_quota` and seeds its capability
 // table from `initial_capabilities`: slot 0 is the new compartment's own
@@ -212,32 +210,11 @@ uint64_t sys_fault_install(
     capability_exec_t        code
 );
 
-// Mints a type key naming `record`. The record's ADDRESS is the type identity;
-// its contents are never read.
-capability_type_t sys_type_mint(
-    capability_t record
-);
-
-// Re-issues `key` with a subset of its permissions. Permit_Store authorizes
-// sealing, Permit_Load authorizes unsealing.
-capability_type_t sys_type_derive(
-    capability_type_t key,
-    uint32_t          permissions
-);
-
-// Seals `obj` under `key`, storing a tagged copy of `key` in the object's
-// 16-byte header. Requires Permit_Store on the key.
-capability_sealed_t sys_seal(
-    capability_type_t key,
-    capability_data_t obj
-);
-
-// Opens `handle` if its header holds a tagged OTYPE_TYPE_KEY capability whose
-// address equals `key`'s. Requires Permit_Load on the key.
-capability_data_t sys_unseal(
-    capability_type_t   key,
-    capability_sealed_t handle
-);
+// Compartment-minted sealing types (type keys and sealed objects,
+// CORE_DESIGN.md §2.3) are not kernel calls. The user-space `sealer` service
+// (external/services/sealer.cpp) provides them as the `seal.*` entry points,
+// holding the `OType::TypeKey` and `OType::SealedObject` authorities that
+// `init` delegates to it; the mechanism itself is the library user/vseal.hpp.
 
 // --- Threads ---------------------------------------------------------------
 
@@ -338,10 +315,6 @@ namespace signetos::syscall {
   X(compartment_invoke)           \
   X(sentry)                       \
   X(fault_install)                \
-  X(type_mint)                    \
-  X(type_derive)                  \
-  X(seal)                         \
-  X(unseal)                       \
   X(thread_create)                \
   X(thread_exit)                  \
   X(thread_kill)                  \
@@ -372,8 +345,8 @@ constexpr size_t kSyscallCount = static_cast<size_t>(Id::Count);
 // `__signetos_switcher_return`, test image + production demo, -O2): the deepest
 // entry is `thread_create` at 672 bytes, then `sentry` 576, the two quota
 // derives 544, `vm_allocate` 496, `compartment_create` 464; everything else is
-// under 400 and `type_mint`/`unseal`/`thread_tid` touch none. 4096 is six times
-// the worst case. Re-measure before adding a syscall with large locals.
+// under 400 and `thread_tid` touches none. 4096 is six times the worst case.
+// Re-measure before adding a syscall with large locals.
 constexpr uint64_t SYSCALL_STACK_BYTES = 4096;
 
 // Builds the kernel's entry records from the running kernel PCC. Called once

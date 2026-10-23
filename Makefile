@@ -137,8 +137,9 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 #
 # `external/` (`EXT_SERVICES` and `EXT_APPS`): written into `disk.img` at build
 # time by `tools/signetfs.py` (never linked into the kernel image).
-#   - `external/services/`: root-owned system services (`naming`, `sched`,
-#     `trap_mgr`, `shell`) that `init` reads from `fs` out of `/` and loads.
+#   - `external/services/`: root-owned system services (`naming`, `sealer`,
+#     `sched`, `trap_mgr`, `shell`) that `init` reads from `fs` out of `/` and
+#     loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell reaches
 #     through a read-only disk quota rooted there and can `run`.
 BOOT_COMPS = init fs uart dma blk
@@ -147,13 +148,13 @@ BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))
 BOOT_BINS  = $(patsubst %,boot/%.bin,$(BOOT_COMPS))
 
-EXT_SERVICES     = naming sched trap_mgr shell
+EXT_SERVICES     = naming sealer sched trap_mgr shell
 EXT_SERVICE_SRCS = $(patsubst %,external/services/%.cpp,$(EXT_SERVICES))
 EXT_SERVICE_OBJS = $(patsubst %.cpp,%.o,$(EXT_SERVICE_SRCS))
 EXT_SERVICE_ELFS = $(patsubst %,external/services/%.elf,$(EXT_SERVICES))
 EXT_SERVICE_BINS = $(patsubst %,external/services/%.bin,$(EXT_SERVICES))
 
-EXT_APPS     = hello logo fault
+EXT_APPS     = hello logo fault sealtest
 EXT_APP_SRCS = $(patsubst %,external/apps/%.cpp,$(EXT_APPS))
 EXT_APP_OBJS = $(patsubst %.cpp,%.o,$(EXT_APP_SRCS))
 EXT_APP_ELFS = $(patsubst %,external/apps/%.elf,$(EXT_APPS))

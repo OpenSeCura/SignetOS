@@ -81,6 +81,26 @@ struct alignas(16) UartInterface {
 };
 
 // ----------------------------------------------------------------------------
+// Sealing service (`external/services/sealer.cpp`, user/vseal.hpp)
+// ----------------------------------------------------------------------------
+//   Capability seal.mint(Capability record)                 -> TypeKey, or null
+//   Capability seal.derive(Capability key, uint32_t perms)  -> TypeKey, or null
+//   Capability seal.seal(Capability key, Capability obj)    -> SealedObject, or null
+//   Capability seal.unseal(Capability key, Capability handle) -> payload, or null
+//
+// Compartment-minted sealing types (CORE_DESIGN.md §2.3). A key is the
+// 16-byte record it was minted from, sealed as `OType::TypeKey`: Permit_Store
+// on it authorises `seal`, Permit_Load authorises `unseal`, and `derive`
+// re-issues it with a subset of the two. A sealed object is a 16-byte header
+// (a tagged copy of the key) followed by the payload; the handle is sealed
+// as `OType::SealedObject` and the unsealed payload excludes the header. A
+// type dies with its record: once that memory is freed and swept, every key
+// and every object of the type is untagged. There is no status channel: a
+// refused call returns null, as the kernel calls these replaced did.
+//
+// Published by the sealer itself; `init` hands nothing back from it.
+
+// ----------------------------------------------------------------------------
 // Interrupt routing (`external/services/trap_mgr.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  trap_mgr.irq_route(Capability handler, uint64_t source) -> IRQ_*
@@ -459,6 +479,9 @@ constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 26;
 constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 27;
 constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 28;
 constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 29;
+constexpr size_t RW_SLOT_SEALER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 30;
+constexpr size_t RW_SLOT_SEALER_COMP         = RW_SLOT_PROVISIONED_BASE + 31;
+constexpr size_t RW_SLOT_SEALER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 32;
 
 __attribute__((always_inline)) inline constexpr size_t syscall_slot(
     syscall::Id id) {

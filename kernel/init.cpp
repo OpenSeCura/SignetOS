@@ -130,8 +130,12 @@ Status launch(Capability system_quota, Capability thread_quota,
     debug::boot_capability("syscall", syscall::gate(static_cast<syscall::Id>(i)));
   }
   init_seeds[idx++] = thread_quota;
+  // The authorities of the user-managed OTypes, for `init` to hand to their
+  // managers: the scheduler, the file system, and the `sealer` (its two).
   init_seeds[idx++] = sealing::authority_for(OType::QuotaSched);
   init_seeds[idx++] = sealing::authority_for(OType::QuotaDisk);
+  init_seeds[idx++] = sealing::authority_for(OType::TypeKey);
+  init_seeds[idx++] = sealing::authority_for(OType::SealedObject);
 
   // Check the init seed table: these kernel-minted authorities
   // are written straight into `init`'s capability table.

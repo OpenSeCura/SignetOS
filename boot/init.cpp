@@ -53,18 +53,20 @@
  *      disk; its handshake returns the root `quota_disk` handle and its entry
  *      points. From here on every image is a file read off the disk.
  *   5. `naming`: `init` publishes `uart` and `fs.*` on their behalf.
- *   6. `sched`: hands `blk` the scheduler's entries (the disk is polled until
+ *   6. `sealer`: the one holder of the `TypeKey` and `SealedObject`
+ *      authorities, which publishes `seal.*` (user/vseal.hpp).
+ *   7. `sched`: hands `blk` the scheduler's entries (the disk is polled until
  *      then).
- *   7. `trap_mgr`: routes the UART's and the block device's PLIC sources to
+ *   8. `trap_mgr`: routes the UART's and the block device's PLIC sources to
  *      their drivers' interrupt entries.
- *   8. `shell`: its manifest asks for its own quotas (VM, thread memory, a
+ *   9. `shell`: its manifest asks for its own quotas (VM, thread memory, a
  *      `quota_sched` node), `/home` and `/bin`, and the system's root quotas,
  *      which it holds from then on; its thread is made from those quotas and
  *      registered with the scheduler. Then, if `blk` found swap, the pager's
  *      thread, and paging on. Last, so that every compartment `init` started
  *      stays in RAM (vm.hpp, PAGING): what pages is what the shell runs.
- *   9. Records every handle in its own table for the kernel's tests, then
- *  10. scrubs every authority out of that table and exits: `init` is
+ *  10. Records every handle in its own table for the kernel's tests, then
+ *  11. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
  *      runs on.
  */
@@ -188,16 +190,16 @@ struct Launcher {
   Capability fs_query;
   Capability fs_node_funding;  // the QuotaVm that pays for the nodes
 
-  // The scheduler (step 6), for ROOT_SCHED and QUOTA_SCHED entries: its root
+  // The scheduler (step 7), for ROOT_SCHED and QUOTA_SCHED entries: its root
   // quota, `sched.quota_derive`, and the QuotaVm that pays for the nodes.
   Capability root_sched;
   Capability sched_derive;
   Capability sched_node_funding;
 
-  // Recorded for step 9 (the kernel's exec tests tear the system down through
+  // Recorded for step 10 (the kernel's exec tests tear the system down through
   // `init`'s table): the thread-memory quota, the `quota_sched` node and the
   // ADMIN disk node the shell asked for. The first two are also what the
-  // shell's thread is paid from and registered under (step 8).
+  // shell's thread is paid from and registered under (step 9).
   Capability shell_t_quota;
   Capability shell_sched_quota;
   Capability shell_disk_quota;
@@ -391,7 +393,7 @@ struct Launcher {
   }
 
   // QUOTA_SCHED: a node under the scheduler's root with the bandwidth and
-  // class asked for -- so not before the scheduler is up (step 6). The node
+  // class asked for -- so not before the scheduler is up (step 7). The node
   // page is paid from `sched_node_funding`.
   Capability sched_node(const init::ManifestEntry& e) {
     if (!capability_is_valid(root_sched) || !capability_is_valid(sched_derive) ||
@@ -468,6 +470,10 @@ struct Launcher {
             return rw[init::RW_SLOT_SEAL_SCHED];
           case OType::QuotaDisk:
             return rw[init::RW_SLOT_SEAL_DISK];
+          case OType::TypeKey:
+            return rw[init::RW_SLOT_SEAL_TYPE_KEY];
+          case OType::SealedObject:
+            return rw[init::RW_SLOT_SEAL_OBJECT];
           default:
             return nullptr;
         }
@@ -650,7 +656,7 @@ extern "C" int64_t compartment_main(Capability arg) {
 
   // Every kernel entry is an `OType::EntryPoint` handle passed to the
   // switcher (`invoke`, the only sentry a compartment jumps to). A local copy:
-  // the launcher is scrubbed in step 10, and the exit comes after.
+  // the launcher is scrubbed in step 11, and the exit comes after.
   const Capability invoke = L.invoke;
   auto comp_invoke = reinterpret_cast<FnInvoke>(invoke);
   auto thread_create = [&](auto... a) {
@@ -707,13 +713,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // Its manifest asks for the UART window, `sentry` and the switcher: it
   // drives the device and nothing else. Its interrupt entry is routed to it
-  // by `trap_mgr` (step 7), and `compartment_invoke` is how it notifies
+  // by `trap_mgr` (step 8), and `compartment_invoke` is how it notifies
   // whoever is waiting for input.
   const Started uart = L.start("uart", manifest->uart_img, 0);
   // The first word to `uart` must be the console-input handshake: it mints
   // `uart.read` and `uart.irq` for whoever calls first and never again
   // (abi.hpp, `UartInterface`), and only the shell's manifest asks for
-  // `read`; `irq` goes nowhere but the interrupt route set up in step 7.
+  // `read`; `irq` goes nowhere but the interrupt route set up in step 8.
   init::UartInterface uart_if{};
   if (capability_is_valid(uart.sentry)) {
     comp_invoke(uart.sentry, bounded(&uart_if));
@@ -751,8 +757,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 3. `blk`: the block driver
   // =========================================================================
   // There is no scheduler for it to sleep in yet (that is a file on its own
-  // disk): it polls until step 6 hands it the scheduler's entries, and its
-  // interrupt entry is routed to it by `trap_mgr` in step 7.
+  // disk): it polls until step 7 hands it the scheduler's entries, and its
+  // interrupt entry is routed to it by `trap_mgr` in step 8.
   const Started blk = L.start("blk", manifest->blk_img, 0);
   // Nobody after `blk` gets the pager's calls: with them, whoever holds them
   // reads every page that goes to swap, and says what comes back.
@@ -882,7 +888,27 @@ extern "C" int64_t compartment_main(Capability arg) {
   publish("fs.list", fs_if.list);
 
   // =========================================================================
-  // 6. `sched`
+  // 6. `sealer`
+  // =========================================================================
+  // Its manifest is the only one that asks for the `TypeKey` and
+  // `SealedObject` authorities: it is the one compartment that can mint type
+  // keys and open sealed objects (user/vseal.hpp). It publishes `seal.*`
+  // itself and hands nothing back; the shell grants those entries to the
+  // programs that ask for them.
+  const Started sealer = L.start_file("sealer.bin");
+  if (capability_is_valid(sealer.sentry)) {
+    if (comp_invoke(sealer.sentry, nullptr) != 0) {
+      say("[init]     WARNING: the sealer did not come up; compartment-minted "
+          "sealing is unavailable\n");
+    }
+  }
+  // The authorities go to nobody else: once the sealer has them, `init`'s
+  // copies are inert until the scrub (step 11), which clears them.
+  rw[init::RW_SLOT_SEAL_TYPE_KEY] = nullptr;
+  rw[init::RW_SLOT_SEAL_OBJECT] = nullptr;
+
+  // =========================================================================
+  // 7. `sched`
   // =========================================================================
   const Started sched = L.start_file("sched.bin");
   // `sched` hands back the root `quota_sched` handle, its dispatcher entry
@@ -913,7 +939,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // Scheduler nodes are paid for by their creator: this quota funds the
-  // nodes `init` derives for QUOTA_SCHED entries (the shell's, step 8).
+  // nodes `init` derives for QUOTA_SCHED entries (the shell's, step 9).
   L.sched_node_funding = L.vm_quota(64 * 1024);
 
   // Now that there is a scheduler, `blk` can sleep in it instead of polling.
@@ -950,7 +976,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // =========================================================================
-  // 7. `trap_mgr`
+  // 8. `trap_mgr`
   // =========================================================================
   // Its manifest is the only one that asks for the PLIC, and `init` installs
   // its handler for `IRQ_M_EXT`: it decides which handler each device
@@ -1001,7 +1027,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // =========================================================================
-  // 8. `shell`
+  // 9. `shell`
   // =========================================================================
   // The shell's manifest asks for its own quotas -- the VM it lives on, the
   // thread memory it and its workers run on, and its CPU bandwidth (half the
@@ -1010,7 +1036,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   // an ADMIN node with everything the system's images leave free, `/bin` as a
   // budget-less read-only view of the programs (abi.hpp, "File system") --
   // and the system's root quotas: `init` exits in a moment and scrubs its own
-  // table (step 10), so the shell is their long-lived holder. All of it is
+  // table (step 11), so the shell is their long-lived holder. All of it is
   // granted by `Launcher::grant` as the image starts; what is left here is
   // its one-time setup and its thread.
   const Started shell = L.start_file("shell.bin");
@@ -1092,7 +1118,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // =========================================================================
-  // 9. Record all provisioned handles in `init`'s capability table
+  // 10. Record all provisioned handles in `init`'s capability table
   // =========================================================================
   rw[init::RW_SLOT_UART_QUOTA] = uart.quota;
   rw[init::RW_SLOT_UART_COMP] = uart.comp;
@@ -1124,19 +1150,22 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[init::RW_SLOT_BLK_SENTRY] = blk.sentry;
   rw[init::RW_SLOT_FS_NODE_FUNDING] = L.fs_node_funding;
   rw[init::RW_SLOT_SHELL_DISK_QUOTA] = L.shell_disk_quota;
+  rw[init::RW_SLOT_SEALER_QUOTA] = sealer.quota;
+  rw[init::RW_SLOT_SEALER_COMP] = sealer.comp;
+  rw[init::RW_SLOT_SEALER_SENTRY] = sealer.sentry;
   // Read back by the kernel once this thread exits (`init::launch` step 6).
   rw[init::RW_SLOT_SCHED_RUN] = sched_run;
 
   say("[init]     All core compartments provisioned and verified.\n");
 
   // =========================================================================
-  // 10. Scrub: nothing runs in `init` after this thread exits, so nothing
+  // 11. Scrub: nothing runs in `init` after this thread exits, so nothing
   //     here may still be able to act. Every seed the kernel gave it -- the
   //     root VM quota, every kernel gate, every IRQ authority,
-  //     the root thread-memory quota and the two sealing authorities -- is
+  //     the root thread-memory quota and the four sealing authorities -- is
   //     cleared from the table, and the launcher's copies of everything it
   //     granted with them. What stays is inert without a gate: the handles
-  //     recorded in step 9 and `RW_SLOT_SCHED_RUN`, which the kernel reads
+  //     recorded in step 10 and `RW_SLOT_SCHED_RUN`, which the kernel reads
   //     next. The locals this thread still holds die with its stack.
   // =========================================================================
   for (size_t s = compartment::RW_SLOT_SEED_BASE; s < init::RW_SLOT_SCHED_RUN;

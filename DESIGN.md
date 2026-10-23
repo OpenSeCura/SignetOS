@@ -162,8 +162,8 @@ Zyseal, but this is an area of active investigation!) to distinguish the
 handles of its resource managers. Each hardware type belongs to the manager of
 that resource, which holds the authority to seal and unseal it. The kernel
 delegates `QuotaSched` and `QuotaDisk` to the user-space scheduler and
-filesystem via `init` (§2.8, §5.8), and holds the remaining hardware types
-itself.
+filesystem, and `TypeKey` and `SealedObject` to the sealer, via `init` (§2.8,
+§5.8), and holds the remaining hardware types itself.
 
 Sealed types managed by the kernel:
 
@@ -174,8 +174,6 @@ Sealed types managed by the kernel:
 | `QuotaThreadMem` | `capability_quota_thread_mem_t` | Budget for thread stacks and thread state (§2.4). |
 | `Compartment` | `capability_compartment_t` | Handle to a compartment (§2.2). |
 | `Thread` | `capability_thread_t` | Handle to a thread; Load → switch to it, Store → kill it. |
-| `TypeKey` | `capability_type_t` | Compartment-minted type key (§2.7). |
-| `SealedObject` | `capability_sealed_t` | Compartment-sealed object (§2.7). |
 | `EntryPoint` | `Sentry` | Sealed pointer to an entry record describing a compartment or kernel entry point (§2.5). |
 | `Trap` | — | Per-vector trap authority minted at boot (§3.6). |
 
@@ -186,6 +184,8 @@ seal and unseal them:
 | --- | --- | --- |
 | `QuotaSched` | scheduler | CPU-bandwidth quotas (§2.4, §2.6). |
 | `QuotaDisk` | filesystem | Disk quotas and open-file handles (§2.4, §5.7.3). |
+| `TypeKey` | sealer | Compartment-minted type key (§2.7). |
+| `SealedObject` | sealer | Compartment-sealed object (§2.7). |
 | `QuotaHeap` | heap allocator | Reserved for the heap allocator (§5.7.1), which does not exist yet. |
 
 **Permission convention on handles:** `Permit_Load` is the *operational*
@@ -588,18 +588,23 @@ they are never picked, and only a thread that runs could move them to a node.
 ### 2.7 Compartment-minted sealing types
 
 Hardware object types are scarce and assigned at boot. Any compartment can
-still define its own object types, all sharing the one hardware type
-`OType::SealedObject` (syscalls in §5.4).
+still define its own object types, all sharing two hardware types,
+`OType::TypeKey` and `OType::SealedObject`. Both belong to the user-space
+**`sealer`** service (`external/services/sealer.cpp`), which `init` grants
+their sealing authorities to and which offers the four operations below as the
+entry points `seal.mint`, `seal.derive`, `seal.seal` and `seal.unseal`
+(`user/abi.hpp`). The mechanism itself is the library `user/vseal.hpp`; the
+kernel's only part in it is minting the two authorities at boot.
 
 1. **Type records.** A type is named by the address of a small record in the
-   owner's own memory. The kernel never allocates it and never reads it.
-   Uniqueness follows from ownership, so there is no registry, no global
-   counter and no limit on how many types a compartment may define.
-2. **Type keys.** `sys_type_mint` returns the record capability, bounded and
-   sealed as `TypeKey`. The seal proves the kernel issued the key and stops a
-   holder from retargeting it. `Permit_Store` authorises sealing,
-   `Permit_Load` authorises unsealing, and `sys_type_derive` restricts these
-   rights.
+   owner's own memory. Neither the kernel nor the sealer allocates it or
+   reads it. Uniqueness follows from ownership, so there is no registry, no
+   global counter and no limit on how many types a compartment may define.
+2. **Type keys.** `seal.mint(record)` returns the record capability, bounded
+   and sealed as `TypeKey`. The seal proves the sealer issued the key and
+   stops a holder from retargeting it. `Permit_Store` authorises sealing,
+   `Permit_Load` authorises unsealing, and `seal.derive(key, permissions)`
+   restricts these rights.
 3. **Object layout.** A sealed object is a header followed by the payload. The
    sealed handle covers header and payload. The unsealed payload capability
    covers the payload alone, so a holder that can open an object cannot retype
@@ -615,14 +620,14 @@ still define its own object types, all sharing the one hardware type
    so it could overwrite the ID. A tagged capability sealed as `TypeKey`
    cannot be written by hand, because anything stored manually lands
    untagged.
-5. **Sealing.** `sys_seal(key, obj)` requires `Permit_Store` on the key and a
+5. **Sealing.** `seal.seal(key, obj)` requires `Permit_Store` on the key and a
    suitably aligned, capability-storing `obj` that spans header and payload.
-   The kernel writes a permissionless copy of the key into the header and
-   returns the sealed handle.
-6. **Unsealing.** `sys_unseal(key, handle)` requires `Permit_Load` on the key.
-   It returns the payload only if the header holds a **tagged** `TypeKey`
+   The sealer writes a permissionless copy of the key into the header,
+   through the caller's own capability, and returns the sealed handle.
+6. **Unsealing.** `seal.unseal(key, handle)` requires `Permit_Load` on the
+   key. It returns the payload only if the header holds a **tagged** `TypeKey`
    whose address equals the key's. That is one capability load and a few
-   register checks, and uses no kernel memory.
+   register checks, and uses no memory of the sealer's.
 7. **Keep typed memory private.** Anyone with a capability to an object's
    backing memory can read its header, and anyone whose capability covers the
    record can mint the same type. Seal only memory you allocated.
@@ -638,9 +643,20 @@ still define its own object types, all sharing the one hardware type
     can always open its child's sealed objects. **Sealing protects a
     compartment from its peers, not from its creator.** Nothing provisions
     types this way yet.
+11. **The sealer's trust boundary.** Holding the `TypeKey` authority, the
+    sealer could mint a key for any record and open any object it is handed,
+    so its clients trust it for the integrity of their type system -- as they
+    trust the scheduler for CPU time. It holds no capability to a client's
+    memory beyond the object each call passes, no quota and no interrupt, so
+    the rest of the system does not depend on it at all. Compared with the
+    kernel calls it replaced, its entries run on the caller's thread with the
+    caller's interrupt state, and an object on a page out in swap is faulted
+    in rather than refused.
 
-Users today: none in the default image (`sched` and `fs` now use their
-dedicated hardware `OType`s; see §2.1, §2.4).
+Users today: none in the default image (`sched` and `fs` use their dedicated
+hardware `OType`s; see §2.1, §2.4). The shell grants `seal.*` to a program
+whose manifest asks for them; `external/apps/sealtest.cpp`, and the shell's
+`sealtest` command, exercise every point above.
 
 ### 2.8 Images, manifests and the loader
 
@@ -690,7 +706,8 @@ header points to.
   * `QUOTA_THREAD`: a thread-memory quota.
   * `QUOTA_SCHED`: a `quota_sched` node (budget, period, class).
   * `ROOT`: one of the system's root quotas.
-  * `OTYPE`: a hardware sealing authority (`OType::QuotaSched`, `OType::QuotaDisk`).
+  * `OTYPE`: a hardware sealing authority (`OType::QuotaSched`,
+    `OType::QuotaDisk`, `OType::TypeKey`, `OType::SealedObject`).
 
   Only `init` can meet the hardware and root kinds. The `QUOTA_*` kinds are
   how a compartment comes to hold its own quotas: its launcher derives each
@@ -1246,7 +1263,7 @@ status.
 | `sys_quota_thread_mem_derive(parent, amount_bytes, permissions)` | As in 5.2, on the thread-memory tree. |
 | `int sys_quota_thread_mem_destroy(quota)` | As in 5.2, on the thread-memory tree. Threads the subtree funded keep running; each node is freed when the last of its threads has exited. |
 
-### 5.4 Compartments, entry points and types
+### 5.4 Compartments and entry points
 
 | Syscall | Behaviour |
 | --- | --- |
@@ -1255,10 +1272,12 @@ status.
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
 | `Sentry sys_sentry(comp, code)` | §2.5. Returns the `EntryPoint` handle. |
 | `uint64_t sys_fault_install(comp, code)` | Makes `code` (in `comp`'s own memory) `comp`'s fault handler, replacing any earlier one. Returns a `Status` (§3.6). |
-| `capability_type_t sys_type_mint(record)` | §2.7. Returns the type key with both rights, or NULL. |
-| `capability_type_t sys_type_derive(key, permissions)` | Re-issues `key` with a subset of its unseal (Load) and seal (Store) rights. |
-| `capability_sealed_t sys_seal(key, obj)` | §2.7. Returns the `SealedObject` handle, or NULL. |
-| `capability_data_t sys_unseal(key, handle)` | §2.7. Returns the payload, or NULL. |
+
+Compartment-minted sealing types (§2.7) are not kernel calls: the `sealer`
+service's `seal.mint`, `seal.derive`, `seal.seal` and `seal.unseal` entry
+points (`user/abi.hpp`) take their place, with the same arguments and the same
+null-on-refusal results the former `sys_type_mint`, `sys_type_derive`,
+`sys_seal` and `sys_unseal` had.
 
 ### 5.5 Threads
 
