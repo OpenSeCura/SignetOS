@@ -2,7 +2,7 @@
 
 SignetOS is a single-address-space, single-privilege-level capability microkernel
 for CHERI architectures. Isolation is enforced by capabilities alone; the MMU is
-used for address translation and backing memory, never for protection.
+used for address translation, never for protection.
 
 ---
 
@@ -18,17 +18,18 @@ used for address translation and backing memory, never for protection.
 
 **Kernel vs. user space.** The kernel provides only mechanisms requiring
 system-register or sealing-root access: the domain switcher, virtual memory,
-memory and thread-memory quotas, capability sealing, DMA mediation, revocation
-sweeps, and trap delivery. Scheduling, filesystems, drivers, interrupt routing,
-naming, and program loading all run as unprivileged compartments holding only
+memory and thread-memory quotas, sealing of its own handles, contiguous DMA
+allocation (`FLAG_DMA`), revocation sweeps, and trap delivery. Scheduling,
+filesystems, drivers, interrupt routing, naming, compartment-minted sealing
+types, and program loading all run as unprivileged compartments holding only
 what is in their capability tables.
 
 **Bootstrap.** At boot, the kernel creates one compartment (`init`) seeded with
 the root quotas, all syscall gates, device windows, and service sealing
 authorities. `init` starts the core services (console, block driver, filesystem,
-naming, scheduler, interrupt manager, shell), grants each only what its manifest
-requests, hands the scheduler's dispatch entry to the kernel, clears its own
-table, and exits.
+naming, sealing service, scheduler, interrupt manager, shell), grants each only
+what its manifest requests, hands the scheduler's dispatch entry to the kernel,
+clears its own table, and exits.
 
 ---
 
@@ -37,9 +38,10 @@ table, and exits.
 ### 2.1 Hardware capability types
 
 Each hardware object type belongs to a resource manager, which holds the
-authority to seal and unseal it. The kernel delegates CPU-quota and disk-quota
-etc types (sealing/unsealing capabilities) to the user-space scheduler and
-filesystem at boot and holds the rest itself.
+authority to seal and unseal it. The kernel delegates the CPU-quota, disk-quota,
+type-key and sealed-object types (sealing/unsealing capabilities) to the
+user-space scheduler, filesystem and sealing service at boot and holds the rest
+itself.
 
 Sealed types managed by the kernel:
 
@@ -58,8 +60,8 @@ Sealed types managed by user-space services:
 | --- | --- | --- |
 | **CPU quota** | scheduler | Hierarchical CPU-bandwidth budget (§6, §7). |
 | **Disk quota** | filesystem | Hierarchical storage budget and open-file handles (§6). |
-| **Type key** | | Compartment-minted type key (§2.3). (WIP) |
-| **Sealed object** | | Compartment-sealed object (§2.3). (WIP) |
+| **Type key** | sealer | Compartment-minted type key (§2.3). |
+| **Sealed object** | sealer | Compartment-sealed object (§2.3). |
 
 ### 2.2 Global vs. local capabilities
 
@@ -77,8 +79,11 @@ revocation sweep (§8).
 ### 2.3 Compartment-minted sealing types
 
 Hardware object types are scarce and fixed at boot. Any compartment can mint its
-own object types dynamically, all sharing the hardware **Sealed object** type which is
-controlled by the sealing compartment (currently the kernel but moving out of the kernel):
+own object types dynamically, all sharing the hardware **Type key** and
+**Sealed object** types. Both belong to one user-space service, the **sealer**,
+which holds their authorities and offers mint, derive, seal and unseal as
+ordinary entry points; the kernel neither mints keys nor opens objects, and the
+mechanism needs no kernel memory:
 
 1. **Type records and keys.** A type is named by the address of a small record
    in the owner's memory. Minting returns that capability bounded and sealed as
@@ -100,6 +105,14 @@ controlled by the sealing compartment (currently the kernel but moving out of th
 4. **Creator trust boundary.** A creator can mint types for a child and seed the
    keys into its table. **Sealing protects a compartment from its peers, not
    from its creator.**
+5. **Sealer trust boundary.** Whoever holds the type-key authority can mint a
+   key for any record address, so the sealer could open any object it is
+   handed. Its clients trust it for the integrity of their type system, as they
+   trust the scheduler for CPU time; it holds no capability to any client's
+   memory beyond the object each call passes, no quota, and no interrupt, so
+   it can harm nothing else. Its calls run on the caller's thread with the
+   caller's interrupt state, and an object on a swapped-out page is faulted in
+   rather than refused.
 
 ---
 
@@ -328,8 +341,8 @@ into the scheduler whenever a thread exits.
   page on the disk is checked for revoked capabilities and if present the corresponding 
   bit in the bitmap is cleared so that the capability is not reconstructed when paged in.
 * **Bounded DMA:** drivers never see physical addresses or writable descriptor
-  rings; the kernel confines DMA to a fixed window and mediates
-  descriptors.
+  rings; an isolated `dma` compartment confines DMA to a fixed window and
+  configures static descriptor chains at boot.
 
 ---
 
@@ -357,3 +370,55 @@ faulted**, never to a global handler (unless handled by the kernel like a page f
     space is full, or the handler itself faults. The frame is scrubbed and
     popped, returning an error to the caller (or ending the thread at its root).
     Only a fault in the kernel halts the machine.
+
+---
+
+## 10. Privilege by Sealed Type
+
+Everything a compartment can do beyond accessing its own memory comes from a
+sealed capability in its table. So the privilege of the system can be read off
+three questions per type: who can seal it (holds the sealing authority), who
+holds instances, and what an instance lets its holder do.
+
+### 10.1 The types
+
+| Type | Sealed by | Who holds instances | What an instance lets the holder do |
+| --- | --- | --- | --- |
+| **Sentry** (switcher gate) | kernel | every compartment | Make a call. Carries no authority of its own: every call also needs an entry-point handle. |
+| **Entry point** (kernel syscall gate) | kernel; all seeded into `init`, which hands each out per manifest | see §10.2 | Invoke that syscall. Only a gate available to a compartment can be called. |
+| **Entry point** (service entry) | the exporting service, over its own code; handed out through `naming` or returned to `init` in some cases (implementation detail right now) | the clients that named it in their manifest AND the policy of the compartment that lauched it allowed it | Invoke that entry point via the switcher. |
+| **Compartment** | kernel | the compartment itself and its launcher | Name the compartment to the syscalls that act on it: allocate memory it owns, create its entry points, install its fault handler, revoke its sub-ranges, destroy it. |
+| **Thread** | kernel | its creator; the scheduler (passed in at registration) | Switch to it (with `thread_switch`), kill it (with `thread_kill`). |
+| **VM quota** | kernel; root seeded into `init` | one per service that allocates (`fs`, `sched`, `trap_mgr`, `shell` etc); the shell derives a sub-quota per program | Allocate memory against it, derive and destroy children. A leak lets the holder spend or close that budget, never read or write anyone's memory. |
+| **Thread-memory quota** | kernel; root seeded into `init` | `shell` etc, anyone who would need to create threads. | Fund thread descriptors and stacks (with `thread_create`). |
+| **CPU quota** | **scheduler** (authority handed to it by `init`) | root in the scheduler; the shell holds its own node and derives a child per worker and program | Register threads under it, derive children, query. |
+| **Disk quota / file handle** | **filesystem** (authority handed to it by `init`) | `fs` holds the root; `shell` holds `/home` (read-write) and `/bin` (read-only); each program gets a node under `/home` plus any files the shell opens for it | Filesystem operations confined to the node's directory subtree, with the handle's rights. A leak exposes exactly that subtree. |
+| **Type key / Sealed object** | **sealer** (authorities handed to it by `init`) | nobody in the default image | Seal and unseal objects of one compartment-defined type. A leaked key is forgery within that type only. |
+
+After `init` exits, the only places a handle can be sealed are the kernel (its
+own types), the scheduler (CPU quota), the filesystem (disk quota) and the
+sealer (type keys and sealed objects). Future types such as network or credential quotas will add to these types.
+
+### 10.2 Kernel gates by holder
+
+Which syscall gates a compartment holds decides what it can ask the kernel to
+do. As granted by `init` today:
+
+| Gate(s) | Held by | What it allows |
+| --- | --- | --- |
+| `compartment_invoke` | everyone | The switcher gate itself. |
+| `sentry` | every service; no program | Create entry points to export. |
+| `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `trap_mgr`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
+| `thread_switch`, `thread_tid` | `sched` | The only compartment that can run a thread. |
+| `thread_kill` | `sched` | End a thread it holds a handle to. |
+| `compartment_create`, `compartment_destroy`, `thread_create`, `fault_install`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. |
+| `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Still evolving WIP.|
+| `revoke_query` | `shell` | Ask for a rate-limited sweep. |
+| `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: binding hardware IRQs, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
+| `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |
+
+Beyond gates, three compartments hold raw hardware: `uart` its device window,
+`trap_mgr` the interrupt controller, and `dma` the virtio window and the DMA
+arena. `dma` runs once, writes the only device-visible physical addresses, and
+hands `blk` views that reach neither the descriptor table nor the queue
+registers.
