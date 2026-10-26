@@ -55,10 +55,11 @@
  *   5. `naming`: `init` publishes `uart` and `fs.*` on their behalf.
  *   6. `sealer`: the one holder of the `TypeKey` and `SealedObject`
  *      authorities, which publishes `seal.*` (user/vseal.hpp).
- *   7. `sched`: hands `blk` the scheduler's entries (the disk is polled until
- *      then).
- *   8. `trap_mgr`: routes the UART's and the block device's PLIC sources to
- *      their drivers' interrupt entries.
+ *   7. `sched`: the scheduler, and the interrupt handler's thread, created
+ *      on its interrupt entry and installed with the kernel.
+ *   8. Device interrupts: the UART's and the block device's PLIC sources are
+ *      routed through the scheduler, and their drivers sleep on them from
+ *      then on (the disk is polled until then).
  *   9. `shell`: its manifest asks for its own quotas (VM, thread memory, a
  *      `quota_sched` node), `/home` and `/bin`, and the system's root quotas,
  *      which it holds from then on; its thread is made from those quotas and
@@ -635,8 +636,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_thread_create =
       rw[init::syscall_slot(syscall::Id::thread_create)];
   Capability gate_thread_exit = rw[init::syscall_slot(syscall::Id::thread_exit)];
-  // Installs the handler for one of the two interrupts that leave the kernel
-  // (irq.hpp, INTERRUPT HANDLERS). Only `init` holds this gate.
+  // Installs the interrupt handler's thread (irq.hpp, THE INTERRUPT HANDLER).
+  // Only `init` holds this gate.
   const Capability gate_trap_install =
       rw[init::syscall_slot(syscall::Id::trap_install)];
   // Turns paging on, once the shell is up. Out of the table at once, so that
@@ -645,10 +646,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   const Capability gate_page_setup =
       rw[init::syscall_slot(syscall::Id::page_setup)];
   rw[init::syscall_slot(syscall::Id::page_setup)] = nullptr;
-  auto install_irq = [&](uint64_t irq, Capability handler) -> bool {
+  auto install_irq = [&](Capability thread) -> bool {
     using Fn = decltype(&sys_trap_install);
-    return sealing::is_sealed_as(OType::EntryPoint, handler) &&
-           syscall::call<Fn>(L.invoke, gate_trap_install, irq, handler) ==
+    return sealing::is_sealed_as(OType::Thread, thread) &&
+           syscall::call<Fn>(L.invoke, gate_trap_install, thread) ==
                static_cast<uint64_t>(Status::Ok);
   };
 
@@ -712,14 +713,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 1. `uart`: the console
   // =========================================================================
   // Its manifest asks for the UART window, `sentry` and the switcher: it
-  // drives the device and nothing else. Its interrupt entry is routed to it
-  // by `trap_mgr` (step 8), and `compartment_invoke` is how it notifies
-  // whoever is waiting for input.
+  // drives the device and nothing else. From step 8 on it sleeps on its
+  // interrupt, through the scheduler.
   const Started uart = L.start("uart", manifest->uart_img, 0);
   // The first word to `uart` must be the console-input handshake: it mints
   // `uart.read` and `uart.irq` for whoever calls first and never again
   // (abi.hpp, `UartInterface`), and only the shell's manifest asks for
-  // `read`; `irq` goes nowhere but the interrupt route set up in step 8.
+  // `read`; `irq` is how step 8 hands it the wait for its interrupt.
   init::UartInterface uart_if{};
   if (capability_is_valid(uart.sentry)) {
     comp_invoke(uart.sentry, bounded(&uart_if));
@@ -757,16 +757,16 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 3. `blk`: the block driver
   // =========================================================================
   // There is no scheduler for it to sleep in yet (that is a file on its own
-  // disk): it polls until step 7 hands it the scheduler's entries, and its
-  // interrupt entry is routed to it by `trap_mgr` in step 8.
+  // disk): it polls until step 8 hands it the scheduler's entries and the
+  // wait for its device's interrupt.
   const Started blk = L.start("blk", manifest->blk_img, 0);
   // Nobody after `blk` gets the pager's calls: with them, whoever holds them
   // reads every page that goes to swap, and says what comes back.
   rw[init::syscall_slot(syscall::Id::page_next)] = nullptr;
   rw[init::syscall_slot(syscall::Id::page_done)] = nullptr;
   // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what `dma`
-  // set up for it and hands back `read`, `write` and `irq`, the pager's
-  // entries, and how much of the disk is swap.
+  // set up for it and hands back `read` and `write`, the pager's entries,
+  // and how much of the disk is swap.
   init::BlkInterface blk_if;
   zero_bytes(&blk_if, sizeof(blk_if));  // too big for `{}` (zero_bytes)
   blk_if.buf = dma_if.buf;
@@ -910,21 +910,37 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 7. `sched`
   // =========================================================================
+  // Its manifest is the only one that asks for the PLIC: it owns device
+  // interrupts as well as the CPU.
   const Started sched = L.start_file("sched.bin");
   // `sched` hands back the root `quota_sched` handle, its dispatcher entry
-  // point and its tick handler; it publishes its operations ("sched.*")
-  // itself.
-  init::SchedInterface sched_if{};
+  // point, its interrupt entry and `irq_route`; it publishes its operations
+  // ("sched.*") itself.
+  init::SchedInterface sched_if;
+  zero_bytes(&sched_if, sizeof(sched_if));  // too big for `{}` (zero_bytes)
   sched_if.timebase_hz = board.timebase_hz;
+  sched_if.plic_ndev = board.plic_ndev;
+  for (size_t h = 0; h < platform::MAX_HARTS; ++h) {
+    sched_if.plic_m_context[h] = board.plic_m_context[h];
+  }
   if (capability_is_valid(sched.sentry)) {
     comp_invoke(sched.sentry, bounded(&sched_if));
   }
   L.root_sched = sched_if.root_quota;
   L.offer("sched", sched.sentry);
-  // The kernel tick goes to the scheduler, and to nobody else.
-  if (!install_irq(trap::IRQ_M_TIMER, sched_if.tick)) {
-    say("[init]     WARNING: the scheduler's tick handler is not installed; "
-        "threads will not be preempted\n");
+  // Every interrupt goes to the scheduler, and to nobody else: it wakes a
+  // thread of its own on its interrupt entry, which this hart holds from the
+  // install on, so nothing ever switches to it (thread.hpp, THE INTERRUPT
+  // HANDLER).
+  const Capability irq_quota = L.tmem_quota(64 * 1024);
+  const Capability irq_thread =
+      capability_is_valid(irq_quota) &&
+              sealing::is_sealed_as(OType::EntryPoint, sched_if.interrupt)
+          ? thread_create(irq_quota, 16 * 1024, sched_if.interrupt, nullptr)
+          : nullptr;
+  if (!install_irq(irq_thread)) {
+    say("[init]     WARNING: the scheduler's interrupt handler is not "
+        "installed; threads will not be preempted\n");
   }
   Capability sched_run = sched_if.run;
   L.sched_derive = lookup("sched.quota_derive");
@@ -942,25 +958,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   // nodes `init` derives for QUOTA_SCHED entries (the shell's, step 9).
   L.sched_node_funding = L.vm_quota(64 * 1024);
 
-  // Now that there is a scheduler, `blk` can sleep in it instead of polling.
-  // Without it the disk still works, polled.
-  if (blk_if.status == init::BLK_OK) {
-    const Capability s_block = lookup("sched.block");
-    const Capability s_wake = lookup("sched.wake");
-    const Capability s_lock_wait = lookup("sched.lock_wait");
-    const Capability s_lock_wake = lookup("sched.lock_wake");
-    int64_t st = init::BLK_BAD_REQUEST;
-    if (sealing::is_sealed_as(OType::EntryPoint, s_block) &&
-        sealing::is_sealed_as(OType::EntryPoint, s_wake)) {
-      st = ::signetos::user::invoke<int64_t>(invoke, blk.sentry, s_block,
-                                             s_wake, s_lock_wait, s_lock_wake);
-    }
-    if (st != init::BLK_OK) {
-      say("[init]     WARNING: blk has no scheduler entries; the block device "
-          "will poll\n");
-    }
-  }
-
   // `fs` waits for its lock in the scheduler from now on (fs.cpp, ONE CALLER
   // AT A TIME); until now `init` was its only caller. This is the one call
   // `fs` takes the lock's entries from, so it is made even if they are
@@ -976,52 +973,51 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
 
   // =========================================================================
-  // 8. `trap_mgr`
+  // 8. Device interrupts
   // =========================================================================
-  // Its manifest is the only one that asks for the PLIC, and `init` installs
-  // its handler for `IRQ_M_EXT`: it decides which handler each device
-  // interrupt reaches.
-  const Started trap_mgr = L.start_file("trap_mgr.bin");
-  // Like `uart`, `trap_mgr` hands its routing entry to whoever brings it up
-  // and to nobody else: `irq_route` is not published by name.
-  init::TrapMgrInterface tm_if{};
-  tm_if.plic_ndev = board.plic_ndev;
-  for (size_t h = 0; h < platform::MAX_HARTS; ++h) {
-    tm_if.plic_m_context[h] = board.plic_m_context[h];
-  }
-  if (capability_is_valid(trap_mgr.sentry)) {
-    comp_invoke(trap_mgr.sentry, bounded(&tm_if));
-  }
-  // The external interrupt goes to the trap manager, which owns the PLIC.
-  if (!install_irq(trap::IRQ_M_EXT, tm_if.irq)) {
-    say("[init]     WARNING: the trap manager's interrupt handler is not "
-        "installed; device interrupts will not arrive\n");
-  }
-  const bool have_irq_route =
-      sealing::is_sealed_as(OType::EntryPoint, tm_if.irq_route);
-
-  // Platform wiring: a device's PLIC source reaches its driver's interrupt
-  // entry. IRQ_OK, or the reason it is not.
-  auto route_irq = [&](Capability handler, uint32_t source) -> int64_t {
-    if (!have_irq_route || source == 0 ||
-        !sealing::is_sealed_as(OType::EntryPoint, handler)) {
-      return init::IRQ_BAD_REQUEST;
+  // Platform wiring: a device's PLIC source is routed through the scheduler,
+  // and its driver -- and nobody else -- gets the `irq_wait` it sleeps on
+  // (sched.cpp, DEVICE INTERRUPTS). `irq_route` is not published by name.
+  // Null if the source is not routed; the driver then polls.
+  auto route_irq = [&](uint32_t source) -> Capability {
+    if (!sealing::is_sealed_as(OType::EntryPoint, sched_if.irq_route) ||
+        source == 0) {
+      return nullptr;
     }
-    return ::signetos::user::invoke<int64_t>(
-        invoke, tm_if.irq_route, handler, static_cast<uint64_t>(source));
+    return ::signetos::user::invoke<Capability>(
+        invoke, sched_if.irq_route, static_cast<uint64_t>(source));
   };
-  // The UART's, which is what makes console input interrupt driven.
-  if (route_irq(uart_irq, board.uart_irq) != init::IRQ_OK) {
+  // The UART's, which is what lets console input sleep.
+  const Capability uart_wait = route_irq(board.uart_irq);
+  if (!sealing::is_sealed_as(OType::EntryPoint, uart_wait) ||
+      !sealing::is_sealed_as(OType::EntryPoint, uart_irq)) {
     say("[init]     WARNING: the UART interrupt is not routed; console input "
-        "will not wake\n");
+        "will be polled\n");
+  } else {
+    ::signetos::user::invoke<uint64_t>(invoke, uart_irq, uart_wait);
   }
-  // The block device's. Without the route the driver keeps polling.
+  // The block device's, with the scheduler's entries: now that there is a
+  // scheduler, `blk` can sleep in it instead of polling. Without them the
+  // disk still works, polled.
   if (blk_if.status == init::BLK_OK) {
     const uint32_t source = (blk_if.slot < platform::MAX_VIRTIO_SLOTS)
                                 ? board.virtio_irq[blk_if.slot]
                                 : 0;
-    if (route_irq(blk_if.irq, source) != init::IRQ_OK) {
-      say("[init]     WARNING: the block device interrupt is not routed; "
+    const Capability blk_wait = route_irq(source);
+    const Capability s_block = lookup("sched.block");
+    const Capability s_wake = lookup("sched.wake");
+    const Capability s_lock_wait = lookup("sched.lock_wait");
+    const Capability s_lock_wake = lookup("sched.lock_wake");
+    int64_t st = init::BLK_BAD_REQUEST;
+    if (sealing::is_sealed_as(OType::EntryPoint, s_block) &&
+        sealing::is_sealed_as(OType::EntryPoint, s_wake)) {
+      st = ::signetos::user::invoke<int64_t>(invoke, blk.sentry, s_block,
+                                             s_wake, s_lock_wait, s_lock_wake,
+                                             blk_wait);
+    }
+    if (st != init::BLK_OK ||
+        !sealing::is_sealed_as(OType::EntryPoint, blk_wait)) {
+      say("[init]     WARNING: blk has no scheduler entries or no interrupt; "
           "the block device will poll\n");
     }
   }
@@ -1129,9 +1125,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[init::RW_SLOT_SCHED_QUOTA] = sched.quota;
   rw[init::RW_SLOT_SCHED_COMP] = sched.comp;
   rw[init::RW_SLOT_SCHED_SENTRY] = sched.sentry;
-  rw[init::RW_SLOT_TRAP_MGR_QUOTA] = trap_mgr.quota;
-  rw[init::RW_SLOT_TRAP_MGR_COMP] = trap_mgr.comp;
-  rw[init::RW_SLOT_TRAP_MGR_SENTRY] = trap_mgr.sentry;
   rw[init::RW_SLOT_FS_QUOTA] = fs.quota;
   rw[init::RW_SLOT_FS_COMP] = fs.comp;
   rw[init::RW_SLOT_FS_SENTRY] = fs.sentry;

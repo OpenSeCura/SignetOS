@@ -34,8 +34,8 @@ echo "==========================================================================
 echo " Launching SignetOS on QEMU CHERI RISC-V..."
 echo " - Press Ctrl+A then X to force terminate QEMU at any time."
 echo " - Or type 'shutdown' at the SignetOS> prompt ('help' lists commands)."
-echo " - Console input is interrupt driven (UART -> PLIC -> trap_mgr -> uart -> shell);"
-echo "   the shell sleeps in sched.block between keystrokes."
+echo " - Console input is interrupt driven (UART -> PLIC -> sched -> uart -> shell);"
+echo "   the shell sleeps in sched.irq_wait between keystrokes."
 echo " - TRACE_SWITCH=1 $0 logs every thread switch the scheduler makes."
 echo "=================================================================================="
 # The QEMU command line (CPU flags, virtio-blk disk, serial console) lives in

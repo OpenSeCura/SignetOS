@@ -48,7 +48,7 @@
 namespace signetos::platform {
 
 // Ceiling on hart IDs tracked in fixed-size arrays (`thread::s_cpus`,
-// `TrapMgrInterface::plic_m_context`). Harts present in the DTB are recorded
+// `SchedInterface::plic_m_context`). Harts present in the DTB are recorded
 // up to this limit; `thread::init_hart` refuses any hart ID that was not
 // enabled in the DTB or lies at or above `MAX_HARTS`.
 constexpr size_t MAX_HARTS = 16;
@@ -68,7 +68,7 @@ constexpr uint32_t PLIC_NO_CONTEXT = ~0u;
 
 // Standard RISC-V / SiFive PLIC architectural register offsets within the
 // PLIC MMIO window (not board-specific).
-// Used by `external/services/trap_mgr.cpp`; the kernel never touches the PLIC.
+// Used by `external/services/sched.cpp`; the kernel never touches the PLIC.
 constexpr uint64_t PLIC_PRIORITY       = 0x000000ULL;  // + 4 * source
 constexpr uint64_t PLIC_PENDING        = 0x001000ULL;  // + 4 * (source / 32)
 constexpr uint64_t PLIC_ENABLE_STRIDE  = 0x80ULL;      // per context

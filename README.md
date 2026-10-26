@@ -110,7 +110,7 @@ include/     kernel headers and a minimal freestanding libc
 user/        runtime and linker script shared by all user compartments
 boot/        compartments embedded in the kernel: init, fs, uart, blk
 external/    compartments loaded from disk.img: services/ (naming, sealer,
-             sched, trap_mgr, shell) and apps/ (programs the shell can `run`)
+             sched, shell) and apps/ (programs the shell can `run`)
 tools/       signetfs.py, which writes disk.img
 toolchain/   patches and scripts that build the CHERI LLVM and QEMU (Zyseal,
              mmodemmu, sentries)

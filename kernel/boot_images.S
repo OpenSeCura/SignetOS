@@ -39,7 +39,7 @@
  * Only `boot/` is packaged here: `init` and what it needs to reach the
  * disk (`uart` to report, `dma` to set the device up, `blk` and `fs` to
  * read). Every external service (`external/services/` -- `naming`, `sched`,
- * `trap_mgr`, `shell`) and program (`external/apps/`) is a file on the disk
+ * `shell`) and program (`external/apps/`) is a file on the disk
  * image (`tools/signetfs.py` puts them there at build time) that `init` or
  * the shell reads through `fs` and loads via `user::create_compartment`.
  */

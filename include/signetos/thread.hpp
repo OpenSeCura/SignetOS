@@ -44,6 +44,7 @@
 #include <signetos/hw/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sentry.hpp>
+#include <signetos/trap.hpp>
 #include <signetos/types.hpp>
 #include <signetos/vm.hpp>
 
@@ -53,24 +54,19 @@ using quota::QUOTA_NODE_COST;
 using quota::QUOTA_NODE_PAGES;
 
 // Tunable parameter controlling the per-thread kernel allocation size (in 4 KiB
-// pages). `ThreadState` (464 bytes) occupies the front of this allocation and
+// pages). `ThreadState` (144 bytes) occupies the front of this allocation and
 // the remaining space (`THREAD_STATE_COST - sizeof(ThreadState)`) is the
-// thread's kernel stack. It holds frames only -- the `SwitchFrame`, one
-// `ReturnFrame` per call in progress through the switcher, the `TrapFrame`s
-// of traps taken in the thread -- plus the switcher's and trap dispatcher's
-// own C++ helpers directly below the frame they manage. System call bodies do
-// not run here: they run on the caller's own stack, narrowed, like any other
+// thread's kernel stack. It holds frames only -- one `ReturnFrame` per call
+// in progress through the switcher, and `TrapFrame`s: one for each trap in
+// progress, and, while the thread is not running, the one it is parked in
+// (PARKED THREADS) -- plus the switcher's and trap dispatcher's own C++
+// helpers directly below the frame they manage. System call bodies do not
+// run here: they run on the caller's own stack, narrowed, like any other
 // callee (see sentry.hpp).
 //
-// The size sets how deep a thread's compartment calls can nest, and how deep
-// a handler chain can run on top of them (asm_macros.h, KERNEL-STACK ROOM):
-// one page allowed four nested calls with interrupts enabled, and a two-call
-// handler chain (an interrupt -> the driver's IRQ entry -> `sched.wake`) only
-// over a thread at depth 3 or less, so a program launched by the shell on
-// the shell's thread (shell -> program -> fs -> blk -> sched.block, depth 4)
-// lost its disk completion. Two pages allow fourteen nested calls and that
-// chain over a thread at depth 13. The cost is billed to the thread's
-// funding quota like the stack is.
+// The size sets how deep a thread's compartment calls can nest
+// (asm_macros.h, KERNEL-STACK ROOM): two pages allow sixteen. The cost is
+// billed to the thread's funding quota like the stack is.
 constexpr size_t THREAD_STATE_PAGES = 2;
 constexpr uint64_t THREAD_STATE_COST = THREAD_STATE_PAGES * vm::PAGE_SIZE;
 
@@ -93,22 +89,16 @@ using signetos::status_name;
 // same node layout as the VM quota.
 using QuotaThreadMem = quota::QuotaNode;
 
-// Saved register frame pushed onto a thread's kernel stack (`kernel_sp`) across
-// `dispatch()` context switches, and pre-populated at the top of the kernel
-// stack by `create()` so a newly created thread starts through the same path.
-struct alignas(16) SwitchFrame {
-  Capability ra;
-  Capability sp;
-  Capability gp;
-  Capability active_kernel_sp;  // 48: FRAME LINK (asm_macros.h)
-  Capability t[7];
-  Capability s[12];
-  Capability a[8];
-  Capability tp;                // 496
-};
-
-static_assert(sizeof(SwitchFrame) == 32 * sizeof(Capability),
-              "SwitchFrame must be 32 capabilities (512 bytes)");
+// PARKED THREADS
+//
+// A thread that is not running is parked in a `TrapFrame` on top of its
+// kernel stack, whatever stopped it: an interrupt (the frame the trap vector
+// pushed), `sys_thread_switch` or `sys_trap_wait` (which push one that
+// resumes just after the call), or nothing yet (`create` builds one that
+// starts at `__thread_start`).
+// So there is one way to resume a thread: the trap return path
+// (`unwind::resume`), which is also where a killed thread ends and where the
+// frames of destroyed compartments are skipped.
 
 // Occupies the front of the thread's state pages; the remainder,
 // `[sizeof(ThreadState), THREAD_STATE_COST)`, is the thread's kernel return
@@ -120,7 +110,7 @@ struct alignas(16) ThreadState {
   Capability entry_sentry;   // validated OType::EntryPoint (CT = 18)
   Capability initial_arg;    // initial value for ca0
   Capability user_sp;        // top of user stack ([base, base + stack_bytes))
-  Capability kernel_sp;      // saved kernel stack pointer (SwitchFrame* when halted)
+  Capability kernel_sp;      // the TrapFrame it is parked in (PARKED THREADS)
 
   uint64_t tid;
   uint64_t total_billed;     // THREAD_STATE_COST + stack_bytes
@@ -131,7 +121,7 @@ struct alignas(16) ThreadState {
 static_assert(sizeof(ThreadState) == 144,
               "ThreadState is 144 bytes (asm_macros.h, KERNEL-STACK ROOM)");
 
-static_assert(sizeof(ThreadState) + sizeof(SwitchFrame) <= 1024,
+static_assert(sizeof(ThreadState) + sizeof(trap::TrapFrame) <= 1024,
               "ThreadState must leave room in the allocation for the kernel "
               "return stack");
 
@@ -171,17 +161,20 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
                   Capability entry_sentry, Capability initial_arg,
                   Status* out_status = nullptr);
 
-// Dispatches execution to `thread_handle` (requires Permit_Load), saving the
-// current thread's full register state onto its kernel stack and loading the
-// target thread's state from its kernel stack. This is the `sys_thread_switch`
-// kernel entry itself: a thread reaches it through the switcher, the host
-// (`init::launch`, the test suites) calls it directly. Returns `Status::Ok`
-// when this context is next resumed, or the reason the switch was refused.
+// Dispatches execution to `thread_handle` (requires Permit_Load): parks the
+// caller in a `TrapFrame` on its own kernel stack (PARKED THREADS) and
+// resumes the target from the one it is parked in. This is the
+// `sys_thread_switch` kernel entry itself: a thread reaches it through the
+// switcher, the host (`init::launch`) calls it directly. Returns
+// `Status::Ok` when this context is next resumed, or the reason the switch
+// was refused. Refused while an interrupt is being handled on this hart:
+// the handler leaves through `sys_trap_wait`.
 Status dispatch(Capability thread_handle) __asm__("sys_thread_switch");
 
 // Terminates the currently running thread with `exit_status`, reclaiming its
 // stack and state page back to its `funding_quota` and returning control to the
-// caller of `dispatch()`.
+// caller of `dispatch()` -- or, if it is the interrupt handler, to the thread
+// it interrupted.
 void exit(int exit_status);
 
 // Ends a thread (requires Permit_Store on `thread_handle`). A thread that has
@@ -192,6 +185,34 @@ void exit(int exit_status);
 // scheduler's job (`sched.thread_kill`). InvalidCapability if it is not a
 // live thread or is already ending.
 Status kill(Capability thread_handle);
+
+// THE INTERRUPT HANDLER
+//
+// Each hart has one interrupt handler thread: an ordinary thread, created on
+// the scheduler's interrupt entry, that this hart holds (FLAG_RUNNING) from
+// `install_handler` on, so nothing else can switch to it. It waits in
+// `sys_trap_wait`. An interrupt parks the thread it interrupts in the
+// `TrapFrame` the trap vector pushed and resumes the handler from where it
+// waits, masked, with the interrupt written to its `irq::Event`. The
+// handler then calls `sys_trap_wait` again, naming the thread to run next.
+// The first interrupt only starts the handler, at its entry point, and is
+// not reported: it is the next tick, or a level that is still pending, or a
+// page fault that is taken again.
+//
+// The interrupted thread stays this hart's until the handler has chosen, so
+// it is released only once this hart is off its kernel stack.
+
+// Makes `thread_handle` (Permit_Load and Permit_Store, never run) this
+// hart's interrupt handler, for good. InvalidCapability if it is not such a
+// thread, Busy if this hart has one.
+Status install_handler(Capability thread_handle);
+
+// For the trap dispatcher, with the `TrapFrame` the trap vector has just
+// pushed: parks the running thread in it and resumes this hart's handler
+// with `(cause, the parked thread's id, aux)`. Returns false, with nothing
+// changed, if there is no handler waiting or no thread to park; otherwise
+// does not return.
+bool wake_handler(trap::TrapFrame* frame, uint64_t cause, uint64_t aux);
 
 // True if the thread running on this hart has been killed.
 bool current_kill_pending();

@@ -37,20 +37,15 @@ static_assert(KIND_NONE == UNWIND_NONE &&
                   KIND_TRAP_FRAME == UNWIND_TRAP_FRAME,
               "unwind::Kind must match the UNWIND_* codes the assembly tests");
 static_assert(offsetof(switcher::ReturnFrame, prev_ksp) == FRAME_LINK &&
-                  offsetof(trap::TrapFrame, active_kernel_sp) == FRAME_LINK &&
-                  offsetof(thread::SwitchFrame, active_kernel_sp) == FRAME_LINK,
+                  offsetof(trap::TrapFrame, active_kernel_sp) == FRAME_LINK,
               "every kernel frame keeps its link at FRAME_LINK");
 static_assert(offsetof(switcher::ReturnFrame, tp) == RET_FRAME_TP &&
-                  offsetof(trap::TrapFrame, tp) == FRAME_TP &&
-                  offsetof(thread::SwitchFrame, tp) == FRAME_TP,
+                  offsetof(trap::TrapFrame, tp) == FRAME_TP,
               "ctp save slots must match asm_macros.h");
 static_assert(sizeof(switcher::ReturnFrame) == RET_FRAME_SIZE &&
-                  sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE &&
-                  sizeof(thread::SwitchFrame) == SWITCH_FRAME_SIZE,
+                  sizeof(trap::TrapFrame) == TRAP_FRAME_SIZE,
               "frame sizes must match asm_macros.h");
-static_assert(RET_FRAME_SIZE != TRAP_FRAME_SIZE &&
-                  RET_FRAME_SIZE != SWITCH_FRAME_SIZE &&
-                  TRAP_FRAME_SIZE != SWITCH_FRAME_SIZE,
+static_assert(RET_FRAME_SIZE != TRAP_FRAME_SIZE,
               "kind_at tells frames apart by their size");
 
 namespace {
@@ -99,9 +94,6 @@ Kind kind_at(Capability ksp) {
     case sizeof(trap::TrapFrame):
       return KIND_TRAP_FRAME;
     default:
-      // A `SwitchFrame` (512) is never on top when a return path runs: it is
-      // popped by `__thread_restore` before user code runs again. Not
-      // something to resume.
       return KIND_NONE;
   }
 }

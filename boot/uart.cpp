@@ -18,42 +18,34 @@
  * uart.cpp - SignetOS User-Space UART 16550 Console Compartment
  *
  * Holds the exclusive 4 KiB UART MMIO capability (`0x10000000`) delegated by
- * `init`. Output is polled; input is interrupt driven.
+ * `init`. Output is polled; input sleeps on the UART's interrupt.
  *
  * Three entry points (see `UartInterface` in abi.hpp):
  *   compartment_main(str)      output: prints a NUL-terminated string. This is
  *                              the sentry published as "uart".
- *   uart_irq_entry(source)     the UART's PLIC source fired: drain the receive
- *                              FIFO into the ring buffer and, if a reader asked
- *                              to be told, tell it. `trap_mgr` invokes this from
- *                              interrupt context.
- *   uart_read_entry(buf, wake) input: hands the reader what the ring buffer
- *                              holds, without blocking, and remembers whom to
- *                              tell when more arrives.
+ *   uart_irq_entry(irq_wait)   `init` hands over the scheduler entry that waits
+ *                              for the UART's PLIC source (sched.cpp, DEVICE
+ *                              INTERRUPTS), once.
+ *   uart_read_entry(buf)       input: hands the reader what the UART holds,
+ *                              first sleeping until there is something.
  *
  * `read` and `irq` are minted once, on the very first invocation of
  * `compartment_main`, if the argument is a writable `UartInterface` rather
  * than a string. `init` makes that call before anybody else exists and before
- * it prints anything, seeds `read` to the shell alone and routes the UART's
- * PLIC source to `irq` through `trap_mgr`. After that first call the
- * handshake is closed for good, so holding the print sentry never turns into
- * the right to read the keyboard. The same call switches the UART's
- * "received data available" interrupt on; until `trap_mgr` enables the source
- * at the PLIC that is a wire nobody listens to.
+ * it prints anything, seeds `read` to the shell alone and keeps `irq` to
+ * itself. After that first call the handshake is closed for good, so holding
+ * the print sentry never turns into the right to read the keyboard. The same
+ * call switches the UART's "received data available" interrupt on; until the
+ * scheduler routes the source at the PLIC that is a wire nobody listens to.
  *
- * THE RING BUFFER
- *   One producer (`irq`, interrupt context) and one consumer (`read`, thread
- *   context) on one hart: the producer can run between any two instructions
- *   of the consumer, never the other way round. Each side owns one index and
- *   only reads the other's, so no lock is needed.
- *
- * THE WAKE
- *   `read` records the reader's `wake` entry point *before* it looks at the
- *   buffer and drops it again if it found something. So a byte that lands
- *   between the look and the reader going to sleep still produces a wake,
- *   and the scheduler turns a wake that arrives before the reader has gone
- *   to sleep into an immediate return from `sched.block` (sched.cpp). No
- *   interleaving loses a keystroke.
+ * THE WAIT
+ *   `read` takes what the UART holds and returns it; with nothing there, it
+ *   sleeps in `irq_wait` until the UART interrupts, and looks again. Reading
+ *   the bytes is what drops the UART's line, so `irq_wait`, which completes
+ *   the interrupt at the PLIC before it sleeps, never completes one the UART
+ *   is still raising: a key pressed between the look and the sleep
+ *   interrupts again at once. Bytes that arrive while nobody reads wait in
+ *   the UART.
  */
 
 #include "runtime.hpp"
@@ -69,16 +61,9 @@ constexpr uint8_t IER_RX_DATA = 0x01;     // "received data available"
 constexpr uint8_t LSR_DATA_READY = 0x01;
 constexpr uint8_t LSR_THR_EMPTY = 0x20;
 
-// Received bytes the reader has not collected yet. Power-of-two size; the
-// indices run free and are reduced modulo the size on access, so
-// `head - tail` is the fill level even across wrap-around.
-constexpr uint32_t RING_SIZE = 256;
-uint8_t s_ring[RING_SIZE];
-volatile uint32_t s_head = 0;   // written by `irq` only
-volatile uint32_t s_tail = 0;   // written by `read` only
-
-// Entry point to invoke when input arrives, or null if nobody is waiting.
-Capability volatile s_waiter = nullptr;
+// `sched.irq_wait` for the UART's source, once `init` has routed it; until
+// then `read` returns what there is without waiting.
+Capability s_irq_wait = nullptr;
 
 // Set by the first invocation of `compartment_main`, whatever it was.
 bool s_first_call_done = false;
@@ -133,35 +118,19 @@ SIGNETOS_FAULT_HANDLER compartment_error_handler(fault::ErrorState* state) {
   return fault::UNWIND;
 }
 
-/// Interrupt context (see trap_mgr.cpp): short, no blocking, no switching.
-extern "C" uint64_t uart_irq_entry(uint64_t source) {
-  (void)source;  // the only source routed here is ours
-  volatile uint8_t* uart = uart_regs();
-  if (uart == nullptr) {
-    return 0;
-  }
-  bool received = false;
-  while ((uart[REG_LSR] & LSR_DATA_READY) != 0) {
-    const uint8_t byte = uart[REG_RBR_THR];  // the read is what drops the line
-    const uint32_t head = s_head;
-    if (head - s_tail < RING_SIZE) {
-      s_ring[head % RING_SIZE] = byte;
-      s_head = head + 1;
-    }
-    // else: full -- a reader that far behind loses the byte.
-    received = true;
-  }
-  Capability waiter = s_waiter;
-  if (received && capability_is_valid(waiter)) {
-    s_waiter = nullptr;  // one wake per request
-    Capability gate = rw_table()[SLOT_SYS_COMP_INVOKE];
-    invoke(gate, waiter);
+// From `init`, once: the UART's `irq_wait` (THE WAIT).
+extern "C" uint64_t uart_irq_entry(Capability irq_wait) {
+  if (!capability_is_valid(s_irq_wait) &&
+      sealing::is_sealed_as(OType::EntryPoint, irq_wait)) {
+    s_irq_wait = irq_wait;
   }
   return 0;
 }
 
-extern "C" uint64_t uart_read_entry(Capability buf_cap, Capability wake) {
-  if (!capability_is_valid(buf_cap) || sealing::is_sealed(buf_cap) ||
+extern "C" uint64_t uart_read_entry(Capability buf_cap) {
+  volatile uint8_t* uart = uart_regs();
+  if (uart == nullptr || !capability_is_valid(buf_cap) ||
+      sealing::is_sealed(buf_cap) ||
       !capability_has_perms(buf_cap, perms::Store)) {
     return 0;
   }
@@ -170,21 +139,19 @@ extern "C" uint64_t uart_read_entry(Capability buf_cap, Capability wake) {
   const uint64_t addr = capability_get_address(buf_cap);
   const size_t room = (end > addr) ? static_cast<size_t>(end - addr) : 0;
 
-  // Arm first, look second (file comment, THE WAKE).
-  s_waiter = sealing::is_sealed_as(OType::EntryPoint, wake) ? wake : nullptr;
-
   auto* buf = reinterpret_cast<uint8_t*>(buf_cap);
   uint64_t count = 0;
-  uint32_t tail = s_tail;
-  while (count < room && tail != s_head) {
-    buf[count] = s_ring[tail % RING_SIZE];
-    count += 1;
-    tail += 1;
-  }
-  s_tail = tail;
-
-  if (count > 0) {
-    s_waiter = nullptr;  // the caller has something to do; it will be back
+  while (room > 0) {
+    while (count < room && (uart[REG_LSR] & LSR_DATA_READY) != 0) {
+      buf[count++] = uart[REG_RBR_THR];  // the read is what drops the line
+    }
+    // Something for the reader, or no sleeping until there is: no route
+    // yet, a caller the scheduler does not run, or a killed one.
+    if (count > 0 || !capability_is_valid(s_irq_wait) ||
+        invoke<int64_t>(rw_table()[SLOT_SYS_COMP_INVOKE], s_irq_wait, 0ULL) !=
+            init::SCHED_OK) {
+      break;
+    }
   }
   return count;
 }

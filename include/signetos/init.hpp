@@ -206,7 +206,7 @@ inline void image_install(Capability code_mem, Capability img_cap,
 // narrows `mmio` down to one window per driver (`boot/init.cpp`).
 //
 // Only the boot set is packaged: what `init` needs to reach the disk. Every
-// other service (`naming`, `sched`, `trap_mgr`, `shell`) is a file on the
+// other service (`naming`, `sched`, `shell`) is a file on the
 // disk, read through `fs` and loaded by `init`.
 struct alignas(16) BootManifest {
   Capability dtb;           // read-only copy of the flattened device tree

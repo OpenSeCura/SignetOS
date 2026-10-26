@@ -257,14 +257,27 @@ uint64_t sys_thread_tid(
 
 // --- Traps and interrupts --------------------------------------------------
 
-// Installs `handler`, a compartment entry point, as the handler of `irq`:
-// IRQ_M_TIMER (the scheduler's tick) or IRQ_M_EXT (the trap manager). Once
-// each, for good (irq.hpp, INTERRUPT HANDLERS). `init` calls it at boot and
-// hands the gate to nobody. Returns a `Status`: Ok, InvalidAuthority (another
-// `irq`), InvalidSentry, or Busy (already installed).
+// Installs this hart's interrupt handler: `thread`, which has never run,
+// created on the scheduler's interrupt entry, is held by this hart from now
+// on and woken by every interrupt (irq.hpp, THE INTERRUPT HANDLER;
+// thread.hpp, THE INTERRUPT HANDLER). Once per hart. `init` calls it at
+// boot and hands the gate to nobody. Returns a `Status`: Ok,
+// InvalidCapability (not a thread that can be the handler), or Busy (this
+// hart has one).
 uint64_t sys_trap_install(
-    uint64_t irq,
-    Sentry   handler
+    capability_thread_t thread
+);
+
+// The interrupt handler's wait (thread.hpp, THE INTERRUPT HANDLER): runs
+// `next` (requires Permit_Load), or, if it cannot run, the thread the
+// handler was woken for; parks the handler until the next interrupt, which
+// is written to `event` (an `irq::Event` on the handler's own stack) before
+// this returns 0 (`Status::Ok`). InvalidCapability, at once, if the caller
+// is not this hart's handler handling an interrupt, or `event` is not such
+// a place.
+uint64_t sys_trap_wait(
+    capability_thread_t next,
+    capability_data_t   event
 );
 
 // --- Paging (vm.hpp, PAGING) -------------------------------------------------
@@ -321,6 +334,7 @@ namespace signetos::syscall {
   X(thread_switch)                \
   X(thread_tid)                   \
   X(trap_install)                 \
+  X(trap_wait)                    \
   X(page_setup)                   \
   X(page_next)                    \
   X(page_done)                    \
@@ -338,8 +352,9 @@ constexpr size_t kSyscallCount = static_cast<size_t>(Id::Count);
 // Stack a kernel entry runs on: exactly this many bytes of the caller's own
 // stack, directly below its `csp`, scrubbed by the switcher on the way out. A
 // caller with less than this free is refused with `Status::StackTooSmall`.
-// `sys_thread_switch` is the exception: it needs no caller stack at all (its
-// frame and its C++ live on the kernel stack), so its record says 0.
+// `sys_thread_switch` and `sys_trap_wait` are the exceptions: they need no
+// caller stack at all (their frame and their C++ live on the kernel stack),
+// so their records say 0.
 //
 // Measured (pattern-fill the slice in `__signetos_switcher_prepare`, scan it in
 // `__signetos_switcher_return`, test image + production demo, -O2): the deepest

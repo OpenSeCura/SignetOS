@@ -30,13 +30,9 @@
  * CONSOLE
  *   The shell starts three background workers under 10/6/2 ms-per-second
  *   sub-quotas of its own bandwidth, so the scheduler always has something to
- *   switch between, then waits for keystrokes without spending a cycle on it.
- *   `uart.read` hands over whatever the UART's interrupt handler has buffered
- *   so far; when that is nothing, the shell sleeps in `sched.block`. The next
- *   keystroke's interrupt reaches `uart` (routed through `trap_mgr`), `uart`
- *   invokes `shell_notify_entry` (handed to it in the read request), that
- *   calls `sched.wake` with the shell thread's tid, and the shell is runnable
- *   again. Commands:
+ *   switch between, then waits for keystrokes without spending a cycle on it:
+ *   `uart.read` sleeps in the scheduler until the UART interrupts (sched.cpp,
+ *   DEVICE INTERRUPTS) and hands over what was typed. Commands:
  *     help       list commands
  *     stats      CPU time each background worker has received so far
  *     demo       the 300 ms bandwidth self-test described below
@@ -235,9 +231,6 @@ Capability s_sched_query = nullptr;
 Capability s_sched_register = nullptr;
 Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
-Capability s_sched_wake = nullptr;
-Capability s_notify_entry = nullptr;  // OType::EntryPoint -> shell_notify_entry
-uint64_t s_my_tid = 0;                // the shell thread, as `sched.wake` knows it
 
 WorkerSet s_background;
 WorkerSet s_demo;
@@ -268,10 +261,6 @@ void out_dec(const char* prefix, uint64_t value, const char* suffix) {
 }
 
 void yield() { invoke<int64_t>(s_gate_invoke, s_sched_yield); }
-
-// Sleeps until `shell_notify_entry` has run (or had already run since the
-// last time: the scheduler remembers a wake that arrives early).
-void block() { invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL); }
 
 // Runs `attempt` until `ok` accepts what it returns, giving what the shell
 // has freed the chance to come back first: it comes back to its quotas only
@@ -2690,14 +2679,11 @@ bool execute(char* line) {
 
 // --- Console -----------------------------------------------------------------
 
-// Whatever has been typed since the last call; 0 if nothing. Every call also
-// tells `uart` whom to wake when the next byte arrives: a byte that lands
-// between this returning 0 and the `block()` below still ends up as a wake the
-// scheduler holds for us.
+// What has been typed, once something has (`uart.read` sleeps until then);
+// 0 if the console cannot sleep (its interrupt is not routed).
 size_t read_input(char* buf, size_t max) {
   Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), max);
-  return static_cast<size_t>(
-      invoke<uint64_t>(s_gate_invoke, s_uart_read, b, s_notify_entry));
+  return static_cast<size_t>(invoke<uint64_t>(s_gate_invoke, s_uart_read, b));
 }
 
 void echo(char c) {
@@ -2715,7 +2701,7 @@ void console_loop() {
     char in[16];
     const size_t n = read_input(in, sizeof(in));
     if (n == 0) {
-      block();  // sleep until the UART interrupt says a key was pressed
+      yield();  // nothing to sleep on: poll
       continue;
     }
     for (size_t i = 0; i < n; ++i) {
@@ -2772,14 +2758,6 @@ extern "C" uint64_t shell_worker_entry(Capability arg) {
   __atomic_fetch_add(&sh->done, 1, __ATOMIC_SEQ_CST);
   // Returning exits the thread; the scheduler unregisters it.
   return 0;
-}
-
-// Invoked by `uart` from interrupt context when input arrives and the shell
-// asked to be told (see `read_input`). Runs masked, on whichever thread was
-// interrupted -- possibly the shell's own, asleep in `sched.block` -- so it
-// does the one thing it is for and returns: wake the shell thread.
-extern "C" int64_t shell_notify_entry() {
-  return invoke<int64_t>(s_gate_invoke, s_sched_wake, s_my_tid);
 }
 
 // TODO: This is hacky (multiplexing one-time init/banner vs scheduled thread
@@ -2852,14 +2830,12 @@ extern "C" int64_t compartment_main(Capability arg) {
       lookup_name(gate_invoke, naming_lookup, "sched.thread_register");
   s_sched_yield = lookup_name(gate_invoke, naming_lookup, "sched.yield");
   s_sched_block = lookup_name(gate_invoke, naming_lookup, "sched.block");
-  s_sched_wake = lookup_name(gate_invoke, naming_lookup, "sched.wake");
   if (!capability_is_valid(s_sched_derive) ||
       !capability_is_valid(s_sched_destroy) ||
       !capability_is_valid(s_sched_query) ||
       !capability_is_valid(s_sched_register) ||
       !capability_is_valid(s_sched_yield) ||
-      !capability_is_valid(s_sched_block) ||
-      !capability_is_valid(s_sched_wake)) {
+      !capability_is_valid(s_sched_block)) {
     out("[shell]    sched.* lookup FAILED\n");
     return -1;
   }
@@ -2960,22 +2936,6 @@ extern "C" int64_t compartment_main(Capability arg) {
     run_demo();
     out("[shell]    shell exiting\n");
     return 0;
-  }
-
-  // The two halves of going to sleep on the keyboard: what `uart` invokes when
-  // a key is pressed, and which thread that should wake (this one, by the tid
-  // the kernel keeps in `utidc`). Without the entry the console would sleep
-  // for good, so it polls instead (`read_input` passes whatever
-  // `s_notify_entry` is, and `uart` ignores a non-entry).
-  Capability notify = mint_entry(gate_invoke, gate_sentry, self_comp,
-                                 reinterpret_cast<const void*>(&shell_notify_entry));
-  if (sealing::is_sealed_as(OType::EntryPoint, notify)) {
-    s_my_tid = self_tid();
-    s_notify_entry = notify;
-  } else {
-    out("[shell]    WARNING: notify entry FAILED; console input will be "
-        "polled\n");
-    s_sched_block = s_sched_yield;
   }
 
   const WorkerConfig bg{BG_WORKERS, BG_PERIOD_US, BG_BUDGET_US, BG_CLASS,

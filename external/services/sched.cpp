@@ -20,8 +20,9 @@
  * sched.cpp - SignetOS User-Space CPU Bandwidth Scheduler Compartment
  *
  * The kernel holds no scheduling state: it provides `sys_thread_switch`, a
- * periodic tick on `IRQ_M_TIMER`, and re-dispatches this compartment's
- * dispatcher thread whenever a thread exits.
+ * periodic tick, and re-dispatches this compartment's dispatcher thread
+ * whenever a thread exits. Every interrupt comes here (irq.hpp): it wakes a
+ * thread of this compartment's (thread.hpp, THE INTERRUPT HANDLER).
  *
  * OBJECTS
  *   quota_sched   One page per node, paid for by the caller's `node_funding`
@@ -44,7 +45,10 @@
  *   sched.lock_wait        (word, seen)           wait for a lock (LOCKS)
  *   sched.lock_wake        (word)                 hand a lock to its next owner
  *   sched.run              (kernel-created dispatcher thread; not published)
- *   (tick)                 bound to IRQ_M_TIMER; not published
+ *   (interrupt)            the interrupt handler's thread; not published
+ *   sched.irq_route        (source)               route a device; `init` only
+ *   sched.irq_wait         (timeout_us)           one per route, for its driver
+ *                                                 only (DEVICE INTERRUPTS)
  *
  * ORDERING
  *   `pick` chooses among the threads that can run: those on a node with
@@ -70,36 +74,38 @@
  *   thread exit unwinds to the kernel's host context, which re-dispatches
  *   the dispatcher: its `sys_thread_switch` returns, and it forgets every
  *   registered thread the kernel no longer knows (`sys_thread_tid` is 0).
- *   `yield`, `block`, `lock_wait` and the tick handler switch thread-to-thread
- *   directly (`reschedule`). The dispatcher exits when no registered thread
+ *   `yield`, `block` and `lock_wait` switch thread-to-thread directly
+ *   (`reschedule`); the tick hands its choice back to the kernel
+ *   (PREEMPTION). The dispatcher exits when no registered thread
  *   is on a node, which ends the system: a stopped thread (DESTROYING) is
  *   never picked, and only a thread that runs can put it on a node again.
  *
  * PREEMPTION
- *   The scheduler binds `IRQ_M_TIMER` to `sched_tick_entry`. The handler runs
- *   on the interrupted thread's stack with interrupts masked: it charges the
- *   slice, picks, and if someone else should run it calls `sys_thread_switch`
- *   from inside the handler. The preempted thread stays parked in its handler
- *   until it is switched back to, when the handler returns and `mret`
- *   resumes it. The handler stands down while an entry point is mid-update
- *   (`s_busy`), and when the interrupted thread is not `s_running` (`caller`;
- *   `utidc` says which thread is really running): the dispatcher, or a
- *   thread in `switch_to` that has named the next thread but not yet
- *   switched to it. Those cases catch up at the next tick or on their own.
+ *   Every tick wakes the interrupt handler's thread, which `init` created on
+ *   `sched_interrupt_entry` (thread.hpp, THE INTERRUPT HANDLER): masked, on
+ *   that thread's stack, with the interrupted thread parked. It charges the
+ *   slice, picks, and waits again (`sys_trap_wait`) naming the thread to run
+ *   next -- or null, and the parked thread carries on. A preempted thread
+ *   stays parked until it is switched to
+ *   again, by a later tick or by `sys_thread_switch` alike. The handler
+ *   stands down while an entry point is mid-update (`s_busy`), and when the
+ *   parked thread is not `s_running` (the kernel passes its tid): the
+ *   dispatcher, or a thread in `switch_to` that has named the next thread
+ *   but not yet switched to it. Those cases catch up at the next tick or on
+ *   their own.
  *
  * BLOCKING
  *   `block` marks the caller BLOCKED and picks someone else; a BLOCKED thread
  *   is invisible to `pick` until `wake` makes it READY again, and then runs
  *   when `pick` next chooses it, like any other. `wake` is built to be called
- *   from interrupt context (a device driver, via whoever it notifies): it
- *   only flips one record, never picks or switches, and so needs no `s_busy`
- *   protection. The classic lost-wakeup race -- the event lands after the
- *   caller looked and before it blocked -- is closed by `wake_pending`: a
- *   wake that finds its target not BLOCKED is remembered, and `block`
- *   consumes it and stays READY. `block` writes BLOCKED before it reads
- *   `wake_pending`, and `wake` tests BLOCKED before it sets `wake_pending`,
- *   so whichever instruction the interrupt lands on, one of the two sides
- *   sees the other.
+ *   from the interrupt handler: it only flips one record, never picks or
+ *   switches, and so needs no `s_busy` protection. The classic lost-wakeup
+ *   race -- the event lands after the caller looked and before it blocked --
+ *   is closed by `wake_pending`: a wake that finds its target not BLOCKED is
+ *   remembered, and `block` consumes it and stays READY. `block` writes
+ *   BLOCKED before it reads `wake_pending`, and `wake` tests BLOCKED before
+ *   it sets `wake_pending`, so whichever instruction the interrupt lands on,
+ *   one of the two sides sees the other.
  *
  *   A `block` with a timeout also records `wake_at_us`; `expire` (run at the
  *   top of every `pick`) makes a BLOCKED thread whose time has come READY by
@@ -108,12 +114,28 @@
  *   A thread that keeps the CPU without yielding still gets ticked, and the
  *   tick picks, so a timeout is late by at most a tick.
  *
- *   A thread that waits for a page is blocked the same way, by the tick
- *   handler: the kernel delivers it with PAGE_WAIT for a cause (trap.hpp),
- *   and the pager's tid, which it wakes. The pager wakes the thread with
+ *   A thread that waits for a page is blocked the same way, by the interrupt
+ *   handler: the kernel wakes it with PAGE_WAIT for a cause (trap.hpp), and
+ *   the pager's tid, which it wakes. The pager wakes the thread with
  *   `wake` once the page is in; the timeout, PAGE_WAIT_MAX_US, only covers a
  *   thread the kernel could not note. Should nothing else be able to run,
  *   the thread runs on, faults again, and is blocked again.
+ *
+ * DEVICE INTERRUPTS
+ *   The scheduler owns the PLIC (`init` grants its window to nobody else).
+ *   `init` routes each device's source here (`irq_route`) and hands the
+ *   `irq_wait` entry it gets back to that device's driver: one entry per
+ *   route, so holding it is the right to that source and no other. The
+ *   driver's thread sleeps in `irq_wait`. When the external interrupt wakes
+ *   the handler, it claims every pending source at the PLIC, marks its
+ *   route and wakes its waiter (`claim_and_wake`); nothing else. A claimed
+ *   source cannot interrupt again until it is completed, so a
+ *   level-triggered device does not storm while its driver gets round to
+ *   it: the driver's next `irq_wait` completes it, once the driver has dealt
+ *   with the device. A wake that lands before the driver sleeps is not lost:
+ *   `irq_wait` looks at the route's `pending` after it has named itself the
+ *   waiter, and `block` keeps a wake that comes early (BLOCKING). A source
+ *   nobody routed is turned off at the PLIC when it first fires.
  *
  * KILLING
  *   `thread_kill` asks the kernel to end a thread (`sys_thread_kill`, see
@@ -159,11 +181,12 @@
  *   idle time, ended by the earliest period reset or timeout, or by a wake.
  *   A thread whose node has spent its budget idles there too when it yields,
  *   blocks or waits, rather than running on borrowed time: spare bandwidth
- *   is not handed out, it is idled. The tick handler is the one exception --
- *   it cannot spin masked -- so a thread that never yields keeps the CPU
- *   when nothing else can run.
+ *   is not handed out, it is idled. The interrupt handler is the one
+ *   exception -- it cannot spin masked -- so a thread that never yields
+ *   keeps the CPU when nothing else can run.
  */
 
+#include <signetos/hw/platform.hpp>
 #include <signetos/irq.hpp>
 
 #include "runtime.hpp"
@@ -172,23 +195,28 @@ namespace signetos::user {
 namespace {
 
 // --- What `sched` asks `init` for (user/manifest.hpp) -----------------------
-// The timer interrupt is the scheduler's clock, but `sched` asks for nothing
-// to get it: `init` installs its tick handler. `thread_switch`, `thread_tid` and
-// `thread_kill` are what dispatching and killing are made of;
-// `OType::QuotaSched` makes `quota_sched` handles; the VM entries fund the
-// per-node pages. `naming.publish` is asked for because the scheduler publishes
-// its own entry points as it mints them, rather than handing them all back in
-// the handshake. Its VM quota pays for the root node's page.
+// Every interrupt comes to the scheduler: `init` creates its interrupt
+// handler's thread and installs it, and `trap_wait` is how that thread waits.
+// The PLIC window is how it tells device interrupts apart (DEVICE
+// INTERRUPTS).
+// `thread_switch`, `thread_tid` and `thread_kill` are what dispatching and
+// killing are made of; `OType::QuotaSched` makes `quota_sched` handles; the
+// VM entries fund the per-node pages. `naming.publish` is asked for because
+// the scheduler publishes its own entry points as it mints them, rather than
+// handing them all back in the handshake. Its VM quota pays for the root
+// node's page.
 #define SCHED_MANIFEST(X)                              \
   M_QUOTA_VM(X, VM_QUOTA)                              \
   M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaSched) \
   M_SYSCALL(X, SYS_THREAD_SWITCH, thread_switch)       \
   M_SYSCALL(X, SYS_THREAD_TID, thread_tid)             \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)           \
+  M_SYSCALL(X, SYS_TRAP_WAIT, trap_wait)               \
   M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)              \
   M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)          \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)    \
   M_SYSCALL(X, SYS_SENTRY, sentry)                     \
+  M_MMIO(X, PLIC_MMIO, "plic")                         \
   M_SERVICE(X, UART_SENTRY, "uart")                    \
   M_SERVICE(X, NAMING_PUBLISH, "naming.publish")
 SIGNETOS_MANIFEST(SCHED_MANIFEST, 256 * 1024)
@@ -252,6 +280,7 @@ Capability s_seal_auth = nullptr;
 Capability s_gate_alloc = nullptr;
 Capability s_gate_dealloc = nullptr;
 Capability s_gate_switch = nullptr;
+Capability s_gate_trap_wait = nullptr;
 Capability s_gate_thread_tid = nullptr;
 Capability s_gate_thread_kill = nullptr;
 Capability s_gate_invoke = nullptr;
@@ -673,10 +702,10 @@ bool switch_to(ThreadRec* t, uint64_t now) {
 
 // Spins until `at` or a wake, whichever is first, and returns the time
 // afterwards (IDLE in the header). Called holding `s_busy`, which keeps the
-// tick handler out; ticks and device interrupts are still taken, which is
-// how a wake gets in. The idle time is billed to nobody. `wfi` would do here
-// instead of a spin -- everything runs in M-mode -- but a spin keeps the
-// time base simple.
+// tick out; ticks and device interrupts are still taken, which is how a wake
+// gets in. The idle time is billed to nobody. `wfi` would do here instead of
+// a spin -- everything runs in M-mode -- but a spin keeps the time base
+// simple.
 uint64_t idle_until(uint64_t at) {
   const uint64_t seen = s_wakeups;
   while (now_us() < at && s_wakeups == seen) {
@@ -690,16 +719,11 @@ uint64_t idle_until(uint64_t at) {
 // again. Called holding `s_busy`, with `cur`'s slice charged and its state
 // set: READY to stay in the running, BLOCKED or LOCK_WAIT to sleep. Returns
 // with `s_busy` clear and `cur` running. When nothing can run it idles (IDLE
-// in the header) -- except from the tick handler (`can_idle` false), which
-// cannot spin masked and lets `cur` run on instead. That time is spare, and
-// like idle time it is billed to nobody (BUDGETS).
-void reschedule(ThreadRec* cur, uint64_t now, bool can_idle) {
+// in the header).
+void reschedule(ThreadRec* cur, uint64_t now) {
   for (;;) {
     ThreadRec* next = pick(now);
-    if (next == cur || (next == nullptr && !can_idle)) {
-      if (next == nullptr) {
-        cur->paying = nullptr;  // spare time: nobody pays for it
-      }
+    if (next == cur) {
       busy_end();
       return;
     }
@@ -943,7 +967,7 @@ extern "C" int64_t sched_yield_entry() {
   busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
-  reschedule(cur, now, true);
+  reschedule(cur, now);
   return 0;
 }
 
@@ -975,7 +999,7 @@ extern "C" int64_t sched_block_entry(uint64_t timeout_us) {
   if (__atomic_exchange_n(&cur->wake_pending, 0u, __ATOMIC_SEQ_CST) != 0) {
     __atomic_store_n(&cur->state, T_READY, __ATOMIC_SEQ_CST);
   }
-  reschedule(cur, now, true);
+  reschedule(cur, now);
   cur->wake_at_us = 0;
   if (__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST)) {
     return init::SCHED_KILLED;  // woken by `thread_kill`
@@ -1080,7 +1104,7 @@ extern "C" int64_t sched_lock_wait_entry(Capability word_cap, uint64_t seen) {
       cur->lock_owner = owner->tid;
       cur->lock_since_us = now;
       cur->state = T_LOCK_WAIT;
-      reschedule(cur, now, true);  // until the lock is handed to us
+      reschedule(cur, now);  // until the lock is handed to us
       const bool granted = (cur->lock_owner == cur->tid);
       cur->lock_word = 0;
       cur->lock_owner = 0;
@@ -1124,52 +1148,228 @@ extern "C" int64_t sched_lock_wake_entry(Capability word_cap) {
   return static_cast<int64_t>(next->tid);
 }
 
+// --- Device interrupts (DEVICE INTERRUPTS in the header) -----------------------
+
+namespace {
+
+// One per routed PLIC source. The interrupt handler sets `claimed` and
+// `pending` and reads `waiter`; the route's `irq_wait` does the opposite.
+// Each is one aligned word, so either side can land between any two
+// instructions of the other.
+struct Route {
+  uint32_t source;   // 0: free
+  uint32_t pending;  // it fired since the waiter last looked
+  uint32_t claimed;  // claimed at the PLIC, not completed yet
+  uint32_t pad_;
+  uint64_t waiter;   // the tid asleep in `irq_wait`; 0: none
+};
+constexpr size_t MAX_ROUTES = 4;
+Route s_routes[MAX_ROUTES];
+
+Capability s_plic = nullptr;  // the PLIC window (Load|Store); null: unusable
+uint64_t s_plic_context = 0;  // this hart's M-mode context
+uint32_t s_plic_ndev = platform::DEFAULT_PLIC_NDEV;
+
+// 32-bit PLIC registers, offsets from platform.hpp.
+volatile uint32_t* plic_reg(uint64_t offset) {
+  return reinterpret_cast<volatile uint32_t*>(
+      capability_set_address(s_plic, capability_get_base(s_plic) + offset));
+}
+
+volatile uint32_t* plic_enable_word(uint32_t source) {
+  return plic_reg(platform::PLIC_ENABLE_BASE +
+                  s_plic_context * platform::PLIC_ENABLE_STRIDE +
+                  4 * (source / 32));
+}
+
+// Read: claims the highest-priority pending source (0: none). Write a
+// claimed source back: completes it, and it may interrupt again.
+volatile uint32_t* plic_claim() {
+  return plic_reg(platform::PLIC_CONTEXT_BASE +
+                  s_plic_context * platform::PLIC_CONTEXT_STRIDE +
+                  platform::PLIC_CLAIM_OFFSET);
+}
+
+// The external interrupt, in the interrupt handler: claims every source the
+// PLIC has pending for this hart, marks its route and wakes its waiter. A
+// routed source stays claimed until its driver's next `irq_wait`; one nobody
+// routed is turned off rather than left to storm.
+void claim_and_wake() {
+  if (!capability_is_valid(s_plic)) {
+    return;
+  }
+  volatile uint32_t* claim = plic_claim();
+  for (uint32_t source = *claim; source != 0; source = *claim) {
+    Route* r = nullptr;
+    for (Route& x : s_routes) {
+      r = x.source == source ? &x : r;
+    }
+    if (r == nullptr) {
+      volatile uint32_t* word = plic_enable_word(source);
+      *word = *word & ~(1u << (source % 32));
+      *claim = source;
+      continue;
+    }
+    __atomic_store_n(&r->claimed, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&r->pending, 1u, __ATOMIC_SEQ_CST);
+    const uint64_t waiter = __atomic_load_n(&r->waiter, __ATOMIC_SEQ_CST);
+    if (waiter != 0) {
+      sched_wake_entry(waiter);
+    }
+  }
+}
+
+// `sched.irq_wait` for route N (abi.hpp): completes the source's last
+// interrupt, then sleeps until the next one, or `timeout_us` (0: none). An
+// entry point carries nothing of its own, so the route it is for is which of
+// these functions it enters.
+template <size_t N>
+int64_t sched_irq_wait_entry(uint64_t timeout_us) {
+  Route& r = s_routes[N];
+  ThreadRec* cur = caller();
+  if (cur == nullptr) {
+    return init::SCHED_INVALID_THREAD;
+  }
+  uint64_t nobody = 0;
+  if (!__atomic_compare_exchange_n(&r.waiter, &nobody, cur->tid, false,
+                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+    return init::SCHED_BUSY;
+  }
+  if (__atomic_exchange_n(&r.claimed, 0u, __ATOMIC_SEQ_CST) != 0) {
+    *plic_claim() = r.source;
+  }
+  // Named the waiter before looking: an interrupt from here on wakes us, and
+  // `block` keeps a wake that lands before it sleeps (BLOCKING).
+  int64_t status = init::SCHED_OK;
+  while (status == init::SCHED_OK &&
+         __atomic_exchange_n(&r.pending, 0u, __ATOMIC_SEQ_CST) == 0) {
+    status = sched_block_entry(timeout_us);
+  }
+  __atomic_store_n(&r.waiter, 0, __ATOMIC_SEQ_CST);
+  return status;
+}
+
+const void* irq_wait_fn(size_t n) {
+  static_assert(MAX_ROUTES == 4);
+  switch (n) {
+    case 0: return reinterpret_cast<const void*>(&sched_irq_wait_entry<0>);
+    case 1: return reinterpret_cast<const void*>(&sched_irq_wait_entry<1>);
+    case 2: return reinterpret_cast<const void*>(&sched_irq_wait_entry<2>);
+    default: return reinterpret_cast<const void*>(&sched_irq_wait_entry<3>);
+  }
+}
+
+}  // namespace
+
+// `sched.irq_route` (abi.hpp): routes PLIC source `source` and returns its
+// `irq_wait` entry for `init` to hand to the device's driver; null if there
+// is no PLIC, the source is out of range or routed already, or no route is
+// left. It goes back to `init` through `SchedInterface` and is not
+// published: which device reaches which driver is `init`'s decision.
+extern "C" Capability sched_irq_route_entry(uint64_t source) {
+  if (!capability_is_valid(s_plic) || source == 0 || source > s_plic_ndev) {
+    return nullptr;
+  }
+  size_t n = MAX_ROUTES;
+  for (size_t i = MAX_ROUTES; i-- > 0;) {
+    if (s_routes[i].source == source) {
+      return nullptr;
+    }
+    n = s_routes[i].source == 0 ? i : n;
+  }
+  const Capability wait =
+      n == MAX_ROUTES ? nullptr
+                      : mint_entry(s_gate_invoke, rw_table()[SLOT_SYS_SENTRY],
+                                   s_self_comp, irq_wait_fn(n));
+  if (!sealing::is_sealed_as(OType::EntryPoint, wait)) {
+    return nullptr;
+  }
+  // The route is in place before the source can fire.
+  s_routes[n].source = static_cast<uint32_t>(source);
+  *plic_reg(platform::PLIC_PRIORITY + 4 * source) = 1;  // lowest non-zero
+  volatile uint32_t* word = plic_enable_word(static_cast<uint32_t>(source));
+  *word = *word | (1u << (source % 32));
+  return wait;
+}
+
 // The longest a thread waiting for a page sleeps before it tries again
 // (BLOCKING).
 constexpr uint64_t PAGE_WAIT_MAX_US = 10'000;
 
-// IRQ_M_TIMER handler (kernel trap ABI: a0-a3 = mcause/mtval/mepc/mtval2,
-// ca4 = this compartment's table slice). Runs masked on the interrupted
-// thread's stack; `cgp` is our table, so globals resolve as usual. With
-// PAGE_WAIT for `mcause`, the thread waits for a page and `mtval2` is the
-// pager's tid (BLOCKING).
-extern "C" uint64_t sched_tick_entry(uint64_t mcause, uint64_t mtval,
-                                     uint64_t mepc, uint64_t mtval2,
-                                     Capability cap_table_rw) {
-  (void)mtval;
-  (void)mepc;
-  (void)cap_table_rw;
-  // Nothing to do while scheduler state is mid-update on the interrupted
-  // thread, or if that thread is not `s_running` (`caller`).
-  ThreadRec* cur = caller();
-  if (s_busy || cur == nullptr) {
-    return 0;
+// One interrupt (irq::Event), in the interrupt handler's thread: the thread
+// to run next, or null to carry on with the interrupted one. A device
+// interrupt only wakes its driver (DEVICE INTERRUPTS); the tick picks
+// (PREEMPTION); with PAGE_WAIT for the cause, the interrupted thread waits
+// for a page (BLOCKING).
+Capability on_interrupt(uint64_t cause, uint64_t tid, uint64_t pager) {
+  if (cause == irq::IRQ_M_EXT) {
+    claim_and_wake();
+    return nullptr;
+  }
+  // Nothing to do while scheduler state is mid-update on the parked thread,
+  // or if that thread is not `s_running`.
+  ThreadRec* cur = s_running;
+  if (s_busy || cur == nullptr || cur->tid != tid) {
+    return nullptr;
   }
   busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
-  const bool page_wait = mcause == irq::PAGE_WAIT &&
+  const bool page_wait = cause == irq::PAGE_WAIT &&
                          !__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST);
   if (page_wait) {
-    if (mtval2 != 0) {
-      sched_wake_entry(mtval2);  // the pager
+    if (pager != 0) {
+      sched_wake_entry(pager);
     }
     cur->timed_out = false;
     cur->wake_at_us = now + PAGE_WAIT_MAX_US;
     __atomic_store_n(&cur->state, T_BLOCKED, __ATOMIC_SEQ_CST);
   }
-  // If someone else should run, this switches from inside the handler: `cur`
-  // stays parked here, masked, until someone switches back to it; then this
-  // returns and `mret` resumes it.
-  reschedule(cur, now, false);
-  if (page_wait) {
-    // Back: woken, or nothing else could run and it runs on regardless.
-    uint32_t expected = T_BLOCKED;
-    __atomic_compare_exchange_n(&cur->state, &expected, T_READY, false,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    cur->wake_at_us = 0;
+  for (;;) {
+    ThreadRec* next = pick(now);
+    if (next != nullptr && next != cur && thread_tid(next->thread) == 0) {
+      reap(next);  // it has ended: pick again
+      continue;
+    }
+    if (next == nullptr || next == cur) {
+      if (next == nullptr) {
+        // Nothing else can run, and a handler cannot idle (IDLE): `cur` runs
+        // on, on spare time, billed to nobody (BUDGETS). One waiting for a
+        // page faults again and is back here.
+        cur->paying = nullptr;
+        if (page_wait) {
+          uint32_t expected = T_BLOCKED;
+          __atomic_compare_exchange_n(&cur->state, &expected, T_READY, false,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+          cur->wake_at_us = 0;
+        }
+      }
+      busy_end();
+      return nullptr;
+    }
+    // Someone else should run: the handler's wait resumes it, and `cur`
+    // stays parked until it is switched to again.
+    s_running = next;
+    s_slice_start_us = now;
+    busy_end();
+    return next->thread;
   }
-  return 0;
+}
+
+// The interrupt handler's thread (irq.hpp; thread.hpp, THE INTERRUPT
+// HANDLER), which `init` creates on this entry and installs. It runs masked,
+// on its own stack, and spends its life waiting in `sys_trap_wait`, which
+// runs the thread it names and returns at the next interrupt. The interrupt
+// that starts it is not reported, so its first wait names nobody.
+extern "C" void sched_interrupt_entry(Capability arg) {
+  (void)arg;
+  irq::Event ev{};
+  Capability next = nullptr;
+  using FnWait = decltype(&sys_trap_wait);
+  while (syscall::call<FnWait>(s_gate_invoke, s_gate_trap_wait, next,
+                               reinterpret_cast<Capability>(&ev)) == 0) {
+    next = on_interrupt(ev.cause, ev.tid, ev.aux);
+  }
 }
 
 // The dispatcher thread (`sched.run`), created and re-dispatched by the kernel.
@@ -1213,6 +1413,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];
   s_gate_dealloc = rw[SLOT_SYS_VM_DEALLOC];
   s_gate_switch = rw[SLOT_SYS_THREAD_SWITCH];
+  s_gate_trap_wait = rw[SLOT_SYS_TRAP_WAIT];
   s_gate_thread_tid = rw[SLOT_SYS_THREAD_TID];
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
@@ -1233,7 +1434,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
   iface->root_quota = nullptr;
   iface->run = nullptr;
-  iface->tick = nullptr;
+  iface->interrupt = nullptr;
+  iface->irq_route = nullptr;
 
   // 1. Root node: the whole machine, funded from our own VM quota.
   QuotaSched* root = alloc_node(vm_quota, nullptr, init::SCHED_ROOT_PERIOD_US,
@@ -1271,8 +1473,36 @@ extern "C" int64_t compartment_main(Capability arg) {
   iface->root_quota = seal_node(root);
   iface->run = entry(reinterpret_cast<const void*>(&sched_run_entry));
 
-  // 3. Preemption: `init` installs this as the kernel tick's handler.
-  iface->tick = entry(reinterpret_cast<const void*>(&sched_tick_entry));
+  // 3. Interrupts: `init` creates the handler's thread on this entry and
+  //    installs it (irq.hpp).
+  iface->interrupt =
+      entry(reinterpret_cast<const void*>(&sched_interrupt_entry));
+
+  // 4. Device interrupts (DEVICE INTERRUPTS): this hart's M-mode PLIC
+  //    context, from the device tree, with every priority let through.
+  //    Sources stay off until `irq_route` turns them on. Without a usable
+  //    window nothing is routed, and the drivers poll.
+  const Capability plic = rw[SLOT_PLIC_MMIO];
+  const uint64_t hart = this_hart();
+  const uint64_t ctx = iface->plic_ndev == 0         ? 2 * hart
+                       : hart < platform::MAX_HARTS ? iface->plic_m_context[hart]
+                                                    : platform::PLIC_NO_CONTEXT;
+  if (capability_is_valid(plic) &&
+      capability_has_perms(plic, perms::Load | perms::Store) &&
+      ctx != platform::PLIC_NO_CONTEXT &&
+      capability_get_length(plic) >= platform::plic_window_for_context(ctx)) {
+    s_plic = plic;
+    s_plic_context = ctx;
+    if (iface->plic_ndev != 0) {
+      s_plic_ndev = iface->plic_ndev < platform::PLIC_MAX_SOURCE
+                        ? iface->plic_ndev
+                        : platform::PLIC_MAX_SOURCE;
+    }
+    *plic_reg(platform::PLIC_CONTEXT_BASE +
+              ctx * platform::PLIC_CONTEXT_STRIDE) = 0;  // threshold
+    iface->irq_route =
+        entry(reinterpret_cast<const void*>(&sched_irq_route_entry));
+  }
 
   print(s_gate_invoke, s_uart,
         "[sched]    Scheduler online: root quota minted, sched.* published\n");

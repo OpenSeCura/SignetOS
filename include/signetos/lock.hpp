@@ -36,9 +36,7 @@
  *                           mapped-page counts (never held while zeroing an
  *                           allocation).
  *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
- *   6. `irq::s_lock`        leaf lock serializing the two handler installs
- *                           (`irq::install`).
- *   7. `uart::s_lock`       leaf lock protecting console line output.
+ *   6. `uart::s_lock`       leaf lock protecting console line output.
  *
  * Locks are acquired strictly in the order listed above (outermost to
  * innermost). Pure capability-derivation and read-only syscalls

@@ -25,25 +25,23 @@
  * (`mscratchc`, or `csp` if in boot/host context) without clobbering any
  * register, then calls `__signetos_trap_dispatch`.
  *
- * The tick and the external interrupt go to the handlers `init` installed
- * (`sys_trap_install`, trap.hpp); synchronous faults go to the faulting compartment's own
- * fault handler (`compartment_error_handler`), if it installed one, or unwind
- * it. A handler runs on a narrowed stack capability with
- * `(ca0, mtval, mepc, mtval2, cap_table_rw)` in `(ca0, a1, a2, a3, ca4)` --
- * `ca0` is the integer `mcause` for an interrupt, the compartment's
- * ErrorState for a fault (see `fault.hpp`) -- and all other registers
- * scrubbed. On return the `TrapFrame` is restored (or, for a fault, reloaded
- * from the ErrorState or unwound, per the handler's verdict in `a0`) and
- * `mret` executed.
+ * An interrupt wakes this hart's interrupt handler thread (thread.hpp, THE
+ * INTERRUPT HANDLER): the interrupted thread stays parked in that
+ * `TrapFrame`, and the dispatcher resumes the handler thread from where it
+ * waits, so it does not come back here. Synchronous faults go to the
+ * faulting compartment's own fault handler (`compartment_error_handler`),
+ * if it installed one, or unwind it. A fault handler runs on a narrowed
+ * stack capability with `(ErrorState, mtval, mepc, mtval2, cap_table_rw)`
+ * in `(ca0, a1, a2, a3, ca4)` (fault.hpp) and all other registers scrubbed.
+ * On return the `TrapFrame` is reloaded from the ErrorState or unwound, per
+ * the handler's verdict in `a0`, and `mret` executed.
  *
  * INTERRUPT MASKING (see `asm_macros.h`): the hardware clears `mstatus.MIE`
- * on entry. Just before entering the handler, step 3 sets `MIE` from the
- * frame's `handler_mie`, which the dispatcher chose: 0 for an interrupt
- * handler (and every gate it calls restores the masked state on return),
- * the interrupted code's `MIE` for an exception handler, so an interrupt can
- * be taken on top of it and return into it. `__signetos_trap_return` sets
- * `mstatus.MPIE` from the `mstatus` the dispatcher recorded, so the final
- * `mret` gives the interrupted context back exactly the `MIE` it had.
+ * on entry. Just before entering a fault handler, step 3 sets `MIE` from the
+ * frame's `handler_mie`: the faulting code's `MIE`, so an interrupt can be
+ * taken on top of it and return into it. `unwind::resume` sets
+ * `mstatus.MPIE` from the `mstatus` recorded in the frame it resumes, so the
+ * final `mret` gives that context back exactly the `MIE` it had.
  *
  * NO MACROS: every register sequence is written out in place, as in
  * `switch.S`. Only the `TRAP_FRAME_*` offsets and `mstatus` bits come from
@@ -111,11 +109,12 @@ _early_trap_entry:
     cmv     csp, ct0
 
     /*
-     * 2. Call `__signetos_trap_dispatch(mcause, mtval, mtval2, frame)`.
-     *    Three outcomes in `ca0`:
-     *      - a tagged `CT = 1` hardware sentry: deliver to it (step 3) — the
-     *        bound interrupt handler, or the faulting compartment's fault
-     *        handler;
+     * 2. Call `__signetos_trap_dispatch(mcause, mtval, mtval2, frame)`. An
+     *    interrupt handed to the interrupt handler thread does not come
+     *    back (the thread is resumed from there). Otherwise three outcomes
+     *    in `ca0`:
+     *      - a tagged `CT = 1` hardware sentry: enter it (step 3) — the
+     *        faulting compartment's fault handler;
      *      - `nullptr`: handled in-kernel, resume the frame as it is;
      *      - an untagged non-null sentinel: a fault nobody can handle — the
      *        dispatcher has marked the frame and pointed `mscratchc` at it,
@@ -136,22 +135,19 @@ _early_trap_entry:
 .Ltrap_deliver:
 
     /*
-     * 3. Invoke the bound compartment trap handler (`ca0`) with:
-     *      ca0 = handler_ca0   a1  = mtval
-     *      a2  = mepc          a3  = mtval2
-     *      ca4 = rw_table      cgp = rw_table
+     * 3. Enter the faulting compartment's fault handler (`ca0`) with:
+     *      ca0 = its ErrorState (fault.hpp)   a1  = mtval
+     *      a2  = mepc                         a3  = mtval2
+     *      ca4 = rw_table                     cgp = rw_table
      *      csp = narrowed handler_sp
-     *    (`handler_ca0` is the integer `mcause` for an interrupt handler,
-     *    the ErrorState for a fault handler: fault.hpp)
      *    all other registers scrubbed to `cnull`, everything below `csp` zeroed
-     *    (what the interrupted code left there; a fault handler's ErrorState
-     *    sits just above its `csp`), and `mstatus.MIE` set from the frame's
-     *    `handler_mie`.
+     *    (what the faulting code left there; the ErrorState sits just above
+     *    `csp`), and `mstatus.MIE` set from the frame's `handler_mie`.
      *
      *    `MIE` is set last, after the CSRs have been read: from then on an
-     *    interrupt can be taken here, and it is an ordinary nested trap
-     *    (`mscratchc` points at this frame, so the nested frame goes below
-     *    it, and every register set up here is saved and restored).
+     *    interrupt can be taken here, and it is an ordinary trap (`mscratchc`
+     *    points at this frame, so the new frame goes below it, and every
+     *    register set up here is saved and restored).
      */
     cmv     ct0, ca0                    /* ct0 = handler CT = 1 sentry */
     clc     ct3, TRAP_FRAME_HANDLER_SP(csp)
@@ -185,7 +181,7 @@ _early_trap_entry:
     cmv     ca5, cnull
     cmv     ca6, cnull
     cmv     ca7, cnull
-    clc     ca0, TRAP_FRAME_HANDLER_CA0(csp) /* mcause, or the ErrorState */
+    clc     ca0, TRAP_FRAME_HANDLER_CA0(csp) /* the ErrorState */
     csrr    a1, mtval
     csrr    ca2, mepcc
     scaddr  ca2, cnull, a2              /* a2 = integer address of mepcc */
@@ -198,19 +194,17 @@ _early_trap_entry:
     cjalr   cra, ct0
 
     /*
-     * 4. Handler returned: mask (an exception handler may come back with
+     * 4. Handler returned: mask (a fault handler may come back with
      *    interrupts enabled; an interrupt taken before this instruction is
-     *    an ordinary nested trap, as in step 3), scrub the handler's
-     *    narrowed stack and pop the `TrapFrame` from the hart's `mscratchc`
-     *    in C++ (`__signetos_trap_return` = `unwind::resume`). If the
-     *    interrupted code's compartment has been destroyed and swept it
-     *    unwinds further; `a0` says what kind of frame it stopped at
-     *    (UNWIND_*; UNWIND_NONE does not come back), and that frame sits
-     *    just below the new `mscratchc`.
+     *    an ordinary trap, as in step 3), then pop the `TrapFrame` in C++
+     *    (`__signetos_trap_return` = `unwind::resume`). If the code under it
+     *    was in a compartment that has been destroyed and swept, it unwinds
+     *    further; `a0` says what kind of frame it stopped at (UNWIND_*;
+     *    UNWIND_NONE does not come back), and that frame sits just below the
+     *    new `mscratchc`.
      *
      *    The handler's `a0` is left in place as `__signetos_trap_return`'s
-     *    argument: for a fault handler it is the verdict (`fault::UNWIND`
-     *    or `INSTALL_CONTEXT`); for an interrupt frame it is ignored.
+     *    argument: the verdict (`fault::UNWIND` or `INSTALL_CONTEXT`).
      */
     csrci   mstatus, MSTATUS_MIE
 .Lhandler_returned:

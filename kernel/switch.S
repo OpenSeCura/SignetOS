@@ -45,15 +45,18 @@
  *      `ca0` carries the callee's checked return value, or the `Status` of a
  *      refused call.
  *
- *   2. THREAD CONTEXT SWITCHER (`sys_thread_switch`, `__thread_restore`,
- *      `__thread_exit_to_host`, `__thread_start`):
+ *   2. THREAD CONTEXT SWITCHER (`sys_thread_switch`, `sys_trap_wait`,
+ *      `__thread_exit_to_host`, `__thread_resume_on`, `__thread_start`):
  *      Outgoing Thread (or Kernel Host) -> Incoming Thread.
- *      Saves all 31 capability registers in a `SwitchFrame` on the outgoing
- *      kernel stack, calls `__signetos_thread_dispatch`, and restores the
- *      incoming thread's `SwitchFrame`. `sys_thread_switch` is a kernel entry
- *      like any other (reached through the switcher), except that it needs no
- *      user stack at all: its frame goes on the kernel stack and its C++ runs
- *      there. The host (`init::launch`) calls it directly.
+ *      Parks the outgoing context in a `TrapFrame` on its kernel stack that
+ *      resumes just after the call (thread.hpp, PARKED THREADS) and calls
+ *      `__signetos_thread_dispatch` (or, for the interrupt handler's wait,
+ *      `__signetos_trap_wait`), which resumes the incoming thread through
+ *      the trap return path, as every parked thread is resumed.
+ *      `sys_thread_switch` is a kernel entry like any other (reached through
+ *      the switcher), except that it needs no user stack at all: its frame
+ *      goes on the kernel stack and its C++ runs there. The host
+ *      (`init::launch`) calls it directly.
  *
  * INTERRUPT MASKING: see `asm_macros.h`. Every entry below masks first; the
  * caller's `MIE` is re-established only by the last few instructions before
@@ -74,9 +77,9 @@
  *
  * NO MACROS: every register sequence in this file is written out in place so
  * each path reads top to bottom. Only constants come from `asm_macros.h`: the
- * frame offsets (`RET_FRAME_*`, `FRAME_SP`, `SWITCH_FRAME_SIZE`), which
- * `switcher.cpp` static_asserts against `ReturnFrame`, and the `mstatus`,
- * `ENTRY_TRUSTED` and `Status` values.
+ * frame offsets (`RET_FRAME_*`, `TRAP_FRAME_*`, `FRAME_SP`), which
+ * `switcher.cpp` and `trap.cpp` static_assert against the structs, and the
+ * `mstatus`, `ENTRY_TRUSTED` and `Status` values.
  */
 
 #include <signetos/asm_macros.h>
@@ -350,29 +353,49 @@ __signetos_resume_return_frame:
  * ========================================================================= */
 
     .align 4
+    .globl sys_trap_wait
+    .type sys_trap_wait, @function
+sys_trap_wait:
+    /*
+     * The interrupt handler's wait (thread.hpp, THE INTERRUPT HANDLER):
+     * parks its caller exactly as `sys_thread_switch` does, then calls
+     * `__signetos_trap_wait(next, saved_frame, event)` instead of
+     * `__signetos_thread_dispatch(thread_handle, saved_frame)`. Which one
+     * goes in `ct2`, a temporary its callers do not keep.
+     */
+    csrci   mstatus, MSTATUS_MIE
+    llc     ct2, __signetos_trap_wait
+    j       .Lpark
+    .size sys_trap_wait, . - sys_trap_wait
+
+    .align 4
     .globl sys_thread_switch
     .type sys_thread_switch, @function
 sys_thread_switch:
     /*
      * 1. Mask interrupts (already masked when entered through the switcher;
-     *    the host runs masked), then push a `SwitchFrame` onto the current
-     *    thread's kernel stack and save all 31 capability registers. `csp` is
+     *    the host runs masked), then park the caller like any other parked
+     *    thread (thread.hpp, PARKED THREADS): push a `TrapFrame` onto the
+     *    current kernel stack, save all 31 capability registers, and have it
+     *    resume at `.Lswitch_resume`, just after this call, masked. `csp` is
      *    whatever the caller handed over and is never used: the frame and the
      *    C++ below both live on the kernel stack.
      */
     csrci   mstatus, MSTATUS_MIE
+    llc     ct2, __signetos_thread_dispatch
+.Lpark:
     /*
      * Carve the frame from `mscratchc` without losing any register: swap
      * `ct0` with `mscratchc` (caller's `ct0` is now in the CSR, `ct0` is the
      * kernel SP), save `ct1` so it can serve as scratch, swap the caller's
      * `ct0` back out through `ct1` and leave `mscratchc` exactly as it was
-     * (= frame + SWITCH_FRAME_SIZE, the invariant `__thread_restore` relies
+     * (= frame + TRAP_FRAME_SIZE, the invariant `.Ltrap_restore` relies
      * on). Same sequence as `_early_trap_entry` step 1 in `early_trap.S`.
      */
     csrrw   ct0, mscratchc, ct0         /* ct0 = ksp, mscratchc = caller's ct0 */
-    caddi   ct0, ct0, -SWITCH_FRAME_SIZE /* ct0 = frame base */
+    caddi   ct0, ct0, -TRAP_FRAME_SIZE  /* ct0 = frame base */
     csc     ct1,  80(ct0)               /* frame->t[1]; ct1 is scratch below */
-    caddi   ct1, ct0, SWITCH_FRAME_SIZE /* ct1 = original ksp */
+    caddi   ct1, ct0, TRAP_FRAME_SIZE   /* ct1 = original ksp */
     csc     ct1, FRAME_LINK(ct0)        /* frame->active_kernel_sp */
     csrrw   ct1, mscratchc, ct1         /* ct1 = caller's ct0, mscratchc = ksp */
     csc     ct1,  64(ct0)               /* frame->t[0] = caller's ct0 */
@@ -405,124 +428,101 @@ sys_thread_switch:
     csc     ca5, 448(ct0)
     csc     ca6, 464(ct0)
     csc     ca7, 480(ct0)
+    llc     ct1, .Lswitch_resume
+    csc     ct1, TRAP_FRAME_MEPCC(ct0)
+    csc     cnull, TRAP_FRAME_HANDLER_SP(ct0) /* no handler stack to zero */
+    sd      zero, TRAP_FRAME_MSTATUS(ct0)     /* MPIE = 0: resumes masked */
+    sd      zero, TRAP_FRAME_FLAGS(ct0)
 
     /*
-     * 2. Call `__signetos_thread_dispatch(thread_handle, saved_frame)`.
-     *    Returns the `SwitchFrame*` to restore in `ca0` (the incoming thread's
-     *    frame on success, or `saved_frame` with `frame->a[0] = Status` on
-     *    refusal).
+     * 2. Call the C++ in `ct2` with `(ca0, saved_frame, ca1)`. A switch that
+     *    is made leaves from there, through the trap return path; it comes
+     *    back only to refuse, with the `Status` in the frame's `a0`, and then
+     *    this frame is resumed at once, masked.
      */
     cmv     csp, ct0
+    cmv     ca2, ca1
     cmv     ca1, ct0
-    cjal    cra, __signetos_thread_dispatch
+    cjalr   cra, ct2
+    li      t0, MSTATUS_MPIE
+    csrc    mstatus, t0
+    j       __signetos_resume_trap_frame
+
+.Lswitch_resume:
+    /*
+     * 3. Resumed, with every register as the caller left it and the switch's
+     *    `Status` in `a0`: back to the caller -- the switcher's return path,
+     *    which restores the caller's `MIE`, or the host loop, which never
+     *    unmasks.
+     */
+    ret
     .size sys_thread_switch, . - sys_thread_switch
 
     /*
-     * 3. `__thread_restore(Capability next_ksp)`
-     *    Re-installs `mscratchc = frame + SWITCH_FRAME_SIZE`, restores all 31
-     *    capability registers from the `SwitchFrame` at `ca0` and jumps to
-     *    `cra` -- always still masked. Every frame restored here
-     *    resumes kernel code that unmasks on its own way out: the switcher's
-     *    `.Lcomp_restore` (a thread parked by `sys_thread_switch`),
-     *    `__thread_start` (a new thread) or the host loop (which never
-     *    unmasks).
-     */
-    .align 4
-    .globl __thread_restore
-    .type __thread_restore, @function
-__thread_restore:
-    /*
-     * `ct6` is the frame base, reloaded last. Same sequence as
-     * `.Ltrap_restore` in `early_trap.S`, except that the base comes from
-     * `ca0`, not `csp`.
-     */
-    cmv     ct6, ca0                    /* ct6 = frame base */
-    caddi   ct5, ct6, SWITCH_FRAME_SIZE
-    csrw    mscratchc, ct5              /* kernel SP: just above the frame */
-    clc     cra,   0(ct6)
-    clc     csp,  16(ct6)
-    clc     cgp,  32(ct6)
-    clc     ctp, FRAME_TP(ct6)
-    clc     ct0,  64(ct6)
-    clc     ct1,  80(ct6)
-    clc     ct2,  96(ct6)
-    clc     ct3, 112(ct6)
-    clc     ct4, 128(ct6)
-    clc     ct5, 144(ct6)
-    clc     cs0, 176(ct6)
-    clc     cs1, 192(ct6)
-    clc     cs2, 208(ct6)
-    clc     cs3, 224(ct6)
-    clc     cs4, 240(ct6)
-    clc     cs5, 256(ct6)
-    clc     cs6, 272(ct6)
-    clc     cs7, 288(ct6)
-    clc     cs8, 304(ct6)
-    clc     cs9, 320(ct6)
-    clc     cs10, 336(ct6)
-    clc     cs11, 352(ct6)
-    clc     ca0, 368(ct6)
-    clc     ca1, 384(ct6)
-    clc     ca2, 400(ct6)
-    clc     ca3, 416(ct6)
-    clc     ca4, 432(ct6)
-    clc     ca5, 448(ct6)
-    clc     ca6, 464(ct6)
-    clc     ca7, 480(ct6)
-    clc     ct6, 160(ct6)               /* the base, last */
-    ret
-    .size __thread_restore, . - __thread_restore
-
-    /*
-     * `__thread_exit_to_host(ThreadState* t, Capability host_ksp)`
-     * Pivots `csp` onto `host_ksp` (`ca1`) BEFORE `__signetos_teardown_thread`
-     * frees the dying thread's `state_page` and stack, then restores the host
-     * context.
+     * `__thread_exit_to_host(ThreadState* t, Capability host_frame)`
+     * Pivots `csp` onto the host's frame (`ca1`) BEFORE
+     * `__signetos_teardown_thread` frees the dying thread's `state_page` and
+     * stack, then resumes the host from that frame, masked: the host parked
+     * there in `sys_thread_switch`, and `mscratchc` is already just above it.
      */
     .align 4
     .globl __thread_exit_to_host
     .type __thread_exit_to_host, @function
 __thread_exit_to_host:
     cmv     csp, ca1
-    cmv     cs0, ca1
     cjal    cra, __signetos_teardown_thread
-    cmv     ca0, cs0
-    j       __thread_restore
+    li      t0, MSTATUS_MPIE
+    csrc    mstatus, t0
+    j       __signetos_resume_trap_frame
     .size __thread_exit_to_host, . - __thread_exit_to_host
 
     /*
+     * `__thread_resume_on(ThreadState* next, Capability sp, ThreadState* dead)`
+     * Pivots `csp` onto `sp` -- free kernel stack below the frame `next` is
+     * parked in -- tears `dead` down if it is not null, then resumes `next`
+     * (`__signetos_resume_thread`). The interrupt path uses it to resume the
+     * handler on the handler's own kernel stack, and a handler that ends to
+     * resume the thread it was woken for before its own stacks are freed.
+     */
+    .align 4
+    .globl __thread_resume_on
+    .type __thread_resume_on, @function
+__thread_resume_on:
+    cmv     csp, ca1
+    cmv     cs0, ca0                    /* `next`; nothing returns here */
+    beqz    a2, 1f
+    cmv     ca0, ca2
+    cjal    cra, __signetos_teardown_thread
+1:
+    cmv     ca0, cs0
+    cjal    cra, __signetos_resume_thread
+    unimp
+    .size __thread_resume_on, . - __thread_resume_on
+
+    /*
      * `__thread_start`
-     * Initial trampoline for a newly created thread (`ct0` = entry sentry,
-     * `ca0` = `initial_arg`, `cgp` = compartment cap table, `csp` = `user_sp`).
-     * A new thread is plain user code, so it starts unmasked. If the entry
-     * ever returns, the thread ends: `thread::exit` runs on the thread's own
-     * kernel stack (the user stack is whatever the entry left behind).
+     * Where a new thread starts (`thread::create` parks it here): `ct0` =
+     * entry sentry, `ca0` = `initial_arg`, `cgp` = compartment cap table,
+     * `csp` = `user_sp`, `t2` = the `MIE` its entry runs with: set for an
+     * ordinary thread, clear for an interrupt handler
+     * (`thread::install_handler`). If the entry ever returns, the thread
+     * ends: `thread::exit` runs on the thread's own kernel stack (the user
+     * stack is whatever the entry left behind).
      *
      * The entry sentry was resolved when the thread was created. If its
      * compartment has been destroyed and swept since, `ct0` has lost its tag
      * (the sweep scans the frame it was loaded from): jumping to it would
      * fault in kernel text and halt the machine, so the thread ends instead.
-     *
-     * A new thread reaches it through `__thread_restore`'s `ret`, and a return
-     * only goes through a return sentry, which only the hardware makes, as
-     * the link of a jump (toolchain/sentries). `__thread_start_link` makes one
-     * by jumping from the instruction just before `__thread_start`, so
-     * nothing may come between the two.
      */
     .align 4
-    .globl __thread_start_link
-    .type __thread_start_link, @function
-__thread_start_link:
-    cmv     ct1, cra
-    cjal    cra, .Lthread_start_linked  /* cra = return sentry to __thread_start */
-    .size __thread_start_link, . - __thread_start_link
-
     .globl __thread_start
     .type __thread_start, @function
 __thread_start:
     gctag   t1, ct0
     beqz    t1, 1f
-    csrsi   mstatus, MSTATUS_MIE
+    andi    t2, t2, MSTATUS_MIE
+    csrs    mstatus, t2
+    cmv     ct2, cnull
     cjalr   cra, ct0
     csrci   mstatus, MSTATUS_MIE
     csrr    csp, mscratchc
@@ -535,12 +535,6 @@ __thread_start:
     cjal    cra, sys_thread_exit
     unimp
     .size __thread_start, . - __thread_start
-
-    /* The rest of `__thread_start_link`: hand the link back in `ca0`. */
-.Lthread_start_linked:
-    cmv     ca0, cra
-    cmv     cra, ct1
-    ret
 
 
 /* =========================================================================

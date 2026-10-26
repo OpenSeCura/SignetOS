@@ -73,8 +73,8 @@ struct alignas(16) NamingInterface {
 // Console (`boot/uart.cpp`)
 // ----------------------------------------------------------------------------
 //   uint64_t uart(const char* str)
-//   uint64_t uart.read(Capability buf, Capability wake) -> bytes read
-//   uint64_t uart.irq(uint64_t source)
+//   uint64_t uart.read(Capability buf) -> bytes read; sleeps until there are some
+//   uint64_t uart.irq(Capability irq_wait)   [once, from `init`]
 struct alignas(16) UartInterface {
   Capability read;          // OType::EntryPoint -> uart_read_entry
   Capability irq;           // OType::EntryPoint -> uart_irq_entry
@@ -101,26 +101,6 @@ struct alignas(16) UartInterface {
 // Published by the sealer itself; `init` hands nothing back from it.
 
 // ----------------------------------------------------------------------------
-// Interrupt routing (`external/services/trap_mgr.cpp`)
-// ----------------------------------------------------------------------------
-//   int64_t  trap_mgr.irq_route(Capability handler, uint64_t source) -> IRQ_*
-//   uint64_t routed_handler(uint64_t source)
-constexpr size_t IRQ_MAX_HANDLERS = 4;   // per source
-
-constexpr int64_t IRQ_OK          = 0;
-constexpr int64_t IRQ_BAD_REQUEST = -1;  // bad source, or not an EntryPoint
-constexpr int64_t IRQ_FULL        = -2;
-
-struct alignas(16) TrapMgrInterface {
-  Capability irq_route;     // out: OType::EntryPoint -> trap_mgr_irq_route_entry
-  Capability irq;           // out: OType::EntryPoint -> the IRQ_M_EXT handler,
-                            //      which `init` installs
-  uint32_t plic_ndev;       // in: max PLIC source number (from DTB; 0 = default)
-  uint32_t pad_;
-  uint32_t plic_m_context[platform::MAX_HARTS];  // in: hart -> M-mode PLIC context
-};
-
-// ----------------------------------------------------------------------------
 // Scheduler service (`external/services/sched.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  sched.quota_derive(SchedDeriveRequest* req) -> SCHED_*
@@ -133,16 +113,26 @@ struct alignas(16) TrapMgrInterface {
 //   int64_t  sched.thread_kill(Capability thread) -> SCHED_OK, SCHED_PERMISSION or SCHED_INVALID_THREAD
 //   int64_t  sched.lock_wait(uint64_t* word, uint64_t seen) -> SCHED_OK, SCHED_OWNER_DEAD or SCHED_DEADLOCK
 //   int64_t  sched.lock_wake(uint64_t* word) -> SCHED_OK or SCHED_PERMISSION
+//   int64_t  sched.irq_wait(uint64_t timeout_us) -> SCHED_OK, SCHED_TIMED_OUT, SCHED_KILLED or SCHED_BUSY
+//   Capability sched.irq_route(uint64_t source) -> irq_wait for it, or null [`init` only]
 //
-// `block`, `lock_wait` and `lock_wake` return SCHED_INVALID_THREAD to a thread
-// the scheduler does not run (`init`, before the dispatcher starts). A thread
-// reads its own tid, which is what `wake` takes, from `utidc` (runtime.hpp,
-// `self_tid`).
+// `block`, `lock_wait`, `lock_wake` and `irq_wait` return SCHED_INVALID_THREAD
+// to a thread the scheduler does not run (`init`, before the dispatcher
+// starts). A thread reads its own tid, which is what `wake` takes, from
+// `utidc` (runtime.hpp, `self_tid`).
 //
 // A killed thread never sleeps: every `block` it makes returns SCHED_KILLED
 // at once. A caller waiting for something certain to happen (a device
 // finishing a request it was given) keeps waiting, and so polls; one waiting
 // for something that may never happen (input, another thread) gives up.
+//
+// A device interrupt reaches its driver as an `irq_wait` entry: there is one
+// for each PLIC source `init` routes, and it is handed to that device's
+// driver and nobody else (sched.cpp, DEVICE INTERRUPTS). `irq_wait` tells the
+// PLIC the source's last interrupt has been dealt with, then sleeps until the
+// next one (or `timeout_us`; 0: no timeout). One thread waits on a source at a
+// time; another gets SCHED_BUSY. A driver deals with an interrupt (reads or
+// acknowledges its device) before it waits again.
 //
 // There is one kind of handle to a node, and whoever holds it has full use of
 // the node's time: registering threads on it, deriving from it, querying it.
@@ -180,11 +170,12 @@ constexpr int64_t SCHED_INVALID_QUOTA  = -2;
 constexpr int64_t SCHED_PERMISSION     = -3;  // not allowed through these handles (above)
 constexpr int64_t SCHED_BANDWIDTH      = -4;  // temporal conservation violated
 constexpr int64_t SCHED_NO_MEMORY      = -5;  // node_funding could not pay
-constexpr int64_t SCHED_BUSY           = -6;  // destroy: the node's term has not ended
+constexpr int64_t SCHED_BUSY           = -6;  // destroy: the node's term has not ended;
+                                              // irq_wait: another thread waits on it
 constexpr int64_t SCHED_FULL           = -7;
 constexpr int64_t SCHED_INVALID_THREAD = -8;
-constexpr int64_t SCHED_TIMED_OUT      = -10;  // block: the timeout ran out first
-constexpr int64_t SCHED_KILLED         = -11;  // block: the caller was killed; it did not sleep
+constexpr int64_t SCHED_TIMED_OUT      = -10;  // block, irq_wait: the timeout ran out first
+constexpr int64_t SCHED_KILLED         = -11;  // block, irq_wait: the caller was killed; it did not sleep
 constexpr int64_t SCHED_OWNER_DEAD     = -12;  // lock_wait: taken over from an owner that ended
 constexpr int64_t SCHED_DEADLOCK       = -13;  // lock_wait: the owner is waiting for the caller
 
@@ -228,10 +219,14 @@ struct alignas(16) SchedQueryRequest {
 struct alignas(16) SchedInterface {
   Capability root_quota;    // out: handle of the root node
   Capability run;           // out: OType::EntryPoint -> dispatcher (RW_SLOT_SCHED_RUN)
-  Capability tick;          // out: OType::EntryPoint -> the tick handler, which
-                            //      `init` installs for IRQ_M_TIMER
+  Capability interrupt;     // out: OType::EntryPoint -> the interrupt handler;
+                            //      `init` creates a thread on it and installs
+                            //      that (thread.hpp, THE INTERRUPT HANDLER)
+  Capability irq_route;     // out: OType::EntryPoint -> sched.irq_route
   uint64_t timebase_hz;     // in: `time` CSR frequency in Hz (from DTB; 0 = default)
-  uint64_t pad_;
+  uint32_t plic_ndev;       // in: max PLIC source number (from DTB; 0 = default)
+  uint32_t pad_;
+  uint32_t plic_m_context[platform::MAX_HARTS];  // in: hart -> M-mode PLIC context
 };
 
 // The last sector of a disk with a swap region (`tools/signetfs.py swap`):
@@ -292,11 +287,10 @@ struct alignas(16) DmaInterface {
 // ----------------------------------------------------------------------------
 //   int64_t  blk.read(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
 //   int64_t  blk.write(Capability buf, uint64_t sector, uint64_t count) -> BLK_*
-//   uint64_t blk.irq(uint64_t source)
 //   uint64_t blk_paging(Capability)        the pager's thread (blk.cpp, PAGING)
 //   int64_t  blk.paging_stop() -> BLK_OK   the pager's thread ends
 //   int64_t  blk(Capability block, Capability wake, Capability lock_wait,
-//                Capability lock_wake) [2nd call]
+//                Capability lock_wake, Capability irq_wait) [2nd call]
 // Every request is exactly BLK_XFER_BYTES: `count` must be
 // BLK_XFER_BYTES / BLK_SECTOR_BYTES (the descriptor chains are fixed, dma.cpp).
 constexpr uint64_t BLK_SECTOR_BYTES = 512;
@@ -313,7 +307,6 @@ constexpr int64_t BLK_BUSY         = -5;  // a request is already in flight
 struct alignas(16) BlkInterface {
   Capability read;          // out: OType::EntryPoint -> blk_read_entry
   Capability write;         // out: OType::EntryPoint -> blk_write_entry
-  Capability irq;           // out: OType::EntryPoint -> blk_irq_entry
   Capability paging;        // out: OType::EntryPoint -> blk_paging_entry
   Capability paging_stop;   // out: OType::EntryPoint -> blk_paging_stop_entry
   Capability buf;           // in: DmaInterface::buf
@@ -458,30 +451,27 @@ constexpr size_t RW_SLOT_NAMING_SENTRY       = RW_SLOT_PROVISIONED_BASE + 5;
 constexpr size_t RW_SLOT_SCHED_QUOTA         = RW_SLOT_PROVISIONED_BASE + 6;
 constexpr size_t RW_SLOT_SCHED_COMP          = RW_SLOT_PROVISIONED_BASE + 7;
 constexpr size_t RW_SLOT_SCHED_SENTRY        = RW_SLOT_PROVISIONED_BASE + 8;
-constexpr size_t RW_SLOT_TRAP_MGR_QUOTA      = RW_SLOT_PROVISIONED_BASE + 9;
-constexpr size_t RW_SLOT_TRAP_MGR_COMP       = RW_SLOT_PROVISIONED_BASE + 10;
-constexpr size_t RW_SLOT_TRAP_MGR_SENTRY     = RW_SLOT_PROVISIONED_BASE + 11;
-constexpr size_t RW_SLOT_FS_QUOTA            = RW_SLOT_PROVISIONED_BASE + 12;
-constexpr size_t RW_SLOT_FS_COMP             = RW_SLOT_PROVISIONED_BASE + 13;
-constexpr size_t RW_SLOT_FS_SENTRY           = RW_SLOT_PROVISIONED_BASE + 14;
-constexpr size_t RW_SLOT_SHELL_VM_QUOTA      = RW_SLOT_PROVISIONED_BASE + 15;
-constexpr size_t RW_SLOT_SHELL_T_QUOTA       = RW_SLOT_PROVISIONED_BASE + 16;
-constexpr size_t RW_SLOT_SHELL_COMP          = RW_SLOT_PROVISIONED_BASE + 17;
-constexpr size_t RW_SLOT_SHELL_SENTRY        = RW_SLOT_PROVISIONED_BASE + 18;
-constexpr size_t RW_SLOT_SHELL_THREAD        = RW_SLOT_PROVISIONED_BASE + 19;
-constexpr size_t RW_SLOT_NAMING_PUBLISH      = RW_SLOT_PROVISIONED_BASE + 20;
-constexpr size_t RW_SLOT_NAMING_LOOKUP       = RW_SLOT_PROVISIONED_BASE + 21;
-constexpr size_t RW_SLOT_NAMING_PROOF        = RW_SLOT_PROVISIONED_BASE + 22;
-constexpr size_t RW_SLOT_SCHED_NODE_FUNDING  = RW_SLOT_PROVISIONED_BASE + 23;
-constexpr size_t RW_SLOT_SHELL_SCHED_QUOTA   = RW_SLOT_PROVISIONED_BASE + 24;
-constexpr size_t RW_SLOT_BLK_QUOTA           = RW_SLOT_PROVISIONED_BASE + 25;
-constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 26;
-constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 27;
-constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 28;
-constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 29;
-constexpr size_t RW_SLOT_SEALER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 30;
-constexpr size_t RW_SLOT_SEALER_COMP         = RW_SLOT_PROVISIONED_BASE + 31;
-constexpr size_t RW_SLOT_SEALER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 32;
+constexpr size_t RW_SLOT_FS_QUOTA            = RW_SLOT_PROVISIONED_BASE + 9;
+constexpr size_t RW_SLOT_FS_COMP             = RW_SLOT_PROVISIONED_BASE + 10;
+constexpr size_t RW_SLOT_FS_SENTRY           = RW_SLOT_PROVISIONED_BASE + 11;
+constexpr size_t RW_SLOT_SHELL_VM_QUOTA      = RW_SLOT_PROVISIONED_BASE + 12;
+constexpr size_t RW_SLOT_SHELL_T_QUOTA       = RW_SLOT_PROVISIONED_BASE + 13;
+constexpr size_t RW_SLOT_SHELL_COMP          = RW_SLOT_PROVISIONED_BASE + 14;
+constexpr size_t RW_SLOT_SHELL_SENTRY        = RW_SLOT_PROVISIONED_BASE + 15;
+constexpr size_t RW_SLOT_SHELL_THREAD        = RW_SLOT_PROVISIONED_BASE + 16;
+constexpr size_t RW_SLOT_NAMING_PUBLISH      = RW_SLOT_PROVISIONED_BASE + 17;
+constexpr size_t RW_SLOT_NAMING_LOOKUP       = RW_SLOT_PROVISIONED_BASE + 18;
+constexpr size_t RW_SLOT_NAMING_PROOF        = RW_SLOT_PROVISIONED_BASE + 19;
+constexpr size_t RW_SLOT_SCHED_NODE_FUNDING  = RW_SLOT_PROVISIONED_BASE + 20;
+constexpr size_t RW_SLOT_SHELL_SCHED_QUOTA   = RW_SLOT_PROVISIONED_BASE + 21;
+constexpr size_t RW_SLOT_BLK_QUOTA           = RW_SLOT_PROVISIONED_BASE + 22;
+constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 23;
+constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 24;
+constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 25;
+constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 26;
+constexpr size_t RW_SLOT_SEALER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 27;
+constexpr size_t RW_SLOT_SEALER_COMP         = RW_SLOT_PROVISIONED_BASE + 28;
+constexpr size_t RW_SLOT_SEALER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 29;
 
 __attribute__((always_inline)) inline constexpr size_t syscall_slot(
     syscall::Id id) {

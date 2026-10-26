@@ -56,11 +56,6 @@ void fault_report(const char* why, uint64_t comp_uid, uint64_t mcause,
 // `why`.
 void thread_ending(const char* who, const char* why);
 
-// The running thread is being ended because it cannot take the trap it just
-// took (`why`, `status`; trap.cpp, `end_interrupted_thread`).
-void interrupted_thread_ending(const char* why, Status status,
-                               uint64_t mcause, uint64_t mepc);
-
 // `online` of `total` harts are up, booted from `boot_hart`.
 void harts_online(uint64_t online, uint64_t total, uint64_t boot_hart);
 

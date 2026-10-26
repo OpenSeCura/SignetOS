@@ -146,14 +146,8 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
     return refuse(status);
   }
   // `trusted` means a kernel syscall gate (syscall::gate); otherwise it's a
-  // user compartment. Unmasked compartments can be interrupted at any time,
-  // so ensure enough kernel stack remains for a trap frame and handler.
+  // user compartment.
   const bool trusted = (entry.flags & ENTRY_FLAG_TRUSTED) != 0;
-  if (!trusted && (frame->mstatus & MSTATUS_MIE) != 0 &&
-      thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
-          TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE) {
-    return refuse(Status::NoKernelStack);
-  }
 
   // The callee's stack is carved out of the caller's, below the caller's
   // current `csp`, so CHERI monotonicity guarantees the callee cannot reach

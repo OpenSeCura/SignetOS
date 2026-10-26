@@ -19,6 +19,7 @@
  */
 
 #include <signetos/debug/inspect.hpp>
+#include <signetos/irq.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
@@ -27,15 +28,20 @@
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/debug/report.hpp>
+#include <signetos/unwind.hpp>
 #include <signetos/vm.hpp>
 
-// Thread context switching, restoration, teardown pivot, and startup trampoline
-// are implemented in `kernel/switch.S`.
-extern "C" void __thread_restore(signetos::Capability next_ksp);
+// The teardown pivots and the startup trampoline are in `kernel/switch.S`;
+// the two exits a resumed frame leaves through are the trap vector's and the
+// switcher's.
 extern "C" void __thread_exit_to_host(signetos::thread::ThreadState* t,
-                                      signetos::Capability host_ksp);
+                                      signetos::Capability host_frame);
+extern "C" [[noreturn]] void __thread_resume_on(
+    signetos::thread::ThreadState* next, signetos::Capability sp,
+    signetos::thread::ThreadState* dead);
 extern "C" void __thread_start(void);
-extern "C" signetos::Capability __thread_start_link(void);
+extern "C" [[noreturn]] void __signetos_resume_trap_frame(void);
+extern "C" [[noreturn]] void __signetos_resume_return_frame(void);
 
 namespace signetos::thread {
 namespace {
@@ -52,7 +58,7 @@ size_t s_live_threads = 0;
 // A hart finds its block by its number, which the kernel keeps in `utidc`
 // (CSR 0x480) as an untagged integer, together with the id of the thread the
 // hart is running (platform.hpp, UTIDC_*). `utidc` is readable without ASR, so
-// a compartment can learn both too (`trap_mgr` reads the hart number, a lock
+// a compartment can learn both too (`sched` reads the hart number, a lock
 // the thread id); nothing with authority goes in it. Writing it takes ASR,
 // which compartment code (CodeRx) does not have, so no compartment can change
 // the number this lookup uses, or pass itself off as another thread.
@@ -60,9 +66,17 @@ size_t s_live_threads = 0;
 // S-mode only, but this QEMU traps on it.)
 struct alignas(16) Cpu {
   ThreadState* current;       // thread this hart is running; null in host context
-  Capability host_kernel_sp;  // this hart's host SwitchFrame while a thread runs
+  // This hart's interrupt handler (THE INTERRUPT HANDLER), held by this hart
+  // from `install_handler` on; null if none, or once it has ended.
+  ThreadState* handler;
+  // The thread the handler was woken for, still this hart's: non-null
+  // exactly while the handler runs.
+  ThreadState* interrupted;
+  Capability host_kernel_sp;  // this hart's parked host frame while a thread runs
   uint64_t hart_id;
-  uint64_t pad_;
+  // Where in the handler's stack its `sys_trap_wait` wants the next
+  // `irq::Event`; 0 before its first wait.
+  uint64_t event_addr;
 };
 Cpu s_cpus[MAX_HARTS];
 
@@ -116,7 +130,58 @@ void teardown_thread(ThreadState* t) {
   __atomic_fetch_sub(&s_live_threads, 1, __ATOMIC_RELAXED);
 }
 
+void release(ThreadState* t) {
+  __atomic_fetch_and(&t->flags, ~FLAG_RUNNING, __ATOMIC_RELEASE);
+}
+
+// Takes `t` for this hart before reading anything else of it: one
+// compare-and-swap that fails if it is running or held (on any hart) or has
+// exited, so two harts cannot both take the same thread and resume the same
+// frame. It must be parked (PARKED THREADS) to be taken.
+bool take(ThreadState* t) {
+  uint32_t old = __atomic_load_n(&t->flags, __ATOMIC_RELAXED);
+  do {
+    if ((old & (FLAG_RUNNING | FLAG_EXITED)) != 0) {
+      return false;
+    }
+  } while (!__atomic_compare_exchange_n(&t->flags, &old,
+                                        old | FLAG_RUNNING | FLAG_STARTED,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED));
+  if (unwind::kind_at(t->kernel_sp) != unwind::KIND_TRAP_FRAME) {
+    release(t);
+    return false;
+  }
+  return true;
+}
+
+// Runs `t`, which this hart has taken: resumes it from the frame it is parked
+// in, as a trap handler's return resumes its frame (`unwind::resume`, which is
+// also where a killed thread ends and where the frames of destroyed
+// compartments are skipped), with the MIE that frame records. Never returns.
+[[noreturn]] void resume(ThreadState* t) {
+  Cpu* c = cpu();
+  c->current = t;
+  set_utidc(c->hart_id, t->tid);
+  set_kernel_sp(t->kernel_sp);
+  switch (unwind::resume(unwind::KIND_TRAP_FRAME, nullptr)) {
+    case unwind::KIND_TRAP_FRAME:
+      __signetos_resume_trap_frame();
+    case unwind::KIND_RETURN_FRAME:
+      __signetos_resume_return_frame();
+    default:
+      break;
+  }
+  exit(-1);  // nothing left to resume: `unwind::resume` has said why
+  debug::panic("thread: a thread with nothing to resume did not end");
+}
+
 }  // namespace
+
+// `__thread_resume_on`'s way back in, on the stack it moved to (switch.S).
+extern "C" [[noreturn]] void __signetos_resume_thread(ThreadState* t) {
+  resume(t);
+}
 
 void init() {
   quota::init(s_quota_tree, OType::QuotaThreadMem);
@@ -266,36 +331,26 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
   kstack_top = capability_set_bounds(kstack_top, kstack_bytes);
   kstack_top = capability_set_address(kstack_top, kstack_top_addr);
 
-  // Pre-populate a SwitchFrame at the top of the thread's kernel stack so that
-  // `dispatch()` loads the new thread's state from its kernel stack through the
-  // exact same path as resuming a halted thread.
-  Capability kernel_sp =
-      capability_set_address(kstack_top, kstack_top_addr - sizeof(SwitchFrame));
-  SwitchFrame* frame = reinterpret_cast<SwitchFrame*>(kernel_sp);
+  // Park the new thread at `__thread_start` (PARKED THREADS): a `TrapFrame`
+  // at the top of its kernel stack, which `mret` resumes masked, so starting
+  // it is the same path as resuming any other thread. Its `mepcc` is the
+  // kernel's own PCC, re-addressed. `t[2]` is the MIE its entry runs with:
+  // unmasked, unless it becomes an interrupt handler (`install_handler`).
+  Capability kernel_sp = capability_set_address(
+      kstack_top, kstack_top_addr - sizeof(trap::TrapFrame));
+  auto* frame = reinterpret_cast<trap::TrapFrame*>(kernel_sp);
+  *frame = trap::TrapFrame{};
   frame->sp = user_sp;
   frame->gp = entry_table;
-  frame->tp = nullptr;
-  for (size_t i = 0; i < 7; ++i) {
-    frame->t[i] = nullptr;
-  }
-  for (size_t i = 0; i < 12; ++i) {
-    frame->s[i] = nullptr;
-  }
-  for (size_t i = 0; i < 8; ++i) {
-    frame->a[i] = nullptr;
-  }
   frame->t[0] = hw_sentry;
+  frame->t[2] = reinterpret_cast<Capability>(
+      static_cast<uintptr_t>(MSTATUS_MIE));
   frame->a[0] = initial_arg;
   frame->active_kernel_sp = kstack_top;
-  // `__thread_restore` ends in `ret`, and a return only goes through a return
-  // sentry (toolchain/sentries), which only the hardware makes: the link of a
-  // jump from just before `__thread_start` (switch.S).
-  const Capability start_ra = __thread_start_link();
-  if (capability_get_address(start_ra) !=
-      capability_get_address(reinterpret_cast<Capability>(&__thread_start))) {
-    debug::panic("thread::create: __thread_start_link does not link to __thread_start");
-  }
-  frame->ra = start_ra;
+  __asm__ volatile("auipcc %0, 0" : "=C"(frame->mepcc));
+  frame->mepcc = capability_set_address(
+      frame->mepcc,
+      capability_get_address(reinterpret_cast<Capability>(&__thread_start)));
 
   ThreadState* t = reinterpret_cast<ThreadState*>(state_page);
   const uint64_t tid = __atomic_fetch_add(&s_next_tid, 1, __ATOMIC_RELAXED) + 1;
@@ -327,15 +382,14 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
   // and swept before the thread first runs, the sentry in its initial frame
   // loses its tag and `__thread_start` ends the thread (switch.S).
 
-  // Thread creation and initial SwitchFrame: verify every capability seeded into the new thread's initial register frame
-  // (`csp = user_sp`, `cgp = entry_table`, `ct0 = hw_sentry`,
-  // `ca0 = initial_arg`, `cra = __thread_start`). The thread handle itself is
-  // checked by the syscall gate on its way out.
+  // Thread creation and initial frame: verify every capability seeded into
+  // the new thread's initial register frame (`csp = user_sp`,
+  // `cgp = entry_table`, `ct0 = hw_sentry`, `ca0 = initial_arg`). The thread
+  // handle itself is checked by the syscall gate on its way out.
   inspect::assert_user_capability(user_sp, "thread::create:user_sp");
   inspect::assert_user_capability(entry_table, "thread::create:entry_table");
   inspect::assert_user_capability(hw_sentry, "thread::create:hw_sentry");
   inspect::assert_user_capability(initial_arg, "thread::create:initial_arg");
-  inspect::assert_user_capability(frame->ra, "thread::create:start_ra");
 
   __atomic_fetch_add(&s_live_threads, 1, __ATOMIC_RELAXED);
 
@@ -350,47 +404,32 @@ extern "C" void __signetos_teardown_thread(ThreadState* t) {
   teardown_thread(t);
 }
 
-extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
-                                                 SwitchFrame* saved_frame) {
-  // A refused switch resumes the same context with the Status in its `a0`.
-  auto fail = [&](Status s) -> Capability {
+extern "C" void __signetos_thread_dispatch(Capability thread_handle,
+                                           trap::TrapFrame* saved_frame) {
+  // A refused switch comes back here with the Status in the caller's `a0`,
+  // and the assembly resumes the caller at once. A switch that is made never
+  // comes back: it leaves through `resume`.
+  auto refuse = [&](Status s) {
     saved_frame->a[0] =
         reinterpret_cast<Capability>(static_cast<uintptr_t>(s));
-    return reinterpret_cast<Capability>(saved_frame);
   };
 
   ThreadState* t = unseal_thread(thread_handle);
   if (t == nullptr) {
-    return fail(Status::InvalidCapability);
+    return refuse(Status::InvalidCapability);
   }
   if (!capability_has_perms(thread_handle, perms::Load)) {
-    return fail(Status::InsufficientPermission);
+    return refuse(Status::InsufficientPermission);
   }
-
-  // Claim `t` before reading anything else of it: one compare-and-swap that
-  // fails if it is running (on any hart) or exited, so two harts cannot both
-  // take the same thread and reload the same frame.
-  uint32_t old = __atomic_load_n(&t->flags, __ATOMIC_RELAXED);
-  do {
-    if ((old & (FLAG_RUNNING | FLAG_EXITED)) != 0) {
-      return fail(Status::InvalidCapability);
-    }
-  } while (!__atomic_compare_exchange_n(&t->flags, &old,
-                                        old | FLAG_RUNNING | FLAG_STARTED,
-                                        false, __ATOMIC_ACQUIRE,
-                                        __ATOMIC_RELAXED));
-
-  SwitchFrame* next_frame = reinterpret_cast<SwitchFrame*>(t->kernel_sp);
-
-  // `__thread_restore` re-derives the hart's kernel SP as
-  // `frame + sizeof(SwitchFrame)`. Refuse to switch if the
-  // frame's recorded `active_kernel_sp` disagrees: that would mean the frame
-  // was not carved from `mscratchc` by `sys_thread_switch` / `thread::create`.
-  if (!capability_is_valid(next_frame->active_kernel_sp) ||
-      capability_get_address(next_frame->active_kernel_sp) !=
-          capability_get_address(t->kernel_sp) + sizeof(SwitchFrame)) {
-    __atomic_fetch_and(&t->flags, ~FLAG_RUNNING, __ATOMIC_RELEASE);
-    return fail(Status::InvalidCapability);
+  Cpu* c = cpu();
+  ThreadState* prev = c->current;
+  // While an interrupt is handled the interrupted thread is still this
+  // hart's: the handler leaves through `sys_trap_wait`, which settles it.
+  if (c->interrupted != nullptr) {
+    return refuse(Status::InvalidCapability);
+  }
+  if (!take(t)) {
+    return refuse(Status::InvalidCapability);
   }
 
   // `saved_frame->active_kernel_sp` was written by `sys_thread_switch` at
@@ -402,37 +441,126 @@ extern "C" Capability __signetos_thread_dispatch(Capability thread_handle,
 
   // Release the outgoing context. This function runs on `prev`'s kernel page
   // (below `saved_frame`), so on more than one hart the clearing of
-  // FLAG_RUNNING has to move to after this function's epilogue -- into
-  // `sys_thread_switch` between the return from here and `__thread_restore`
-  // -- or another hart may resume `prev` onto this frame while it is live.
-  // One hart today: nobody can take `prev` before this hart has left.
-  Cpu* c = cpu();
-  ThreadState* prev = c->current;
+  // FLAG_RUNNING has to move to after this hart has left it, or another hart
+  // may resume `prev` onto this frame while it is live. One hart today:
+  // nobody can take `prev` before this hart has left.
   if (prev != nullptr) {
     prev->kernel_sp = reinterpret_cast<Capability>(saved_frame);
-    __atomic_fetch_and(&prev->flags, ~FLAG_RUNNING, __ATOMIC_RELEASE);
+    release(prev);
   } else {
     c->host_kernel_sp = reinterpret_cast<Capability>(saved_frame);
   }
 
-  c->current = t;
-  set_utidc(c->hart_id, t->tid);
-
   // Only once the switch is committed, so a refused handle never shows up
   // (TRACE_SWITCH=1 builds only).
   debug::trace_switch(prev != nullptr ? prev->tid : 0, t->tid);
+  resume(t);
+}
 
-  // The incoming frame is reloaded as-is. Every register in it was either
-  // seeded by `create()` (asserted there) or saved from the thread's own
-  // register file, which CHERI monotonicity says it cannot have widened.
-  //
-  // `__thread_restore` leaves interrupts masked. Whatever the frame resumes
-  // unmasks on its own way out, with the value its user context had: the
-  // switcher's return path from its `ReturnFrame` (a thread parked by
-  // `sys_thread_switch`, from a trap handler or not), `__thread_start` for a
-  // new thread, and the host never.
-  set_kernel_sp(next_frame->active_kernel_sp);
-  return t->kernel_sp;
+// Where `sys_trap_wait`'s `event` points, if the kernel may write an
+// `irq::Event` there when the handler is next woken: through a capability
+// the handler may store through, into its own stack, which is resident and
+// nobody else's for as long as the handler lives. 0 if not.
+static uint64_t event_addr(ThreadState* h, Capability event) {
+  const uint64_t a = capability_get_address(event);
+  const uint64_t end = a + sizeof(irq::Event);
+  const uint64_t base = capability_get_base(event);
+  const uint64_t s_base = capability_get_base(h->stack_alloc);
+  if (!capability_is_valid(event) || __builtin_cheri_sealed_get(event) ||
+      !capability_has_perms(event, perms::Store) || a % 8 != 0 ||
+      a < base || end > base + capability_get_length(event) || a < s_base ||
+      end > s_base + capability_get_length(h->stack_alloc)) {
+    return 0;
+  }
+  return a;
+}
+
+Status install_handler(Capability thread_handle) {
+  ThreadState* t = unseal_thread(thread_handle);
+  if (t == nullptr ||
+      !capability_has_perms(thread_handle, perms::Load | perms::Store)) {
+    return Status::InvalidCapability;
+  }
+  Cpu* c = cpu();
+  if (c->handler != nullptr) {
+    return Status::Busy;
+  }
+  // Only a thread that has never run, held by this hart from now on: the
+  // compare-and-swap `take` uses, so nothing else can take it.
+  uint32_t old = __atomic_load_n(&t->flags, __ATOMIC_RELAXED);
+  do {
+    if ((old & (FLAG_RUNNING | FLAG_EXITED | FLAG_STARTED)) != 0) {
+      return Status::InvalidCapability;
+    }
+  } while (!__atomic_compare_exchange_n(&t->flags, &old,
+                                        old | FLAG_RUNNING | FLAG_STARTED,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED));
+  // Its entry runs masked, as the handler must (`create`, `__thread_start`).
+  reinterpret_cast<trap::TrapFrame*>(t->kernel_sp)->t[2] = nullptr;
+  c->handler = t;
+  c->event_addr = 0;
+  return Status::Ok;
+}
+
+bool wake_handler(trap::TrapFrame* frame, uint64_t cause, uint64_t aux) {
+  Cpu* c = cpu();
+  ThreadState* h = c->handler;
+  ThreadState* t = c->current;
+  // The handler waits whenever it is not handling one (it runs masked).
+  if (h == nullptr || t == nullptr || c->interrupted != nullptr) {
+    return false;
+  }
+
+  // Park `t` in `frame`, the trap's: its `mstatus` MPIE is the MIE `t`
+  // resumes with (PARKED THREADS). It stays this hart's (FLAG_RUNNING)
+  // until the handler's `sys_trap_wait`, which runs on the handler's stacks.
+  __asm__ volatile("csrr %0, mstatus" : "=r"(frame->mstatus));
+  t->kernel_sp = reinterpret_cast<Capability>(frame);
+  c->interrupted = t;
+  if (c->event_addr != 0) {
+    *reinterpret_cast<irq::Event*>(
+        capability_set_address(h->stack_alloc, c->event_addr)) =
+        irq::Event{cause, t->tid, aux};
+  }
+  // Resumed from where it waits, with C++ on its own kernel stack.
+  __thread_resume_on(h, h->kernel_sp, nullptr);
+}
+
+extern "C" void __signetos_trap_wait(Capability next,
+                                    trap::TrapFrame* saved_frame,
+                                    Capability event) {
+  // Only the handler, between being woken and waiting again: the interrupted
+  // thread is this hart's exactly then, and the handler is the one running.
+  Cpu* c = cpu();
+  ThreadState* h = c->current;
+  ThreadState* parked = c->interrupted;
+  const uint64_t addr = parked != nullptr ? event_addr(h, event) : 0;
+  if (addr == 0) {
+    saved_frame->a[0] = reinterpret_cast<Capability>(
+        static_cast<uintptr_t>(Status::InvalidCapability));
+    return;
+  }
+
+  // Park the handler where the next interrupt resumes it, still this
+  // hart's, so nothing else can switch to it.
+  saved_frame->a[0] = nullptr;  // Status::Ok, when it is woken
+  h->kernel_sp = reinterpret_cast<Capability>(saved_frame);
+  c->event_addr = addr;
+  c->interrupted = nullptr;
+
+  // The handler's choice if it can run (a live thread it may switch to:
+  // Permit_Load, as for `sys_thread_switch`), otherwise the thread it was
+  // woken for. That one is released only if it is not chosen, and only now:
+  // this hart has been off its kernel stack since the handler was woken.
+  ThreadState* n = unseal_thread(next);
+  if (n == nullptr || !capability_has_perms(next, perms::Load) || !take(n)) {
+    n = parked;
+  } else {
+    release(parked);
+    debug::trace_switch(parked->tid, n->tid);
+  }
+  resume(n);
 }
 
 void exit(int exit_status) {
@@ -446,10 +574,23 @@ void exit(int exit_status) {
   c->current = nullptr;
   set_utidc(c->hart_id, 0);
 
+  // The interrupt handler ending (its entry returned, or it was unwound or
+  // killed): this hart has none from now on, and carries on with the thread
+  // it was woken for. `t` is torn down once off its stacks.
+  if (t == c->handler) {
+    ThreadState* parked = c->interrupted;
+    c->handler = nullptr;
+    c->interrupted = nullptr;
+    c->event_addr = 0;
+    if (parked != nullptr) {
+      __thread_resume_on(parked, parked->kernel_sp, t);
+    }
+  }
+
   Capability host_sp = c->host_kernel_sp;
   c->host_kernel_sp = nullptr;
 
-  SwitchFrame* host_frame = reinterpret_cast<SwitchFrame*>(host_sp);
+  auto* host_frame = reinterpret_cast<trap::TrapFrame*>(host_sp);
   host_frame->a[0] = nullptr;  // Status::Ok (0)
   set_kernel_sp(host_frame->active_kernel_sp);
 

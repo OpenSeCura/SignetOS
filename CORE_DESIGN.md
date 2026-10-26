@@ -27,7 +27,7 @@ what is in their capability tables.
 **Bootstrap.** At boot, the kernel creates one compartment (`init`) seeded with
 the root quotas, all syscall gates, device windows, and service sealing
 authorities. `init` starts the core services (console, block driver, filesystem,
-naming, sealing service, scheduler, interrupt manager, shell), grants each only
+naming, sealing service, scheduler, shell), grants each only
 what its manifest requests, hands the scheduler's dispatch entry to the kernel,
 clears its own table, and exits.
 
@@ -348,14 +348,17 @@ into the scheduler whenever a thread exits.
 
 ## 9. Interrupts and Per-Compartment Faults
 
-Interrupts and synchronous faults take separate paths: only two interrupts leave
-the kernel, whereas synchronous faults go strictly to **the compartment that
-faulted**, never to a global handler (unless handled by the kernel like a page fault).
+Interrupts and synchronous faults take separate paths: every interrupt goes to
+one handler on its own thread, whereas synchronous faults go strictly to **the
+compartment that faulted**, never to a global handler (unless handled by the kernel like a page fault).
 
-* **Interrupts:** boot installs fixed handlers for timer ticks (scheduler) and
-  external device interrupts (interrupt manager, which claims sources and calls
-  driver handlers). Both run with interrupts masked on the **interrupted
-  thread's narrowed stack**, scrubbed on return.
+* **Interrupts:** boot installs one handler thread per hart, an ordinary
+  thread on the scheduler's interrupt entry that the hart holds. On a tick
+  or device interrupt the kernel parks the interrupted thread and resumes
+  the handler from its wait (`sys_trap_wait`), masked; it waits again naming
+  which thread to run next. The scheduler owns the PLIC: a
+  device interrupt just wakes the driver thread waiting for it
+  (`sched.irq_wait`). Nothing runs on the interrupted thread.
 * **Fault identification:** each compartment may register a private code sentry
   as its fault handler in its kernel descriptor. On trap, the kernel identifies
   the faulting compartment from its own trusted frame beneath the trap—never
@@ -389,7 +392,7 @@ holds instances, and what an instance lets its holder do.
 | **Entry point** (service entry) | the exporting service, over its own code; handed out through `naming` or returned to `init` in some cases (implementation detail right now) | the clients that named it in their manifest AND the policy of the compartment that lauched it allowed it | Invoke that entry point via the switcher. |
 | **Compartment** | kernel | the compartment itself and its launcher | Name the compartment to the syscalls that act on it: allocate memory it owns, create its entry points, install its fault handler, revoke its sub-ranges, destroy it. |
 | **Thread** | kernel | its creator; the scheduler (passed in at registration) | Switch to it (with `thread_switch`), kill it (with `thread_kill`). |
-| **VM quota** | kernel; root seeded into `init` | one per service that allocates (`fs`, `sched`, `trap_mgr`, `shell` etc); the shell derives a sub-quota per program | Allocate memory against it, derive and destroy children. A leak lets the holder spend or close that budget, never read or write anyone's memory. |
+| **VM quota** | kernel; root seeded into `init` | one per service that allocates (`fs`, `sched`, `shell` etc); the shell derives a sub-quota per program | Allocate memory against it, derive and destroy children. A leak lets the holder spend or close that budget, never read or write anyone's memory. |
 | **Thread-memory quota** | kernel; root seeded into `init` | `shell` etc, anyone who would need to create threads. | Fund thread descriptors and stacks (with `thread_create`). |
 | **CPU quota** | **scheduler** (authority handed to it by `init`) | root in the scheduler; the shell holds its own node and derives a child per worker and program | Register threads under it, derive children, query. |
 | **Disk quota / file handle** | **filesystem** (authority handed to it by `init`) | `fs` holds the root; `shell` holds `/home` (read-write) and `/bin` (read-only); each program gets a node under `/home` plus any files the shell opens for it | Filesystem operations confined to the node's directory subtree, with the handle's rights. A leak exposes exactly that subtree. |
@@ -408,7 +411,7 @@ do. As granted by `init` today:
 | --- | --- | --- |
 | `compartment_invoke` | everyone | The switcher gate itself. |
 | `sentry` | every service; no program | Create entry points to export. |
-| `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `trap_mgr`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
+| `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
 | `thread_switch`, `thread_tid` | `sched` | The only compartment that can run a thread. |
 | `thread_kill` | `sched` | End a thread it holds a handle to. |
 | `compartment_create`, `compartment_destroy`, `thread_create`, `fault_install`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. |
@@ -418,7 +421,7 @@ do. As granted by `init` today:
 | `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |
 
 Beyond gates, three compartments hold raw hardware: `uart` its device window,
-`trap_mgr` the interrupt controller, and `dma` the virtio window and the DMA
+`sched` the interrupt controller, and `dma` the virtio window and the DMA
 arena. `dma` runs once, writes the only device-visible physical addresses, and
 hands `blk` views that reach neither the descriptor table nor the queue
 registers.

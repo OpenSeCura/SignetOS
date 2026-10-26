@@ -51,7 +51,7 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 
 | Path | Contents |
 | --- | --- |
-| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`switcher.cpp` + `switch.S`), entry records (`sentry.cpp`), compartments, quotas, threads, VM and frame allocator, revocation, trap dispatch and fault delivery (`trap.cpp`), the two interrupt handlers and each hart's interrupt state (`irq.cpp`), unwinding. It does not print: it reports through `debug/report.hpp`. |
+| `kernel/` | The microkernel proper: boot, syscalls, the domain switcher (`switcher.cpp` + `switch.S`), entry records (`sentry.cpp`), compartments, quotas, threads, VM and frame allocator, revocation, trap dispatch and fault delivery (`trap.cpp`), the interrupt handler and each hart's interrupt state (`irq.cpp`), unwinding. It does not print: it reports through `debug/report.hpp`. |
 | `kernel/hw/` | Drivers for the board: the console (`uart.cpp`), timer and cross-hart poke (`clint.cpp`), DTB discovery (`platform.cpp`) |
 | `kernel/debug/` | Diagnostics and checks: everything the kernel prints (`report.cpp`), the outbound capability check (`inspect.cpp`), boot self-tests (`quota_selftest.cpp`) |
 | `kernel/lib/` | Freestanding C library routines (`kstring.cpp`) |
@@ -96,7 +96,7 @@ count.
  hardware  ──►  kernel (M-mode, ASR)  ──►  init (embedded)
                                              │  creates the core services
                                              │  (drivers, fs, naming,
-                                             │   sched, trap_mgr, shell)
+                                             │   sched, shell)
                                              │  publishes sched.run, exits
                                              ▼
                       kernel host loop re-dispatches sched.run
@@ -512,10 +512,10 @@ thread is running from `utidc`.
 
 1. **Sealing authority.** The scheduler seals and opens `quota_sched`
    handles.
-2. **Hardware preemption.** The scheduler hands its tick handler back to
-   `init` in its handshake, and `init` installs it for the timer interrupt
-   (`sys_trap_install`, §3.6). The kernel owns the tick period (10 ms) and
-   re-arms the timer.
+2. **Hardware preemption.** The scheduler hands its interrupt entry back to
+   `init` in its handshake; `init` creates a thread on it and installs that
+   as the interrupt handler (`sys_trap_install`, §3.6). The kernel owns the
+   tick period (10 ms) and re-arms the timer.
 3. **Thread tables and bandwidth tracking in user memory**, debited with no
    syscalls.
 4. **Ordering.** Priority classes are strict. Within a class the node served
@@ -530,11 +530,12 @@ thread is running from `utidc`.
    idles rather than hand out time nobody was promised. A thread that never
    yields keeps the CPU while nothing else can run (the tick handler cannot
    idle); that spare time, like idle time, is billed to nobody.
-6. **Dispatch** via `sys_thread_switch`, including from inside the tick
-   handler. A preempted thread then parks in its trap handler until it is
-   picked again. The tick handler stands down while an entry point is
-   updating scheduler state on the interrupted thread, and when the
-   interrupted thread is not the one the scheduler last switched to.
+6. **Dispatch** via `sys_thread_switch`, and on a tick by the interrupt
+   handler returning the thread to run next (§3.6). A preempted thread
+   stays parked where the tick stopped it until it is picked again. The
+   tick handler stands down while an entry point is updating scheduler
+   state on the interrupted thread, and when the interrupted thread is not
+   the one the scheduler last switched to.
 7. **Allowance reclaim.** Destroying a sub-quota returns its bandwidth, and
    that of everything derived under it, to the parent at once. Its threads
    **stop**: they keep their state and their registration but are never picked
@@ -776,11 +777,11 @@ filesystem; which is which is a build detail.
 | 1 | — | Parse the DTB to find the UART, PLIC and virtio devices. |
 | 2 | `uart` | Its MMIO window. Handshake returns its `read` and IRQ entries; init offers `uart` (print) and `uart.read`. |
 | 3 | `dma` | The virtio MMIO window and a physically contiguous **DMA arena allocated by init** (`FLAG_DMA`). Run once: it sets up the device on a fixed descriptor table in the arena's first page and returns, for `blk`, the rest of the arena and a window onto the notify/interrupt registers. Never entered again. |
-| 3b | `blk` | What `dma` returned. Handshake returns `read`/`write`/IRQ entries. |
+| 3b | `blk` | What `dma` returned. Handshake returns `read`/`write` and the pager's entries. |
 | 4 | `fs` | Memory syscalls, `OType::QuotaDisk`, `uart`, `blk.read`/`blk.write`, and memory for its tables sized to the disk. It mounts the disk and creates the root `quota_disk`. |
 | 5 | `naming` | Once it is up, init publishes `uart` and the `fs.*` entries. |
-| 6 | `sched` | `OType::QuotaSched` and the timer trap authority. Afterwards init tells `blk` how to reach the scheduler so it can sleep instead of polling. |
-| 7 | `trap_mgr` | The PLIC window and the external-interrupt authority. Init routes the UART and blk interrupt sources to their drivers; routing is init-only. |
+| 6 | `sched` | `OType::QuotaSched`, the PLIC window and the `trap_wait` gate. Init creates the interrupt handler's thread on the scheduler's interrupt entry and installs it (§3.6). |
+| 7 | — | Device interrupts: init routes the UART's and `blk`'s PLIC sources through the scheduler (`irq_route`, init-only) and hands each driver its `irq_wait`; `blk` also gets the scheduler's entries, so it sleeps instead of polling. |
 | 8 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
 | 9 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
@@ -950,33 +951,40 @@ Rough edges:
 
 ### 3.6 Hardware trap and interrupt handling
 
-Interrupts and faults are routed differently. Only two interrupts leave
-the kernel, each to one fixed handler. A synchronous fault goes to **the
-compartment that raised it**, never to a global handler.
+Interrupts and faults are routed differently. Every interrupt that leaves
+the kernel wakes the scheduler's interrupt handler thread. A synchronous
+fault goes to **the compartment that raised it**, never to a global handler.
 
 #### Interrupts (`include/signetos/irq.hpp`)
 
-1. **Two handlers, installed by `init`:** the timer (the kernel tick) goes
-   to the scheduler, and the external interrupt (every PLIC device) to the
-   trap manager. The software interrupt is the kernel's own cross-hart poke,
-   and nothing else can fire. `sched` and `trap_mgr` hand their handler
-   entries back to `init` in their handshakes, and `init` installs each with
-   `sys_trap_install(irq, EntryPoint)`. Nothing else is bindable, and there
-   is no table, no unbind and no rebinding.
+1. **One handler thread per hart, installed by `init`:** the timer (the
+   kernel tick) and the external interrupt (every PLIC device) both go to
+   the scheduler, which owns the PLIC. The software interrupt is the
+   kernel's own cross-hart poke, and nothing else can fire. `init` creates
+   an ordinary thread on the scheduler's interrupt entry and installs it
+   with `sys_trap_install(thread)`, for the hart it runs on (the only one
+   that runs threads). From then on that hart holds the thread, so nothing
+   can switch to it. There is no table, no unbind and no rebinding.
 2. **Authority:** the `sys_trap_install` gate itself. `init` is seeded with
-   every syscall gate and hands this one to nobody. Each handler can be
-   installed once (`Busy` afterwards) and is never removed. An install is
-   synchronised to all harts by IPI. If the handler's compartment is
-   destroyed, its entry stops resolving and the interrupt is silenced on
-   each hart where it arrives.
-3. **Delivery:** a trap frame is pushed on the interrupted thread's kernel
-   stack. The handler then runs **on the interrupted thread's own, narrowed
-   stack**, masked, with `(mcause, mtval, mepc, mtval2)` as arguments. Its
-   stack region is scrubbed on return. The kernel re-arms the tick before
-   each timer delivery.
-4. **Resolution:** the handler returns and the thread resumes. The
-   scheduler's handler may instead `sys_thread_switch` away, and the thread
-   then stays parked in its handler.
+   every syscall gate and hands this one to nobody. A hart's handler is
+   installed once (`Busy` afterwards). If it ends, that hart's interrupts are
+   silenced where they arrive. `sys_trap_wait` needs no authority: only the
+   hart's handler, while it handles an interrupt, can use it.
+3. **Delivery:** the interrupted thread stays parked in its trap frame, the
+   same way `sys_thread_switch` parks a thread, and the handler thread is
+   resumed from its `sys_trap_wait`, masked, with an `irq::Event` (cause,
+   interrupted tid, pager tid) written to its stack. The cause is
+   `IRQ_M_TIMER`, `IRQ_M_EXT`, or `PAGE_WAIT` for a thread that must wait
+   for a page (§8). The first interrupt only starts the handler, at its
+   entry, and is not reported. The kernel re-arms the tick before each
+   timer wake. Nothing runs on the interrupted thread, so an interrupt
+   never ends it.
+4. **Resolution:** the handler calls `sys_trap_wait(next, &event)` again;
+   the kernel runs `next` (or the interrupted thread, if `next` cannot run)
+   and parks the handler until the next interrupt. The interrupted thread
+   is released only then, once the hart is off its kernel stack. On a
+   device interrupt the handler only wakes the driver thread waiting in
+   `sched.irq_wait`.
 
 #### Per-compartment faults (`include/signetos/fault.hpp`)
 
@@ -1050,21 +1058,21 @@ faulting compartment's business.
    own handler.
 
    A fault inside kernel code always halts the machine.
-7. **Interrupt state:** a fault handler runs with the interrupted code's
-   `MIE` when there is kernel-stack room for a nested trap (asm_macros.h,
-   KERNEL-STACK ROOM). Otherwise it runs masked.
+7. **Interrupt state:** a fault handler runs with the faulting code's
+   `MIE` (asm_macros.h, INTERRUPT MASKING RULE).
 
 Demand-paging and CoW faults are meant to be resolved silently by the kernel
 before this path. None exist yet (§3.7).
 
-**The trap manager (`external/services/trap_mgr.cpp`):**
+**Device interrupts (`external/services/sched.cpp`, DEVICE INTERRUPTS):**
 
-* Owns the PLIC and handles the external interrupt (`init` installs its
-  handler), for the **boot hart only**.
-* Keeps a small static routing table from sources to driver handlers. `init`
-  fills it and the routing entry is not published. There is no unroute.
-* On an interrupt it claims the source, invokes each routed handler, and
-  completes the source.
+* The scheduler owns the PLIC, for the **boot hart only**.
+* `init` routes each device's source (`irq_route`, not published) and gives
+  the returned `irq_wait` entry to that device's driver. One entry per
+  source. There is no unroute.
+* On an interrupt the handler claims the source and wakes the thread in its
+  `irq_wait`. The source stays claimed until that thread's next `irq_wait`,
+  so a level-triggered device cannot storm meanwhile.
 * Has nothing to do with faults: those never leave the faulting compartment.
 
 **Tests:** `run fault.bin skip|retry|fix|unwind|double|overflow|loop`
@@ -1293,7 +1301,8 @@ null-on-refusal results the former `sys_type_mint`, `sys_type_derive`,
 
 | Syscall | Behaviour |
 | --- | --- |
-| `uint64_t sys_trap_install(irq, handler)` | §3.6. Installs `handler`, a compartment `EntryPoint`, for `IRQ_M_TIMER` or `IRQ_M_EXT` (anything else is `InvalidAuthority`). Once each (`Busy` afterwards); a kernel, fault or local entry is `InvalidSentry`. Only `init` holds the gate. Returns a `Status`. |
+| `uint64_t sys_trap_install(thread)` | §3.6. Makes `thread`, which has never run, this hart's interrupt handler. Once per hart (`Busy` afterwards); a thread that has run is `InvalidCapability`. Only `init` holds the gate. Returns a `Status`. |
+| `uint64_t sys_trap_wait(next, event)` | §3.6. The handler's wait: runs `next` (or the interrupted thread), parks the handler, and returns 0 at the next interrupt with an `irq::Event` written to `event`, which must lie on the handler's own stack. `InvalidCapability` at once if the caller is not the hart's handler handling an interrupt. Only `sched` asks for the gate. |
 
 The kernel's `Status` codes are defined in `types.hpp`. Only the few noted
 above ever reach user space.
@@ -1334,10 +1343,12 @@ from page-granular `sys_vm_allocate` and static arrays.
 | `sched.thread_register` | Register a thread under a node, or move a stopped thread onto one. The thread is unregistered automatically when it exits. |
 | `sched.yield` | Charge the running node and pick again. |
 | `sched.block` | Sleep until woken or until an optional timeout. A wake that arrives before the block is remembered. A woken thread runs when it is next picked, so not before its node has budget. It may return spuriously, so callers loop. The caller's tid, which `wake` takes, is in `utidc` (`runtime.hpp`, `self_tid`). |
-| `sched.wake` | Wake a tid. Safe to call from interrupt context. **Unprotected**: anyone holding the entry and a tid can wake that thread. |
+| `sched.wake` | Wake a tid. Safe to call from the interrupt handler. **Unprotected**: anyone holding the entry and a tid can wake that thread. |
 | `sched.thread_kill` | `sys_thread_kill`, then wake the thread. From then on its `block` returns `SCHED_KILLED` without sleeping, so a callee waiting on its behalf returns, and the thread ends once back in its own code (§2.3). A stopped thread is put on the caller's node first, so this is called from thread context. |
 | `sched.lock_wait` | Wait for a lock whose word showed it taken, lending the owner this thread's time meanwhile (§2.6). |
 | `sched.lock_wake` | Release a lock that has waiters, handing it to the next of them. |
+| `sched.irq_wait` | One per routed PLIC source, for that device's driver only: complete the source's last interrupt, then sleep until the next one (optional timeout). |
+| `irq_route` | Route a PLIC source and return its `irq_wait`. Not published; `init` only. |
 | `run` | The scheduler's main loop. Not published; `init` hands it to the kernel (§2.6). |
 
 #### 5.7.3 Filesystem (`fs`)
@@ -1374,12 +1385,11 @@ their parent; there are no directory-entry blocks.
 
 | Compartment | Role | Notes |
 | --- | --- | --- |
-| `uart` | Console output (`uart`) and non-blocking input (`uart.read`) | Input is buffered in a small ring that drops data when full. A reader passes a wake entry point, which the driver invokes **from interrupt context** when bytes arrive; the shell's wake entry then calls `sched.wake`. |
+| `uart` | Console output (`uart`) and input (`uart.read`) | `uart.read` returns what the UART holds, first sleeping in `sched.irq_wait` until it interrupts if it holds nothing. |
 | `dma` | Device setup, once | The only compartment that knows a physical address. Writes queue 0's addresses and a fixed four-entry descriptor table (one 4 KiB read chain, one 4 KiB write chain), negotiates `VERSION_1` only, and keeps status, features, queue select/ready and the queue addresses out of `blk`'s reach. |
-| `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one 4 KiB request at a time** through a bounce buffer in the DMA arena, starting one of `dma`'s two chains. It never sees a physical address and cannot point the device outside the arena. Completion arrives as an interrupt that wakes the caller, which waits in `sched.block` with a timeout and falls back to polling. |
+| `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one 4 KiB request at a time** through a bounce buffer in the DMA arena, starting one of `dma`'s two chains. It never sees a physical address and cannot point the device outside the arena. The caller sleeps in `sched.irq_wait` until the device interrupts, with a timeout, and polls when it cannot sleep. |
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
-| `trap_mgr` | External-interrupt routing | §3.6. |
-| `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read` plus `sched.block`, woken through IRQ → `trap_mgr` → `uart` → the shell's wake entry → `sched.wake`. |
+| `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read`, which sleeps until a key is pressed. |
 
 DMA is isolated by `dma` (`boot/dma.cpp`): every address the device can use
 is written once, at boot, into memory and registers only `dma` can reach, so
@@ -1527,8 +1537,8 @@ What a compartment must do:
   trusted service that is a bug; an untrusted one is destroyed by whoever
   owns it, which unwinds the threads parked in it.
 * **Cope with a holder that has ended anyway.** The kernel still ends a
-  thread wherever it is if it has no kernel stack left to take a trap, or
-  if every frame on its kernel stack is in a destroyed compartment. A lock
+  thread wherever it is if every frame on its kernel stack is in a
+  destroyed compartment. A lock
   whose owner has ended goes to the next waiter with `SCHED_OWNER_DEAD`;
   `blk` then drains and catches up its device queue, `fs` warns that its
   tables may be half-updated. Making `fs`'s updates safe to abandon (ordered
@@ -1536,7 +1546,7 @@ What a compartment must do:
 
 Work that nobody's call asked for -- a packet arriving, a timer, delayed
 writeback -- has no caller's thread to run on and belongs on a thread the
-service owns, woken from its interrupt handler. A future network stack is
-built that way: the interrupt handler acknowledges and wakes, the stack's
-own thread runs the protocols, and callers' threads touch only socket
+service owns, woken by its device's interrupt (`sched.irq_wait`). A future
+network stack is built that way: the stack's own thread sleeps on the
+interrupt, acknowledges the device and runs the protocols, and callers' threads touch only socket
 buffers, under locks, as above.

@@ -72,7 +72,7 @@ namespace signetos::sentry {
 // way in, interrupts stay masked, the callee's stack is exactly `min_stack`
 // bytes of the caller's, and the callee's `a0` comes back to the caller. Only
 // `syscall::gate` ever sets it; `sys_sentry` records are never trusted, and
-// `sys_thread_create` / `sys_trap_install` refuse trusted entries.
+// `sys_thread_create` refuses trusted entries.
 constexpr uint64_t ENTRY_FLAG_TRUSTED = 1u << 0;
 
 // Stack a `sys_sentry` entry is promised: the switcher refuses a call whose

@@ -32,9 +32,10 @@
  * (which lack `AccessSystemRegs`) cannot read or modify it, and each hart has
  * its own independent register with no global `.bss` state.
  *
- * The kernel stack holds frames only: a thread's `SwitchFrame`, the
- * `TrapFrame`s of traps taken in it, and one `ReturnFrame` per call that is
- * in progress through the switcher. Kernel C++ that runs on behalf of a call
+ * The kernel stack holds frames only: the `TrapFrame`s of traps taken in the
+ * thread and the one it is parked in while it does not run (thread.hpp,
+ * PARKED THREADS), and one `ReturnFrame` per call that is in progress
+ * through the switcher. Kernel C++ that runs on behalf of a call
  * (a system call body) runs on the caller's own stack, narrowed, exactly like
  * a compartment callee does; only the switcher's own helpers and the trap
  * dispatcher run on the kernel stack, directly below the frame they manage.
@@ -44,9 +45,7 @@
  * Every frame keeps its FRAME LINK at offset 48 (below). The rest of the
  * layouts follow.
  *
- * 1. `SwitchFrame` (512 bytes = 32 capabilities, `thread.hpp`) and
- *    `TrapFrame`   (640 bytes = 37 capabilities + 6 integers, `trap.hpp`)
- *    share the same layout for offsets 0..496:
+ * 1. `TrapFrame` (640 bytes = 37 capabilities + 6 integers, `trap.hpp`):
  *
  *      Offset    Field              Register(s)
  *      ------    -----              -----------
@@ -58,28 +57,23 @@
  *      176..352  s[0..11]           cs0..cs11
  *      368..480  a[0..7]            ca0..ca7
  *      496       tp                 ctp
- *
- *    `TrapFrame` appends three trap-specific capability slots, four
- *    integers in two more 16-byte slots, one more capability, then the
- *    handler's arguments:
- *      512       mepcc              interrupted PC capability
- *      528       handler_sp         narrowed stack for bound trap handler
+ *      512       mepcc              where `mret` resumes it
+ *      528       handler_sp         the handler's stack (null: no handler)
  *      544       handler_rw_table   handler compartment cap table (`cgp`)
- *      560       mstatus            integer `mstatus` at trap entry (only
- *                                   bit 7, `MPIE`, is consulted: it is the
- *                                   `MIE` the interrupted code had)
+ *      560       mstatus            integer `mstatus` (only bit 7, `MPIE`,
+ *                                   is consulted: the `MIE` the frame
+ *                                   resumes with)
  *      568       handler_mie        `MSTATUS_MIE` or 0: what the trap vector
  *                                   sets in `mstatus` just before it enters
- *                                   the bound handler
- *      576       flags              TRAP_FLAG_* (trap.hpp): fault delivery
+ *                                   the handler
+ *      576       flags              TRAP_FLAG_* (trap.hpp)
  *      584       fault_status       for a fault frame, the `Status` whoever
  *                                   is beneath gets if it is unwound
  *      592       handler_comp       the handler's compartment handle (null if
  *                                   no handler was entered)
- *      608       handler_ca0        the handler's `ca0`: the integer `mcause`
- *                                   for an interrupt, the ErrorState for a
- *                                   fault (fault.hpp)
- *      624       handler_a3         the handler's `a3` (`mtval2`)
+ *      608       handler_ca0        the fault handler's `ca0`: its
+ *                                   ErrorState (fault.hpp)
+ *      624       handler_a3         the fault handler's `a3`: `mtval2`
  *      632       (reserved)
  *
  * 2. `ReturnFrame` (416 bytes = 26 capability slots, `switcher.hpp`):
@@ -113,10 +107,10 @@
  * Offset 48 of every frame on a kernel stack holds the kernel SP from just
  * above it: a capability with the kernel stack's own bounds and address
  * `frame + size`. Every push sequence writes it (`sys_compartment_invoke`,
- * `sys_thread_switch`, the trap vector, `thread::create`), and no compartment
- * can hold a capability with those bounds, so it is what identifies a frame
- * and its kind (`unwind::kind_at`): the address says how big the frame is.
- * Popping a frame is setting `mscratchc` to it.
+ * `sys_thread_switch`, the trap vector, `thread::create`), and no
+ * compartment can hold a capability with those bounds, so it is what
+ * identifies a frame and its kind (`unwind::kind_at`): the address says how
+ * big the frame is. Popping a frame is setting `mscratchc` to it.
  *
  * INTERRUPT MASKING RULE
  * ----------------------
@@ -126,35 +120,33 @@
  * (`sys_compartment_invoke`, the switcher's return path `.Lcomp_restore`,
  * the trap vector) masks as its first instruction; `MIE` is set again only
  * on the way back out to user code, and only to the value the interrupted or
- * calling user context had: `1` for ordinary thread code, `0` inside the
- * dynamic extent of an interrupt handler (which must stay masked until its
- * own `mret`), never for the boot/host context. The switcher saves that
- * value in its `ReturnFrame` and restores it when the call returns, whether
- * the callee was a compartment or the kernel and whether or not the thread
- * was switched out in between. A compartment callee runs with the caller's
- * `MIE`; a kernel entry runs masked. A brand-new thread is unmasked by
- * `__thread_start`.
+ * calling user context had: `1` for ordinary thread code, `0` in the
+ * interrupt handler thread (masked from its first instruction, thread.hpp),
+ * never for the boot/host context. The switcher saves that value in its
+ * `ReturnFrame` and restores it when the call returns, whether the callee
+ * was a compartment or the kernel and whether or not the thread was switched
+ * out in between. A compartment callee runs with the caller's `MIE`; a
+ * kernel entry runs masked. A brand-new thread is unmasked by
+ * `__thread_start`, unless it is an interrupt handler. A parked thread
+ * resumes with the `MIE` its `TrapFrame` records: the interrupted code's, or
+ * 0 for one parked by `sys_thread_switch` or `sys_trap_wait`, whose own way
+ * out restores its caller's.
  *
- * Trap handlers. An interrupt handler always runs masked. An exception
- * handler runs with the `MIE` of the code that raised the exception, the way
- * a callee runs with its caller's: over ordinary thread code it runs
- * unmasked, so an interrupt that arrives meanwhile is handled on top of it
- * and returns into it. Except: if the kernel stack has no room for that
- * interrupt (KERNEL-STACK ROOM, check 3), it runs masked. The dispatcher
- * records the interrupted `mstatus` in the `TrapFrame` and decides
- * `handler_mie`; the trap vector sets `MIE` from `handler_mie` just before
- * it enters the handler; and the trap's final `mret` gives the interrupted
- * code back the `MIE` it had (the recorded `MPIE`), whatever trapped or
- * switched threads in between.
+ * A fault handler runs with the `MIE` of the code that raised the fault, the
+ * way a callee runs with its caller's: over ordinary thread code it runs
+ * unmasked, and an interrupt that arrives meanwhile parks it like any other
+ * code. The dispatcher records the faulting `mstatus` in the `TrapFrame` and
+ * sets `handler_mie`; the trap vector sets `MIE` from `handler_mie` just
+ * before it enters the handler; and the trap's final `mret` gives the
+ * faulting code back the `MIE` it had (the recorded `MPIE`), whatever trapped
+ * or switched threads in between.
  */
 
 #define FRAME_SP                16
 #define FRAME_LINK              48
-/* Where `ctp` is saved: SwitchFrame / TrapFrame, and ReturnFrame. */
+/* Where `ctp` is saved: TrapFrame, and ReturnFrame. */
 #define FRAME_TP                496
 #define RET_FRAME_TP            256
-
-#define SWITCH_FRAME_SIZE       512
 
 #define TRAP_FRAME_MEPCC        512
 #define TRAP_FRAME_HANDLER_SP   528
@@ -183,70 +175,44 @@
 /*
  * KERNEL-STACK ROOM
  * -----------------
- * Three checks, one constant. Together they keep this true: wherever a trap
+ * Two checks, one constant. Together they keep this true: wherever a trap
  * can be taken, the kernel stack has room for its `TrapFrame` and for
- * dispatching it -- to a handler, to ending the thread, or to a halt. The
- * trap vector itself checks nothing (it has no free register before it
- * stores), so this is what keeps it from overflowing the kernel stack.
+ * dispatching it -- to the interrupt handler's thread, to a fault handler,
+ * or to unwinding. The trap vector itself checks nothing (it has no free
+ * register before it stores), so this is what keeps it from overflowing the
+ * kernel stack. No interrupt handler runs on the interrupted thread (trap.hpp),
+ * so an interrupt costs that thread its `TrapFrame` and the dispatcher, up
+ * to where the handler is resumed on its own kernel stack
+ * (`__thread_resume_on`).
  *
  *   1. `sys_compartment_invoke` pushes a `ReturnFrame` only if at least
  *      RET_FRAME_MIN_FREE bytes are free. That covers the frame (416) plus
- *      the most its callee puts on the kernel stack: `_prepare` (160, plus
- *      `sentry::resolve` 128, at -O2), or for `sys_thread_switch` the
- *      `SwitchFrame` (512) and `__signetos_thread_dispatch` (leaf); or, for
- *      a fault inside the callee (compartment code, or a kernel bug), one
+ *      the most its callee puts on the kernel stack: `_prepare` (128, plus
+ *      `sentry::resolve` 128); for `sys_thread_switch` the `TrapFrame` it
+ *      parks its caller in (640) and `__signetos_thread_dispatch` with the
+ *      resume path under it (432; `sys_trap_wait`'s is the same frame and
+ *      400); or a trap in the callee -- an interrupt anywhere in compartment
+ *      code, or a fault (compartment code, or a kernel bug) -- one
  *      `TrapFrame` (640) plus the trap dispatcher's deepest path
- *      (`__signetos_trap_dispatch` with `dispatch_fault` inlined, 448, +
- *      `fault_report`/`trap_report` 144 + the console helpers, 64 = 656), so
- *      the fault is delivered or reported instead of overflowing. 416 + 640
- *      + 656 = 1712, rounded up.
- *   2. `__signetos_switcher_prepare` enters a compartment callee that will
- *      run with interrupts enabled (its caller's `MIE` was set) only if,
- *      below the `ReturnFrame`, TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE bytes
- *      are free: such code can be ticked at any instruction, and the trap
- *      taken there must satisfy check 3. A callee that runs masked (called
- *      from an interrupt handler) cannot be ticked, and a fault in it fits
- *      in what check 1 left (640 + 656 < 1728 - 416), so it needs nothing
- *      more.
- *   3. `__signetos_trap_dispatch` enters a handler -- a bound interrupt
- *      handler or the faulting compartment's fault handler (fault.hpp) --
- *      only if at least RET_FRAME_MIN_FREE bytes are free below the
- *      `TrapFrame`: enough for the handler's one kernel call (the tick
- *      handler's `sys_thread_switch` goes through check 1), and enough to
- *      dispatch a fault inside the handler (640 + 656). A fault handler
- *      that would run unmasked (INTERRUPT MASKING RULE) can be ticked at
- *      its first instruction, so, as in check 2, it runs unmasked only if
- *      TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE bytes are free; with less it
- *      runs masked. A fault inside a handler is never delivered again: it
- *      unwinds (fault.hpp), so a faulting handler costs one more
- *      `TrapFrame` at most. A fault with less than RET_FRAME_MIN_FREE free
- *      below its `TrapFrame` is reported and unwound, not delivered.
+ *      (`__signetos_trap_dispatch` 272 + `debug::fault_report` 112 +
+ *      `uart::print_dec` 48 = 432; waking the handler is 272 + 16), so the
+ *      trap is dispatched instead of overflowing. 416 + 640 + 432 = 1488,
+ *      with room to spare.
+ *   2. `__signetos_trap_dispatch` enters a fault handler (fault.hpp) only if
+ *      at least RET_FRAME_MIN_FREE bytes are free below the fault's
+ *      `TrapFrame`: enough for the handler's kernel calls (check 1), and for
+ *      a trap inside the handler (640 + 432). A fault inside a fault handler
+ *      is never delivered again: it unwinds (fault.hpp), so a faulting
+ *      handler costs one more `TrapFrame` at most. A fault with less than
+ *      RET_FRAME_MIN_FREE free below its `TrapFrame` is reported and unwound,
+ *      not delivered.
  *
  * On a 8048-byte thread kernel stack (two pages, `THREAD_STATE_PAGES`, less
- * the 144-byte `ThreadState`) this allows a thread thirteen nested
- * compartment calls with interrupts enabled (each 416 bytes; check 2 refuses
- * the fourteenth at 2224 free), kernel calls on top of them down to check 1,
- * and, inside a handler, further compartment calls down to check 1 (the
- * console's keystroke chain and the disk's completion chain each nest two:
- * handler -> uart RX / blk IRQ entry -> sched.wake). Handler frames live on
- * the interrupted thread's kernel stack, so how deep a handler chain can nest
- * depends on how deep that thread was: a two-call chain fits over a thread
- * at compartment depth 12 (3056 free before the `TrapFrame`) but not depth
- * 13 (its second call is refused at 1584 free), and a fault handler runs
- * unmasked over a thread at compartment depth 0 to 12 but masked at 13 (2000
- * free below the `TrapFrame`, short of 640 + 1728). With one page (3792
- * bytes) the numbers were four nested calls, the chain over depth 3 but not
- * 4, unmasked over depth 0 to 2 -- and a program the shell runs on its own
- * thread sits at depth 4 when it waits for the disk (shell -> program -> fs
- * -> blk -> sched.block), so its wake was refused and lost; that is why there
- * are two pages. Measured high-water of a thread's kernel stack, before the
- * `TrapFrame` grew from 576 to 640 bytes and the `ReturnFrame` from 400 to
- * 416 (add the difference for the frames on each path): 1888 bytes under the
- * test image, 2416 under the production demo (tick handler preempting a
- * thread that was itself inside the switcher). The test image goes deeper on
- * purpose: `PREEMPT.11c` traps thirteen compartment calls deep, about 6500
- * bytes by the frame sizes above. Frame sizes are from `llvm-objdump` of the
- * -O2 kernel; re-measure if the trap path or these helpers grow.
+ * the 144-byte `ThreadState`) this allows a thread sixteen nested
+ * compartment calls (each 416 bytes; check 1 refuses the seventeenth at 1392
+ * free), and kernel calls on top of them down to check 1. Frame sizes are
+ * from `llvm-objdump` of the -O2 kernel; re-measure if the trap path or these
+ * helpers grow.
  */
 #define RET_FRAME_MIN_FREE      1728
 

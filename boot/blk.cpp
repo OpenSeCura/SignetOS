@@ -29,11 +29,6 @@
  *   blk_read_entry(buf, sector, count)   copies `count` sectors from the
  *                                        device into `buf`.
  *   blk_write_entry(buf, sector, count)  the other way round.
- *   blk_irq_entry(source)                the device's PLIC source fired:
- *                                        acknowledge it and wake whichever
- *                                        thread is waiting for its request.
- *                                        `trap_mgr` invokes this from
- *                                        interrupt context.
  *   blk_paging_entry                     the pager's thread (PAGING).
  *   blk_paging_stop_entry                ends it, for the shell's
  *                                        `shutdown`.
@@ -50,33 +45,25 @@
  *   from submission to completion. A caller that is stopped (its scheduler
  *   node taken back) while it holds it is lent time by the next caller until
  *   it releases it (sched.cpp, LOCKS). A caller can also end while it holds
- *   it -- the kernel ends a thread that has no room to take a trap, or whose
- *   every frame is in a destroyed compartment -- possibly with its request
- *   still in flight. The next caller then gets the lock with SCHED_OWNER_DEAD
- *   and recovers before using the device (`recover`): it waits for the device
- *   to finish everything submitted and catches the used ring up. Before there
- *   is a scheduler (`init` alone) the lock is taken without waiting.
+ *   it -- the kernel ends a thread whose every frame is in a destroyed
+ *   compartment -- possibly with its request still in flight. The next
+ *   caller then gets the lock with SCHED_OWNER_DEAD and recovers before
+ *   using the device (`recover`): it waits for the device to finish
+ *   everything submitted and catches the used ring up. Before there is a
+ *   scheduler (`init` alone) the lock is taken without waiting.
  *
  *   A request is one of `dma`'s two fixed chains (read or write) placed in
  *   the available ring, then a notify. Completion is a new entry in the used
- *   ring. While it is in flight the calling thread sleeps in `sched.block`;
- *   `blk_irq_entry` wakes it by tid. The wait loop re-checks the used ring
- *   after every return from `block`, so a wake that arrives early (or a
- *   spurious one) costs a trip round the loop and nothing else.
- *
- *   A wake can also fail to arrive: `sched.wake` is a compartment call made
- *   from interrupt context on the interrupted thread's kernel stack, and the
- *   switcher refuses it when that stack has no room. So the waiter never sleeps
- *   without a bound: it blocks for at most WAIT_TIMEOUT_US at a time and
- *   looks at the used ring again, and a lost wake costs that much and no
- *   more. The interrupt entry checks what `wake` said and counts the
- *   refusals; the waiter reports the first one on the console, since it is
- *   a sign that some caller is running deeper than the system allows for.
- *   Until the
- *   first interrupt has been seen -- or when the caller is not a scheduled
- *   thread, such as `init` mounting the disk, which `block` turns away with
- *   SCHED_INVALID_THREAD -- the loop polls instead, so a missing interrupt
- *   route degrades to polling rather than a hang.
+ *   ring. While it is in flight the calling thread sleeps in the scheduler
+ *   until the device interrupts (`sched.irq_wait`, for the device's own
+ *   PLIC source), then acknowledges the interrupt at the device so it can
+ *   interrupt again. The wait loop re-checks the used ring after every
+ *   return from `irq_wait`, so an interrupt for something else costs a trip
+ *   round the loop and nothing else; and it waits WAIT_TIMEOUT_US at most at
+ *   a time, so an interrupt that never comes (a misrouted source) costs
+ *   that much and no hang. When the caller is not a scheduled thread, such
+ *   as `init` mounting the disk, which `irq_wait` turns away with
+ *   SCHED_INVALID_THREAD, or there is no route, the loop polls instead.
  *
  * SWAP
  *   The disk's last sector may describe a swap region after the file system
@@ -102,12 +89,11 @@
  *   does.
  *
  * BEFORE THERE IS A SCHEDULER
- *   `blk` is in the boot set: `sched` and `trap_mgr` are files on the disk it
- *   serves, so at its handshake there is nothing to look up and no interrupt
- *   route. Every request polls until `init` has loaded the scheduler and
- *   hands over its entries (`block`, `wake`, `lock_wait`, `lock_wake`) in a
- *   second call, and until
- *   `trap_mgr` is up and the device's interrupt is routed here.
+ *   `blk` is in the boot set: `sched` is a file on the disk it serves, so at
+ *   its handshake there is nothing to look up and no interrupt route. Every
+ *   request polls until `init` has loaded the scheduler and hands over its
+ *   entries (`block`, `wake`, `lock_wait`, `lock_wake`) and the device's
+ *   `irq_wait` in a second call.
  */
 
 #include "runtime.hpp"
@@ -131,9 +117,8 @@ SIGNETOS_MANIFEST(BLK_MANIFEST, 64 * 1024)
 // Runtime slots: the entry points minted in the handshake.
 constexpr size_t SLOT_READ_ENTRY  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 0;
 constexpr size_t SLOT_WRITE_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 1;
-constexpr size_t SLOT_IRQ_ENTRY   = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
-constexpr size_t SLOT_PAGING_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 3;
-constexpr size_t SLOT_PAGING_STOP  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 4;
+constexpr size_t SLOT_PAGING_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
+constexpr size_t SLOT_PAGING_STOP  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 3;
 
 // --- The device, as `dma` left it (dma.cpp) ------------------------------------
 // The registers `blk` may write, as offsets into `s_notify`.
@@ -184,6 +169,7 @@ Capability s_sched_block = nullptr;
 Capability s_sched_wake = nullptr;
 Capability s_lock_wait = nullptr;
 Capability s_lock_wake = nullptr;
+Capability s_irq_wait = nullptr;  // the device's `sched.irq_wait`; null: poll
 
 volatile uint32_t* s_notify = nullptr;  // QUEUE_NOTIFY .. INTERRUPT_ACK
 uint8_t* s_buf = nullptr;               // the arena past its descriptor page
@@ -196,19 +182,9 @@ uint64_t s_lock = 0;                  // ONE REQUEST AT A TIME
 bool s_first_call_done = false;
 uint16_t s_last_used = 0;             // used-ring entries consumed so far
 
-// The thread waiting for the in-flight request (0: nobody), and how many
-// interrupts have ever reached us.
-volatile uint64_t s_waiter_tid = 0;
-volatile uint32_t s_irq_count = 0;
-
-// Wakes `blk_irq_entry` could not deliver (the call refused, or `wake` said
-// no), and how many of them the waiter has already reported.
-volatile uint32_t s_wakes_lost = 0;
-uint32_t s_wakes_reported = 0;
-
 // The longest the waiter sleeps before it looks at the used ring itself; a
-// request completes in well under this, so it only matters when a wake was
-// lost.
+// request completes in well under this, so it only matters when the
+// interrupt does not come.
 constexpr uint64_t WAIT_TIMEOUT_US = 10'000;
 
 // PAGING: how long the pager sleeps at most when the kernel has no job for
@@ -245,14 +221,6 @@ volatile BlkReqHeader* header() {
 volatile uint8_t* status_byte() { return s_buf + init::DMA_BUF_STATUS; }
 uint8_t* data() { return s_buf + init::DMA_BUF_DATA; }
 
-// Sleeps until woken or WAIT_TIMEOUT_US, whichever is first. False if the
-// scheduler does not run the calling thread (`init`, before the dispatcher
-// starts), which cannot sleep and polls instead.
-bool block() {
-  return invoke<int64_t>(s_gate_invoke, s_sched_block, WAIT_TIMEOUT_US) !=
-         init::SCHED_INVALID_THREAD;
-}
-
 // Submits one request and waits for it. `type` is BLK_T_IN or BLK_T_OUT; the
 // data -- always BLK_XFER_BYTES -- goes through the arena's data buffer, which
 // the caller has filled (OUT) or will drain (IN). Returns BLK_OK or
@@ -263,9 +231,6 @@ int64_t transfer(uint32_t type, uint64_t sector) {
   h->reserved = 0;
   h->sector = sector;
   *status_byte() = STATUS_POISON;
-
-  // Whom to wake, recorded before the device can possibly complete.
-  s_waiter_tid = self_tid();
 
   volatile VirtqAvail* av = avail();
   const uint16_t idx = av->idx;
@@ -278,31 +243,28 @@ int64_t transfer(uint32_t type, uint64_t sector) {
   fence();
   reg_write(R_QUEUE_NOTIFY, 0);
 
-  // Sleep until the used ring moves. Polling instead if we are not a
-  // scheduled thread or no interrupt has ever arrived (no route). A killed
-  // thread never sleeps (`block` returns SCHED_KILLED at once), so for one
-  // this loop polls. It must still wait for the completion: the device owns
-  // the request until then.
+  // Sleep until the used ring moves, acknowledging the device's interrupt
+  // each time so it can interrupt again (ONE REQUEST AT A TIME). Polling
+  // instead with no route, or if we are not a scheduled thread. A killed
+  // thread never sleeps (`irq_wait` returns SCHED_KILLED at once), so for
+  // one this loop polls. It must still wait for the completion: the device
+  // owns the request until then.
   volatile VirtqUsed* us = used();
-  bool scheduled = capability_is_valid(s_sched_block);
+  bool sleep = capability_is_valid(s_irq_wait);
   for (;;) {
     fence();
     if (us->idx != s_last_used) {
       break;
     }
-    if (scheduled && s_irq_count > 0) {
-      scheduled = block();
-    } else {
-      __asm__ volatile("" ::: "memory");
+    if (sleep) {
+      const int64_t st = invoke<int64_t>(s_gate_invoke, s_irq_wait,
+                                         WAIT_TIMEOUT_US);
+      sleep = st == init::SCHED_OK || st == init::SCHED_TIMED_OUT;
+      const uint32_t pending = reg_read(R_INTERRUPT_STATUS);
+      if (pending != 0) {
+        reg_write(R_INTERRUPT_ACK, pending);
+      }
     }
-  }
-  s_waiter_tid = 0;
-  if (s_wakes_lost != s_wakes_reported) {
-    if (s_wakes_reported == 0) {
-      out("[blk]      WARNING: a completion wake was refused; "
-          "the request finished on the wait timeout\n");
-    }
-    s_wakes_reported = s_wakes_lost;
   }
   const VirtqUsedElem done = {us->ring[s_last_used % QUEUE_SIZE].id,
                               us->ring[s_last_used % QUEUE_SIZE].len};
@@ -332,7 +294,6 @@ void recover() {
     }
   }
   s_last_used = us->idx;
-  s_waiter_tid = 0;
   out("[blk]      a caller ended mid-request; recovered the device queue\n");
 }
 
@@ -386,29 +347,6 @@ int64_t handle(Capability buf, uint64_t sector, uint64_t count, uint32_t type) {
 }  // namespace
 
 SIGNETOS_DEFAULT_FAULT_HANDLER("blk")
-
-// Interrupt context (see trap_mgr.cpp): acknowledge, wake the waiter, return.
-extern "C" uint64_t blk_irq_entry(uint64_t source) {
-  (void)source;  // the only source routed here is ours
-  if (s_notify == nullptr) {
-    return 0;
-  }
-  const uint32_t pending = reg_read(R_INTERRUPT_STATUS);
-  if (pending != 0) {
-    reg_write(R_INTERRUPT_ACK, pending);
-  }
-  s_irq_count = s_irq_count + 1;
-  const uint64_t tid = s_waiter_tid;
-  if (tid != 0 && capability_is_valid(s_sched_wake)) {
-    const int64_t st = invoke<int64_t>(s_gate_invoke, s_sched_wake, tid);
-    // SCHED_INVALID_THREAD: a waiter the scheduler does not run (`init`),
-    // which polls. Anything else that is not SCHED_OK was lost.
-    if (st != init::SCHED_OK && st != init::SCHED_INVALID_THREAD) {
-      s_wakes_lost = s_wakes_lost + 1;
-    }
-  }
-  return 0;
-}
 
 extern "C" int64_t blk_read_entry(Capability buf, uint64_t sector,
                                   uint64_t count) {
@@ -468,11 +406,12 @@ extern "C" int64_t blk_paging_stop_entry() {
 namespace {
 
 // A later call from `init` (abi.hpp): the scheduler's entries (`block`,
-// `wake`, `lock_wait`, `lock_wake`), now that there is a scheduler. Nothing
-// else reaches our sentry, so the entries are taken on the strength of their
-// shape alone.
+// `wake`, `lock_wait`, `lock_wake`), now that there is a scheduler, and the
+// device's `irq_wait`, if its interrupt is routed. Nothing else reaches our
+// sentry, so the entries are taken on the strength of their shape alone.
 int64_t bind_sched(Capability block_ep, Capability wake_ep,
-                   Capability lock_wait_ep, Capability lock_wake_ep) {
+                   Capability lock_wait_ep, Capability lock_wake_ep,
+                   Capability irq_wait_ep) {
   if (!sealing::is_sealed_as(OType::EntryPoint, block_ep) ||
       !sealing::is_sealed_as(OType::EntryPoint, wake_ep) ||
       !sealing::is_sealed_as(OType::EntryPoint, lock_wait_ep) ||
@@ -483,6 +422,9 @@ int64_t bind_sched(Capability block_ep, Capability wake_ep,
   s_sched_wake = wake_ep;
   s_lock_wait = lock_wait_ep;
   s_lock_wake = lock_wake_ep;
+  if (sealing::is_sealed_as(OType::EntryPoint, irq_wait_ep)) {
+    s_irq_wait = irq_wait_ep;
+  }
   return init::BLK_OK;
 }
 
@@ -510,7 +452,8 @@ void setup_swap() {
 }  // namespace
 
 extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
-                                    Capability arg2, Capability arg3) {
+                                    Capability arg2, Capability arg3,
+                                    Capability arg4) {
   Capability* rw = rw_table();
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
@@ -519,7 +462,7 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   // argument of `BlkInterface`'s size is `init` bringing us up. Any later
   // call can only be `init` handing over the scheduler's entries.
   if (s_first_call_done) {
-    return bind_sched(arg0, arg1, arg2, arg3);
+    return bind_sched(arg0, arg1, arg2, arg3, arg4);
   }
   s_first_call_done = true;
   if (!capability_is_valid(arg0) || sealing::is_sealed(arg0) ||
@@ -530,7 +473,6 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
   auto* iface = reinterpret_cast<init::BlkInterface*>(arg0);
   iface->read = nullptr;
   iface->write = nullptr;
-  iface->irq = nullptr;
   iface->paging = nullptr;
   iface->paging_stop = nullptr;
   iface->swap_pages = 0;
@@ -568,8 +510,6 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
                                  reinterpret_cast<const void*>(&blk_read_entry));
   Capability e_write = mint_entry(s_gate_invoke, gate_sentry, self,
                                   reinterpret_cast<const void*>(&blk_write_entry));
-  Capability e_irq = mint_entry(s_gate_invoke, gate_sentry, self,
-                                reinterpret_cast<const void*>(&blk_irq_entry));
   Capability e_paging = mint_entry(
       s_gate_invoke, gate_sentry, self,
       reinterpret_cast<const void*>(&blk_paging_entry));
@@ -578,12 +518,10 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
       reinterpret_cast<const void*>(&blk_paging_stop_entry));
   rw[SLOT_READ_ENTRY] = e_read;
   rw[SLOT_WRITE_ENTRY] = e_write;
-  rw[SLOT_IRQ_ENTRY] = e_irq;
   rw[SLOT_PAGING_ENTRY] = e_paging;
   rw[SLOT_PAGING_STOP] = e_paging_stop;
   iface->read = e_read;
   iface->write = e_write;
-  iface->irq = e_irq;
   iface->paging = e_paging;
   iface->paging_stop = e_paging_stop;
   iface->capacity_sectors = s_capacity;

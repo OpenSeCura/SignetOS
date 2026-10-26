@@ -231,21 +231,6 @@ void thread_ending(const char* who, const char* why) {
   uart::print("\n");
 }
 
-void interrupted_thread_ending(const char* why, Status status,
-                               uint64_t mcause, uint64_t mepc) {
-  uart::print("[trap] ending thread ");
-  uart::print_dec(thread::current_tid());
-  uart::print(": ");
-  uart::print(why);
-  uart::print(" (");
-  uart::print(status_name(status));
-  uart::print("), mcause 0x");
-  uart::print_hex64(mcause);
-  uart::print(" at 0x");
-  uart::print_hex64(mepc);
-  uart::print("\n");
-}
-
 void harts_online(uint64_t online, uint64_t total, uint64_t boot_hart) {
   uart::print("[smp]      ");
   uart::print_dec(online);

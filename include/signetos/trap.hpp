@@ -19,50 +19,40 @@
 //
 // trap.hpp - SignetOS trap dispatch: delivering interrupts and faults
 //
-// Two interrupts leave the kernel, each to the one handler `init` installed
-// for it (irq.hpp, which also keeps every hart's `mie` and timer in line).
-// Synchronous exceptions have no handler there: a fault is handled by the
-// compartment that raised it, through the fault handler it installed in its
-// own descriptor (fault.hpp, PER-COMPARTMENT FAULTS below).
+// Every interrupt that leaves the kernel -- the tick and the external
+// interrupt -- wakes this hart's interrupt handler thread, the scheduler's
+// (thread.hpp, THE INTERRUPT HANDLER): the interrupted thread stays parked
+// in the `TrapFrame` the trap vector pushed, and the handler thread is
+// resumed from where it waits. No handler is entered from the trap vector
+// for it. Synchronous exceptions are handled by the compartment that raised
+// them, through the fault handler it installed in its own descriptor
+// (fault.hpp, PER-COMPARTMENT FAULTS below).
 //
 // Everything runs in M-mode and nothing is delegated, so every trap is taken
-// in M-mode, by the kernel. When an installed interrupt fires, or compartment
-// code faults:
+// in M-mode, by the kernel. For a fault in compartment code:
 //   1. `_early_trap_entry` saves all 31 capability registers (`cra`, `csp`,
 //      `cgp`, `ctp`, `ct0`..`ct6`, `cs0`..`cs11`, `ca0`..`ca7`), `mepcc`, and
 //      the hart's `mscratchc` kernel SP into a 640-byte `TrapFrame` on the
 //      active kernel stack.
-//   2. `__signetos_trap_dispatch` picks the handler -- the interrupt's
-//      installed `OType::EntryPoint`, or the faulting compartment's fault
-//      handler --
-//      as a `CT = 1` hardware sentry. The handler runs below the interrupted
-//      `csp`, narrowed by the same stack rule as a callee's
-//      (`switcher::narrow_stack`: permissions including StoreLocal, the
-//      handler's `min_stack` free, exactly representable, never the kernel
-//      stack), and makes its kernel calls on the interrupted kernel stack,
-//      which must have `RET_FRAME_MIN_FREE` below the `TrapFrame`. An
-//      interrupted thread that fails either cannot be preempted and is ended
-//      there (`trap.cpp`, `end_interrupted_thread`); a fault that fails
-//      either is reported and unwound instead of delivered.
-//   3. The handler sentry is invoked with `(ca0, mtval, mepc, mtval2,
+//   2. `__signetos_trap_dispatch` picks the faulting compartment's fault
+//      handler as a `CT = 1` hardware sentry. It runs on the faulting
+//      thread, below its `csp`, narrowed by the same stack rule as a callee's
+//      (`switcher::narrow_stack`), with its kernel calls on the faulting
+//      thread's kernel stack, which must have `RET_FRAME_MIN_FREE` below the
+//      `TrapFrame`. A fault that fails either is reported and unwound
+//      instead of delivered. The handler runs with the faulting code's `MIE`
+//      (asm_macros.h, INTERRUPT MASKING RULE).
+//   3. The handler sentry is invoked with `(ErrorState, mtval, mepc, mtval2,
 //      cap_table)` in `(ca0, a1, a2, a3, ca4)` (with `cgp = ca4`) and all
-//      other registers scrubbed to `cnull`. For an interrupt `ca0` is the
-//      integer `mcause`; for a fault it is the compartment's ErrorState
-//      (fault.hpp), at the top of the handler's stack.
-//   4. Because `mscratchc` points to the `TrapFrame` while the handler runs,
-//      the handler may freely invoke syscalls or call `sys_thread_switch` to
-//      preempt the interrupted thread. An interrupt handler runs with
-//      interrupts masked. A fault handler runs with the interrupted code's
-//      `MIE`, so over thread code an interrupt can be handled on top of it
-//      and return into it (asm_macros.h, INTERRUPT MASKING RULE).
-//   5. When the handler returns, the kernel scrubs the handler's narrowed
-//      stack and pops the `TrapFrame` (`__signetos_trap_return` =
-//      `unwind::resume`). An interrupted context is always resumed; a
-//      faulting one only on the handler's INSTALL_CONTEXT verdict, with the
-//      register file it left in the ErrorState, and otherwise unwound: the
-//      frame beneath gets `Status::Faulted` in a0. `_early_trap_entry` then
-//      restores `mepcc` and all 31 capability registers of whatever frame it
-//      stopped at and executes `mret` (or returns through the switcher).
+//      other registers scrubbed to `cnull`. The ErrorState (fault.hpp) is at
+//      the top of the handler's stack.
+//   4. When the handler returns, `__signetos_trap_return` (`unwind::resume`)
+//      pops the `TrapFrame`. The faulting context is resumed only on its
+//      handler's INSTALL_CONTEXT verdict, with the register file it left in
+//      the ErrorState, and otherwise unwound: the frame beneath gets
+//      `Status::Faulted` in a0. `_early_trap_entry` then restores `mepcc` and
+//      all 31 capability registers of whatever frame it stopped at and
+//      executes `mret` (or returns through the switcher).
 //
 // PER-COMPARTMENT FAULTS
 // ----------------------
@@ -110,10 +100,10 @@ constexpr uint64_t IRQ_M_SOFT  = INTERRUPT_BIT | 3;
 constexpr uint64_t IRQ_M_TIMER = INTERRUPT_BIT | 7;
 constexpr uint64_t IRQ_M_EXT   = INTERRUPT_BIT | 11;
 
-// Not a hardware cause: what the IRQ_M_TIMER handler gets as its cause when
-// the running thread waits for a page (vm.hpp, PAGING, FAULTS). It is to
-// block that thread and wake the pager, whose tid it gets in a3 (0: none);
-// the pager wakes it once the page is in.
+// Not a hardware cause: what the interrupt handler is told when the running
+// thread waits for a page (vm.hpp, PAGING, FAULTS). It is to block that
+// thread and wake the pager, whose tid it gets as `aux` (0: none); the pager
+// wakes it once the page is in.
 constexpr uint64_t PAGE_WAIT = INTERRUPT_BIT | 0x100;
 
 using Status = signetos::Status;
@@ -130,24 +120,25 @@ using signetos::status_name;
 constexpr uint64_t TRAP_FLAG_FAULT = 1u << 4;
 
 // Saved context pushed onto the active kernel stack by `_early_trap_entry`
-// before dispatching a trap or interrupt.
+// before dispatching a trap, or by `sys_thread_switch` (thread.hpp, PARKED
+// THREADS).
 struct alignas(16) TrapFrame {
   Capability ra;                //   0
   Capability sp;                //  16
   Capability gp;                //  32
   Capability active_kernel_sp;  //  48 FRAME LINK (asm_macros.h), written
-                                //     by the trap vector at push
+                                //     at push
   Capability t[7];              //  64..160
   Capability s[12];             // 176..352
   Capability a[8];              // 368..480
   Capability tp;                // 496
-  Capability mepcc;             // 512
-  Capability handler_sp;        // 528 (populated by __signetos_trap_dispatch)
+  Capability mepcc;             // 512 where `mret` resumes it
+  Capability handler_sp;        // 528 the fault handler's stack, zeroed by
+                                //     the assembly; null: no handler
   Capability handler_rw_table;  // 544 (populated by __signetos_trap_dispatch)
-  // Both populated by __signetos_trap_dispatch for a handler it delivers
-  // (asm_macros.h, INTERRUPT MASKING RULE):
-  uint64_t mstatus;             // 560 `mstatus` at entry; its MPIE is the
-                                //     interrupted code's MIE
+  uint64_t mstatus;             // 560 its MPIE is the MIE the frame resumes
+                                //     with (asm_macros.h, INTERRUPT MASKING
+                                //     RULE)
   uint64_t handler_mie;         // 568 MSTATUS_MIE if the handler runs with
                                 //     interrupts enabled, else 0
   uint64_t flags;               // 576 TRAP_FLAG_* above
@@ -157,10 +148,9 @@ struct alignas(16) TrapFrame {
   Capability handler_comp;      // 592 the delivered handler's compartment
                                 //     handle; null if none was delivered
                                 //     (WHO FAULTED)
-  // The handler's ca0 and a3, written by __signetos_trap_dispatch (a1 and a2
-  // are always mtval and mepc, read from the CSRs): for an interrupt the
-  // integer `mcause` and `mtval2`; for a fault its ErrorState (fault.hpp) and
-  // `mtval2`.
+  // The fault handler's ca0 and a3, written by __signetos_trap_dispatch (a1
+  // and a2 are always mtval and mepc, read from the CSRs): its ErrorState
+  // (fault.hpp) and `mtval2`.
   Capability handler_ca0;       // 608
   uint64_t handler_a3;          // 624
   uint64_t reserved_;           // 632 (keeps the frame a capability multiple)

@@ -51,10 +51,12 @@ alignas(16) sentry::EntryRecord s_entries[kSyscallCount];
 // not, and the switcher's first instruction is a CSR access).
 Capability s_invoke_gate = nullptr;
 
-// Stack each entry asks of its caller. Only `thread_switch` is special: its
-// `SwitchFrame` and `__signetos_thread_dispatch` live on the kernel stack.
+// Stack each entry asks of its caller. Only `thread_switch` and `trap_wait`
+// are special: the `TrapFrame` they park their caller in and the C++ they
+// call live on the kernel stack.
 constexpr uint64_t stack_for(Id id) {
-  return id == Id::thread_switch ? 0 : SYSCALL_STACK_BYTES;
+  return id == Id::thread_switch || id == Id::trap_wait ? 0
+                                                        : SYSCALL_STACK_BYTES;
 }
 
 }  // namespace
@@ -247,8 +249,8 @@ extern "C" uint64_t sys_thread_tid(capability_thread_t thread) {
 
 // --- Traps and interrupts --------------------------------------------------
 
-extern "C" uint64_t sys_trap_install(uint64_t irq, Sentry handler) {
-  return static_cast<uint64_t>(::signetos::irq::install(irq, handler));
+extern "C" uint64_t sys_trap_install(capability_thread_t thread) {
+  return static_cast<uint64_t>(::signetos::irq::install(thread));
 }
 
 // --- Paging ------------------------------------------------------------------

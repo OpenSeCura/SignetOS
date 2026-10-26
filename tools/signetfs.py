@@ -32,7 +32,7 @@ is the number of the directory it is an entry of (ROOT_DIR = 0xFFFFFFFF for
 ownership on the disk: after a mount every file belongs to the root
 `quota_disk`, and what a holder of a derived quota can reach is decided by
 the directory that quota is rooted at. `init` reads the system's own images
-(`naming.bin`, `sched.bin`, `trap_mgr.bin`, `shell.bin`) out of `/`, where
+(`naming.bin`, `sched.bin`, `shell.bin`) out of `/`, where
 nothing but the root quota is rooted; the programs the shell can `run` go in
 `/bin`, which the shell reaches through a read-only quota rooted there.
 

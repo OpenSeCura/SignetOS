@@ -91,7 +91,6 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   compartment::init();
   thread::init();
   thread::init_hart(hartid);
-  irq::init();
   irq::init_hart();
   smp::bring_up_secondary_harts(root_data_cap, hartid);
 

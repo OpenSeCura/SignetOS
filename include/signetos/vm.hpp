@@ -28,7 +28,7 @@
 // Only addresses fixed by hardware are fixed here:
 //
 //   0x00000000 .. 0x00200000    QEMU test/poweroff device   megapage, boot
-//   0x0c000000 .. 0x0c202000    PLIC (delegated to trap_mgr) megapages, boot
+//   0x0c000000 .. 0x0c202000    PLIC (delegated to sched)    megapages, boot
 //   0x10000000 .. 0x10001000    UART                        4KB page, boot
 //   0x80000000 .. 0x81000000    kernel image (identity)     megapages, boot
 //   DIRECT_BASE .. + RAM size   the direct map              megapages, boot
@@ -372,8 +372,8 @@ Capability bitmap_view();
 //
 // WHAT MUST NOT WAIT. Nor may anything the pager needs wait for a page: `blk`
 // holding its lock, the scheduler holding its own, or code running with
-// interrupts masked (an interrupt handler, and what it calls: the console
-// calls the shell). That is why everything `init` starts stays in RAM. It is
+// interrupts masked (the interrupt handler, and what it calls). That is why
+// everything `init` starts stays in RAM. It is
 // a rule, not a check: the programs the shell runs reach those services
 // only through `fs` and the console, which touch a program's memory only
 // while holding nothing the pager needs.

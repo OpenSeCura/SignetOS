@@ -15,7 +15,7 @@
  */
 
 /*
- * trap.cpp - SignetOS trap dispatch: the two interrupt handlers and faults
+ * trap.cpp - SignetOS trap dispatch: interrupts and faults
  *
  * Called from _early_trap_entry (early_trap.S) when a synchronous exception or
  * asynchronous interrupt reaches the machine trap vector. Everything runs in
@@ -25,25 +25,17 @@
  * is a kernel bug: `debug::trap_report()` prints it and halts.
  *
  * A fault in compartment code goes to that compartment's fault handler
- * (fault.hpp, `dispatch_fault`). The tick and the external interrupt go to
- * the handlers `init` installed (irq.hpp, INTERRUPT HANDLERS):
- * `__signetos_trap_dispatch` resolves the handler and `_early_trap_entry`
- * invokes it with the interrupted context saved in a `TrapFrame` on the
- * active kernel stack -- provided the
- * interrupted context can take a trap at all: its kernel stack must have the
- * room of asm_macros.h (KERNEL-STACK ROOM, check 3) and its `csp` must pass
- * the stack rule every callee's stack passes (`switcher::narrow_stack`), since
- * the handler runs below it. A thread that fails either cannot be preempted
- * and is ended on the spot (`end_interrupted_thread`); in host context the
- * machine halts.
+ * (fault.hpp, `dispatch_fault`), on the faulting thread. Every interrupt, and
+ * a thread that must wait for a page, wakes this hart's interrupt handler
+ * thread (thread.hpp, THE INTERRUPT HANDLER): the interrupted thread stays
+ * parked in the `TrapFrame` the trap vector pushed, and the handler is
+ * resumed from where it waits. Nothing is asked of the interrupted thread,
+ * so an interrupt never ends one.
  *
- * An interrupt with no handler that resolves is silenced at its source on
- * this hart (`irq::silence`) and returned from.
+ * An interrupt with no handler waiting is silenced at its source on this
+ * hart (`irq::silence`) and returned from.
  *
- * Who each interrupt goes to, the tick, and keeping every hart's `mie` and
- * timer in line are irq.cpp's. This file decides which `MIE` a handler runs
- * with and which the interrupted context resumes with (see asm_macros.h,
- * INTERRUPT MASKING RULE).
+ * Who the interrupts go to, the tick, and each hart's `mie` are irq.cpp's.
  */
 
 #include <signetos/asm_macros.h>
@@ -90,11 +82,11 @@ namespace signetos::trap {
 namespace {
 
 
-// The stack an interrupt handler runs on: the interrupted context's own stack,
+// The stack a fault handler runs on: the faulting context's own stack,
 // everything below its `csp`, by the rule the switcher applies to every
 // callee (`switcher::narrow_stack`, with the handler's `min_stack`). One check
 // the switcher never needs: it must not be the kernel stack the `TrapFrame`
-// sits on, or the handler could read the interrupted registers out of it.
+// sits on, or the handler could read the faulting registers out of it.
 // `frame` carries that stack's bounds.
 Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
                          TrapFrame* frame, Status* out_status) {
@@ -115,27 +107,6 @@ Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
   return h_sp;
 }
 
-// Ends the interrupted thread because it cannot take the trap it just took
-// (`why`, `status`). A thread that cannot take a trap cannot be preempted,
-// so it is not resumed. If this was the tick, the timer is re-armed first so
-// the remaining threads keep being scheduled; any other interrupt stays
-// pending and is delivered to the next context that unmasks. `thread::exit`
-// does not return in a thread. In host context there is no thread to end:
-// the machine halts.
-[[noreturn]] void end_interrupted_thread(const char* why, Status status,
-                                         uint64_t mcause, uint64_t mtval,
-                                         uint64_t mtval2,
-                                         const TrapFrame* frame) {
-  const uint64_t mepc = capability_get_address(frame->mepcc);
-  debug::interrupted_thread_ending(why, status, mcause, mepc);
-  if (mcause == IRQ_M_TIMER) {
-    irq::rearm_tick();
-  }
-  thread::exit(-1);
-  debug::trap_report("in host context, and the host cannot take this trap", mcause,
-              mepc, mtval, mtval2, capability_get_address(frame->sp));
-}
-
 // What `__signetos_trap_dispatch` returns to make `_early_trap_entry` unwind
 // at once, without entering a handler: neither null (resume) nor a tagged
 // sentry (enter it). early_trap.S tells the three apart.
@@ -143,16 +114,13 @@ Capability unwind_sentinel() {
   return reinterpret_cast<Capability>(static_cast<uintptr_t>(1));
 }
 
-// Sets `frame` up for `entry` -- an interrupt handler, or a
-// compartment's fault handler -- to run on `h_sp` (the trap vector zeroes it
-// below its address before entering it, early_trap.S step 3)
-// with `a0`/`a3` as its first capability and last integer arguments, and
-// returns the sentry `_early_trap_entry` enters it through. `flags` are the
-// TRAP_FLAG_* of the delivery. `async`: an interrupt, whose handler always
-// runs masked.
+// Sets fault frame `frame` up for `entry`, the compartment's fault handler,
+// to run on `h_sp` (the trap vector zeroes it below its address before
+// entering it, early_trap.S step 3) with the ErrorState `es` in `ca0` and
+// `mtval2` in `a3`, and returns the sentry `_early_trap_entry` enters it
+// through.
 Capability deliver(TrapFrame* frame, const sentry::Entry& entry,
-                   Capability h_sp, uint64_t flags, Capability a0, uint64_t a3,
-                   bool async) {
+                   Capability h_sp, Capability es, uint64_t mtval2) {
   // `frame->active_kernel_sp` was written by the trap vector at push
   // (asm_macros.h, FRAME LINK).
   thread::set_kernel_sp(reinterpret_cast<Capability>(frame));
@@ -160,41 +128,30 @@ Capability deliver(TrapFrame* frame, const sentry::Entry& entry,
   frame->handler_rw_table = entry.table;
   // Whose code runs above this frame (WHO FAULTED).
   frame->handler_comp = entry.owner;
-  frame->handler_ca0 = a0;
-  frame->handler_a3 = a3;
-  frame->flags = flags;
+  frame->handler_ca0 = es;
+  frame->handler_a3 = mtval2;
+  frame->flags = TRAP_FLAG_FAULT;
 
-  // The MIE the handler runs with (asm_macros.h, INTERRUPT MASKING RULE): an
-  // interrupt handler, masked; a fault handler, the interrupted code's.
-  // Unmasked, it can be interrupted at its first instruction, so, like an
-  // unmasked callee (KERNEL-STACK ROOM, check 2), it also needs room for one
-  // more `TrapFrame` that still passes check 3; with less it runs masked.
-  //
-  // `mstatus` is as the trap left it: its MPIE is the MIE the interrupted
-  // code had (the dispatcher runs masked, so nothing has changed it since).
-  // The copy recorded here is what `__signetos_trap_return` resumes the
-  // interrupted code with.
+  // The handler runs with the faulting code's MIE (asm_macros.h, INTERRUPT
+  // MASKING RULE). `mstatus` is as the trap left it: its MPIE is that MIE
+  // (the dispatcher runs masked, so nothing has changed it since). The copy
+  // recorded here is what `__signetos_trap_return` resumes the faulting code
+  // with.
   uint64_t mstatus = 0;
   __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
-  const bool unmasked =
-      !async && (mstatus & MSTATUS_MPIE) != 0 &&
-      thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) >=
-          TRAP_FRAME_SIZE + RET_FRAME_MIN_FREE;
   frame->mstatus = mstatus;
-  frame->handler_mie = unmasked ? MSTATUS_MIE : 0;
+  frame->handler_mie = (mstatus & MSTATUS_MPIE) != 0 ? MSTATUS_MIE : 0;
 
   // User-space trap delivery: verify that the handler's hardware sentry
-  // (`ct0`), stack (`csp`), capability table (`ca4`/`cgp`) and, if it is a
-  // capability, first argument (`ca0`) are restricted and do not overlap
-  // kernel memory before `early_trap.S` enters it.
+  // (`ct0`), stack (`csp`), capability table (`ca4`/`cgp`) and first argument
+  // (`ca0`) are restricted and do not overlap kernel memory before
+  // `early_trap.S` enters it.
   inspect::assert_user_capability(entry.sentry, "trap_dispatch:hw_sentry");
   inspect::assert_user_capability(frame->handler_sp,
                                   "trap_dispatch:handler_sp");
   inspect::assert_user_capability(frame->handler_rw_table,
                                   "trap_dispatch:rw_table");
-  if (capability_is_valid(frame->handler_ca0)) {
-    inspect::assert_user_capability(frame->handler_ca0, "trap_dispatch:ca0");
-  }
+  inspect::assert_user_capability(frame->handler_ca0, "trap_dispatch:ca0");
   return entry.sentry;
 }
 
@@ -333,9 +290,8 @@ Capability dispatch_fault(uint64_t mcause, uint64_t mtval, uint64_t mtval2,
   // The handler's `csp` starts just below the ErrorState: the trap vector
   // zeroes everything below that, and the ErrorState itself is filled in
   // whole here.
-  const Capability handler =
-      deliver(frame, e, capability_set_address(h_sp, es_addr), TRAP_FLAG_FAULT,
-              es, mtval2, false);
+  const Capability handler = deliver(
+      frame, e, capability_set_address(h_sp, es_addr), es, mtval2);
   save_context(frame, es, mcause, mtval, mtval2);
   return handler;
 }
@@ -367,10 +323,10 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
                                                TrapFrame* frame) {
   const bool async = (mcause & INTERRUPT_BIT) != 0;
   const uint64_t mepc = capability_get_address(frame->mepcc);
-  // What an interrupt handler gets as its cause and a3: the trap's own,
-  // unless a thread waits for a page (below).
-  uint64_t handler_cause = mcause;
-  uint64_t handler_a3 = mtval2;
+  // What the interrupt handler is told: the interrupt, or that the thread
+  // waits for a page (below), and the pager's tid for that.
+  uint64_t cause = mcause;
+  uint64_t pager = 0;
   frame->flags = 0;
   frame->fault_status = 0;
   frame->handler_comp = nullptr;
@@ -394,8 +350,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   }
 
   // A software interrupt is a poke from the kernel (irq.hpp, THE SOFTWARE
-  // INTERRUPT IS THE KERNEL'S): a handler was installed, so this hart brings
-  // its `mie` and timer in line, and the interrupted context resumes.
+  // INTERRUPT IS THE KERNEL'S): cleared, and the interrupted context resumes.
   if (mcause == IRQ_M_SOFT) {
     irq::on_poke();
     return nullptr;
@@ -404,8 +359,7 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   // A synchronous exception raised by compartment code is that compartment's
   // fault, for its own handler (fault.hpp) -- unless it is a page fault on
   // pageable memory, which is paging's: the access runs again, once the page
-  // is in (vm.hpp, PAGING, FAULTS). The per-vector table holds only
-  // interrupts.
+  // is in (vm.hpp, PAGING, FAULTS).
   if (!async) {
     // MPIE is the MIE the faulting code had: only code that can be
     // interrupted can wait for a page.
@@ -423,81 +377,44 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
     if (paging == vm::Fault::Retry) {
       return nullptr;
     }
-    // Waiting for a page: the scheduler's tick handler is told so
-    // (PAGE_WAIT), blocks the thread and wakes the pager, which wakes the
-    // thread again once the page is in; the access then runs again.
-    mcause = IRQ_M_TIMER;
-    handler_cause = PAGE_WAIT;
-    handler_a3 = vm::pager_tid();
+    // Waiting for a page: the interrupt handler is told so (PAGE_WAIT),
+    // blocks the thread and wakes the pager, which wakes the thread again
+    // once the page is in; the access then runs again.
+    cause = PAGE_WAIT;
+    pager = vm::pager_tid();
   }
 
-  // The installed handler, if it still resolves: `resolve` refuses an entry
-  // whose compartment has been destroyed.
-  {
-    const Capability handler = irq::handler_for(mcause);
-    sentry::Entry entry{};
-    if (handler != nullptr &&
-        sentry::resolve(handler, &entry) == Status::Ok &&
-        (entry.flags & sentry::ENTRY_FLAG_TRUSTED) == 0) {
-      // The handler makes its kernel calls on this kernel stack and runs on
-      // the interrupted context's own stack, below its `csp`. The context
-      // must be able to carry both (asm_macros.h, KERNEL-STACK ROOM, check
-      // 3, and the stack rule of every callee). If it cannot, it cannot take
-      // any trap, and a thread that cannot take a trap cannot be preempted:
-      // it is ended rather than resumed.
-      if (thread::kernel_stack_free(reinterpret_cast<Capability>(frame)) <
-          RET_FRAME_MIN_FREE) {
-        end_interrupted_thread("no room on its kernel stack for the handler",
-                               Status::NoKernelStack, mcause, mtval, mtval2,
-                               frame);
-      }
-      Status status = Status::Ok;
-      Capability h_sp =
-          handler_stack(frame->sp, entry.min_stack, frame, &status);
-      if (!capability_is_valid(h_sp)) {
-        end_interrupted_thread("its stack cannot host the handler", status,
-                               mcause, mtval, mtval2, frame);
-      }
-      if (async && mcause == IRQ_M_TIMER) {
-        // Re-arm before the handler runs: this clears MTIP, so a handler
-        // that simply returns is safe, and the period does not drift with
-        // the handler's running time.
-        irq::rearm_tick();
-      }
-      return deliver(
-          frame, entry, h_sp, 0,
-          reinterpret_cast<Capability>(static_cast<uintptr_t>(handler_cause)),
-          handler_a3, true);
-    }
+  // Wake this hart's interrupt handler (thread.hpp, THE INTERRUPT HANDLER):
+  // the interrupted thread stays parked in `frame`, and this does not
+  // return. The tick is re-armed first: that clears MTIP, and the period
+  // does not drift with the handler's running time. With no handler waiting
+  // -- none installed on this hart, or it has ended -- the interrupt is
+  // silenced on this hart and the interrupted PC resumed. A thread waiting
+  // for a page with nobody to tell just runs again.
+  if (async && mcause == IRQ_M_TIMER) {
+    irq::rearm_tick();
   }
-
-  // An interrupt with no handler that resolves: silence it on this hart and
-  // return to the interrupted PC. This is a hart whose poke has not arrived
-  // yet, or a handler whose compartment has been destroyed. A thread waiting
-  // for a page with no tick to give way to just runs again.
-  if (async) {
+  if (!thread::wake_handler(frame, cause, pager) && async) {
     irq::silence(mcause);
   }
-  (void)mepc;
   return nullptr;
 }
 
-extern "C" uint64_t __signetos_trap_return(uint64_t verdict) {
-  // Pop the handler's `TrapFrame` (the assembly then zeroes the stack loaned
-  // to the handler) and resume the interrupted code with the MIE it had -- or,
-  // if its compartment has been destroyed and swept while the handler ran, the
-  // nearest live frame beneath (unwind.hpp). A fault frame is resumed only
-  // on its handler's INSTALL_CONTEXT `verdict`, with the context it left
-  // (fault.hpp); otherwise the faulting code is abandoned and the frame
-  // beneath it gets the fault's status. The
-  // top frame must be a `TrapFrame` the dispatcher pushed for a handler, not
-  // something else reached through a stashed trap-return sentry (e.g. a
-  // handler's own `ReturnFrame` from a call into itself); `resume` refuses
-  // anything else before it reads from the frame.
+extern "C" uint64_t __signetos_trap_return(Capability ret) {
+  // Pop the frame the fault handler was entered from (unwind.hpp). It is
+  // resumed only on the handler's INSTALL_CONTEXT verdict (`ret`'s address),
+  // with the context it left (fault.hpp); otherwise the faulting code is
+  // abandoned and the frame beneath it gets the fault's status -- or, if its
+  // compartment has been destroyed and swept while the handler ran, the
+  // nearest live frame beneath does. The top frame must be a `TrapFrame` the
+  // dispatcher set up for a handler, not something else reached through a
+  // stashed trap-return sentry (e.g. a handler's own `ReturnFrame` from a
+  // call into itself); `resume` refuses anything else before it reads from
+  // the frame.
   const bool top_ok =
       unwind::kind_at(thread::current_kernel_sp()) == unwind::KIND_TRAP_FRAME;
-  const unwind::Kind kind =
-      unwind::resume(unwind::KIND_TRAP_FRAME, nullptr, verdict);
+  const unwind::Kind kind = unwind::resume(unwind::KIND_TRAP_FRAME, ret,
+                                           capability_get_address(ret));
   if (kind == unwind::KIND_NONE) {
     // If anything was popped, `resume` has already said why the thread ends.
     if (!top_ok) {
