@@ -353,7 +353,8 @@ faulted**, never to a global handler (unless handled by the kernel like a page f
 * **Interrupts:** boot installs fixed handlers for timer ticks (scheduler) and
   external device interrupts (interrupt manager, which claims sources and calls
   driver handlers). Both run with interrupts masked on the **interrupted
-  thread's narrowed stack**, scrubbed on return.
+  thread's narrowed stack**, scrubbed on return. (Currently investigating if interrupt handling
+  should be moved to a dedicated waiting thread)
 * **Fault identification:** each compartment may register a private code sentry
   as its fault handler in its kernel descriptor. On trap, the kernel identifies
   the faulting compartment from its own trusted frame beneath the trap—never
