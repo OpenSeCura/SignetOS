@@ -131,9 +131,7 @@ funding VM quota. It owns no threads.
 | seeded slots | Initial capabilities in the order supplied by the creator. |
 | remaining slots | Free for the compartment's own use. It can store anything it wants in the table. |
 
-The funding quota pays for the compartment's metadata pages without being put
-in its table; if a compartment allocates resources itself, its creator derives
-and seeds sub-quotas for it.
+The vm quota pays for the compartment's metadata pages.
 
 **Destruction.** Destroying a compartment marks it dead but doesn't immediately destroy it:
 
