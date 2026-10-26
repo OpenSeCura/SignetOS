@@ -96,16 +96,16 @@ mechanism needs no kernel memory:
    ```
 
    Sealing writes a permissionless tagged copy of the key into `header` and
-   returns a sealed handle over header and payload. Unsealing checks in one
-   capability load that `header` holds a **tagged** type key with the same
+   returns a sealed handle over header and payload. Unsealing checks
+   that `header` holds a **tagged** type key with the same
    address and returns a capability bounded to `payload` alone.
-3. **Privacy and lifetime.** Typed memory must stay private to the minter, since
+4. **Privacy and lifetime.** Typed memory must stay private to the minter, since
    holding a capability over the record lets a compartment mint the same key.
    When the record is freed, the revocation sweep untags every key and header copy.
-4. **Creator trust boundary.** A creator can mint types for a child and seed the
+5. **Creator trust boundary.** A creator can mint types for a child and seed the
    keys into its table. **Sealing protects a compartment from its peers, not
    from its creator.**
-5. **Sealer trust boundary.** Whoever holds the type-key authority can mint a
+6. **Sealer trust boundary.** Whoever holds the type-key authority can mint a
    key for any record address, so the sealer could open any object it is
    handed. Its clients trust it for the integrity of their type system, as they
    trust the scheduler for CPU time; it holds no capability to any client's
