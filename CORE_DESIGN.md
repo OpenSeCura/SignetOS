@@ -323,9 +323,15 @@ into the scheduler whenever a thread exits.
   whose *base* lies in a quarantined allocation (memory unmap) or a marked sub-range
   (capabilities based outside a marked sub-range, like a heap's arena
   capability, survive).
-* **Pre-funded marks:** revocable arenas pay up front at allocation for their
-  virtual-address revocation bitmap pages, so marking freed sub-ranges costs no
-  memory and sweep checks are `O(1)`.
+* **Revocable arenas:** an allocation made with `FLAG_REVOCABLE`, which its
+  owner (a heap, typically) hands out in pieces. It is the only memory that can
+  be revoked in part: the owner marks a freed sub-range with `sys_revoke`, and
+  the next sweep untags every capability based inside it. The arena's first
+  byte can never be marked, so the owner's own capability to the whole arena
+  survives. Ordinary allocations are only ever revoked whole, when freed.
+* **Pre-funded marks:** a revocable arena pays up front, from the same quota,
+  for its revocation bitmap (one bit per 16 bytes, one page per 512 KiB), so
+  marking freed sub-ranges costs no memory and sweep checks are `O(1)`.
 * **Charged until swept:** quarantined memory stays charged as *owed* on its
   funding quota until a sweep reclaims it and refunds owed bytes, so rapid
   alloc/free loops exhaust only the freer's own quota.
@@ -412,10 +418,11 @@ do. As granted by `init` today:
 | `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
 | `thread_switch`, `thread_tid` | `sched` | The only compartment that can run a thread. |
 | `thread_kill` | `sched` | End a thread it holds a handle to. |
+| `trap_wait` | `sched` | The interrupt handler's wait. Refused to anyone but the hart's installed handler while it handles an interrupt. |
 | `compartment_create`, `compartment_destroy`, `thread_create`, `fault_install`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. |
 | `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Still evolving WIP.|
 | `revoke_query` | `shell` | Ask for a rate-limited sweep. |
-| `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: binding hardware IRQs, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
+| `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: installing the interrupt handler thread, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
 | `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |
 
 Beyond gates, three compartments hold raw hardware: `uart` its device window,
