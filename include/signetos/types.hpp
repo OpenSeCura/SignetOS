@@ -135,6 +135,8 @@ enum class Status : uint32_t {
     // called through, faulted and was unwound -- by its fault handler's
     // verdict, or because it had none (fault.hpp, trap.hpp)
     Faulted,
+    // a callee returned a pointer into its own stack slice (switcher.hpp)
+    StackCapability,
     NoKernelStack = 40,
 };
 
@@ -175,6 +177,7 @@ inline const char* status_name(Status s) {
         case Status::StackTooSmall:           return "StackTooSmall";
         case Status::CompartmentDestroyed:    return "CompartmentDestroyed";
         case Status::Faulted:                 return "Faulted";
+        case Status::StackCapability:         return "StackCapability";
         case Status::NoKernelStack:           return "NoKernelStack";
     }
     return "Unknown";

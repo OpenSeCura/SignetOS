@@ -51,14 +51,19 @@ __attribute__((always_inline)) inline Capability* rw_table() {
 
 // Invokes a compartment or kernel entry point `entry` through `invoke_gate`
 // with up to five arguments in `ca1..ca5` (callee `ca0..ca4`) and returns
-// `R` from `ca0`.
+// `R` from `ca0`. Missing arguments are passed as null, so nothing left in
+// those registers reaches the callee.
 template <typename R = uint64_t, typename... A>
 __attribute__((always_inline)) inline R invoke(Capability invoke_gate,
                                                Capability entry, A... args) {
   static_assert(sizeof...(A) <= 5,
                 "an entry takes at most five arguments (ca1..ca5)");
-  using Switcher = R (*)(Capability, A...);
-  return reinterpret_cast<Switcher>(invoke_gate)(entry, args...);
+  if constexpr (sizeof...(A) < 5) {
+    return invoke<R>(invoke_gate, entry, args..., static_cast<Capability>(nullptr));
+  } else {
+    using Switcher = R (*)(Capability, A...);
+    return reinterpret_cast<Switcher>(invoke_gate)(entry, args...);
+  }
 }
 
 // Bounds a NUL-terminated string `s` to its bytes (including the NUL) and

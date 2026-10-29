@@ -69,16 +69,17 @@ namespace signetos::sentry {
 //
 // ENTRY_FLAG_TRUSTED marks a kernel entry. The switcher treats the callee as
 // the kernel: arguments pass through in registers, nothing is scrubbed on the
-// way in, interrupts stay masked, the callee's stack is exactly `min_stack`
-// bytes of the caller's, and the callee's `a0` comes back to the caller. Only
+// way in, interrupts stay masked, the callee's stack is a `min_stack` slice,
+// and the callee's `a0` comes back to the caller. Only
 // `syscall::gate` ever sets it; `sys_sentry` records are never trusted, and
 // `sys_thread_create` refuses trusted entries.
 constexpr uint64_t ENTRY_FLAG_TRUSTED = 1u << 0;
 
-// Stack a `sys_sentry` entry is promised: the switcher refuses a call whose
-// caller has less than this free below `csp`, so a callee is never entered on
-// a stack too small to run its prologue and fault half way through an update.
-constexpr uint64_t DEFAULT_MIN_STACK = 2048;
+// The stack slice a `sys_sentry` entry runs on (switcher.hpp, STACK SLICES).
+constexpr uint64_t DEFAULT_MIN_STACK = 8192;
+
+// Room a fault handler needs below the faulting `csp`, in the same slice.
+constexpr uint64_t FAULT_MIN_STACK = 1024;
 
 // An entry on one of a compartment's entry pages. A sentry is a sealed pointer
 // to one of these.

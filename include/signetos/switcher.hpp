@@ -22,12 +22,16 @@
 // `sys_compartment_invoke` (switch.S) is the one way code crosses a
 // compartment boundary, kernel or not. It pushes a `ReturnFrame` on the
 // thread's kernel stack, has `__signetos_switcher_prepare` check the callee
-// and carve its stack out of the caller's by the stack rule (`narrow_stack`),
-// enters the callee, and on return has `__signetos_switcher_return` pop the
-// frame. The assembly zeroes the callee's stack on the way in and out
-// (switch.S, STACK ZEROING). The trap path applies the same stack rule to the
-// handlers it delivers (trap.cpp). Entry records -- what a callee is -- are
-// sentry.hpp's.
+// and give it a stack slice, enters the callee, and on return has
+// `__signetos_switcher_return` pop the frame. The assembly zeroes the callee's
+// slice on the way in and out (switch.S, STACK ZEROING). Entry records --
+// what a callee is -- are sentry.hpp's.
+//
+// STACK SLICES: every call gets its own `min_stack` slice of the thread's
+// stack, directly below the caller's. A stack pointer passed as an argument
+// loses StoreLocal and a pointer below the caller's slice is never returned,
+// so a pointer into a slice only exists while its call runs (CORE_DESIGN.md
+// §2.2). A fault handler runs inside the faulting code's slice (trap.cpp).
 //
 
 #include <stddef.h>
@@ -86,18 +90,15 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame);
 extern "C" uint64_t __signetos_switcher_return(Capability ret);
 
-// The stack rule. Validates `caller_sp` as a stack anyone may be run on --
-// tagged, unsealed, carrying every load/store permission a stack needs
-// (including StoreLocal, which only thread stacks have) and no Execute,
-// 16-byte aligned with `min_stack` bytes below its address -- and returns
-// the slice a callee gets: `[addr - want, addr)` if `want` is non-zero,
-// else everything below, `[base, addr)`. The result is exactly
-// representable (never rounded up into the caller's frames) and positioned
-// at its own top. Null, with the reason in `*out_status`, otherwise.
-//
-// The switcher applies it to every callee's stack; the trap path applies it
-// to the stack an interrupt or fault handler gets (`trap.cpp`).
-Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
-                        uint64_t want, Status* out_status);
+// A fault handler's stack (trap.cpp): everything below `sp`, which must be a
+// real stack (StoreLocal, no Execute), 16-byte aligned, with at least
+// `min_stack` bytes below it. Exactly representable and positioned at its own
+// top. Null, with the reason in `*out_status`, otherwise.
+Capability narrow_stack(Capability sp, uint64_t min_stack, Status* out_status);
+
+// `bytes` of `stack` ending at or just below `ceiling`, rounded so its bounds
+// are exact, positioned at its top. Null (`StackTooSmall`) if it does not fit.
+Capability slice_below(Capability stack, uint64_t ceiling, uint64_t bytes,
+                       Status* out_status);
 
 }  // namespace signetos::switcher

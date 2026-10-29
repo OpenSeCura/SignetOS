@@ -24,6 +24,7 @@
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
+#include <signetos/switcher.hpp>
 #include <signetos/syscall.hpp>
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
@@ -305,15 +306,22 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
 
   // Build the user stack capability: bounded to [stack_base, stack_base +
   // stack_bytes), positioned at the top (stacks grow downward), and LOCAL.
-  // Every capability derived from it -- every narrowed `csp` the switcher and
-  // the trap path hand out -- inherits that, and the only memory a compartment
+  // Every capability derived from it -- every slice the switcher and the
+  // trap path hand out -- inherits that, and the only memory a compartment
   // holds with StoreLocal is its thread stacks (compartment.cpp, `user_view`).
   // So a pointer into this stack can be kept on this stack and nowhere else:
   // not in a table, not in an allocation, not in another thread's hands.
-  const uint64_t stack_base = capability_get_base(stack_mem);
-  Capability user_sp = capability_restrict_levels(
-      capability_set_address(stack_mem, stack_base + stack_bytes),
-      perms::Global);
+  // The entry gets only the top slice (switcher.hpp).
+  Status slice_status = Status::Ok;
+  Capability user_sp = switcher::slice_below(
+      capability_restrict_levels(stack_mem, perms::Global),
+      capability_get_base(stack_mem) + stack_bytes, entry.min_stack,
+      &slice_status);
+  if (!capability_is_valid(user_sp)) {
+    quota::owe(thread_mem_quota, vm::free_pages(stack_mem));
+    quota::owe(thread_mem_quota, vm::free_pages(state_page));
+    return fail_with(out_status, Status::BadStackSize);
+  }
 
   // Build the kernel return stack capability inside the back of `state_page`:
   // bounded strictly to `[page_base + kstack_offset, page_base +
@@ -649,6 +657,13 @@ Capability current_entry_sentry() {
 }
 
 Capability current_user_stack() {
+  ThreadState* t = cpu()->current;
+  return t == nullptr
+             ? nullptr
+             : capability_restrict_levels(t->stack_alloc, perms::Global);
+}
+
+Capability current_initial_sp() {
   ThreadState* t = cpu()->current;
   return t == nullptr ? nullptr : t->user_sp;
 }

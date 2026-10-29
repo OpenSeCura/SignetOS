@@ -97,7 +97,7 @@ namespace {
 
 uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
 constexpr size_t MAX_WORKERS = 4;
-constexpr size_t WORKER_STACK = 8 * 1024;
+constexpr size_t WORKER_STACK = 32 * 1024;
 constexpr int DESTROY_RETRIES = 64;
 constexpr size_t LINE_MAX = 64;
 constexpr uint64_t FOREVER_US = ~0ULL;
@@ -993,7 +993,7 @@ constexpr uint32_t APP_DISK_MAX_INODES = 32;
 //   meanwhile and knows the program is done when nothing is registered on
 //   the node any more (`sched.quota_query`): the scheduler unregisters a
 //   thread when it ends. Then it destroys the node.
-constexpr size_t APP_STACK = 16 * 1024;
+constexpr size_t APP_STACK = 64 * 1024;
 constexpr uint32_t APP_BUDGET_US = 20'000;
 constexpr uint32_t APP_PERIOD_US = 100'000;
 constexpr uint32_t APP_PERIOD_MIN_US = 1'000;      // the periods a manifest

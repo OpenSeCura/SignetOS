@@ -86,10 +86,9 @@ Kind kind_at(Capability ksp);
 // frame was skipped (the callee's return value); after a skipped frame it is
 // Status::CompartmentDestroyed, or the frame's `fault_status`
 // (Status::Faulted) if it was a fault frame. A `TrapFrame` resumed has its
-// `mstatus.MPIE` restored from the frame. Nothing here zeroes stacks: the
-// assembly zeroes the slice the resumed frame lent (`callee_sp` /
-// `handler_sp`), which covers every slice above it (switch.S, STACK
-// ZEROING).
+// `mstatus.MPIE` restored from the frame. The slice of each `ReturnFrame`
+// skipped is zeroed here; the assembly zeroes the slice of the frame resumed
+// (switch.S, STACK ZEROING).
 //
 // FAULT FRAMES (trap.hpp, TRAP_FLAG_FAULT; fault.hpp)
 //

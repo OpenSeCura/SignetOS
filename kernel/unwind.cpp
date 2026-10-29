@@ -65,6 +65,18 @@ bool kill_lands_here(Capability below) {
   return thread::current_kill_pending() && kind_at(below) == KIND_NONE;
 }
 
+// Zeroes slice `sp` (null: nothing).
+void zero_slice(Capability sp) {
+  if (!capability_is_valid(sp)) {
+    return;
+  }
+  auto* p = reinterpret_cast<Capability*>(
+      capability_set_address(sp, capability_get_base(sp)));
+  for (size_t i = 0; i < capability_get_length(sp) / sizeof(Capability); ++i) {
+    p[i] = nullptr;
+  }
+}
+
 }  // namespace
 
 Kind kind_at(Capability ksp) {
@@ -141,6 +153,8 @@ Kind resume(Kind expected_top, Capability value, uint64_t verdict) {
         f->args[0] = value;
         return KIND_RETURN_FRAME;
       }
+      // Skipped: its callee's slice is not inside the one the assembly zeroes.
+      zero_slice(f->callee_sp);
     } else {
       auto* f = reinterpret_cast<trap::TrapFrame*>(ksp);
       thread::set_kernel_sp(f->active_kernel_sp);  // pop

@@ -1054,7 +1054,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability shell_thread = nullptr;
   if (capability_is_valid(shell.sentry) &&
       capability_is_valid(L.shell_t_quota)) {
-    shell_thread = thread_create(L.shell_t_quota, 16 * 1024, shell.sentry,
+    shell_thread = thread_create(L.shell_t_quota, 64 * 1024, shell.sentry,
                                  nullptr);
   }
   if (capability_is_valid(shell_thread) &&
@@ -1088,7 +1088,7 @@ extern "C" int64_t compartment_main(Capability arg) {
     const Capability pager_node = L.sched_node(node);
     const Capability pager =
         capability_is_valid(pager_quota)
-            ? thread_create(pager_quota, 16 * 1024, blk_if.paging, nullptr)
+            ? thread_create(pager_quota, 32 * 1024, blk_if.paging, nullptr)
             : nullptr;
     const bool running =
         capability_is_valid(pager) && capability_is_valid(pager_node) &&

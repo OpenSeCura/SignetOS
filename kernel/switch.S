@@ -29,14 +29,14 @@
  *      Pushes a `ReturnFrame` (callee-saved registers, the five argument
  *      registers `ca1..ca5`) onto the thread's kernel stack (`mscratchc`),
  *      calls `__signetos_switcher_prepare` to resolve the target record and
- *      narrow the caller's stack, then enters the callee with a `CT = 2`
+ *      give the callee its stack slice, then enters it with a `CT = 2`
  *      return sentry in `cra`:
  *
- *        compartment callee   csp = everything below the caller's csp,
+ *        compartment callee   csp = its slice below the caller's,
  *                             cgp = its table, ca0..ca4 = args[0..4], every
  *                             other register scrubbed, caller's MIE restored.
- *        kernel callee        csp = exactly `min_stack` bytes below the
- *             (ENTRY_FLAG_TRUSTED)  caller's csp, ca0..ca4 = args[0..4],
+ *        kernel callee        csp = its slice below the caller's,
+ *             (ENTRY_FLAG_TRUSTED)  ca0..ca4 = args[0..4],
  *                             nothing scrubbed, interrupts stay masked.
  *
  *      On return, calls `__signetos_switcher_return` to pop the `ReturnFrame`,
@@ -67,9 +67,8 @@
  * handler starts with is zeroed just before it is entered, and the whole
  * slice it was lent (`callee_sp`, `handler_sp`) when the frame that lent it
  * is resumed. Both are done here and in `early_trap.S`, with
- * `__signetos_zero_stack` (section 3). Unwinding past dead frames zeroes only
- * the slice of the frame it resumes: every slice above it was carved from
- * that one, so it covers them all.
+ * `__signetos_zero_stack` (section 3). The slices of frames skipped by an
+ * unwind are zeroed by `unwind::resume`.
  *
  * POPPED FRAMES ARE NOT WIPED: once a frame is popped nothing reads it again
  * (every field is written before it is read, at push or by the C++ that set

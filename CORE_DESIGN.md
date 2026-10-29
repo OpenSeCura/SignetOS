@@ -76,6 +76,21 @@ Passing a local capability therefore lends a buffer for a single call: the
 callee cannot keep it outside its stack frame (zeroed on return), avoiding any
 revocation sweep (§8).
 
+Each call runs on its own fixed-size slice of the thread's stack, directly
+below the caller's slice; its `csp` is bounded to that slice. A stack pointer
+passed as an argument loses store-local, and a callee cannot return a pointer
+into its own slice.
+
+Stack memory is safe to reuse because a pointer into a slice can only exist
+while the call that owns the slice is running:
+
+* the caller's `csp` covers only its own slice, so it cannot make one;
+* a stack pointer can only be stored through a capability with store-local:
+  the holder's own slice, never a lent buffer, the heap or globals;
+* callees return, and have their slices zeroed, before their caller does;
+* on return, registers are scrubbed, a pointer into the slice is refused as
+  the return value, and the slice is zeroed.
+
 ### 2.3 Compartment-minted sealing types
 
 Hardware object types are scarce and fixed at boot. Any compartment can mint its
@@ -181,9 +196,8 @@ to prevent the switcher being bypassed.
 
 1. **Validate & push:** verify the entry handle, check the target compartment isn't marked as dead; 
   push caller state onto the thread's kernel return stack (trusted stack only accessible by the kernel), failing if full.
-2. **Narrow stack:** verify it is a real stack by store-local permission and narrow it
-   to the unused region *below* the caller's stack pointer (or a fixed slice for
-   syscalls), failing if below the minimum needed.
+2. **Stack slice:** give the callee its own `min_stack` slice directly below the
+   caller's, failing if the thread's stack has no room left.
 3. **Scrub & enter:** zero the callee's stack region and all non-argument
    registers, switch to the callee's capability table (cgp), and jump (keeping
    interrupt state for user calls, masking interrupts for syscalls).

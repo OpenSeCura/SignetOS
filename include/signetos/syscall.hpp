@@ -349,9 +349,9 @@ enum class Id : uint32_t {
 
 constexpr size_t kSyscallCount = static_cast<size_t>(Id::Count);
 
-// Stack a kernel entry runs on: exactly this many bytes of the caller's own
-// stack, directly below its `csp`, scrubbed by the switcher on the way out. A
-// caller with less than this free is refused with `Status::StackTooSmall`.
+// Stack a kernel entry runs on: a slice of this many bytes below the
+// caller's, scrubbed by the switcher on the way out. If the thread's stack has
+// less left, the call is refused with `Status::StackTooSmall`.
 // `sys_thread_switch` and `sys_trap_wait` are the exceptions: they need no
 // caller stack at all (their frame and their C++ live on the kernel stack),
 // so their records say 0.

@@ -36,7 +36,7 @@
 //      active kernel stack.
 //   2. `__signetos_trap_dispatch` picks the faulting compartment's fault
 //      handler as a `CT = 1` hardware sentry. It runs on the faulting
-//      thread, below its `csp`, narrowed by the same stack rule as a callee's
+//      thread, below its `csp` in the same slice
 //      (`switcher::narrow_stack`), with its kernel calls on the faulting
 //      thread's kernel stack, which must have `RET_FRAME_MIN_FREE` below the
 //      `TrapFrame`. A fault that fails either is reported and unwound

@@ -476,7 +476,7 @@ bool fault_entry(Capability comp, sentry::Entry* out) {
   out->sentry = handler;
   out->table = user_view(table_slice(comp_page, 0, c->table_slots));
   out->owner = canonical_handle(comp_page);
-  out->min_stack = sentry::DEFAULT_MIN_STACK;
+  out->min_stack = sentry::FAULT_MIN_STACK;
   return capability_is_valid(out->table) && capability_is_valid(out->owner);
 }
 

@@ -27,6 +27,7 @@
 #include <signetos/sentry.hpp>
 #include <signetos/switcher.hpp>
 #include <signetos/thread.hpp>
+#include <signetos/trap.hpp>
 #include <signetos/unwind.hpp>
 
 namespace signetos::switcher {
@@ -67,15 +68,8 @@ constexpr uint64_t kStackPerms = perms::Load | perms::Store |
                                  perms::StoreCapability | perms::LoadMutable |
                                  perms::StoreLocal | perms::LoadGlobal;
 
-// Validates the caller's stack capability and returns the stack the callee
-// gets: `[addr - want, addr)` if `want` is non-zero, else everything below
-// the caller's address, `[base, addr)`. Either way the result is at least
-// `min_stack` bytes, 16-byte aligned at both ends, exactly representable (so
-// `csetbounds` cannot round it up into the caller's live frames), and
-// positioned at its own top. Null (and `*out_status`) if the caller's stack
-// cannot be used. The trap path uses it too (switcher.hpp).
 Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
-                        uint64_t want, Status* out_status) {
+                        Status* out_status) {
   if (!capability_is_valid(caller_sp) || sealing::is_sealed(caller_sp)) {
     *out_status = Status::InvalidCapability;
     return nullptr;
@@ -95,11 +89,11 @@ Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
     *out_status = Status::BadAlignment;
     return nullptr;
   }
-  if (addr - base < min_stack || addr - base < want) {
+  if (addr - base < min_stack) {
     *out_status = Status::StackTooSmall;
     return nullptr;
   }
-  const uint64_t lo = want != 0 ? addr - want : base;
+  const uint64_t lo = base;
 
   // For large regions, `csetbounds` (`scbndsr`) rounds the length up if `lo`
   // or the length is not aligned to the representable alignment mask. Round
@@ -126,6 +120,60 @@ Capability narrow_stack(Capability caller_sp, uint64_t min_stack,
   return capability_set_address(narrowed, narrowed_top);
 }
 
+static Capability active_slice(Capability ksp) {
+  // A fault handler runs inside the slice of the code that faulted.
+  while (unwind::kind_at(ksp) == unwind::KIND_TRAP_FRAME) {
+    ksp = reinterpret_cast<const trap::TrapFrame*>(ksp)->active_kernel_sp;
+  }
+  return unwind::kind_at(ksp) == unwind::KIND_RETURN_FRAME
+             ? reinterpret_cast<const ReturnFrame*>(ksp)->callee_sp
+             : thread::current_initial_sp();
+}
+
+Capability slice_below(Capability stack, uint64_t ceiling, uint64_t bytes,
+                       Status* out_status) {
+  // Rounded so the bounds come out exact.
+  const size_t len =
+      __builtin_cheri_round_representable_length((bytes + 0xF) & ~0xFULL);
+  const uint64_t top =
+      ceiling & __builtin_cheri_representable_alignment_mask(len);
+  const uint64_t base = capability_get_base(stack);
+  if (!capability_is_valid(stack) || bytes == 0 || top < base ||
+      top - base < len) {
+    *out_status = Status::StackTooSmall;
+    return nullptr;
+  }
+  Capability slice =
+      capability_set_bounds(capability_set_address(stack, top - len), len);
+  return capability_set_address(slice, top);
+}
+
+static Capability next_slice(Capability ksp, uint64_t bytes,
+                             Status* out_status) {
+  const Capability active = active_slice(ksp);
+  if (!capability_is_valid(active)) {
+    *out_status = Status::InvalidCapability;
+    return nullptr;
+  }
+  return slice_below(thread::current_user_stack(),
+                     capability_get_base(active), bytes, out_status);
+}
+
+// True if `cap` overlaps the thread's stack below address `limit`.
+static bool into_stack(Capability cap, uint64_t limit) {
+  const Capability stack = thread::current_user_stack();
+  if (!capability_is_valid(cap) || !capability_is_valid(stack)) {
+    return false;
+  }
+  const uint64_t stack_lo = capability_get_base(stack);
+  const uint64_t stack_hi = stack_lo + capability_get_length(stack);
+  const uint64_t lo = capability_get_base(cap);
+  const uint64_t len = capability_get_length(cap);
+  const uint64_t hi = len == 0 ? lo + 1 : lo + len;  // may wrap
+  return lo < (limit < stack_hi ? limit : stack_hi) &&
+         (hi < lo || hi > stack_lo);
+}
+
 extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
                                                   ReturnFrame* frame) {
   if (frame == nullptr) {
@@ -149,16 +197,10 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
   // user compartment.
   const bool trusted = (entry.flags & ENTRY_FLAG_TRUSTED) != 0;
 
-  // The callee's stack is carved out of the caller's, below the caller's
-  // current `csp`, so CHERI monotonicity guarantees the callee cannot reach
-  // the caller's live frames at `[addr, top)`. A compartment gets everything
-  // below `csp` (it may need any amount); the kernel gets exactly the
-  // `min_stack` bytes its system calls are sized for, so what it touches --
-  // and what `__signetos_switcher_return` has to scrub -- is bounded.
+  // The callee's slice: `min_stack` bytes directly below the caller's.
   Capability narrowed = nullptr;
   if (entry.min_stack != 0) {
-    narrowed = narrow_stack(frame->sp, entry.min_stack,
-                            trusted ? entry.min_stack : 0, &status);
+    narrowed = next_slice(frame->prev_ksp, entry.min_stack, &status);
     if (!capability_is_valid(narrowed)) {
       return refuse(status);
     }
@@ -182,7 +224,13 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
         return refuse(Status::InvalidCapability);
       }
     }
+    // A lent stack buffer cannot be given stack pointers: the callee could
+    // leave one to its own slice there, outliving the slice.
     for (size_t i = 0; i < 5; ++i) {
+      if (into_stack(frame->args[i], ~0ULL)) {
+        frame->args[i] =
+            capability_and_perms(frame->args[i], ~perms::StoreLocal);
+      }
       inspect::assert_user_capability(frame->args[i], "switcher_prepare:arg");
     }
   }
@@ -215,9 +263,20 @@ extern "C" uint64_t __signetos_switcher_return(Capability ret) {
   //
   // Code never crosses a compartment boundary (DESIGN.md §2.5), so code
   // returned by the callee reaches the caller as `InvalidCapability`.
+  // Nor does a pointer into the callee's slice, which is about to be reused.
+  const Capability ksp = thread::current_kernel_sp();
+  bool into_callee = false;
+  if (unwind::kind_at(ksp) == unwind::KIND_RETURN_FRAME) {
+    const Capability slice = reinterpret_cast<const ReturnFrame*>(ksp)->callee_sp;
+    into_callee = into_stack(ret, capability_get_base(slice) +
+                                      capability_get_length(slice));
+  }
   if (inspect::is_user_code(ret)) {
     ret = reinterpret_cast<Capability>(
         static_cast<uintptr_t>(Status::InvalidCapability));
+  } else if (into_callee) {
+    ret = reinterpret_cast<Capability>(
+        static_cast<uintptr_t>(Status::StackCapability));
   }
   return unwind::resume(unwind::KIND_RETURN_FRAME, ret);
 }

@@ -82,16 +82,15 @@ namespace signetos::trap {
 namespace {
 
 
-// The stack a fault handler runs on: the faulting context's own stack,
-// everything below its `csp`, by the rule the switcher applies to every
-// callee (`switcher::narrow_stack`, with the handler's `min_stack`). One check
-// the switcher never needs: it must not be the kernel stack the `TrapFrame`
-// sits on, or the handler could read the faulting registers out of it.
+// The stack a fault handler runs on: everything below the faulting `csp`, in
+// the same slice (`switcher::narrow_stack`). It must not be the kernel stack
+// the `TrapFrame` sits on, or the handler could read the faulting registers
+// out of it.
 // `frame` carries that stack's bounds.
 Capability handler_stack(Capability interrupted_sp, uint64_t min_stack,
                          TrapFrame* frame, Status* out_status) {
   Capability h_sp =
-      switcher::narrow_stack(interrupted_sp, min_stack, 0, out_status);
+      switcher::narrow_stack(interrupted_sp, min_stack, out_status);
   if (!capability_is_valid(h_sp)) {
     return nullptr;
   }

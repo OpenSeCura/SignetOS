@@ -109,7 +109,7 @@ struct alignas(16) ThreadState {
   Capability stack_alloc;    // unsealed DataRw allocation for user stack
   Capability entry_sentry;   // validated OType::EntryPoint (CT = 18)
   Capability initial_arg;    // initial value for ca0
-  Capability user_sp;        // top of user stack ([base, base + stack_bytes))
+  Capability user_sp;        // the entry's slice, at the top of the stack
   Capability kernel_sp;      // the TrapFrame it is parked in (PARKED THREADS)
 
   uint64_t tid;
@@ -225,12 +225,11 @@ uint64_t tid_of(Capability thread_handle);
 // The id of the thread running on this hart, or 0 in host context.
 uint64_t current_tid();
 
-// The thread running on this hart's entry point (`OType::EntryPoint`), and
-// its stack positioned at the top: whose code it runs when inside no call,
-// and the stack that code was entered with (trap.cpp, a fault at depth 0).
-// Null in host context.
+// The thread running on this hart's entry point (`OType::EntryPoint`), its
+// whole stack, and the slice its entry was given. Null in host context.
 Capability current_entry_sentry();
 Capability current_user_stack();
+Capability current_initial_sp();
 
 // Reads the current hart's active kernel stack capability from `mscratchc`
 // (the boot kernel stack when executing in host context).

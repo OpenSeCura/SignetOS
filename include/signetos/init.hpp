@@ -54,8 +54,8 @@
 
 namespace signetos::init {
 
-// Default stack size for the initial `init` thread (16 KiB = 4 pages).
-constexpr size_t INIT_STACK_SIZE = 16 * 1024;
+// Default stack size for the initial `init` thread (64 KiB = 16 pages).
+constexpr size_t INIT_STACK_SIZE = 64 * 1024;
 
 // Header at offset 0 of every standalone compartment binary (`user/entry.S`).
 constexpr uint64_t COMPARTMENT_IMAGE_MAGIC = 0x5349474e434f4d50ULL;  // "SIGNCOMP"
