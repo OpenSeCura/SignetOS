@@ -34,7 +34,10 @@
  *     is not a TypeKey -- opens nothing; only a holder of the backing memory
  *     AND a key of another type can retype an object, which is the reason
  *     typed memory must stay private to its minter;
- *   - what is not a key, or not a handle, is refused wherever one is needed.
+ *   - what is not a key, or not a handle, is refused wherever one is needed;
+ *   - and, under toolchain/sentries, that a compartment cannot make a call
+ *     sentry of its own: `sentry` and `cbld` refuse, so the only one it holds
+ *     is the switcher gate the kernel sealed.
  *
  * Exit status is the number of failed checks (0: all passed).
  */
@@ -278,6 +281,24 @@ void run_checks() {
             !capability_is_valid(seal(nullptr, obj_a)) &&
             !capability_is_valid(unseal(key_a, nullptr)) &&
             !capability_is_valid(unseal(nullptr, h_a)));
+
+  // --- Call sentries (toolchain/sentries) ------------------------------------
+  // Only the holder of a type 1 authority makes a call sentry, and here that
+  // is the kernel: holding its own code is not enough for a compartment.
+  check("the switcher gate is a call sentry",
+        capability_is_valid(s_invoke) &&
+            sealing::type_of(s_invoke) == static_cast<uint64_t>(OType::Sentry));
+  Capability pcc;
+  __asm__ volatile("auipcc %0, 0" : "=C"(pcc));
+  Capability made;
+  __asm__ volatile("sentry %0, %1" : "=C"(made) : "C"(pcc));
+  check("`sentry` makes no call sentry from a compartment's own code",
+        !capability_is_valid(made));
+  // `made` is a call sentry's bits without the tag: cbld must not tag them.
+  const Capability rebuilt = __builtin_cheri_cap_build(pcc, (__uintcap_t)made);
+  check("`cbld` rebuilds no call sentry from a call sentry's bits",
+        sealing::type_of(made) == static_cast<uint64_t>(OType::Sentry) &&
+            !capability_is_valid(rebuilt));
 }
 
 }  // namespace

@@ -27,7 +27,10 @@ using Sentry = Capability;
 // CHERI hardware object types (the capability CT field, 5 bits wide).
 //
 //   CT = 0        unsealed
-//   CT = 1        call sentry, produced by the `sentry` instruction.
+//   CT = 1        call sentry. Under toolchain/sentries only `yseal` makes
+//                 one, under an authority naming type 1 that only the kernel
+//                 holds (sealing::g_sentry_auth); the `sentry` instruction and
+//                 `cbld` make none.
 //   CT = 2        return sentry (toolchain/sentries): the link `cjal`/`cjalr`
 //                 writes. Only the hardware makes one. Only a return (`ret`)
 //                 can use it, and a return can use nothing else. It is local,
@@ -39,8 +42,9 @@ using Sentry = Capability;
 //                 compartment boundary: entry points do, DESIGN.md §2.5.)
 //   CT = 3..7     reserved for more sentry types.
 //   CT = 8..31    object types, applied with yseal and removed with yunseal.
-//                 yseal/yunseal accept only these, so they cannot make or
-//                 open a sentry.
+//                 yunseal opens nothing else, and yseal makes nothing else
+//                 but CT 1, so neither makes a return sentry or opens any
+//                 sentry.
 //
 // 24 object types are available and 12 are used, so 20..31 are spare.
 enum class OType : uint64_t {

@@ -890,9 +890,10 @@ bool is_revoked_locked(Capability cap) {
 
 // Builds again the capability whose bits, without their tag, are the 16
 // bytes at `w` (as two words) and `c` (as a capability slot): from the root,
-// unsealed, then sealed as it was -- CT 1 as a sentry, a kernel type with its
-// authority. It stays plain bytes if it is revoked, if it is local (pageable
-// memory never holds one), or if what comes out is not exactly what went out.
+// unsealed, then sealed as it was -- CT 1 through seal_entry, the only way a
+// call sentry is made, a kernel type with its authority. It stays plain bytes
+// if it is revoked, if it is local (pageable memory never holds one), or if
+// what comes out is not exactly what went out.
 void rebuild_locked(volatile uint64_t* w, volatile Capability* c) {
   const uint64_t lo = w[0];
   const uint64_t hi = w[1];
@@ -906,7 +907,7 @@ void rebuild_locked(volatile uint64_t* w, volatile Capability* c) {
   const Capability open = *c;
   Capability built = __builtin_cheri_cap_build(s_retag_root, (__uintcap_t)open);
   if (ct == static_cast<uint64_t>(OType::Sentry)) {
-    built = __builtin_cheri_seal_entry(built);
+    built = sealing::seal_entry(built);
   } else if (ct != 0) {
     // Null for the types below kOTypeMin, which no page can hold.
     built = sealing::seal_with(sealing::authority_for(static_cast<OType>(ct)),

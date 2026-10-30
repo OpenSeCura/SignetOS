@@ -215,7 +215,11 @@ sys_compartment_invoke:
     cmv     ca5, cnull
     cmv     ca6, cnull
     cmv     ca7, cnull
-    cjalr   cra, ct0
+    /* Jump through `cra`: the link replaces the sentry, so no register is
+     * left holding it. */
+    cmv     cra, ct0
+    cmv     ct0, cnull
+    cjalr   cra, cra
 
 .Lcomp_restore:
     /*
@@ -312,7 +316,9 @@ __signetos_resume_return_frame:
      *     TODO: revisit
      */
     clc     csp, RET_FRAME_CALLEE_SP(csp)
-    cjalr   cra, ct0
+    cmv     cra, ct0                    /* as in 4a: no register keeps the sentry */
+    cmv     ct0, cnull
+    cjalr   cra, cra
     j       .Lcomp_restore
 
 .Lno_kernel_stack:
@@ -512,6 +518,8 @@ __thread_resume_on:
      * compartment has been destroyed and swept since, `ct0` has lost its tag
      * (the sweep scans the frame it was loaded from): jumping to it would
      * fault in kernel text and halt the machine, so the thread ends instead.
+     * Otherwise it moves to `cra` for the jump, which replaces it with the
+     * link, so the thread never holds it.
      */
     .align 4
     .globl __thread_start
@@ -522,7 +530,9 @@ __thread_start:
     andi    t2, t2, MSTATUS_MIE
     csrs    mstatus, t2
     cmv     ct2, cnull
-    cjalr   cra, ct0
+    cmv     cra, ct0
+    cmv     ct0, cnull
+    cjalr   cra, cra
     csrci   mstatus, MSTATUS_MIE
     csrr    csp, mscratchc
     li      a0, 0

@@ -153,7 +153,8 @@ _early_trap_entry:
     clc     ct3, TRAP_FRAME_HANDLER_SP(csp)
     mv      t4, t3                      /* up to the handler's csp */
     cjal    cra, __signetos_zero_stack  /* switch.S */
-    /* Everything except ct0 and csp (replaced below) and cra (set by cjalr). */
+    /* Everything except csp (replaced below), ct0 (the sentry) and cra (where
+     * the sentry goes for the jump, which replaces it with the link). */
     cmv     ctp, cnull
     cmv     ct1, cnull
     cmv     ct2, cnull
@@ -187,11 +188,13 @@ _early_trap_entry:
     scaddr  ca2, cnull, a2              /* a2 = integer address of mepcc */
     ld      a3, TRAP_FRAME_HANDLER_A3(csp) /* mtval2 */
     clc     ca4, TRAP_FRAME_RW_TABLE(csp)
-    ld      ra, TRAP_FRAME_HANDLER_MIE(csp) /* ra = handler_mie; cjalr overwrites it */
+    cmv     cra, ct0                    /* cjalr replaces the sentry with the link */
+    ld      t0, TRAP_FRAME_HANDLER_MIE(csp) /* t0 = handler_mie */
     clc     csp, TRAP_FRAME_HANDLER_SP(csp)
     cmv     cgp, ca4
-    csrs    mstatus, ra
-    cjalr   cra, ct0
+    csrs    mstatus, t0
+    cmv     ct0, cnull
+    cjalr   cra, cra
 
     /*
      * 4. Handler returned: mask (a fault handler may come back with

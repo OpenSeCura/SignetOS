@@ -83,6 +83,11 @@ void init() {
 
   s_invoke_gate = sealing::seal_entry(
       at(reinterpret_cast<const void*>(&sys_compartment_invoke)));
+  if (!capability_is_valid(s_invoke_gate)) {
+    debug::panic(
+        "syscall: cannot seal the switcher gate: call sentries need a QEMU "
+        "with toolchain/sentries applied, run with -cpu ...,sentries=on");
+  }
 
   size_t i = 0;
 #define SIGNETOS_SYSCALL_RECORD(n)                                   \

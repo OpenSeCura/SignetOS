@@ -25,12 +25,12 @@
 //                    under a sealing authority, removed with `yunseal` under the
 //                    same authority. Not dereferenceable and not jumpable.
 //
-//   seal_entry(cap)  ENTRY POINT (capability_sentry_t). CT = 1, applied by the
-//                    ambient `sentry` instruction and unsealed by the hardware
+//   seal_entry(cap)  ENTRY POINT (capability_sentry_t). CT = 1, applied by
+//                    `yseal` under g_sentry_auth and unsealed by the hardware
 //                    on `jalr`. Jumpable, never dereferenceable.
 //
-// The two cannot be confused: they occupy different CT values, and yseal refuses
-// to produce CT = 1 while yunseal refuses to open it.
+// The two cannot be confused: they occupy different CT values, yseal makes
+// CT = 1 only under the call sentry authority, and yunseal refuses to open it.
 //
 // SEALING AUTHORITIES
 //
@@ -40,9 +40,16 @@
 // yunseal. `yseal` succeeds only if the authority is tagged, holds SE, and its
 // address lies within its own bounds.
 //
-// The kernel keeps one capability, g_type_root, covering [2,16) with SE|US and
-// no memory permissions at all. Per-type authorities are derived from it on
-// demand, so there is no table of authorities to keep consistent.
+// The kernel keeps one capability, g_type_root, covering the object types
+// [8, 32) with SE|US and no memory permissions at all. Per-type authorities are
+// derived from it on demand, so there is no table of authorities to keep
+// consistent.
+//
+// It keeps one more, g_sentry_auth, naming CT = 1 with SE alone: the call
+// sentry authority. Under toolchain/sentries the `sentry` instruction and `cbld`
+// make no call sentry and `yseal` makes one only with this authority, so every
+// call sentry in the system is made here, by seal_entry. The hardware trusts
+// the holder with what it seals, so the checks are seal_entry's.
 //
 // Neither instruction traps. On refusal the destination is the input operand
 // with its tag cleared, so every entry point here returns a null capability
@@ -55,9 +62,14 @@
 
 namespace signetos::sealing {
 
-// The authority root: address 2, bounds [2,16), permissions SE|US only.
+// The authority root: address 8, bounds [8, 32), permissions SE|US only.
 // Established by init_type_root() before any sealing takes place.
 inline Capability g_type_root = nullptr;
+
+// The call sentry authority: address 1, bounds [1, 2), permission SE only.
+// Established by init_type_root() alongside g_type_root; used by seal_entry
+// alone, and never handed out.
+inline Capability g_sentry_auth = nullptr;
 
 // Returns the hardware CT-field of `cap`. 0 means unsealed.
 inline uint64_t type_of(Capability cap) {
@@ -75,8 +87,9 @@ inline bool is_sealed(Capability cap) {
 // All memory permissions are stripped: an authority names a type and must not
 // double as a pointer to whatever address that type number happens to be.
 inline bool init_type_root(Capability root) {
+    g_type_root = nullptr;
+    g_sentry_auth = nullptr;
     if (!capability_is_valid(root)) {
-        g_type_root = nullptr;
         return false;
     }
     Capability r = capability_set_address(root, kOTypeMin);
@@ -85,10 +98,18 @@ inline bool init_type_root(Capability root) {
     if (!capability_is_valid(r) ||
         (capability_get_perms(r) & (perms::Seal | perms::Unseal)) !=
             (perms::Seal | perms::Unseal)) {
-        g_type_root = nullptr;
+        return false;
+    }
+    // The call sentry authority names CT = 1 and nothing else, and can only
+    // seal: the hardware unseals a sentry itself, on the jump.
+    Capability s = capability_set_address(root, static_cast<uint64_t>(OType::Sentry));
+    s = capability_set_bounds(s, 1);
+    s = capability_and_perms(s, perms::Seal);
+    if (!capability_is_valid(s) || !capability_has_perms(s, perms::Seal)) {
         return false;
     }
     g_type_root = r;
+    g_sentry_auth = s;
     return true;
 }
 
@@ -193,7 +214,9 @@ inline T* open_live(OType type, Capability handle, uint32_t live_flag,
   return reinterpret_cast<T*>(ro->self_page);
 }
 
-// Seals an executable capability into an entry point sentry (CT = 1).
+// Seals an executable capability into an entry point sentry (CT = 1), with
+// `yseal` under the call sentry authority: the only way a call sentry is made
+// (toolchain/sentries).
 //
 // Returns a null capability unless ALL of the following hold:
 //
@@ -204,6 +227,9 @@ inline T* open_live(OType type, Capability handle, uint32_t live_flag,
 //   4. The address is even. JALR unseals the target only if
 //      "rs1.address[0] is zero, and the I-immediate is zero". A sentry at an
 //      odd address would stay sealed in PCC and trap.
+//
+// The hardware checks none of this: it trusts the holder of the call sentry
+// authority with what it seals, and the kernel is that holder.
 //
 // Permit_Store is stripped to enforce W^X: after `jalr` this capability becomes
 // PCC, and a writable PCC would let a compartment rewrite its own code.
@@ -222,8 +248,7 @@ inline Capability seal_entry(Capability code_cap) {
         return nullptr;
     }
     Capability wx = capability_and_perms(code_cap, ~perms::Store);
-    Capability sentry = __builtin_cheri_seal_entry(wx);
-    return capability_is_valid(sentry) ? sentry : nullptr;
+    return seal_with(g_sentry_auth, wx);
 }
 
 // True if `cap` is a jumpable entry point.

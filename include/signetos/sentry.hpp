@@ -23,11 +23,13 @@
 // ---------------------------------------------------
 // CHERI RISC-V with Zyseal provides two distinct sealing mechanisms:
 //
-//   1. `sentry` (CT = 1, OType::Sentry):
-//      Ambient (unprivileged) instruction. Automatically unsealed into PCC by
+//   1. Call sentry (CT = 1, OType::Sentry):
+//      Made only by the kernel, with `yseal` under the call sentry authority
+//      (sealing::seal_entry, toolchain/sentries). Unsealed into PCC by
 //      `cjalr`. The only CT = 1 sentry a compartment holds is the switcher
-//      itself (`sys_compartment_invoke`); the switcher also uses CT = 1 for
-//      its final branch into a callee.
+//      itself (`sys_compartment_invoke`). The kernel also makes one for each
+//      jump into a compartment (a callee, a new thread, a fault handler) and
+//      jumps with `cjalr cra, cra`, so the link replaces it.
 //
 //   2. `yseal` with OType::EntryPoint (CT = 18):
 //      Authority-gated instruction requiring the kernel's `g_type_root`.

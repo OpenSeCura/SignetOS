@@ -35,7 +35,9 @@
 # sentries=on (toolchain/sentries) makes the link a call writes a return sentry
 # (CT 2). Only a return can use one, a return can use nothing else, and it is
 # local, so only a stack can hold it. Code never runs from a local capability.
-# It needs Zylevels1.
+# It also leaves `yseal`, under an authority only the kernel holds, the one way
+# to make a call sentry (CT 1); without it the kernel cannot seal the switcher
+# gate and stops at boot. It needs Zylevels1.
 #
 # mmodemmu=on (toolchain/mmodemmu) lets M-mode use the MMU. The kernel and
 # every compartment run in M-mode, so this is what keeps paging; without it

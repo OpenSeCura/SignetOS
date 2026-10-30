@@ -1,0 +1,69 @@
+--- a/target/cheri-common/op_helper_cheri_common.c
++++ b/target/cheri-common/op_helper_cheri_common.c
+@@ -597,6 +597,16 @@
+     if (!RESULT_VALID) {
+         result.cr_tag = 0;
+     }
++#if CAP_HAS_RETURN_SENTRIES
++    if (env_archcpu(env)->cfg.ext_sentries) {
++        /*
++         * sentries: a call sentry takes an authority (yseal with type 1), so
++         * only its trusted holder makes one.  Refused like Zyseal refuses:
++         * the input comes back without its tag.
++         */
++        result.cr_tag = 0;
++    }
++#endif
+     /* NB: Not using `cap_make_sealed_entry` since the input can be untagged. */
+     CAP_cc(update_otype)(&result, CAP_OTYPE_SENTRY);
+     /* Capability can now only be used in cjr/cjalr (or rederived). */
+@@ -743,7 +753,18 @@
+ #endif
+ 
+         if (cap_is_sealed_entry(ctp)) {
+-            cap_make_sealed_entry(&derived);
++#if CAP_HAS_RETURN_SENTRIES
++            if (env_archcpu(env)->cfg.ext_sentries) {
++                /*
++                 * sentries: only yseal, under a type 1 authority, makes a
++                 * call sentry; cbld rebuilds none (nor return sentries).
++                 */
++                derived.cr_tag = 0;
++            } else
++#endif
++            {
++                cap_make_sealed_entry(&derived);
++            }
+         }
+         result.cr_tag = 1; /* Set tag to true for comparison with derived. */
+         if (cap_exactly_equal(&result, &derived)) {
+--- a/target/riscv/op_helper_cheri.c
++++ b/target/riscv/op_helper_cheri.c
+@@ -618,13 +618,26 @@
+     const cap_register_t *src = get_readonly_capreg(env, cs2);
+     cap_register_t result = *src;
+     target_ulong ct = cap_get_cursor(auth);
++    bool type_ok = ct >= CAP_MIN_ZYSEAL_OTYPE && ct <= CAP_MAX_REPRESENTABLE_OTYPE;
++
++#if CAP_HAS_RETURN_SENTRIES
++    /*
++     * sentries (SignetOS local extension, not ratified): with the CPU property
++     * on, a call sentry (CT 1) is made only here, under an authority that names
++     * type 1 -- the ambient sentry instruction and cbld make none.  Whoever
++     * holds that authority is trusted with what it seals.
++     */
++    if (ct == CAP_OTYPE_SENTRY && env_archcpu(env)->cfg.ext_sentries) {
++        type_ok = true;
++    }
++#endif
+ 
+     /* 17.6: rs1 is the sealing authority, rs2 is the capability to seal. */
+     bool ok = src->cr_tag && auth->cr_tag &&
+               cap_is_unsealed(src) &&
+               cap_has_perms(auth, CAP_PERM_SEAL) &&
+               cap_is_in_bounds(auth, ct, 1) &&
+-              ct >= CAP_MIN_ZYSEAL_OTYPE && ct <= CAP_MAX_REPRESENTABLE_OTYPE;
++              type_ok;
+ 
+     if (ok) {
+         CAP_cc(update_otype)(&result, ct);
