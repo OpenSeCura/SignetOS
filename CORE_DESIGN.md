@@ -4,6 +4,79 @@ SignetOS is a single-address-space, single-privilege-level capability microkerne
 for CHERI architectures. Isolation is enforced by capabilities alone; the MMU is
 used for address translation, never for protection.
 
+SignetOS is built around the following core idea: 
+access to objects is controlled by sealed opaque handles, those objects are funded by hierarchical quotas and managed by their respective resource manager compartment.
+
+## Threat model
+
+We assume correct, formally verified hardware. The kernel and the few
+user-space compartments that hold system-wide authority (`init` while it boots
+the system, the scheduler and the resource managers) are trusted to be correct,
+and are kept small so that they can be formally verified in future. Every other
+compartment is untrusted and assumed malicious: it
+runs arbitrary code, alone or in collusion with others, and will try to
+escalate its privileges by forging, widening or reusing stale capabilities, to
+deny service by spinning, holding locks or never returning, to exhaust memory
+or a manager's own state, and to leak, corrupt or keep hold of the shared
+objects and buffers it can reach. The design must contain it regardless: it can
+act only through the handles it holds and consume only what its quotas fund,
+and a driver can misuse its own device but must not be able to compromise the
+integrity of any other compartment (§8). No compartment is protected from physical attacks.
+There inherently exists an initial trust relationship between a parent compartment and its
+children since the parent specifies what should be created.
+
+## Design pillars
+
+Everything a compartment can do beyond accessing its own memory comes from
+sealed capabilities. Access to an object, such as a compartment, thread, compartment entry
+point, file or socket, is granted by a **sealed handle**: an opaque capability
+its holder cannot dereference or alter, only pass on or present to the object's
+manager along with a request to perform a desired operation. 
+Every object which is pointed to by a sealed handle is funded by **quotas**, which themselves are a sealed handles,
+to nodes in a hierarchical budget of a resource such as virtual memory, thread memory, CPU time, storage
+or network.
+
+A compartment asks a **resource manager** for an object and presents a quota to
+pay for it. The manager charges the quota, creates the object and returns a
+handle to it, then serves every later request that presents the handle,
+checking the rights it carries, until the object is destroyed and its budget
+goes back to the quota. Only a manager can seal and unseal its own handles, so
+nobody else can forge or open them.
+
+A quota can also be split monotonically: its holder can derive a smaller one to hand on,
+never more quota than it was given. 
+
+A compartment can act on exactly the objects it holds handles to, 
+and consume no more than its quotas allow (§2, §6, §10).
+
+The resource managers divide between the kernel and user space (§2.1):
+
+| Kernel object handle | Manager | Funded by |
+| --- | --- | --- |
+| **Entry point** | kernel | the exporting compartment's VM quota (none for syscall gates) |
+| **Compartment** | kernel | VM quota |
+| **Thread** | kernel | thread-memory quota, plus a CPU quota (`sched`) to run on |
+
+| User-space object handle | Manager | Funded by |
+| --- | --- | --- |
+| **File** | filesystem (`fs`) | disk quota and memory quota |
+| **Socket** | network service (`net`) | network quota and memory quota |
+| **Allocation** | heap allocator | heap quota (the heap was created with a VM quota) |
+| **Type key** | sealer (`sealer`) | lives in the owner's own memory |
+| **Sealed object** | sealer (`sealer`) | lives in the owner's own memory |
+
+The kernel manages only the types its own mechanisms, such as the switcher and
+virtual memory, depend on. Every manager needs the sealing authority for its
+types; the kernel holds the root they all derive from, gives each user-space
+manager its authority at boot, and never learns what those handles mean.
+For each sealing authority handed to another compartment, the kernel loses the capability needed to
+seal or unseal such capabilities to ensure that the authority lies exclusively with the relevant compartment.
+
+Quota nodes are objects too, each paid for by the quota of whoever derived it in the case of memory quota nodes,
+or by a separate memory quota node provided at creation time to obtain the memory needed for the node.
+Thus the only unpaid things are the boot-time roots. The kernel keeps no heap, 
+and no manager needs to spend its own memory on a client, avoiding potential resource exhaustion attacks.
+
 ---
 
 ## 1. Architecture
@@ -11,18 +84,10 @@ used for address translation, never for protection.
 | Principle | Design |
 | --- | --- |
 | **Single virtual address space** | One address space and one page table shared by everything; nothing is remapped on switches or calls. |
-| **Single privilege level** | One CPU privilege level with permissive page-table entries; only kernel entry points hold system-register access. |
-| **Migrating threads** | Threads do not belong to compartments; they cross domains through the switcher, with a small kernel stack recording active calls and traps. |
-| **Capability syscalls** | Kernel syscalls are entry points invoked through the *same* switcher gate as any cross-compartment call. |
-| **Quarantine & up-front quotas** | Freed pages stay mapped in quarantine until a sweep clears all tags to them, and quotas are debited up front on allocation. |
-
-**Kernel vs. user space.** The kernel provides only mechanisms requiring
-system-register or sealing-root access: the domain switcher, virtual memory,
-memory and thread-memory quotas, sealing of its own handles, contiguous DMA
-allocation (`FLAG_DMA`), revocation sweeps, and trap delivery. Scheduling,
-filesystems, drivers, interrupt routing, naming, compartment-minted sealing
-types, and program loading all run as unprivileged compartments holding only
-what is in their capability tables.
+| **Single privilege level** | One CPU privilege level with permissive page-table entries; only kernel syscall entry points hold system-register access (ASR). |
+| **Migrating threads** | Threads do not belong to compartments; they cross domains through the switcher, with a small trusted kernel stack recording active calls and traps. |
+| **Capability syscalls** | Kernel syscalls are entry points invoked through the *same* switcher gate as any cross-compartment call. Thus the kernel acts as another compartment. |
+| **Quarantine** | Freed pages stay mapped and in quarantine until a sweep clears all tags on capabilities pointing to them. Additionally sub-page memory which is mapped as revocable may be added into a quarantine to be included in such sweeps. |
 
 **Bootstrap.** At boot, the kernel creates one compartment (`init`) seeded with
 the root quotas, all syscall gates, device windows, and service sealing
@@ -35,33 +100,75 @@ clears its own table, and exits.
 
 ## 2. Capabilities and Sealing
 
-### 2.1 Hardware capability types
+### 2.1 Sealed handle types
 
-Each hardware object type belongs to a resource manager, which holds the
-authority to seal and unseal it. The kernel delegates the CPU-quota, disk-quota,
-type-key and sealed-object types (sealing/unsealing capabilities) to the
-user-space scheduler, filesystem and sealing service at boot and holds the rest
-itself.
+Each type is managed by a resource manager, which alone can seal and unseal it.
+`init` hands each user-space manager its sealing authority at boot; the kernel
+keeps the rest. A handle's rights are fixed when its manager creates it: a holder
+cannot weaken a handle itself, since a sealed capability cannot be modified, so
+a weaker handle has to come from the manager.
 
-Sealed types managed by the kernel:
+**Kernel object handles** name an object the kernel manages.
 
-| Type | Purpose |
-| --- | --- |
-| **Sentry** | Jumpable code token. The kernel hands out only the switcher gate; compartments can seal sentries over their own code. |
-| **Entry point** | Handle to a kernel-written entry record for a compartment or syscall (§4). |
-| **Compartment** | Handle to a compartment (§3). |
-| **Thread** | Handle to a thread (§5). |
-| **VM quota** | Hierarchical virtual-memory budget (§6). |
-| **Thread-memory quota** | Hierarchical budget for thread descriptors and stacks (§6). |
-
-Sealed types managed by user-space services:
-
-| Type | Manager | Purpose |
+| Handle | Rights | Held by |
 | --- | --- | --- |
-| **CPU quota** | scheduler | Hierarchical CPU-bandwidth budget (§6, §7). |
-| **Disk quota** | filesystem | Hierarchical storage budget and open-file handles (§6). |
-| **Type key** | sealer | Compartment-minted type key (§2.3). |
-| **Sealed object** | sealer | Compartment-sealed object (§2.3). |
+| **Entry point** | Invoke one syscall, or one entry a compartment exported over its own code (§4). | entry points may be held by any compartment (depending on policies). |
+| **Compartment** | Identify it to the syscalls that act on it: allocate its memory, export entry points, install its fault handler, revoke its sub-ranges (§3), destroy it. Kernel does not track compartments. | the compartment itself (slot 0) and its launcher |
+| **Thread** | Name it to the syscalls that act on it: switch to it, kill it. | its creator; the scheduler, once registered |
+
+**User-space object handles** name an object a user-space manager keeps. A
+handle that is passed on, as a file or a socket is, splits its rights: `Load`
+carries the user right and `Store` the administrative right, so it can be handed
+out with the user right alone. A heap allocation comes as a sealed handle, the
+authority over it, with a plain payload, the memory itself, so its handle needs
+no split. A sealed object has no administrator, so its handle carries no rights
+of its own: whoever unseals it gets the payload with the permissions it was
+sealed with, and the rights over its type are in the type key, which the sealer
+can re-issue with fewer of them.
+
+| Handle | User right | Administrative right | Held by |
+| --- | --- | --- | --- |
+| **File** (filesystem) | Read it. | Write it, close it. | whoever opened it or was passed it |
+| **Socket** (network service) | Send and receive. | Close it. | whoever opened it or was passed it |
+| **Allocation** (heap allocator) | Free it; the memory is the plain payload handed out with it. | — | whoever allocated it |
+| **Type key** (sealer) | Unseal objects of the type (§2.3). | Seal objects of the type. | its minter, and whoever it passes the key to |
+| **Sealed object** (sealer) | Pass it on; only a key opens it. | — | anyone it is passed to |
+| **Credentials** (credential manager) | Use one secret (sign, authenticate to one service) without seeing it. | Derive narrower credentials. | — |
+
+**Quota handles** name a node in a budget tree (§6). `Load` carries the user
+right and `Store` the administrative right: deriving smaller quotas of the same
+type, and destroying the node. Deriving a disk or network quota returns the
+handle asked for plus an administrative one for the creator to keep. Each quota
+budgets one resource, and its manager charges it when minting the handles it
+enables. The kernel keeps two trees:
+
+| Quota | What it budgets | Handles it enables | User right (`Load`) | Administrative right (`Store`) | Held by |
+| --- | --- | --- | --- | --- | --- |
+| **VM** | Bytes of memory | Compartments and entry points; also pays for other trees' nodes and for sockets | Allocate memory. | Derive, destroy. | each service that allocates; the shell derives one per program |
+| **Thread memory** | Bytes of thread descriptors and stacks | Threads | Create threads. | Derive, destroy. | the shell, and anyone else that creates threads |
+
+User-space managers keep the rest:
+
+| Quota | What it budgets | Handles it enables | User right (`Load`) | Administrative right (`Store`) | Held by |
+| --- | --- | --- | --- | --- | --- |
+| **CPU** (scheduler) | CPU time per period, with a priority class and guarantee term | None: threads registered on it run | Register threads, query. | Derive, destroy. | the scheduler (root); the shell derives one per worker and program |
+| **Disk** (filesystem) | Bytes and inodes under one root directory | Files under that directory | Open, read and list under its root. | Create, write and delete files; derive, destroy. | `fs` (root); the shell: `/home` with both rights, `/bin` with the user right only; one per program |
+| **Network** (network service) | Bytes sent and received, and sockets, within a reach (address prefix, ports, protocols) | Sockets within that reach | Open sockets, send and receive within its reach. | Derive, destroy. | `net` (root); the shell; one per program that asks |
+| **Heap** (heap allocator) | Bytes of sub-page allocations | Allocations: a sealed handle each, with its plain payload | Allocate small objects. | Derive, destroy. | — |
+
+A leaked quota lets its holder spend or close that budget, and a leaked disk or
+network quota exposes exactly its directory subtree or reach; none lets it read
+or write anyone's memory.
+
+**Sentries** are sealed code capabilities rather than handles: they name no
+object and no manager unseals them, since the hardware does so on the jump or
+return that uses one. The kernel makes every call sentry, as it alone holds the
+authority to seal one; the hardware makes a return sentry on every call.
+
+| Sentry | Rights | Held by |
+| --- | --- | --- |
+| **Call sentry** (switcher gate) | Make a call; it carries no authority of its own, since every call also needs an entry point. | every compartment |
+| **Return sentry** (hardware) | Return from the call that made it; only a return can use it, and it is local, so only a stack can hold it. | the callee, until it returns |
 
 ### 2.2 Global vs. local capabilities
 
@@ -93,12 +200,11 @@ while the call that owns the slice is running:
 
 ### 2.3 Compartment-minted sealing types
 
-Hardware object types are scarce and fixed at boot. Any compartment can mint its
+Hardware object types are scarce and fixed at boot. However, any compartment can mint its
 own object types dynamically, all sharing the hardware **Type key** and
-**Sealed object** types. Both belong to one user-space service, the **sealer**,
+**Sealed object** types. Both hardware otypes belong to one user-space service, the **sealer**,
 which holds their authorities and offers mint, derive, seal and unseal as
-ordinary entry points; the kernel neither mints keys nor opens objects, and the
-mechanism needs no kernel memory:
+ordinary entry points; the kernel is not involved in or aware of virtual sealed types:
 
 1. **Type records and keys.** A type is named by the address of a small record
    in the owner's memory. Minting returns that capability bounded and sealed as
@@ -140,6 +246,16 @@ records, an optional fault handler, and a private **capability table**.
 Its descriptor and table occupy pages billed to its
 funding VM quota. It owns no threads.
 
+The descriptor sits at the start of the first page, ahead of the table, and
+holds:
+
+* the funding VM quota, which also pays for its entry pages;
+* a linked list of virtual memory regions owned by the compartment
+* a linked list of entry points
+* its fault handler's code sentry, if one is installed (§9);
+* a unique ID, a live flag (cleared when it is destroyed), a pinned flag
+  (created before paging started, so its memory is never paged out) and a lock.
+
 | Table slot | Contents |
 | --- | --- |
 | `0` | The compartment's own handle. Effectively the compartment ID. Sealed as a compartment type. |
@@ -150,7 +266,7 @@ The vm quota pays for the compartment's metadata pages.
 
 **Destruction.** Destroying a compartment marks it dead but doesn't immediately destroy it:
 
-* Its code, capability table, entry records and allocations are **quarantined**,
+* Pages containing its code, capability table, entry records and allocations are **quarantined**,
   not unmapped, so resident threads keep running until a revocation sweep (§8)
   clears every capability into the compartment, including return frames on
   kernel stacks.
@@ -167,7 +283,7 @@ manifest (memory size, syscalls, named services, file/disk handles, MMIO and DMA
 memory, interrupts, quotas etc); unmet required entries prevent launch, while unmet
 optional entries become null capabilities.
 
-**The manifest is a request, never an authority.** The launcher (`init` or the
+**The manifest is a request.** The launcher (`init` or the
 shell or some other launcher) applies its own policy, derives each grant from what it holds itself,
 builds the compartment inside the child's quota, and installs its entry point
 and fault handler.
@@ -215,6 +331,19 @@ of the caller's user stack). The thread including stack is funded from a thread-
 under a CPU quota (scheduler managed, the kernel has no in), threads migrate across compartments on calls and read their
 own ID from a kernel-updated read-only register.
 
+Its descriptor sits at the front of two pages, with the kernel return stack
+behind it, and holds:
+
+* the thread-memory quota that paid for those pages and the user stack;
+* its user stack, and the slice of it its entry was given;
+* its initial entry point;
+* pointer to trusted kernel stack which holds return frames;
+* its unique ID and its flags (live, running, started, kill pending).
+
+It records no compartment and no scheduling state: the compartment it is in
+follows from its entry point and the switcher frames on its kernel return
+stack, and the scheduler keeps its own records.
+
 ### Stopping, killing and unwinding a thread
 
 Stopping a thread from consuming CPU, reclaiming its memory, and forcing it out
@@ -259,17 +388,17 @@ Locks are currently mediated by the scheduler.
 
 Each resource manager owns a quota tree in its own dimension (VM and thread
 memory in the kernel, CPU bandwidth in the scheduler, storage in the
-filesystem, network and more to come soon):
+filesystem, network traffic in the network service):
 
 1. **Caller-funded nodes.** Every quota node is a thing that lives in memory and thus is paid for by a caller VM
    quota, never the manager (to prevent exhaustion as an attack vector). VM quota derivations debit the child's allowance
    *plus the node page itself* from the parent node, bounding runaway derivation.
-   CPU and disk managers etc take a caller VM quota to allocate the node page;
+   The CPU, disk and network managers take a caller VM quota to allocate the node page;
    closing that VM quota early waits until the manager frees the page.
 2. **Immutable static partitions.** Budgets are fixed at derivation with no
    runtime resize; over-budget requests fail at once.
-3. **No reparenting (close vs. cascade).** Destroying a node never moves its
-   children to another parent:
+3. **No reparenting (close, cascade or refuse).** Destroying a node never moves
+   its children to another parent:
    * **Kernel memory trees close:** the subtree refuses new charges and refunds
      all unused allowance to the parent at once, while closed nodes stay until
      sweeps refund their remaining allocations up to the first live ancestor.
@@ -282,7 +411,6 @@ filesystem, network and more to come soon):
    * **Scheduler CPU trees cascade:** the node and its subtree are freed at
      once, returning bandwidth to the parent and stopping its threads (§7).
 
-### Domain-specific nodes
 
 * **CPU quotas:** specify `budget / period`, priority class (at most the
   parent's), and guarantee term: 
@@ -291,7 +419,15 @@ filesystem, network and more to come soon):
   **Revocable** (at any time), **Fixed term**
   (until expiry), or **Permanent** (never). Destroying a child node requires
   the *parent* handle, so a holder cannot revoke its own node.
-* **Disk quotas:** bound bytes and files within a directory path.
+* **Disk quotas:** bound bytes and inodes under one root directory, which paths
+  cannot climb out of. Each file belongs to, and is charged to, the node it was
+  created under. An ADMIN handle (`Load|Store`) can create files and write or
+  delete those its node or a descendant owns; an OP handle (`Load`) can only
+  open, read and list. A file handle is a record in the page of the node it was
+  opened through, so it dies with that node.
+* **Network quotas:** bound bytes sent, bytes received and open sockets, within
+  a reach (an IPv4 prefix, port ranges and protocols) that a child can only
+  narrow.
 
 ## 7. Scheduling and Synchronisation
 
@@ -337,7 +473,7 @@ into the scheduler whenever a thread exits.
   whose *base* lies in a quarantined allocation (memory unmap) or a marked sub-range
   (capabilities based outside a marked sub-range, like a heap's arena
   capability, survive).
-* **Revocable arenas:** an allocation made with `FLAG_REVOCABLE`, which its
+* **Revocable arenas:** an allocation (vm_allocate) made with `FLAG_REVOCABLE`, which its
   owner (a heap, typically) hands out in pieces. It is the only memory that can
   be revoked in part: the owner marks a freed sub-range with `sys_revoke`, and
   the next sweep untags every capability based inside it. The arena's first
@@ -399,28 +535,16 @@ compartment that faulted**, never to a global handler (unless handled by the ker
 Everything a compartment can do beyond accessing its own memory comes from a
 sealed capability in its table. So the privilege of the system can be read off
 three questions per type: who can seal it (holds the sealing authority), who
-holds instances, and what an instance lets its holder do.
-
-### 10.1 The types
-
-| Type | Sealed by | Who holds instances | What an instance lets the holder do |
-| --- | --- | --- | --- |
-| **Sentry** (switcher gate) | kernel | every compartment | Make a call. Carries no authority of its own: every call also needs an entry-point handle. |
-| **Entry point** (kernel syscall gate) | kernel; all seeded into `init`, which hands each out per manifest | see §10.2 | Invoke that syscall. Only a gate available to a compartment can be called. |
-| **Entry point** (service entry) | the exporting service, over its own code; handed out through `naming` or returned to `init` in some cases (implementation detail right now) | the clients that named it in their manifest AND the policy of the compartment that lauched it allowed it | Invoke that entry point via the switcher. |
-| **Compartment** | kernel | the compartment itself and its launcher | Name the compartment to the syscalls that act on it: allocate memory it owns, create its entry points, install its fault handler, revoke its sub-ranges, destroy it. |
-| **Thread** | kernel | its creator; the scheduler (passed in at registration) | Switch to it (with `thread_switch`), kill it (with `thread_kill`). |
-| **VM quota** | kernel; root seeded into `init` | one per service that allocates (`fs`, `sched`, `shell` etc); the shell derives a sub-quota per program | Allocate memory against it, derive and destroy children. A leak lets the holder spend or close that budget, never read or write anyone's memory. |
-| **Thread-memory quota** | kernel; root seeded into `init` | `shell` etc, anyone who would need to create threads. | Fund thread descriptors and stacks (with `thread_create`). |
-| **CPU quota** | **scheduler** (authority handed to it by `init`) | root in the scheduler; the shell holds its own node and derives a child per worker and program | Register threads under it, derive children, query. |
-| **Disk quota / file handle** | **filesystem** (authority handed to it by `init`) | `fs` holds the root; `shell` holds `/home` (read-write) and `/bin` (read-only); each program gets a node under `/home` plus any files the shell opens for it | Filesystem operations confined to the node's directory subtree, with the handle's rights. A leak exposes exactly that subtree. |
-| **Type key / Sealed object** | **sealer** (authorities handed to it by `init`) | nobody in the default image | Seal and unseal objects of one compartment-defined type. A leaked key is forgery within that type only. |
+holds instances, and what an instance lets its holder do. The tables in §2.1
+answer all three.
 
 After `init` exits, the only places a handle can be sealed are the kernel (its
-own types), the scheduler (CPU quota), the filesystem (disk quota) and the
-sealer (type keys and sealed objects). Future types such as network or credential quotas will add to these types.
+own types), the scheduler (CPU quotas), the filesystem (disk quotas and files),
+the network service (network quotas and sockets) and the sealer (type keys and
+sealed objects). Future managers, such as a heap allocator or a credential
+manager, add to these.
 
-### 10.2 Kernel gates by holder
+### 10.1 Kernel gates by holder
 
 Which syscall gates a compartment holds decides what it can ask the kernel to
 do. As granted by `init` today:
