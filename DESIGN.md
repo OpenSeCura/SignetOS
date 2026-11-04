@@ -782,7 +782,7 @@ filesystem; which is which is a build detail.
 | 5 | `naming` | Once it is up, init publishes `uart` and the `fs.*` entries. |
 | 6 | `sched` | `OType::QuotaSched`, the PLIC window and the `trap_wait` gate. Init creates the interrupt handler's thread on the scheduler's interrupt entry and installs it (§3.6). |
 | 7 | — | Device interrupts: init routes the UART's and `blk`'s PLIC sources through the scheduler (`irq_route`, init-only) and hands each driver its `irq_wait`; `blk` also gets the scheduler's entries, so it sleeps instead of polling. |
-| 8 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), `/bin` as a read-only OP view, and the root quotas it asks for. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
+| 8 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), and `/bin` as a read-only OP view. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
 | 9 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
 ### 3.2 Creating and loading a new compartment
@@ -1078,10 +1078,7 @@ before this path. None exist yet (§3.7).
 **Tests:** `run fault.bin skip|retry|fix|unwind|double|overflow|loop`
 exercises each path in a program that defines its own handler: resuming
 past, at, or with a repaired register; unwinding; a fault in the handler; no
-room for the handler; and a handler that retries until its own limit. The shell's
-`faulttest` faults inside a call into one of the shell's own entry points:
-the shell's default handler reports the fault, and the call returns
-`Faulted`.
+room for the handler; and a handler that retries until its own limit.
 
 ### 3.7 Fork-less copy-on-write
 
@@ -1389,7 +1386,7 @@ their parent; there are no directory-entry blocks.
 | `dma` | Device setup, once | The only compartment that knows a physical address. Writes queue 0's addresses and a fixed four-entry descriptor table (one 4 KiB read chain, one 4 KiB write chain), negotiates `VERSION_1` only, and keeps status, features, queue select/ready and the queue addresses out of `blk`'s reach. |
 | `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one 4 KiB request at a time** through a bounce buffer in the DMA arena, starting one of `dma`'s two chains. It never sees a physical address and cannot point the device outside the arena. The caller sleeps in `sched.irq_wait` until the device interrupts, with a timeout, and polls when it cannot sleep. |
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
-| `shell` | Console | Commands: `help`, `stats`, `demo` (class ordering and tick preemption of a non-yielding batch thread), `fsdemo` (`quota_disk` semantics), `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `killtest`, `revoketest`, `faulttest` (a fault in a call is reported by the shell's default handler, and the call returns `Faulted`; §3.6), `shutdown`. Input comes from `uart.read`, which sleeps until a key is pressed. |
+| `shell` | Console | Commands: `help`, `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `shutdown`. Input comes from `uart.read`, which sleeps until a key is pressed. |
 
 DMA is isolated by `dma` (`boot/dma.cpp`): every address the device can use
 is written once, at boot, into memory and registers only `dma` can reach, so

@@ -22,21 +22,16 @@
  * handle as the argument.
  *
  * Two ways in:
- *   compartment_main(nullptr)  `init` probing the image: print a banner and
- *                              prove the naming service works.
- *   compartment_main(quota)    the shell's own thread, dispatched by the
+ *   compartment_main(timebase) `init`, once, before the shell's thread first
+ *                              runs: records the timer frequency.
+ *   compartment_main(nullptr)  the shell's own thread, dispatched by the
  *                              scheduler. A console on the UART.
  *
  * CONSOLE
- *   The shell starts three background workers under 10/6/2 ms-per-second
- *   sub-quotas of its own bandwidth, so the scheduler always has something to
- *   switch between, then waits for keystrokes without spending a cycle on it:
+ *   The shell waits for keystrokes without spending a cycle on it:
  *   `uart.read` sleeps in the scheduler until the UART interrupts (sched.cpp,
  *   DEVICE INTERRUPTS) and hands over what was typed. Commands:
  *     help       list commands
- *     stats      CPU time each background worker has received so far
- *     demo       the 300 ms bandwidth self-test described below
- *     fsdemo     the file-system self-test described below
  *     ls [dir], cat, write, append, mkdir, rm, df
  *                files and directories under `/home`, which every path is
  *                relative to: the ADMIN `quota_disk` handle rooted there
@@ -53,41 +48,11 @@
  *                paging self-test (PAGE TEST below)
  *     sealtest   compartment-minted sealing self-test: the sealer service,
  *                from the shell and from a program (`run sealtest.bin`)
- *     shutdown   stop the workers and the pager, free their quotas and exit.
- *                Nothing is registered after that, so the dispatcher exits
- *                too and the kernel powers the machine off.
+ *     shutdown   stop the pager and exit. Nothing is registered after that,
+ *                so the dispatcher exits too and the kernel powers the
+ *                machine off.
  *   In a build where `init` could not seed `uart.read` nobody is at the
- *   keyboard: the shell then runs the demos and exits by itself.
- *
- * FS DEMO
- *   Writes and reads back a file; makes a directory with a file of the
- *   shell's in it and derives an 8 KiB / 2-inode sub-quota rooted there (its
- *   node paid for from the shell's own VM quota). The sub-quota is shown what
- *   it cannot do: grow past its bytes, create past its inodes, name anything
- *   above its directory, or change the shell's file in it -- though it can
- *   read that. Destroying it unlinks its files and refunds the shell; the
- *   shell's file stays. A directory cannot be removed while it has entries
- *   or a node is rooted at it, and a read-only node is destroyed through the
- *   ADMIN handle its creator kept. The shell's accounting is checked to be
- *   back where it started.
- *
- * RUN DEMO
- *   `run hello.bin` with arguments, expecting status 0 -- which has `run`
- *   read the program's manifest, make `/home/hello` and derive a node of the
- *   shell's quota rooted there for it, open `/home/motd.txt` read-only for
- *   it, and take all of it back when it returns: the demo checks the
- *   directory is gone and the shell's accounting is back where it was. Then
- *   each handle denies the program in its own way: through `/home` it cannot
- *   be named (not under that root, and no `..`), through `/bin` it can be
- *   opened and nothing else -- not written, not removed, not joined by a file
- *   or a directory of the shell's.
- *
- * DEMO
- *   Three interactive workers under 10/6/2 ms-per-100 ms quotas race for
- *   300 ms and report their progress, which should land near 5:3:1. A fourth,
- *   batch-class thread never yields: it uses up the time nobody else has
- *   budget for and proves preemption, since the interactive workers only get
- *   the CPU back from it through the scheduler's tick handler.
+ *   keyboard: the shell then just exits.
  */
 
 #include "runtime.hpp"
@@ -96,26 +61,20 @@ namespace signetos::user {
 namespace {
 
 uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
-constexpr size_t MAX_WORKERS = 4;
-constexpr size_t WORKER_STACK = 32 * 1024;
-constexpr int DESTROY_RETRIES = 64;
 constexpr size_t LINE_MAX = 64;
-constexpr uint64_t FOREVER_US = ~0ULL;
 
 // TODO This obviously isn't a real shell or a good shell, it's just enough to
 // kind of test some things for now
 
 // --- What the shell asks `init` for (user/manifest.hpp) -----------------------
-// Its own quotas: the VM it lives on, thread memory for its workers, and its
-// CPU bandwidth -- half the machine, as an ADMIN `quota_sched` node it
-// sub-divides for its workers and programs; the kernel entries a console that
-// starts threads and runs programs is made of; the services it talks to; its
+// Its own quotas: the VM it lives on, thread memory for its programs' threads,
+// and its CPU bandwidth -- half the machine, as an ADMIN `quota_sched` node it
+// sub-divides for its programs; the kernel entries a console that starts
+// threads and runs programs is made of; the services it talks to; its
 // place on the disk: `/home` as an ADMIN node with all the space and inodes
 // the system's own images leave free (DISK entries are met in order, so this
 // one takes everything before `/bin` asks for nothing), and `/bin` as a
-// 0-byte read-only view of the programs. The system's four root quotas come
-// last, optional: `init` exits and scrubs its own table, so the shell is
-// their long-lived holder, not their user.
+// 0-byte read-only view of the programs.
 #define SHELL_MANIFEST(X)                                                      \
   M_QUOTA_VM(X, VM_QUOTA)                                                      \
   M_QUOTA_THREAD(X, THREAD_QUOTA, 256ULL * 1024 * 1024)                        \
@@ -141,79 +100,13 @@ constexpr uint64_t FOREVER_US = ~0ULL;
   M_DISK(X, DISK_QUOTA, 0, perms::Load | perms::Store,                         \
          ::signetos::init::MANIFEST_ALL, ::signetos::init::MANIFEST_ALL_INODES, \
          "home")                                                               \
-  M_DISK(X, BIN_DIR, 0, perms::Load, 0, 0, "bin")                              \
-  M_ROOT_OPT(X, ROOT_VM, ::signetos::init::ROOT_VM)                            \
-  M_ROOT_OPT(X, ROOT_THREAD_MEM, ::signetos::init::ROOT_THREAD_MEM)            \
-  M_ROOT_OPT(X, ROOT_DISK, ::signetos::init::ROOT_DISK)                        \
-  M_ROOT_OPT(X, ROOT_SCHED, ::signetos::init::ROOT_SCHED)
-// 1 GiB of address space: the shell's own image and tables, its workers' and
-// programs' scheduler nodes, and -- `run <file>` -- the buffer a program is
-// read into plus the VM sub-quota its compartment lives on while it runs. A
-// program's thread is paid from THREAD_QUOTA, like the workers'. Freed memory
-// stays charged until a sweep reclaims it, so both are sized for many
-// programs, not one.
+  M_DISK(X, BIN_DIR, 0, perms::Load, 0, 0, "bin")
+// 1 GiB of address space: the shell's own image and tables, its programs'
+// scheduler nodes, and -- `run <file>` -- the buffer a program is read into
+// plus the VM sub-quota its compartment lives on while it runs. A program's
+// thread is paid from THREAD_QUOTA. Freed memory stays charged until a sweep
+// reclaims it, so both are sized for many programs, not one.
 SIGNETOS_MANIFEST(SHELL_MANIFEST, 1024ULL * 1024 * 1024)
-
-// Demo: 5:3:1 interactive plus a batch hog, 100 us slices, 300 ms.
-constexpr size_t DEMO_WORKERS = 4;
-constexpr uint32_t DEMO_PERIOD_US = 100'000;
-constexpr uint32_t DEMO_BUDGET_US[DEMO_WORKERS] = {10'000, 6'000, 2'000, 20'000};
-constexpr uint8_t DEMO_CLASS[DEMO_WORKERS] = {
-    init::PRIORITY_INTERACTIVE, init::PRIORITY_INTERACTIVE,
-    init::PRIORITY_INTERACTIVE, init::PRIORITY_BATCH};
-constexpr uint64_t DEMO_SLICE_US = 100;
-constexpr uint64_t DEMO_US = 300'000;
-
-// Background: the same 5:3:1 shape stretched to one-second periods with 2 ms
-// slices, so the switching stays visible on a traced console without
-// drowning it: nine slices a second, in a burst at the start of each period.
-// No hog, so idle time stays with the console.
-constexpr size_t BG_WORKERS = 3;
-constexpr uint32_t BG_PERIOD_US = 1'000'000;
-constexpr uint32_t BG_BUDGET_US[BG_WORKERS] = {10'000, 6'000, 2'000};
-constexpr uint8_t BG_CLASS[BG_WORKERS] = {
-    init::PRIORITY_INTERACTIVE, init::PRIORITY_INTERACTIVE,
-    init::PRIORITY_INTERACTIVE};
-constexpr uint64_t BG_SLICE_US = 2'000;
-
-// Shared between the shell thread and one set of workers (all in this
-// compartment).
-struct Shared {
-  Capability invoke;         // sys_compartment_invoke gate
-  Capability yield;          // sched.yield
-  uint64_t deadline_us;      // workers stop at this time...
-  uint64_t stop;             // ...or as soon as this is set
-  uint64_t slice_us;         // busy work per iteration
-  uint64_t done;             // workers that have finished
-  uint64_t count[MAX_WORKERS];  // iterations each worker managed
-  bool greedy[MAX_WORKERS];     // never yields (batch class)
-};
-
-struct alignas(16) WorkerArg {
-  Shared* shared;
-  uint64_t index;
-  uint64_t pad_;
-};
-
-struct WorkerConfig {
-  size_t count;
-  uint32_t period_us;
-  const uint32_t* budget_us;
-  const uint8_t* priority;
-  uint64_t slice_us;
-  uint64_t deadline_us;
-};
-
-// A set of workers: what they share, their arguments, their scheduler nodes,
-// and the configuration they were started with (for `stats`).
-struct WorkerSet {
-  Shared shared;
-  WorkerArg args[MAX_WORKERS];
-  Capability quota[MAX_WORKERS];
-  WorkerConfig cfg;
-  size_t count;    // configured
-  size_t started;  // actually running
-};
 
 // Console state. One shell thread, so plain globals.
 Capability s_gate_invoke = nullptr;
@@ -223,17 +116,13 @@ Capability s_uart = nullptr;
 Capability s_uart_read = nullptr;
 Capability s_vm_quota = nullptr;
 Capability s_thread_quota = nullptr;
-Capability s_my_quota = nullptr;      // SLOT_SCHED_QUOTA: this compartment's node
-Capability s_worker_entry = nullptr;  // OType::EntryPoint -> shell_worker_entry
+Capability s_my_quota = nullptr;  // SLOT_SCHED_QUOTA: this compartment's node
 Capability s_sched_derive = nullptr;
 Capability s_sched_destroy = nullptr;
 Capability s_sched_query = nullptr;
 Capability s_sched_register = nullptr;
 Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
-
-WorkerSet s_background;
-WorkerSet s_demo;
 
 inline uint64_t now_us() {
   uint64_t t;
@@ -360,8 +249,6 @@ constexpr size_t LIST_MAX = 16;
 constexpr size_t DATA_MAX = 8192;
 alignas(16) init::FsDirEntry s_entries[LIST_MAX];
 alignas(16) uint8_t s_data[DATA_MAX];
-// Every file handle one node can hold at once (the fs demo fills a node).
-alignas(16) Capability s_handles[init::FS_OPEN_PER_NODE];
 
 // Compartments link no C library: a request too large for the compiler to
 // zero inline (`T x{}`) would otherwise become a call to `memset`. The
@@ -548,171 +435,6 @@ size_t str_len(const char* s) {
     n += 1;
   }
   return n;
-}
-
-void banner(Capability gate_invoke, Capability uart_sentry,
-            Capability naming_lookup) {
-  print(gate_invoke, uart_sentry,
-        "[shell]    User shell skeleton initialized (VM + thread quotas & service sentries)\n");
-
-  // Resolve the console through the registry and print through what it
-  // returned: proof that lookup hands out a usable entry point.
-  int64_t status = init::NAMING_BAD_REQUEST;
-  Capability uart_by_name =
-      lookup_name(gate_invoke, naming_lookup, "uart", &status);
-  if (status == init::NAMING_OK && capability_is_valid(uart_by_name)) {
-    print(gate_invoke, uart_by_name,
-          "[shell]    naming.lookup(\"uart\") -> printing through the returned entry point\n");
-  } else {
-    print(gate_invoke, uart_sentry, "[shell]    naming.lookup(\"uart\") FAILED\n");
-  }
-  if (lookup_name(gate_invoke, naming_lookup, "no-such-service", &status) ==
-          nullptr &&
-      status == init::NAMING_NOT_FOUND) {
-    print(gate_invoke, uart_sentry,
-          "[shell]    naming.lookup(\"no-such-service\") -> NOT_FOUND as expected\n");
-  }
-}
-
-// --- Workers -----------------------------------------------------------------
-
-// One node per worker, carved out of the shell's own bandwidth; the pages are
-// paid for from the shell's VM quota. Stops at the first failure and returns
-// how many workers are running.
-size_t start_workers(WorkerSet& set, const WorkerConfig& cfg) {
-
-  Shared& sh = set.shared;
-  sh.invoke = s_gate_invoke;
-  sh.yield = s_sched_yield;
-  sh.deadline_us = cfg.deadline_us;
-  sh.stop = 0;
-  sh.slice_us = cfg.slice_us;
-  sh.done = 0;
-  set.cfg = cfg;
-  set.count = cfg.count;
-  set.started = 0;
-  for (size_t i = 0; i < MAX_WORKERS; ++i) {
-    sh.count[i] = 0;
-    sh.greedy[i] = i < cfg.count && cfg.priority[i] == init::PRIORITY_BATCH;
-    set.quota[i] = nullptr;
-  }
-
-  for (size_t i = 0; i < cfg.count; ++i) {
-    init::SchedDeriveRequest dreq{};
-    dreq.parent = s_my_quota;
-    dreq.node_funding = s_vm_quota;
-    dreq.budget_us = cfg.budget_us[i];
-    dreq.period_us = cfg.period_us;
-    dreq.term_us = init::SCHED_REVOCABLE;
-    dreq.priority_class = cfg.priority[i];
-    derive_node(&dreq);
-    if (dreq.status != init::SCHED_OK) {
-      out_dec("[shell]    sched.quota_derive FAILED, status ",
-              static_cast<uint64_t>(-dreq.status), "\n");
-      break;
-    }
-    set.quota[i] = dreq.out_quota;
-
-    set.args[i].shared = &sh;
-    set.args[i].index = i;
-    // `args[i]` sits in this compartment's `.bss`, not on a stack, so the
-    // initial argument is a global capability the kernel will accept.
-    Capability t =
-        new_thread(WORKER_STACK, s_worker_entry, bounded(&set.args[i]));
-    if (!sealing::is_sealed_as(OType::Thread, t)) {
-      out("[shell]    worker thread_create FAILED\n");
-      break;
-    }
-    const int64_t tid =
-        invoke<int64_t>(s_gate_invoke, s_sched_register, t, set.quota[i]);
-    if (tid <= 0) {
-      out("[shell]    sched.thread_register FAILED\n");
-      break;
-    }
-    set.started += 1;
-  }
-  return set.started;
-}
-
-// Waits for every started worker to finish. `yield` hands the CPU over
-// whenever anyone else may run.
-void wait_workers(WorkerSet& set) {
-  while (__atomic_load_n(&set.shared.done, __ATOMIC_SEQ_CST) < set.started) {
-    yield();
-  }
-}
-
-void stop_workers(WorkerSet& set) {
-  __atomic_store_n(&set.shared.stop, 1, __ATOMIC_SEQ_CST);
-  wait_workers(set);
-}
-
-// Tears the nodes down. A worker that has bumped `done` may not have exited
-// yet: yield until nothing is registered on its node, then destroy it.
-size_t destroy_workers(WorkerSet& set) {
-  size_t destroyed = 0;
-  for (size_t i = 0; i < set.count; ++i) {
-    if (!capability_is_valid(set.quota[i])) {
-      continue;
-    }
-    for (int attempt = 0; attempt < DESTROY_RETRIES; ++attempt) {
-      const int64_t threads = node_threads(set.quota[i]);
-      if (threads > 0) {
-        yield();
-        continue;
-      }
-      if (threads == 0 && destroy_sched_node(set.quota[i]) == init::SCHED_OK) {
-        destroyed += 1;
-        set.quota[i] = nullptr;
-      }
-      break;
-    }
-  }
-  set.started = 0;
-  return destroyed;
-}
-
-// --- Commands ----------------------------------------------------------------
-
-void run_demo() {
-  const WorkerConfig cfg{DEMO_WORKERS, DEMO_PERIOD_US, DEMO_BUDGET_US,
-                         DEMO_CLASS, DEMO_SLICE_US, now_us() + DEMO_US};
-  const size_t started = start_workers(s_demo, cfg);
-  out_dec("[shell]    Started ", started,
-          " threads: interactive 10/6/2 ms + batch 20 ms per 100 ms; "
-          "waiting 300 ms...\n");
-  wait_workers(s_demo);
-
-  const Shared& sh = s_demo.shared;
-  out_dec("[shell]    interactive worker0 (10 ms): ", sh.count[0], " x 100 us\n");
-  out_dec("[shell]    interactive worker1 ( 6 ms): ", sh.count[1], " x 100 us\n");
-  out_dec("[shell]    interactive worker2 ( 2 ms): ", sh.count[2], " x 100 us\n");
-  out_dec("[shell]    batch hog, never yields (20 ms): ", sh.count[3],
-          " x 100 us (plus idle time)\n");
-  const bool ordered = started == DEMO_WORKERS && sh.count[2] > 0 &&
-                       sh.count[0] > sh.count[1] && sh.count[1] > sh.count[2];
-  out(ordered ? "[shell]    Bandwidth ordering OK (worker0 > worker1 > worker2)\n"
-              : "[shell]    Bandwidth ordering WRONG\n");
-
-  const size_t destroyed = destroy_workers(s_demo);
-  out_dec("[shell]    Destroyed ", destroyed, " demo quotas\n");
-}
-
-void print_stats() {
-  const WorkerSet& set = s_background;
-  const Shared& sh = set.shared;
-  if (set.started == 0) {
-    out("[shell]    no background workers running\n");
-    return;
-  }
-  for (size_t i = 0; i < set.started; ++i) {
-    out_dec("[shell]    worker", i, sh.greedy[i] ? " (batch hog, " : " (");
-    out_dec("", set.cfg.budget_us[i] / 1000, " ms per ");
-    out_dec("", set.cfg.period_us / 1000, " ms): ");
-    out_dec("", sh.count[i] * sh.slice_us / 1000,
-            sh.greedy[i] ? " ms of CPU so far (plus idle time)\n"
-                         : " ms of CPU so far\n");
-  }
 }
 
 // --- File commands -------------------------------------------------------------
@@ -1484,489 +1206,8 @@ bool cmd_run(const char* name, const char* args, int64_t* out_status) {
   return ok;
 }
 
-// True if `name` is among the first `count` entries of the last `fs_list`.
-bool has_entry(uint64_t count, const char* name) {
-  for (uint64_t i = 0; i < count; ++i) {
-    if (str_eq(s_entries[i].name, name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// The `owner` mark (FS_OWNER_*) of `name` in the last `fs_list`; ~0u if it is
-// not there.
-uint32_t entry_owner(uint64_t count, const char* name) {
-  for (uint64_t i = 0; i < count; ++i) {
-    if (str_eq(s_entries[i].name, name)) {
-      return s_entries[i].owner;
-    }
-  }
-  return ~0u;
-}
-
-// The program self-test: `hello.bin`, in `/bin`, runs with arguments and
-// reports success, which has `run` grant its manifest -- a directory of its
-// own under `/home`, the file operations, the message of the day the demo
-// writes first -- and take it all back: afterwards `/home/hello` is gone and
-// the shell's accounting is what it was. Then each of the shell's two handles
-// on the disk denies the program in its own way. Through the `/home` quota
-// the file cannot so much as be named -- it is not under that root, and a
-// path cannot climb out. Through the read-only `/bin` view it can be opened
-// and nothing else: not written, not removed, not joined by anything of the
-// shell's.
-bool run_app_demo() {
-  if (!fs_available() || !s_run_ready) {
-    return false;
-  }
-  bool ok = true;
-  auto expect_status = [&](int64_t got, int64_t want, const char* what) {
-    if (got != want) {
-      ok = false;
-      out("[shell]    run demo: FAILED at ");
-      out(what);
-      out(": got ");
-      out(fs_status_name(got));
-      out(", wanted ");
-      out(fs_status_name(want));
-      out("\n");
-    }
-  };
-  // A message of the day for the program's optional FILE entry (a leftover
-  // from an interrupted run is replaced), and the shell's accounting with it
-  // in place, to compare with afterwards.
-  fs_unlink(s_disk_quota, "motd.txt");
-  Capability motd = nullptr;
-  expect_status(fs_open_with(s_fs_create, s_disk_quota, "motd.txt", &motd),
-                init::FS_OK, "create motd.txt");
-  if (capability_is_valid(motd)) {
-    const char text[] = "be kind to your sandbox\n";
-    for (size_t i = 0; i < sizeof(text); ++i) {
-      s_data[i] = static_cast<uint8_t>(text[i]);
-    }
-    uint64_t done = 0;
-    expect_status(fs_io(s_fs_write, motd, s_data, 0, sizeof(text) - 1, &done),
-                  init::FS_OK, "write motd.txt");
-    fs_close(motd);
-  }
-  init::FsQueryRequest before{};
-  expect_status(fs_query(s_disk_quota, before), init::FS_OK, "query before run");
-
-  int64_t status = RUN_NOT_RUN;
-  if (!cmd_run("hello.bin", "from the shell's self-test", &status) ||
-      status != 0) {
-    ok = false;
-    out("[shell]    run demo: FAILED at run hello.bin\n");
-  }
-
-  // Nothing of the program's outlives it: not its directory, not its charges.
-  uint64_t count = 0;
-  uint64_t total = 0;
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK,
-                "ls /home after the run");
-  if (has_entry(count, "hello")) {
-    ok = false;
-    out("[shell]    run demo: FAILED: /home/hello outlived the program\n");
-  }
-  init::FsQueryRequest after{};
-  expect_status(fs_query(s_disk_quota, after), init::FS_OK, "query after run");
-  if (after.used_bytes != before.used_bytes ||
-      after.used_inodes != before.used_inodes ||
-      after.delegated_bytes != before.delegated_bytes ||
-      after.delegated_inodes != before.delegated_inodes) {
-    ok = false;
-    out("[shell]    run demo: FAILED: the shell's accounting changed\n");
-    print_quota("[shell]    before: ", before);
-    print_quota("[shell]    after:  ", after);
-  }
-  expect_status(fs_unlink(s_disk_quota, "motd.txt"), init::FS_OK, "rm motd.txt");
-
-  Capability file = nullptr;
-  // Not under /home, and no way to say "up one".
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "hello.bin", &file),
-                init::FS_NOT_FOUND, "open hello.bin through /home");
-  expect_status(fs_unlink(s_disk_quota, "hello.bin"), init::FS_NOT_FOUND,
-                "rm hello.bin through /home");
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "../bin/hello.bin", &file),
-                init::FS_BAD_REQUEST, "open ../bin/hello.bin through /home");
-  // Under /bin, through a handle that only reads.
-  expect_status(fs_unlink(s_bin_quota, "hello.bin"), init::FS_PERMISSION,
-                "rm hello.bin through /bin");
-  expect_status(fs_open_with(s_fs_create, s_bin_quota, "mine.bin", &file),
-                init::FS_PERMISSION, "create mine.bin in /bin");
-  expect_status(fs_mkdir(s_bin_quota, "mine"), init::FS_PERMISSION,
-                "mkdir mine in /bin");
-  expect_status(fs_open_with(s_fs_open, s_bin_quota, "hello.bin", &file),
-                init::FS_OK, "open hello.bin through /bin");
-  if (capability_is_valid(file)) {
-    uint64_t done = 0;
-    s_data[0] = 0;
-    expect_status(fs_io(s_fs_write, file, s_data, 0, 1, &done),
-                  init::FS_PERMISSION, "write hello.bin through /bin");
-    fs_close(file);
-  }
-  out(ok ? "[shell]    run demo OK\n" : "[shell]    run demo FAILED\n");
-  return ok;
-}
-
-// The file-system self-test: a file written and read back; a directory, and a
-// sub-quota rooted at it that runs out of bytes and then of inodes, cannot
-// reach above its directory, and can see but not touch what the shell put in
-// it; its node's page full of open files; the cascade when the sub-quota is
-// destroyed and the handle that dies with it; adoption, down two levels; what
-// keeps a directory from being removed; the shell's own accounting restored
-// at the end. Idempotent: leftovers from an interrupted run are removed first
-// -- and they are the shell's to remove even after a reboot, since `init`
-// derives its node with FS_DERIVE_ADOPT.
-bool run_fs_demo() {
-  if (!fs_available()) {
-    return false;
-  }
-  bool ok = true;
-  auto expect = [&](bool cond, const char* what) {
-    if (!cond) {
-      ok = false;
-      out("[shell]    fs demo: FAILED at ");
-      out(what);
-      out("\n");
-    }
-  };
-  auto expect_status = [&](int64_t got, int64_t want, const char* what) {
-    if (got != want) {
-      ok = false;
-      out("[shell]    fs demo: FAILED at ");
-      out(what);
-      out(": got ");
-      out(fs_status_name(got));
-      out(", wanted ");
-      out(fs_status_name(want));
-      out("\n");
-    }
-  };
-  static const char kText[] = "Hello from SignetOS!\n";
-  const uint64_t kTextLen = sizeof(kText) - 1;
-
-  out("[shell]    fs demo: starting\n");
-  fs_unlink(s_disk_quota, "hello.txt");
-  fs_unlink(s_disk_quota, "big.bin");
-  fs_unlink(s_disk_quota, "sandbox/sub_a");
-  fs_unlink(s_disk_quota, "sandbox/sub_b");
-  fs_unlink(s_disk_quota, "sandbox/readme");
-  fs_unlink(s_disk_quota, "sandbox");
-
-  init::FsQueryRequest q{};
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query");
-  print_quota("[shell]    fs demo: before: ", q);
-  const uint64_t base_used = q.used_bytes;
-  const uint32_t base_inodes = q.used_inodes;
-  // Whatever else is in /home stays there throughout, so the entry counts
-  // below are relative to it.
-  uint64_t count = 0;
-  uint64_t total = 0;
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK,
-                "list at the start");
-  const uint64_t base_total = total;
-
-  // 1. A file: create, write, read back.
-  Capability file = nullptr;
-  expect_status(fs_open_with(s_fs_create, s_disk_quota, "hello.txt", &file),
-                init::FS_OK, "create hello.txt");
-  for (uint64_t i = 0; i < kTextLen; ++i) {
-    s_data[i] = static_cast<uint8_t>(kText[i]);
-  }
-  uint64_t done = 0;
-  expect_status(fs_io(s_fs_write, file, s_data, 0, kTextLen, &done),
-                init::FS_OK, "write hello.txt");
-  expect(done == kTextLen, "write hello.txt count");
-  expect_status(fs_close(file), init::FS_OK, "close hello.txt");
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "hello.txt", &file),
-                init::FS_OK, "open hello.txt");
-  for (uint64_t i = 0; i < kTextLen; ++i) {
-    s_data[i] = 0;
-  }
-  expect_status(fs_io(s_fs_read, file, s_data, 0, DATA_MAX, &done),
-                init::FS_OK, "read hello.txt");
-  bool same = done == kTextLen;
-  for (uint64_t i = 0; same && i < kTextLen; ++i) {
-    same = s_data[i] == static_cast<uint8_t>(kText[i]);
-  }
-  expect(same, "read hello.txt contents");
-  expect_status(fs_close(file), init::FS_OK, "close hello.txt again");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query after write");
-  expect(q.used_bytes == base_used + init::FS_BLOCK_BYTES &&
-             q.used_inodes == base_inodes + 1,
-         "one block and one inode charged for hello.txt");
-
-  // 2. A directory of the shell's with a file of the shell's in it, and a
-  //    sub-quota of 8 KiB and 2 inodes rooted at the directory. The paths the
-  //    sub-quota uses start there.
-  expect_status(fs_mkdir(s_disk_quota, "sandbox"), init::FS_OK, "mkdir sandbox");
-  expect_status(fs_mkdir(s_disk_quota, "sandbox"), init::FS_EXISTS,
-                "mkdir sandbox again");
-  expect_status(fs_open_with(s_fs_create, s_disk_quota, "sandbox/readme", &file),
-                init::FS_OK, "create sandbox/readme");
-  expect_status(fs_close(file), init::FS_OK, "close sandbox/readme");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query with sandbox");
-  expect(q.used_inodes == base_inodes + 3,
-         "an inode each for hello.txt, sandbox and sandbox/readme");
-  Capability sub = nullptr;
-  expect_status(fs_derive(s_disk_quota, "hello.txt", 0, 0, &sub),
-                init::FS_NOT_DIR, "derive at a file");
-  expect_status(fs_derive(s_disk_quota, "nowhere", 0, 0, &sub),
-                init::FS_NOT_FOUND, "derive at a missing directory");
-  expect_status(
-      fs_derive(s_disk_quota, "sandbox", 2 * init::FS_BLOCK_BYTES, 2, &sub),
-      init::FS_OK, "derive sub-quota at sandbox");
-  Capability file_a = nullptr;
-  expect_status(fs_open_with(s_fs_create, sub, "sub_a", &file_a), init::FS_OK,
-                "create sub_a");
-  for (size_t i = 0; i < DATA_MAX; ++i) {
-    s_data[i] = static_cast<uint8_t>(i);
-  }
-  expect_status(fs_io(s_fs_write, file_a, s_data, 0, DATA_MAX, &done),
-                init::FS_OK, "write 8 KiB to sub_a");
-  expect_status(fs_io(s_fs_write, file_a, s_data, DATA_MAX, 1, &done),
-                init::FS_QUOTA, "write past the sub-quota's bytes");
-  expect_status(fs_close(file_a), init::FS_OK, "close sub_a");
-  Capability file_b = nullptr;
-  expect_status(fs_open_with(s_fs_create, sub, "sub_b", &file_b), init::FS_OK,
-                "create sub_b");
-  expect_status(fs_close(file_b), init::FS_OK, "close sub_b");
-  Capability file_c = nullptr;
-  expect_status(fs_open_with(s_fs_create, sub, "sub_c", &file_c),
-                init::FS_QUOTA, "create past the sub-quota's inodes");
-  expect_status(fs_mkdir(sub, "nested"), init::FS_QUOTA,
-                "mkdir past the sub-quota's inodes");
-  // Nothing above its directory can be named, by any spelling.
-  expect_status(fs_open_with(s_fs_open, sub, "hello.txt", &file),
-                init::FS_NOT_FOUND, "open hello.txt through the sub-quota");
-  expect_status(fs_unlink(sub, "hello.txt"), init::FS_NOT_FOUND,
-                "unlink hello.txt through the sub-quota");
-  expect_status(fs_open_with(s_fs_open, sub, "../hello.txt", &file),
-                init::FS_BAD_REQUEST, "open ../hello.txt through the sub-quota");
-  expect_status(fs_open_with(s_fs_open, sub, "/sandbox/readme", &file),
-                init::FS_BAD_REQUEST, "open an absolute path through the sub-quota");
-  // The shell's file in its directory: there to read, not its to change.
-  expect_status(fs_open_with(s_fs_open, sub, "readme", &file), init::FS_OK,
-                "open readme through the sub-quota");
-  expect_status(fs_io(s_fs_write, file, s_data, 0, 1, &done),
-                init::FS_PERMISSION, "write readme through the sub-quota");
-  expect_status(fs_close(file), init::FS_OK, "close readme");
-  expect_status(fs_unlink(sub, "readme"), init::FS_PERMISSION,
-                "unlink readme through the sub-quota");
-  // Open files are the opener's own: the sub-quota's node has room for
-  // FS_OPEN_PER_NODE handles and not one more, and filling it leaves the
-  // shell's node as free to open as before.
-  size_t opened = 0;
-  while (opened < init::FS_OPEN_PER_NODE &&
-         fs_open_with(s_fs_open, sub, "readme", &s_handles[opened]) ==
-             init::FS_OK) {
-    opened += 1;
-  }
-  expect(opened == init::FS_OPEN_PER_NODE,
-         "open readme FS_OPEN_PER_NODE times through the sub-quota");
-  expect_status(fs_open_with(s_fs_open, sub, "readme", &file),
-                init::FS_NO_MEMORY, "open past the sub-quota's node page");
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "hello.txt", &file),
-                init::FS_OK, "open hello.txt while the sub-quota's page is full");
-  expect_status(fs_close(file), init::FS_OK, "close that hello.txt");
-  for (size_t i = 0; i < opened; ++i) {
-    fs_close(s_handles[i]);
-  }
-  // One handle opened through the sub-quota, kept to outlive it (below).
-  Capability orphan = nullptr;
-  expect_status(fs_open_with(s_fs_open, sub, "readme", &orphan), init::FS_OK,
-                "open readme through the sub-quota once more");
-  init::FsQueryRequest qs{};
-  expect_status(fs_query(sub, qs), init::FS_OK, "query sub-quota");
-  print_quota("[shell]    fs demo: sub-quota: ", qs);
-  expect(qs.used_bytes == 2 * init::FS_BLOCK_BYTES && qs.used_inodes == 2 &&
-             qs.limit_bytes == 2 * init::FS_BLOCK_BYTES && qs.limit_inodes == 2,
-         "sub-quota accounting");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query with sub-quota");
-  expect(q.delegated_bytes == 2 * init::FS_BLOCK_BYTES && q.delegated_inodes == 2,
-         "delegation charged to the shell's quota");
-  // Listings: the same directory from both sides, each side's ownership
-  // marks from its own point of view.
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK, "list");
-  expect(total == base_total + 2 && has_entry(count, "hello.txt") &&
-             has_entry(count, "sandbox"),
-         "list sees hello.txt and sandbox");
-  expect_status(fs_list(s_disk_quota, "sandbox", &count, &total), init::FS_OK,
-                "list sandbox");
-  expect(total == 3 && has_entry(count, "readme") && has_entry(count, "sub_a") &&
-             has_entry(count, "sub_b"),
-         "list sandbox sees readme, sub_a and sub_b");
-  expect(entry_owner(count, "readme") == init::FS_OWNER_SELF &&
-             entry_owner(count, "sub_a") == init::FS_OWNER_CHILD,
-         "the shell owns readme; sub_a belongs to its sub-quota");
-  expect_status(fs_list(sub, "", &count, &total), init::FS_OK,
-                "list through the sub-quota");
-  expect(total == 3 && entry_owner(count, "readme") == init::FS_OWNER_OTHER &&
-             entry_owner(count, "sub_a") == init::FS_OWNER_SELF,
-         "to the sub-quota readme is another's and sub_a its own");
-  expect_status(fs_list(s_disk_quota, "hello.txt", &count, &total),
-                init::FS_NOT_DIR, "list a file");
-  expect_status(fs_unlink(s_disk_quota, "sandbox"), init::FS_NOT_EMPTY,
-                "rm sandbox while it has entries");
-
-  // 3. Destroying the sub-quota takes its files with it and refunds the
-  //    shell; the shell's own file in the directory stays. A handle opened
-  //    through the sub-quota went with its page.
-  expect_status(fs_destroy(sub), init::FS_OK, "destroy sub-quota");
-  expect_status(fs_io(s_fs_read, orphan, s_data, 0, 1, &done),
-                init::FS_INVALID_FILE, "read through a handle whose node is gone");
-  expect_status(fs_list(s_disk_quota, "sandbox", &count, &total), init::FS_OK,
-                "list sandbox after destroy");
-  expect(total == 1 && has_entry(count, "readme") && !has_entry(count, "sub_a") &&
-             !has_entry(count, "sub_b"),
-         "only readme is left in sandbox");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query after destroy");
-  expect(q.delegated_bytes == 0 && q.delegated_inodes == 0,
-         "delegation returned to the shell's quota");
-  // Adoption: a node derived with FS_DERIVE_ADOPT starts out owning what its
-  // parent owned at or under its root -- here `sandbox` itself and `readme`,
-  // two inodes -- charged to it from then on, and takes them with it when it
-  // is destroyed. With no room for them, nothing is made.
-  expect_status(fs_derive(s_disk_quota, "sandbox", 0, 1, &sub,
-                          perms::Load | perms::Store, nullptr,
-                          init::FS_DERIVE_ADOPT),
-                init::FS_QUOTA, "adopt two inodes into a node allowed one");
-  expect_status(fs_derive(s_disk_quota, "sandbox", 0, 2, &sub,
-                          perms::Load | perms::Store, nullptr,
-                          init::FS_DERIVE_ADOPT),
-                init::FS_OK, "derive a node adopting sandbox and readme");
-  expect_status(fs_query(sub, qs), init::FS_OK, "query the adopting node");
-  expect(qs.used_inodes == 2 && qs.used_bytes == 0,
-         "sandbox and readme charged to the adopting node");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query after adoption");
-  expect(q.used_inodes == base_inodes + 1,
-         "only hello.txt still charged to the shell");
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK,
-                "list after adoption");
-  expect(entry_owner(count, "sandbox") == init::FS_OWNER_CHILD,
-         "sandbox now belongs to the adopting node");
-  // A node with nothing left to give can still hand down, whole, what it
-  // has: an inner node adopts the same two inodes from a node that spent both
-  // of its own on them. Destroying the inner node unlinks readme; sandbox,
-  // which the outer node is rooted at, passes back to it rather than going --
-  // no node is pinned by another being rooted in a directory of its.
-  Capability inner = nullptr;
-  expect_status(fs_derive(sub, "", 0, 2, &inner, perms::Load | perms::Store,
-                          nullptr, init::FS_DERIVE_ADOPT),
-                init::FS_OK, "hand sandbox down whole from a node with nothing spare");
-  expect_status(fs_query(inner, qs), init::FS_OK, "query the inner node");
-  expect(qs.used_inodes == 2 && qs.limit_inodes == 2,
-         "sandbox and readme charged to the inner node");
-  expect_status(fs_query(sub, qs), init::FS_OK, "query the outer node");
-  expect(qs.used_inodes == 0 && qs.delegated_inodes == 2,
-         "the outer node has passed both inodes on");
-  expect_status(fs_destroy(sub), init::FS_BUSY, "destroy the outer node first");
-  expect_status(fs_destroy(inner), init::FS_OK, "destroy the inner node");
-  expect_status(fs_query(sub, qs), init::FS_OK, "query the outer node after");
-  expect(qs.used_inodes == 1 && qs.delegated_inodes == 0,
-         "readme went with the inner node; sandbox came back to the outer");
-  expect_status(fs_destroy(sub), init::FS_OK, "destroy the adopting node");
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK,
-                "list after the adopting node is gone");
-  expect(total == base_total + 1 && !has_entry(count, "sandbox"),
-         "sandbox went with the node that adopted it");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK,
-                "query after the adopting node is gone");
-  expect(q.used_inodes == base_inodes + 1 && q.delegated_inodes == 0,
-         "nothing of sandbox's is charged anywhere");
-  // A node rooted at a directory keeps it, even an empty one. A read-only
-  // node cannot be destroyed through the handle its holder gets; its creator
-  // destroys it through the ADMIN handle derive hands back alongside.
-  expect_status(fs_mkdir(s_disk_quota, "sandbox"), init::FS_OK,
-                "mkdir sandbox once more");
-  Capability viewer = nullptr;
-  Capability viewer_admin = nullptr;
-  expect_status(fs_derive(s_disk_quota, "sandbox", 0, 0, &viewer, perms::Load,
-                          &viewer_admin),
-                init::FS_OK, "derive a read-only node at sandbox");
-  expect_status(fs_open_with(s_fs_create, viewer, "x", &file),
-                init::FS_PERMISSION, "create through a read-only node");
-  expect_status(fs_unlink(s_disk_quota, "sandbox"), init::FS_BUSY,
-                "rm sandbox while a node is rooted at it");
-  expect_status(fs_destroy(viewer), init::FS_PERMISSION,
-                "destroy a node through its read-only handle");
-  expect_status(fs_destroy(viewer_admin), init::FS_OK,
-                "destroy it through its ADMIN handle");
-  expect_status(fs_unlink(s_disk_quota, "sandbox"), init::FS_OK, "rm sandbox");
-
-  // 4. Still there after all that; then gone.
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "hello.txt", &file),
-                init::FS_OK, "reopen hello.txt");
-  expect_status(fs_io(s_fs_read, file, s_data, 0, DATA_MAX, &done), init::FS_OK,
-                "reread hello.txt");
-  same = done == kTextLen;
-  for (uint64_t i = 0; same && i < kTextLen; ++i) {
-    same = s_data[i] == static_cast<uint8_t>(kText[i]);
-  }
-  expect(same, "reread hello.txt contents");
-  expect_status(fs_close(file), init::FS_OK, "close hello.txt finally");
-  expect_status(fs_io(s_fs_read, file, s_data, 0, 1, &done),
-                init::FS_INVALID_FILE, "read through a closed handle");
-  expect_status(fs_unlink(s_disk_quota, "hello.txt"), init::FS_OK,
-                "unlink hello.txt");
-  expect_status(fs_list(s_disk_quota, "", &count, &total), init::FS_OK,
-                "list at the end");
-  expect(total == base_total && !has_entry(count, "hello.txt") &&
-             !has_entry(count, "sandbox"),
-         "nothing of the demo's left");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query at the end");
-  expect(q.used_bytes == base_used && q.used_inodes == base_inodes,
-         "the shell's quota is back where it started");
-
-  // 5. A file larger than the 16 direct blocks (> 64 KiB): crosses into the
-  //    single-indirect block (17 data blocks + 1 indirect block = 18 blocks).
-  fs_unlink(s_disk_quota, "big.bin");
-  expect_status(fs_open_with(s_fs_create, s_disk_quota, "big.bin", &file),
-                init::FS_OK, "create big.bin");
-  for (size_t i = 0; i < DATA_MAX; ++i) {
-    s_data[i] = static_cast<uint8_t>((i * 7u) ^ 0x5au);
-  }
-  const uint64_t big_off = init::FS_DIRECT_BLOCKS * init::FS_BLOCK_BYTES;
-  expect_status(fs_io(s_fs_write, file, s_data, big_off, init::FS_BLOCK_BYTES,
-                      &done),
-                init::FS_OK, "write 17th block of big.bin (indirect)");
-  expect(done == init::FS_BLOCK_BYTES, "write 17th block count");
-  expect_status(fs_close(file), init::FS_OK, "close big.bin");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query with big.bin");
-  expect(q.used_bytes ==
-             base_used + (init::FS_DIRECT_BLOCKS + 2) * init::FS_BLOCK_BYTES,
-         "17 data blocks + 1 indirect block charged for big.bin");
-  expect_status(fs_open_with(s_fs_open, s_disk_quota, "big.bin", &file),
-                init::FS_OK, "reopen big.bin");
-  for (size_t i = 0; i < init::FS_BLOCK_BYTES; ++i) {
-    s_data[i] = 0;
-  }
-  expect_status(fs_io(s_fs_read, file, s_data, big_off, init::FS_BLOCK_BYTES,
-                      &done),
-                init::FS_OK, "read 17th block of big.bin");
-  bool big_ok = done == init::FS_BLOCK_BYTES;
-  for (size_t i = 0; big_ok && i < init::FS_BLOCK_BYTES; ++i) {
-    big_ok = s_data[i] == static_cast<uint8_t>((i * 7u) ^ 0x5au);
-  }
-  expect(big_ok, "read 17th block contents");
-  expect_status(fs_close(file), init::FS_OK, "close big.bin again");
-  expect_status(fs_unlink(s_disk_quota, "big.bin"), init::FS_OK,
-                "unlink big.bin");
-  expect_status(fs_query(s_disk_quota, q), init::FS_OK, "query after big.bin");
-  expect(q.used_bytes == base_used && q.used_inodes == base_inodes,
-         "indirect + data blocks refunded after unlink");
-  print_quota("[shell]    fs demo: after: ", q);
-
-  out(ok ? "[shell]    fs demo OK\n" : "[shell]    fs demo FAILED\n");
-  return ok;
-}
-
 void print_help() {
   out("  help       this text\n"
-      "  stats      CPU time the background workers have received\n"
-      "  demo       300 ms bandwidth self-test (5:3:1 workers + a batch hog)\n"
-      "  fsdemo     file system self-test (directories, sub-quotas, cascade)\n"
       "  ls [dir]   list a directory (paths are under /home, the shell's root)\n"
       "  cat <f>    print a file\n"
       "  write <f> <text>   replace a file with a line of text\n"
@@ -1978,284 +1219,7 @@ void print_help() {
       "of its own and run it\n"
       "  pagetest [fill <MiB>]  paging self-test\n"
       "  sealtest   compartment-minted sealing self-test (the sealer service)\n"
-      "  shutdown   stop the workers and power the machine off\n");
-}
-
-// killtest: a temporary check of thread kill, not part of the shell.
-// `killtest spin|sleep|fs|stuck` starts a thread whose own code
-// is the shell, lets it run for 100 ms, kills it with `sched.thread_kill`, and
-// says how long it took to go. What the thread is doing when the kill lands:
-//   spin      running its own code
-//   sleep     asleep in `sched.block` with nobody to wake it
-//   fs        reading a file: inside fs, and blk, most of the time
-//   stuck     inside a call to the shell that never returns
-uint64_t s_killtest_mode = 0;
-Capability s_killtest_stuck = nullptr;
-alignas(16) char s_killtest_buf[4096];
-
-// Never returns, and never waits. Reached through a sentry, so a thread in
-// here is inside a call to the shell: a kill cannot end it (a kill never cuts
-// a call short, unwind.hpp), only stopping it can. `killtest stuck` shows
-// exactly that.
-uint64_t killtest_stuck() {
-  for (;;) {
-    __asm__ volatile("" ::: "memory");
-  }
-}
-
-uint64_t killtest_thread(Capability) {
-  Capability file = nullptr;
-  if (s_killtest_mode == 2) {
-    fs_open_with(s_fs_open, s_bin_quota, "logo.bin", &file, nullptr, perms::Load);
-  }
-  for (;;) {
-    if (s_killtest_mode == 1) {
-      invoke<int64_t>(s_gate_invoke, s_sched_block, 0ULL);
-    } else if (s_killtest_mode == 2) {
-      uint64_t got = 0;
-      fs_io(s_fs_read, file, s_killtest_buf, 0, sizeof(s_killtest_buf), &got);
-    } else if (s_killtest_mode == 3) {
-      invoke<int64_t>(s_gate_invoke, s_killtest_stuck);
-    }
-  }
-}
-
-void cmd_killtest(const char* mode) {
-  const char* modes[] = {"spin", "sleep", "fs", "stuck"};
-  s_killtest_mode = 4;
-  for (uint64_t i = 0; i < 4; ++i) {
-    if (str_eq(mode, modes[i])) {
-      s_killtest_mode = i;
-    }
-  }
-  if (s_killtest_mode == 4) {
-    out("[killtest] usage: killtest spin|sleep|fs|stuck\n");
-    return;
-  }
-  Capability* rw = rw_table();
-  auto mint = [&](const void* fn) {
-    return mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp, fn);
-  };
-  s_killtest_stuck = mint(reinterpret_cast<const void*>(&killtest_stuck));
-  const Capability entry = mint(reinterpret_cast<const void*>(&killtest_thread));
-  const Capability kill =
-      lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
-  const Capability node = derive_app_node(init::Manifest{});  // the default share
-  const Capability t = new_thread(APP_STACK, entry, nullptr);
-  if (!capability_is_valid(kill) || !capability_is_valid(node) ||
-      !sealing::is_sealed_as(OType::Thread, t) ||
-      invoke<int64_t>(s_gate_invoke, s_sched_register, t, node) <= 0) {
-    out("[killtest] could not start the test thread\n");
-    return;
-  }
-  sleep_us(100'000);
-  const uint64_t t0 = now_us();
-  const int64_t st = invoke<int64_t>(s_gate_invoke, kill, t);
-  out_dec("[killtest] sched.thread_kill: status -", static_cast<uint64_t>(-st),
-          "\n");
-  while (node_threads(node) > 0) {
-    if (now_us() - t0 > 500'000) {
-      // A thread inside a callee that neither returns nor waits cannot be
-      // killed (DESIGN.md §7). Destroying its node stops it: it keeps its
-      // stack, parked in the shell, until it is run again.
-      out("[killtest] still inside the shell 500 ms after the kill: a callee "
-          "that never returns cannot be killed; stopping it instead\n");
-      destroy_sched_node(node);
-      return;
-    }
-    sleep_us(1'000);
-  }
-  destroy_sched_node(node);
-  out_dec("[killtest] the thread was gone ", (now_us() - t0) / 1000,
-          " ms after the kill\n");
-}
-
-// revoketest: a check of the three kinds of `quota_sched` node, not part of
-// the shell. It derives three nodes from the shell's own -- revocable, fixed
-// term (REVOKE_TERM_US) and permanent -- and starts one thread on each, which
-// prints a line every REVOKE_PRINT_US. Then it tries to take each node back
-// with `sched.quota_destroy` every REVOKE_RETRY_US for REVOKE_TRY_US, and
-// says when it managed it. A node that is taken back stops its thread, so
-// that thread prints no more. The permanent node is never taken back, so its
-// thread keeps printing. Last, it kills all three threads with
-// `sched.thread_kill`. The permanent node outlives the test: nobody can take
-// it back, so every run keeps REVOKE_BUDGET_US per REVOKE_PERIOD_US of the
-// shell's bandwidth for good.
-constexpr uint32_t REVOKE_BUDGET_US = 2'000;
-constexpr uint32_t REVOKE_PERIOD_US = 100'000;
-constexpr uint64_t REVOKE_TERM_US = 400'000;
-constexpr uint64_t REVOKE_PRINT_US = 100'000;
-constexpr uint64_t REVOKE_RETRY_US = 50'000;
-constexpr uint64_t REVOKE_TRY_US = 1'000'000;
-
-struct alignas(16) RevokeThread {
-  const char* line;    // what the thread prints
-  uint64_t printed;    // how many times it has
-  uint64_t pad_;
-};
-
-alignas(16) RevokeThread s_revoke[3];
-
-uint64_t revoketest_thread(Capability arg) {
-  auto* r = reinterpret_cast<RevokeThread*>(arg);
-  for (;;) {
-    out(r->line);
-    __atomic_fetch_add(&r->printed, 1, __ATOMIC_SEQ_CST);
-    sleep_us(REVOKE_PRINT_US);
-  }
-}
-
-void cmd_revoketest() {
-  const char* names[3] = {"revocable", "fixed term", "permanent"};
-  const uint64_t terms[3] = {init::SCHED_REVOCABLE, REVOKE_TERM_US,
-                             init::SCHED_PERMANENT};
-  s_revoke[0].line = "[revoketest] this is thread 1 (revocable)\n";
-  s_revoke[1].line = "[revoketest] this is thread 2 (fixed term)\n";
-  s_revoke[2].line = "[revoketest] this is thread 3 (permanent)\n";
-
-  Capability* rw = rw_table();
-  const Capability kill =
-      lookup_name(s_gate_invoke, rw[SLOT_NAMING_LOOKUP], "sched.thread_kill");
-  const Capability entry =
-      mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp,
-                 reinterpret_cast<const void*>(&revoketest_thread));
-  if (!capability_is_valid(kill) || !capability_is_valid(entry)) {
-    out("[revoketest] sched.thread_kill or the thread entry is missing\n");
-    return;
-  }
-  const int64_t threads_before = node_threads(s_my_quota);
-  const uint64_t t0 = now_us();
-
-  // One node and one thread of each kind.
-  Capability node[3] = {};
-  Capability thread[3] = {};
-  for (int i = 0; i < 3; ++i) {
-    init::SchedDeriveRequest req{};
-    req.parent = s_my_quota;
-    req.node_funding = s_vm_quota;
-    req.term_us = terms[i];
-    req.budget_us = REVOKE_BUDGET_US;
-    req.period_us = REVOKE_PERIOD_US;
-    req.priority_class = init::PRIORITY_INTERACTIVE;
-    derive_node(&req);
-    if (req.status != init::SCHED_OK) {
-      out("[revoketest] could not derive the ");
-      out(names[i]);
-      out_dec(" node, status -", static_cast<uint64_t>(-req.status), "\n");
-      return;
-    }
-    node[i] = req.out_quota;
-    s_revoke[i].printed = 0;
-    thread[i] = new_thread(WORKER_STACK, entry, bounded(&s_revoke[i]));
-    if (!sealing::is_sealed_as(OType::Thread, thread[i]) ||
-        invoke<int64_t>(s_gate_invoke, s_sched_register, thread[i], node[i]) <=
-            0) {
-      out("[revoketest] could not start thread for the ");
-      out(names[i]);
-      out(" node\n");
-      return;
-    }
-  }
-  out_dec("[revoketest] started 3 threads; the fixed term is ",
-          REVOKE_TERM_US / 1000, " ms\n");
-
-  // Let them run, then try to take each node back until it goes or time is
-  // up.
-  sleep_us(2 * REVOKE_PRINT_US);
-  bool revoked[3] = {false, false, false};
-  uint64_t printed_then[3] = {0, 0, 0};
-  while (now_us() - t0 < REVOKE_TRY_US) {
-    for (int i = 0; i < 3; ++i) {
-      if (revoked[i]) {
-        continue;
-      }
-      const int64_t st = destroy_sched_node(node[i]);
-      if (st == init::SCHED_OK) {
-        revoked[i] = true;
-        printed_then[i] = s_revoke[i].printed;
-        out("[revoketest] took back the ");
-        out(names[i]);
-        out_dec(" node after ", (now_us() - t0) / 1000, " ms\n");
-      } else if (st != init::SCHED_BUSY) {
-        out("[revoketest] destroying the ");
-        out(names[i]);
-        out_dec(" node failed, status -", static_cast<uint64_t>(-st), "\n");
-        revoked[i] = true;  // do not try again
-      }
-    }
-    sleep_us(REVOKE_RETRY_US);
-  }
-  for (int i = 0; i < 3; ++i) {
-    if (!revoked[i]) {
-      out("[revoketest] the ");
-      out(names[i]);
-      out_dec(" node was still refused after ", REVOKE_TRY_US / 1000,
-              " ms\n");
-    }
-  }
-
-  // A thread whose node was taken back has stopped: it prints no more.
-  const uint64_t printed_before_wait = s_revoke[2].printed;
-  sleep_us(3 * REVOKE_PRINT_US);
-  for (int i = 0; i < 2; ++i) {
-    if (revoked[i]) {
-      out_dec("[revoketest] thread ", i + 1, "");
-      out_dec(" printed ", s_revoke[i].printed - printed_then[i],
-              " times after its node was taken back\n");
-    }
-  }
-  out_dec("[revoketest] thread 3 printed ",
-          s_revoke[2].printed - printed_before_wait, " times meanwhile\n");
-
-  // Kill all three. A stopped thread is put on the shell's node to end.
-  const uint64_t t_kill = now_us();
-  for (int i = 0; i < 3; ++i) {
-    const int64_t st = invoke<int64_t>(s_gate_invoke, kill, thread[i]);
-    if (st != init::SCHED_OK) {
-      out_dec("[revoketest] sched.thread_kill of thread ", i + 1, "");
-      out_dec(" failed, status -", static_cast<uint64_t>(-st), "\n");
-    }
-  }
-  while (node_threads(s_my_quota) != threads_before) {
-    if (now_us() - t_kill > 2'000'000) {
-      out("[revoketest] the threads are still there 2 s after the kill\n");
-      return;
-    }
-    sleep_us(1'000);
-  }
-  out_dec("[revoketest] all three threads were gone ",
-          (now_us() - t_kill) / 1000, " ms after the kill\n");
-}
-
-// faulttest: a check of fault unwinding across a call, not part of the shell.
-// It invokes an entry point of its own that loads out of bounds. The shell's
-// fault handler (the runtime default, SIGNETOS_DEFAULT_FAULT_HANDLER) reports
-// the fault and unwinds the callee: the invocation returns `Status::Faulted`
-// and the shell carries on.
-alignas(16) volatile uint32_t s_faulttest_small[4];
-
-uint64_t faulttest_callee(Capability) {
-  Capability c = capability_set_bounds(
-      reinterpret_cast<Capability>(const_cast<uint32_t*>(&s_faulttest_small[0])),
-      sizeof(s_faulttest_small));
-  c = capability_set_address(c, capability_get_base(c) + 64);
-  return *reinterpret_cast<volatile uint32_t*>(c) + 1;
-}
-
-void cmd_faulttest() {
-  Capability* rw = rw_table();
-  const Capability entry =
-      mint_entry(s_gate_invoke, rw[SLOT_SYS_SENTRY], s_self_comp,
-                 reinterpret_cast<const void*>(&faulttest_callee));
-  if (!capability_is_valid(entry)) {
-    out("[faulttest] could not mint the entry\n");
-    return;
-  }
-  const int64_t st = invoke<int64_t>(s_gate_invoke, entry, 0ULL);
-  out_dec("[faulttest] the faulting call returned ", static_cast<uint64_t>(st),
-          "");
-  out(st == static_cast<int64_t>(Status::Faulted) ? " (Faulted) -- OK\n"
-                                                  : " -- expected Faulted\n");
+      "  shutdown   power the machine off\n");
 }
 
 // sealtest: compartment-minted sealing types (abi.hpp, "Sealing service";
@@ -2632,12 +1596,6 @@ bool execute(char* line) {
   const char* cmd = first_word(line, &rest);
   if (str_eq(cmd, "help")) {
     print_help();
-  } else if (str_eq(cmd, "stats")) {
-    print_stats();
-  } else if (str_eq(cmd, "demo")) {
-    run_demo();
-  } else if (str_eq(cmd, "fsdemo")) {
-    run_fs_demo();
   } else if (str_eq(cmd, "ls")) {
     cmd_ls(rest);
   } else if (str_eq(cmd, "cat")) {
@@ -2657,12 +1615,6 @@ bool execute(char* line) {
     const char* name = first_word(rest, &args);
     int64_t status = RUN_NOT_RUN;
     cmd_run(name, args, &status);
-  } else if (str_eq(cmd, "killtest")) {
-    cmd_killtest(rest);
-  } else if (str_eq(cmd, "revoketest")) {
-    cmd_revoketest();
-  } else if (str_eq(cmd, "faulttest")) {
-    cmd_faulttest();
   } else if (str_eq(cmd, "sealtest")) {
     cmd_sealtest();
   } else if (str_eq(cmd, "pagetest")) {
@@ -2731,38 +1683,9 @@ void console_loop() {
 
 SIGNETOS_DEFAULT_FAULT_HANDLER("shell")
 
-// A worker: fixed slices of work until told to stop or the deadline passes.
-// Interactive workers yield after each slice; a batch worker never does, so it
-// is only ever displaced by the scheduler's tick handler (preemption).
-extern "C" uint64_t shell_worker_entry(Capability arg) {
-  if (!capability_is_valid(arg) ||
-      capability_get_length(arg) < sizeof(WorkerArg)) {
-    return 0;
-  }
-  auto* wa = reinterpret_cast<WorkerArg*>(arg);
-  Shared* sh = wa->shared;
-  const bool greedy = sh->greedy[wa->index];
-  // A fixed slice of work per iteration, so the count measures CPU time
-  // received and not how cheap a yield happened to be.
-  while (__atomic_load_n(&sh->stop, __ATOMIC_SEQ_CST) == 0 &&
-         now_us() < sh->deadline_us) {
-    const uint64_t until = now_us() + sh->slice_us;
-    while (now_us() < until) {
-      __asm__ volatile("" ::: "memory");
-    }
-    sh->count[wa->index] += 1;
-    if (!greedy) {
-      invoke<int64_t>(sh->invoke, sh->yield);
-    }
-  }
-  __atomic_fetch_add(&sh->done, 1, __ATOMIC_SEQ_CST);
-  // Returning exits the thread; the scheduler unregisters it.
-  return 0;
-}
-
-// TODO: This is hacky (multiplexing one-time init/banner vs scheduled thread
-// entry: `init` calls it once with the timebase, and starts the thread with
-// no argument). Let's make this be nicer.
+// TODO: This is hacky (multiplexing one-time init vs scheduled thread entry:
+// `init` calls it once with the timebase, and starts the thread with no
+// argument). Let's make this be nicer.
 extern "C" int64_t compartment_main(Capability arg) {
   Capability* rw = rw_table();
 
@@ -2786,8 +1709,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability gate_q_destroy = rw[SLOT_SYS_QUOTA_VM_DESTROY];
   Capability gate_comp_create = rw[SLOT_SYS_COMP_CREATE];
   Capability gate_comp_destroy = rw[SLOT_SYS_COMP_DESTROY];
-  // CPU bandwidth: the compartment's own node, which every worker's and
-  // program's node is derived under.
+  // CPU bandwidth: the compartment's own node, which every program's node is
+  // derived under.
   Capability sched_quota = rw[SLOT_SCHED_QUOTA];
 
   if (!sealing::is_sealed_as(OType::Compartment, self_comp) ||
@@ -2808,7 +1731,6 @@ extern "C" int64_t compartment_main(Capability arg) {
         s_ticks_per_us = hz / 1'000'000;
       }
     }
-    banner(gate_invoke, uart_sentry, naming_lookup);
     return 0;
   }
 
@@ -2917,39 +1839,18 @@ extern "C" int64_t compartment_main(Capability arg) {
         "missing; programs disabled\n");
   }
 
-  s_worker_entry = mint_entry(gate_invoke, gate_sentry, self_comp,
-                              reinterpret_cast<const void*>(&shell_worker_entry));
-  if (!sealing::is_sealed_as(OType::EntryPoint, s_worker_entry)) {
-    out("[shell]    worker entry mint FAILED\n");
-    return -1;
-  }
-
   // Nobody to talk to -- no `uart.read` was seeded -- so
   // do what a person would and leave; an interactive session could never end.
   const bool has_keyboard = sealing::is_sealed_as(OType::EntryPoint, s_uart_read);
   if (!has_keyboard) {
-    out("[shell]    no console input available; running the demos instead\n");
-    if (s_fs_ready) {
-      run_fs_demo();
-      run_app_demo();
-    }
-    run_demo();
-    out("[shell]    shell exiting\n");
+    out("[shell]    no console input available; shell exiting\n");
     return 0;
   }
 
-  const WorkerConfig bg{BG_WORKERS, BG_PERIOD_US, BG_BUDGET_US, BG_CLASS,
-                        BG_SLICE_US, FOREVER_US};
-  const size_t started = start_workers(s_background, bg);
-  out_dec("[shell]    Started ", started,
-          " background workers (10/6/2 ms per second); type 'help'\n");
-
+  out("[shell]    Ready; type 'help'\n");
   console_loop();  // returns on `shutdown`
 
-  out("[shell]    shutting down: stopping workers...\n");
-  stop_workers(s_background);
-  const size_t destroyed = destroy_workers(s_background);
-  out_dec("[shell]    Destroyed ", destroyed, " worker quotas; shell exiting\n");
+  out("[shell]    shutting down; shell exiting\n");
   // The pager's thread too, or the machine would never stop (blk.cpp, PAGING).
   if (capability_is_valid(rw[SLOT_PAGING_STOP])) {
     invoke<int64_t>(gate_invoke, rw[SLOT_PAGING_STOP]);

@@ -223,7 +223,7 @@ all: signetos.elf $(DISK_IMG)
 
 # -MMD -MP emits a .d file listing the headers each object depends on, so
 # editing a header rebuilds what includes it. Without this the pure-header
-# subsystems (sealing.hpp, pool.hpp, types.hpp) never trigger a rebuild.
+# subsystems (sealing.hpp, types.hpp) never trigger a rebuild.
 %.o: %.S
 	$(AS) $(ASFLAGS) -MMD -MP -c $< -o $@
 
