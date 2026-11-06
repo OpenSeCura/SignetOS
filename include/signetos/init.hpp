@@ -229,10 +229,14 @@ constexpr size_t RW_SLOT_THREAD_QUOTA =
     RW_SLOT_SYSCALL_BASE + syscall::kSyscallCount;   // root_quota_thread_mem
 constexpr size_t RW_SLOT_SEAL_SCHED =
     RW_SLOT_THREAD_QUOTA + 1;                        // OType::QuotaSched authority
-constexpr size_t RW_SLOT_SEAL_DISK =
-    RW_SLOT_SEAL_SCHED + 1;                          // OType::QuotaDisk authority
+constexpr size_t RW_SLOT_SEAL_FS_FILE =
+    RW_SLOT_SEAL_SCHED + 1;                          // OType::FsFile authority
+constexpr size_t RW_SLOT_SEAL_FS_DIR =
+    RW_SLOT_SEAL_FS_FILE + 1;                        // OType::FsDir authority
+constexpr size_t RW_SLOT_SEAL_FS_QUOTA =
+    RW_SLOT_SEAL_FS_DIR + 1;                         // OType::FsQuota authority
 constexpr size_t RW_SLOT_SEAL_TYPE_KEY =
-    RW_SLOT_SEAL_DISK + 1;                           // OType::TypeKey authority
+    RW_SLOT_SEAL_FS_QUOTA + 1;                       // OType::TypeKey authority
 constexpr size_t RW_SLOT_SEAL_OBJECT =
     RW_SLOT_SEAL_TYPE_KEY + 1;                       // OType::SealedObject authority
 

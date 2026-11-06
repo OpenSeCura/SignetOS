@@ -52,8 +52,7 @@
 //     #define HELLO_MANIFEST(X)                                       \
 //       M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)             \
 //       M_SERVICE(X, UART_SENTRY, "uart")                             \
-//       M_DISK(X, HOME, MANIFEST_REQUIRED, perms::Load | perms::Store, \
-//              64 * 1024, 8, "")
+//       M_OWN_DIR(X, HOME)
 //     SIGNETOS_MANIFEST(HELLO_MANIFEST, 64 * 1024)
 //
 //     ... rw[SLOT_UART_SENTRY] ...
@@ -74,17 +73,18 @@ namespace signetos::init {
 constexpr uint64_t MANIFEST_MAGIC = 0x5349474e4d4e4654ULL;  // "SIGNMNFT"
 constexpr uint32_t MANIFEST_VERSION = 1;
 constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
+constexpr size_t MANIFEST_NAME_BYTES = 96;  // ManifestEntry::name, NUL included
 
 // Kinds. Which parameters each uses:
 //   SYSCALL       count = syscall::Id; the kernel entry (compartment_invoke is
 //                 the switcher, the one every compartment needs)
 //   SERVICE       name = an entry point the launcher holds, by the name it is
 //                 published under ("uart", "fs.open", "naming.lookup", ...)
-//   DISK          a `quota_disk` node: amount = bytes, count = inodes
-//                 (MANIFEST_ALL: whatever the launcher will give), perms =
-//                 perms::Load [| perms::Store] (OP or ADMIN handle), name = the
-//                 directory, relative to wherever the launcher roots programs
-//   FILE          an open-file handle: name = path, perms = Load [| Store]
+//   DIR, FILE,    an fs handle for a request: name = what the image calls
+//   QUOTA_DISK    it, perms = FS_* rights wanted. The launcher picks what
+//                 fills it. With MANIFEST_OWN, the program's own directory
+//                 or disk quota (launch.hpp); for the quota, amount = bytes
+//                 it starts with
 //   QUOTA_VM      the QuotaVm the compartment is funded from (`vm_bytes`,
 //                 derived by the launcher from its own), as an ADMIN handle.
 //                 The kernel does not put it in the table: an image that
@@ -102,7 +102,7 @@ constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
 // interrupt handlers are installed by `init` itself, trap.hpp.)
 constexpr uint32_t MANIFEST_SYSCALL      = 1;
 constexpr uint32_t MANIFEST_SERVICE      = 2;
-constexpr uint32_t MANIFEST_DISK         = 3;
+constexpr uint32_t MANIFEST_DIR          = 3;
 constexpr uint32_t MANIFEST_FILE         = 4;
 constexpr uint32_t MANIFEST_MMIO         = 5;
 constexpr uint32_t MANIFEST_DMA          = 6;
@@ -111,15 +111,13 @@ constexpr uint32_t MANIFEST_ROOT         = 10;
 constexpr uint32_t MANIFEST_OTYPE        = 11;
 constexpr uint32_t MANIFEST_QUOTA_VM     = 12;
 constexpr uint32_t MANIFEST_QUOTA_SCHED  = 13;
+constexpr uint32_t MANIFEST_QUOTA_DISK   = 14;
 
 constexpr uint32_t MANIFEST_REQUIRED = 1;  // flags: do not start me without it
-
-constexpr uint64_t MANIFEST_ALL        = ~0ULL;  // DISK amount: all you will give
-constexpr uint32_t MANIFEST_ALL_INODES = ~0U;    // DISK count: likewise
+constexpr uint32_t MANIFEST_OWN = 2;       // flags: DIR, QUOTA_DISK: my own
 
 constexpr uint32_t ROOT_VM         = 1;  // the root QuotaVm
 constexpr uint32_t ROOT_THREAD_MEM = 2;  // the root QuotaThreadMem
-constexpr uint32_t ROOT_DISK       = 3;  // the root quota_disk (ADMIN)
 constexpr uint32_t ROOT_SCHED      = 4;  // the root quota_sched
 
 struct alignas(16) ManifestHeader {
@@ -133,14 +131,13 @@ static_assert(sizeof(ManifestHeader) == 32, "ManifestHeader is 32 bytes");
 
 struct alignas(16) ManifestEntry {
   uint32_t kind;            // MANIFEST_*
-  uint32_t flags;           // MANIFEST_REQUIRED, or 0
-  uint32_t perms;           // DISK, FILE
-  uint32_t count;           // DISK: inodes; SYSCALL: id; IRQ/EXC: number; ROOT;
-                            // OTYPE; QUOTA_SCHED: period (us)
-  uint64_t amount;          // DISK, DMA, QUOTA_THREAD: bytes; QUOTA_SCHED:
-                            // budget (us)
+  uint32_t flags;           // MANIFEST_REQUIRED, MANIFEST_OWN
+  uint32_t perms;           // DIR, FILE, QUOTA_DISK: FS_* rights
+  uint32_t count;           // SYSCALL: id; ROOT; OTYPE; QUOTA_SCHED: period (us)
+  uint64_t amount;          // DMA, QUOTA_THREAD, own QUOTA_DISK: bytes;
+                            // QUOTA_SCHED: budget (us)
   uint64_t param;           // QUOTA_SCHED: priority class (PRIORITY_*)
-  char name[FS_PATH_MAX];   // SERVICE, DISK, FILE, MMIO; NUL-terminated
+  char name[MANIFEST_NAME_BYTES];  // SERVICE, DIR, FILE, QUOTA_DISK, MMIO; NUL-terminated
 };
 static_assert(sizeof(ManifestEntry) == 128, "ManifestEntry is 128 bytes");
 
@@ -191,7 +188,7 @@ inline bool manifest_of(Capability image, const CompartmentImageHeader* hdr,
       return false;
     }
     bool terminated = false;
-    for (size_t j = 0; j < FS_PATH_MAX && !terminated; ++j) {
+    for (size_t j = 0; j < MANIFEST_NAME_BYTES && !terminated; ++j) {
       terminated = entries[i].name[j] == '\0';
     }
     if (!terminated) {
@@ -204,13 +201,20 @@ inline bool manifest_of(Capability image, const CompartmentImageHeader* hdr,
   return true;
 }
 
+// True for the kinds met with an fs handle.
+inline bool manifest_is_fs(uint32_t kind) {
+  return kind == MANIFEST_DIR || kind == MANIFEST_FILE ||
+         kind == MANIFEST_QUOTA_DISK;
+}
+
 // For a launcher's console: what kind of thing an entry asks for.
 inline const char* manifest_kind_name(uint32_t kind) {
   switch (kind) {
     case MANIFEST_SYSCALL: return "syscall";
     case MANIFEST_SERVICE: return "service";
-    case MANIFEST_DISK: return "disk";
+    case MANIFEST_DIR: return "dir";
     case MANIFEST_FILE: return "file";
+    case MANIFEST_QUOTA_DISK: return "disk quota";
     case MANIFEST_MMIO: return "mmio";
     case MANIFEST_DMA: return "dma";
     case MANIFEST_QUOTA_THREAD: return "thread memory";
@@ -240,7 +244,7 @@ inline const char* manifest_syscall_name(uint32_t id) {
 //
 // Each M_* line is one entry: the slot's name (SLOT_<name> is generated), then
 // the kind's parameters. Everything is REQUIRED unless the _OPT form is used,
-// or `flags` is given explicitly (DISK, FILE).
+// or `flags` is given explicitly (DIR, FILE, QUOTA_DISK).
 #define M_SYSCALL(X, slot, id)                                               \
   X(slot, ::signetos::init::MANIFEST_SYSCALL, ::signetos::init::MANIFEST_REQUIRED, \
     0, static_cast<uint32_t>(::signetos::syscall::Id::id), 0, 0, "")
@@ -249,10 +253,22 @@ inline const char* manifest_syscall_name(uint32_t id) {
     0, 0, 0, 0, name)
 #define M_SERVICE_OPT(X, slot, name)                                         \
   X(slot, ::signetos::init::MANIFEST_SERVICE, 0, 0, 0, 0, 0, name)
-#define M_DISK(X, slot, flags, perms, bytes, inodes, path)                   \
-  X(slot, ::signetos::init::MANIFEST_DISK, flags, perms, inodes, bytes, 0, path)
-#define M_FILE(X, slot, flags, perms, path)                                  \
-  X(slot, ::signetos::init::MANIFEST_FILE, flags, perms, 0, 0, 0, path)
+#define M_DIR(X, slot, flags, rights, role)                                  \
+  X(slot, ::signetos::init::MANIFEST_DIR, flags, rights, 0, 0, 0, role)
+#define M_FILE(X, slot, flags, rights, role)                                 \
+  X(slot, ::signetos::init::MANIFEST_FILE, flags, rights, 0, 0, 0, role)
+#define M_QUOTA_DISK(X, slot, flags, rights, role)                           \
+  X(slot, ::signetos::init::MANIFEST_QUOTA_DISK, flags, rights, 0, 0, 0, role)
+// The program's own directory and disk quota (launch.hpp), the quota made
+// with `bytes` the first time.
+#define M_OWN_DIR(X, slot)                                                   \
+  X(slot, ::signetos::init::MANIFEST_DIR,                                    \
+    ::signetos::init::MANIFEST_REQUIRED | ::signetos::init::MANIFEST_OWN,    \
+    ::signetos::init::FS_ALL, 0, 0, 0, "own")
+#define M_OWN_DISK(X, slot, bytes)                                           \
+  X(slot, ::signetos::init::MANIFEST_QUOTA_DISK,                             \
+    ::signetos::init::MANIFEST_REQUIRED | ::signetos::init::MANIFEST_OWN,    \
+    ::signetos::init::FS_READ | ::signetos::init::FS_ADD, 0, bytes, 0, "own")
 #define M_MMIO(X, slot, device)                                              \
   X(slot, ::signetos::init::MANIFEST_MMIO, ::signetos::init::MANIFEST_REQUIRED, \
     0, 0, 0, 0, device)

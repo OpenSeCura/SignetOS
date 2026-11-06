@@ -46,7 +46,7 @@ using Sentry = Capability;
 //                 but CT 1, so neither makes a return sentry or opens any
 //                 sentry.
 //
-// 24 object types are available and 12 are used, so 20..31 are spare.
+// 24 object types are available; 15 and 22..31 are spare.
 enum class OType : uint64_t {
     Unsealed         = 0,
     Sentry           = 1,
@@ -55,14 +55,14 @@ enum class OType : uint64_t {
     QuotaThreadMem   = 9,
     QuotaHeap        = 10,
     QuotaSched       = 11,
-    QuotaDisk        = 12,
+    FsFile           = 12,  // fs: file handles (boot/fs.cpp)
     Compartment      = 13,
     Thread           = 14,
 
     // Compartment-minted sealing types (CORE_DESIGN.md §2.3). Like QuotaSched
-    // and QuotaDisk these are managed in user space: the kernel mints the two
-    // authorities for `init` at boot and never seals with them itself; `init`
-    // delegates them to the `sealer` service (user/vseal.hpp).
+    // and the Fs types these are managed in user space: the kernel mints the
+    // two authorities for `init` at boot and never seals with them itself;
+    // `init` delegates them to the `sealer` service (user/vseal.hpp).
     TypeKey          = 16,
     SealedObject     = 17,
 
@@ -72,6 +72,9 @@ enum class OType : uint64_t {
     // the caller holds, which is neither jumpable nor dereferenceable.
     EntryPoint       = 18,
     Trap             = 19,
+
+    FsQuota          = 20,  // fs: disk quota handles
+    FsDir            = 21,  // fs: directory handles
 };
 
 // The range yseal and yunseal will act on. Outside it they clear the tag.

@@ -50,8 +50,8 @@
  *      at the end of the disk to itself (blk.cpp, SWAP). Only `blk` gets the
  *      pager's system calls.
  *   4. `fs`: asks for `blk.read`/`blk.write`; its VM quota is sized to the
- *      disk; its handshake returns the root `quota_disk` handle and its entry
- *      points. From here on every image is a file read off the disk.
+ *      disk; its handshake returns handles on `/` and on the root quota, and
+ *      its entry points. From here on every image is a file read off the disk.
  *   5. `naming`: `init` publishes `uart` and `fs.*` on their behalf.
  *   6. `sealer`: the one holder of the `TypeKey` and `SealedObject`
  *      authorities, which publishes `seal.*` (user/vseal.hpp).
@@ -61,8 +61,8 @@
  *      routed through the scheduler, and their drivers sleep on them from
  *      then on (the disk is polled until then).
  *   9. `shell`: its manifest asks for its own quotas (VM, thread memory, a
- *      `quota_sched` node), `/home` and `/bin`, and the system's root quotas,
- *      which it holds from then on; its thread is made from those quotas and
+ *      `quota_sched` node, the disk), `/home`, `/bin` and `/apps`, which it
+ *      holds from then on; its thread is made from those quotas and
  *      registered with the scheduler. Then, if `blk` found swap, the pager's
  *      thread, and paging on. Last, so that every compartment `init` started
  *      stays in RAM (vm.hpp, PAGING): what pages is what the shell runs.
@@ -98,18 +98,6 @@ void zero_bytes(void* p, size_t n) {
   auto* d = static_cast<uint8_t*>(p);
   for (size_t i = 0; i < n; ++i) {
     d[i] = 0;
-  }
-}
-
-// Fills the FS_PATH_MAX-byte path field of an `fs` request: `src`, truncated
-// if need be, then NULs to the end -- every byte written, for the same reason.
-void set_path(char* dst, const char* src) {
-  size_t i = 0;
-  for (; i + 1 < init::FS_PATH_MAX && src[i] != '\0'; ++i) {
-    dst[i] = src[i];
-  }
-  for (; i < init::FS_PATH_MAX; ++i) {
-    dst[i] = '\0';
   }
 }
 
@@ -181,15 +169,10 @@ struct Launcher {
   size_t named_count;
   Capability naming_lookup;
 
-  // The disk, for DISK entries, and for reading the images that are files.
-  Capability fs_root;      // ADMIN handle of the root node: sees every file
-  Capability fs_open;
-  Capability fs_read;
-  Capability fs_close;
-  Capability fs_mkdir;
-  Capability fs_derive;
-  Capability fs_query;
-  Capability fs_node_funding;  // the QuotaVm that pays for the nodes
+  // The disk (step 4): `/`, the root quota, fs entry points.
+  Capability fs_root_dir;
+  Capability fs_root_quota;
+  Capability fs_calls[init::FS_CALLS];
 
   // The scheduler (step 7), for ROOT_SCHED and QUOTA_SCHED entries: its root
   // quota, `sched.quota_derive`, and the QuotaVm that pays for the nodes.
@@ -198,12 +181,11 @@ struct Launcher {
   Capability sched_node_funding;
 
   // Recorded for step 10 (the kernel's exec tests tear the system down through
-  // `init`'s table): the thread-memory quota, the `quota_sched` node and the
-  // ADMIN disk node the shell asked for. The first two are also what the
-  // shell's thread is paid from and registered under (step 9).
+  // `init`'s table): the thread-memory quota and the `quota_sched` node the
+  // shell asked for, which are also what the shell's thread is paid from and
+  // registered under (step 9).
   Capability shell_t_quota;
   Capability shell_sched_quota;
-  Capability shell_disk_quota;
 
   void say(const char* msg) const { print(invoke, uart, msg); }
   void say_dec(const char* p, uint64_t v, const char* s) const {
@@ -292,105 +274,41 @@ struct Launcher {
     return dma;
   }
 
-  // The root's free space: what it has neither used nor delegated.
-  void disk_free(uint64_t* bytes, uint32_t* inodes) const {
-    *bytes = 0;
-    *inodes = 0;
-    init::FsQueryRequest q{};
-    q.quota = fs_root;
-    q.status = init::FS_BAD_REQUEST;
-    reinterpret_cast<FnInvoke>(invoke)(fs_query, bounded(&q));
-    if (q.status == init::FS_OK) {
-      const uint64_t taken_bytes = q.used_bytes + q.delegated_bytes;
-      const uint32_t taken_inodes = q.used_inodes + q.delegated_inodes;
-      *bytes = q.limit_bytes > taken_bytes ? q.limit_bytes - taken_bytes : 0;
-      *inodes = q.limit_inodes > taken_inodes ? q.limit_inodes - taken_inodes : 0;
-    }
+  // Calls fs entry point `which` (FS_CALL_*).
+  template <typename Result = int64_t, typename... Args>
+  Result call_fs(uint32_t which, Args... args) const {
+    return ::signetos::user::invoke<Result>(invoke, fs_calls[which], args...);
   }
 
-  // fs.quota_derive from the root. Requests that carry a path are too big for
-  // `{}` (see zero_bytes): every field by hand.
-  Capability disk_derive(const char* path, uint64_t bytes, uint32_t inodes,
-                         uint32_t handle_perms, uint64_t flags,
-                         int64_t* status) const {
-    init::FsDeriveRequest req;
-    req.parent = fs_root;
-    req.node_funding = fs_node_funding;
-    req.out_quota = nullptr;
-    req.out_admin = nullptr;
-    set_path(req.path, path);
-    req.limit_bytes = bytes;
-    req.limit_inodes = inodes;
-    req.perms = handle_perms;
-    req.status = init::FS_BAD_REQUEST;
-    req.flags = flags;
-    reinterpret_cast<FnInvoke>(invoke)(fs_derive, bounded(&req));
-    *status = req.status;
-    return req.status == init::FS_OK ? req.out_quota : nullptr;
+  // DIR/FILE: `/<name>`, making a missing directory. QUOTA_DISK: the root
+  // quota. With the rights asked for, paid for by `image_quota`.
+  Capability open_fs_handle(const init::ManifestEntry& entry,
+                            Capability image_quota) {
+    const bool is_quota = entry.kind == init::MANIFEST_QUOTA_DISK;
+    const Capability from = is_quota ? fs_root_quota : fs_root_dir;
+    const Capability name = ro_str(is_quota ? "" : entry.name);
+    Capability handle = call_fs<Capability>(init::FS_CALL_OPEN, from, name,
+                                            entry.perms, image_quota);
+    if (entry.kind == init::MANIFEST_DIR &&
+        init::cap_error(handle, 0) == init::FS_NOT_FOUND) {
+      call_fs(init::FS_CALL_CLOSE,
+              call_fs<Capability>(init::FS_CALL_CREATE, fs_root_dir, name,
+                                  fs_root_quota, init::FS_CREATE_DIR,
+                                  mem_quota));
+      handle = call_fs<Capability>(init::FS_CALL_OPEN, fs_root_dir, name,
+                                   entry.perms, image_quota);
+    }
+    return handle;
   }
 
-  // DISK: a node rooted at the directory `/<name>`, made if need be, with
-  // the limits asked for clamped to what the root has left (MANIFEST_ALL:
-  // all of it -- so DISK entries are met in manifest order, first come first
-  // served). An ADMIN node adopts what is already in its directory:
-  // ownership is not kept on the disk, so whatever a previous boot left there
-  // is the root's at mount, and adopting makes it the holder's again, charges
-  // and all; if that would not fit -- leftovers larger than the space they
-  // leave free -- the node is derived without, and the leftovers stay the
-  // root's, visible to the holder and not its to remove. An OP node adopts
-  // nothing: a read-only view owns nothing.
-  Capability disk_node(const char* who, const init::ManifestEntry& e) {
-    if (!capability_is_valid(fs_root) || !capability_is_valid(fs_mkdir) ||
-        !capability_is_valid(fs_derive) || !capability_is_valid(fs_query) ||
-        !capability_is_valid(fs_node_funding) || (e.perms & perms::Load) == 0 ||
-        e.name[0] == '\0') {
-      return nullptr;
-    }
-    const int64_t mk_st =
-        ::signetos::user::invoke<int64_t>(invoke, fs_mkdir, fs_root, ro_str(e.name));
-    if (mk_st != init::FS_OK && mk_st != init::FS_EXISTS) {
-      say_dec("[init]     WARNING: fs.mkdir failed, status -",
-              static_cast<uint64_t>(-mk_st), "\n");
-      return nullptr;
-    }
-
-    uint64_t free_bytes = 0;
-    uint32_t free_inodes = 0;
-    disk_free(&free_bytes, &free_inodes);
-    uint64_t bytes = e.amount == init::MANIFEST_ALL ? free_bytes : e.amount;
-    if (bytes > free_bytes) bytes = free_bytes;
-    bytes &= ~(init::FS_BLOCK_BYTES - 1);
-    uint32_t inodes = e.count == init::MANIFEST_ALL_INODES ? free_inodes : e.count;
-    if (inodes > free_inodes) inodes = free_inodes;
-
-    const uint32_t handle_perms = e.perms & kAdminPerms;
-    const bool admin = (handle_perms & perms::Store) != 0;
-    int64_t status = init::FS_OK;
-    Capability node = nullptr;
-    if (admin) {
-      node = disk_derive(e.name, bytes, inodes, handle_perms,
-                         init::FS_DERIVE_ADOPT, &status);
-      if (!capability_is_valid(node)) {
-        say("[init]     WARNING: ");
-        say(who);
-        say(": could not adopt /");
-        say(e.name);
-        say("'s contents into its node; they stay the root's\n");
+  // Closes the fs handles granted into `s_seeds` for `manifest`.
+  void close_fs_seeds(const init::Manifest& manifest) {
+    for (uint32_t i = 0; i < manifest.count; ++i) {
+      if (init::manifest_is_fs(manifest.entries[i].kind) &&
+          s_seeds[i] != nullptr) {
+        call_fs(init::FS_CALL_CLOSE, s_seeds[i]);
       }
     }
-    if (!capability_is_valid(node)) {
-      node = disk_derive(e.name, bytes, inodes, handle_perms, 0, &status);
-    }
-    if (!capability_is_valid(node)) {
-      say("[init]     WARNING: fs.quota_derive(");
-      say(e.name);
-      say_dec(") failed, status -", static_cast<uint64_t>(-status), "\n");
-      return nullptr;
-    }
-    if (admin) {
-      shell_disk_quota = node;
-    }
-    return node;
   }
 
   // QUOTA_SCHED: a node under the scheduler's root with the bandwidth and
@@ -423,8 +341,7 @@ struct Launcher {
 
   // The policy: one manifest entry, met from what `init` holds, or null.
   // `funding` is the VM quota the image is being started on.
-  Capability grant_one(const char* who, const init::ManifestEntry& e,
-                       Capability funding) {
+  Capability grant_one(const init::ManifestEntry& e, Capability funding) {
     switch (e.kind) {
       case init::MANIFEST_SYSCALL:
         return e.count < syscall::kSyscallCount
@@ -459,18 +376,23 @@ struct Launcher {
         switch (e.count) {
           case init::ROOT_VM: return mem_quota;
           case init::ROOT_THREAD_MEM: return thread_quota;
-          case init::ROOT_DISK: return fs_root;
           case init::ROOT_SCHED: return root_sched;
           default: return nullptr;
         }
-      case init::MANIFEST_DISK:
-        return disk_node(who, e);
+      case init::MANIFEST_DIR:
+      case init::MANIFEST_FILE:
+      case init::MANIFEST_QUOTA_DISK:
+        return open_fs_handle(e, funding);
       case init::MANIFEST_OTYPE:
         switch (static_cast<OType>(e.count)) {
           case OType::QuotaSched:
             return rw[init::RW_SLOT_SEAL_SCHED];
-          case OType::QuotaDisk:
-            return rw[init::RW_SLOT_SEAL_DISK];
+          case OType::FsFile:
+            return rw[init::RW_SLOT_SEAL_FS_FILE];
+          case OType::FsDir:
+            return rw[init::RW_SLOT_SEAL_FS_DIR];
+          case OType::FsQuota:
+            return rw[init::RW_SLOT_SEAL_FS_QUOTA];
           case OType::TypeKey:
             return rw[init::RW_SLOT_SEAL_TYPE_KEY];
           case OType::SealedObject:
@@ -479,17 +401,21 @@ struct Launcher {
             return nullptr;
         }
       default:
-        return nullptr;  // FILE, and kinds this init does not know
+        return nullptr;  // kinds this init does not know
     }
   }
 
   // The manifest, entry by entry, into `s_seeds`. True if every REQUIRED
-  // entry was met; each that was not is named on the console.
+  // entry was met; each that was not is named on the console. fs handles are
+  // paid for by `funding`.
   bool grant(const char* who, const init::Manifest& m, Capability funding) {
     bool ok = true;
     for (uint32_t i = 0; i < m.count; ++i) {
       const init::ManifestEntry& e = m.entries[i];
-      s_seeds[i] = grant_one(who, e, funding);
+      s_seeds[i] = grant_one(e, funding);
+      if (!capability_is_valid(s_seeds[i])) {
+        s_seeds[i] = nullptr;  // no error codes in seeds
+      }
       if (!capability_is_valid(s_seeds[i]) &&
           (e.flags & init::MANIFEST_REQUIRED) != 0) {
         ok = false;
@@ -527,6 +453,7 @@ struct Launcher {
     }
     if (!grant(who, m, r.quota)) {
       warn(who, "not started");
+      close_fs_seeds(m);
       drop_vm_quota(r.quota);
       r.quota = nullptr;
       return r;
@@ -540,49 +467,42 @@ struct Launcher {
                             gate_vm_alloc, gate_sentry, gate_fault_install,
                             r.quota, seeds, image, &r.comp, &r.sentry)) {
       warn(who, "could not be loaded");
+      close_fs_seeds(m);
     }
     return r;
   }
 
-  // The services that are files on the disk rather than images in the
-  // kernel. The file is read through the root `quota_disk` handle (every file
-  // is visible to it) into a page-granular, zeroed allocation of `init`'s
-  // own, which then stands in for a packaged image -- it is the same shape
-  // (`kernel/boot_images.S`: page aligned, zero padded to a page), so its
-  // capability is exact and the zero tail `image_install` copies along is
-  // bytes `.bss` would have been zeroed to anyway -- and is released again
-  // afterwards. The service images sit in `/`, which is the root handle's
-  // root directory, so a bare name is their path.
+  // Reads service image `/<name>` into a zeroed, page-rounded allocation,
+  // shaped like a packaged image (`kernel/boot_images.S`).
   Capability read_file(const char* name) {
-    if (!sealing::is_sealed_as(OType::EntryPoint, fs_open) ||
-        !sealing::is_sealed_as(OType::EntryPoint, fs_read) ||
-        !sealing::is_sealed_as(OType::EntryPoint, fs_close) ||
-        !sealing::is_sealed_as(OType::QuotaDisk, fs_root)) {
+    if (!sealing::is_sealed_as(OType::FsDir, fs_root_dir)) {
       warn(name, "no file system to load it from");
       return nullptr;
     }
-    uint64_t size = 0;
-    Capability file = ::signetos::user::invoke<Capability>(
-        invoke, fs_open, fs_root, ro_str(name), perms::Load, bounded(&size));
+    const Capability file = call_fs<Capability>(init::FS_CALL_OPEN, fs_root_dir,
+                                                ro_str(name), init::FS_READ,
+                                                mem_quota);
     if (!capability_is_valid(file)) {
       warn(name, "not on the disk");
       return nullptr;
     }
-    bool ok = size >= sizeof(init::CompartmentImageHeader) &&
-              size <= init::FS_MAX_FILE_BYTES;
+    init::FsStat stat{};
+    bool ok = call_fs(init::FS_CALL_STAT, file, bounded(&stat)) == init::FS_OK &&
+              stat.size >= sizeof(init::CompartmentImageHeader) &&
+              stat.size <= ~uint64_t{0} - vm::PAGE_SIZE;  // rounds up to pages
     Capability buf = nullptr;
     if (ok) {
-      const size_t bytes = (static_cast<size_t>(size) + vm::PAGE_SIZE - 1) &
+      const size_t bytes = (static_cast<size_t>(stat.size) + vm::PAGE_SIZE - 1) &
                            ~(vm::PAGE_SIZE - 1);
       buf = alloc(bytes);
       ok = capability_is_valid(buf);
     }
     if (ok) {
-      const int64_t n = ::signetos::user::invoke<int64_t>(
-          invoke, fs_read, file, buf, 0ULL, size);
-      ok = n >= 0 && static_cast<uint64_t>(n) == size;
+      const int64_t bytes_read =
+          call_fs(init::FS_CALL_READ, file, buf, 0ULL, stat.size);
+      ok = bytes_read >= 0 && static_cast<uint64_t>(bytes_read) == stat.size;
     }
-    ::signetos::user::invoke<int64_t>(invoke, fs_close, file);
+    call_fs(init::FS_CALL_CLOSE, file);
     if (!ok) {
       warn(name, "could not be read, or is not a compartment image");
       release(buf);
@@ -783,7 +703,7 @@ extern "C" int64_t compartment_main(Capability arg) {
               "); the file system will not be mounted\n");
   }
   // Offered to whoever asks -- and only `fs`'s manifest does: the disk is
-  // reachable through `quota_disk` handles and through nothing else.
+  // reachable through `fs` handles and through nothing else.
   L.offer("blk.read", blk_if.read);
   L.offer("blk.write", blk_if.write);
   // For the shell's `shutdown`: the machine stops once no thread is left.
@@ -792,50 +712,42 @@ extern "C" int64_t compartment_main(Capability arg) {
   // =========================================================================
   // 4. `fs`: the file system
   // =========================================================================
-  // `fs` allocates its in-memory block bitmap (`s_bitmap`), inode table
-  // (`s_inodes`, 128 B/inode) and owner table (`s_owner`, 16 B/inode) out of
-  // its own VM quota at mount time, sized to the disk (`default_geometry` in
-  // `boot/fs.cpp`: 1 bitmap block per 32768 disk blocks, 1 inode per 16 disk
-  // blocks). That is added to what its manifest asks for, which covers code,
-  // stack, `.bss` and the root quota node.
+  // Extra VM for fs's in-memory tables: 128 bytes and a bit per disk block.
   const uint64_t disk_blocks = blk_if.capacity_sectors / 8;
-  const uint64_t bitmap_blocks = (disk_blocks + 32768 - 1) / 32768;
-  const uint64_t want_inodes =
-      (disk_blocks / 16 >= 64) ? (disk_blocks / 16) : 64;
-  const uint64_t inode_blocks = (want_inodes + 32 - 1) / 32;
-  const uint64_t owner_blocks =
-      (inode_blocks * 32 * sizeof(Capability) + init::FS_BLOCK_BYTES - 1) /
-      init::FS_BLOCK_BYTES;
-  const size_t fs_table_bytes =
-      static_cast<size_t>(bitmap_blocks + inode_blocks + owner_blocks) *
-      init::FS_BLOCK_BYTES;
-  const Started fs = L.start("fs", manifest->fs_img, fs_table_bytes);
-  // `fs` mounts (formatting a blank disk) and hands back the root
-  // `quota_disk` handle -- the authority over the whole disk -- together with
-  // its operation entry points, which `init` publishes once `naming` is up.
+  const uint64_t entry_table_bytes =
+      (disk_blocks + 31) / 32 * init::FS_BLOCK_BYTES;
+  const uint64_t block_map_bytes = ((disk_blocks + 7) / 8 + vm::PAGE_SIZE - 1) &
+                                   ~(vm::PAGE_SIZE - 1);
+  const Started fs =
+      L.start("fs", manifest->fs_img,
+              static_cast<size_t>(entry_table_bytes + block_map_bytes));
+  // Nobody after `fs` gets its sealing authorities: with one, an image could
+  // seal a handle record of its own making -- `/` with every right -- and
+  // `fs` would take it. Every image from here on is read off the disk.
+  rw[init::RW_SLOT_SEAL_FS_FILE] = nullptr;
+  rw[init::RW_SLOT_SEAL_FS_DIR] = nullptr;
+  rw[init::RW_SLOT_SEAL_FS_QUOTA] = nullptr;
+  // fs mounts, and returns its entry points and handles on `/` and the root
+  // quota, paid for by init.
   init::FsInterface fs_if;
   zero_bytes(&fs_if, sizeof(fs_if));  // too big for `{}` (see zero_bytes)
+  fs_if.memory_quota = L.mem_quota;
   fs_if.capacity_sectors = blk_if.capacity_sectors;
   fs_if.status = init::FS_NOT_MOUNTED;
   if (capability_is_valid(fs.sentry)) {
     comp_invoke(fs.sentry, bounded(&fs_if));
   }
-  if (fs_if.status != init::FS_OK || !capability_is_valid(fs_if.root_quota)) {
+  if (fs_if.status != init::FS_OK || !capability_is_valid(fs_if.root_dir)) {
     L.say_dec("[init]     WARNING: fs handshake returned status -",
               static_cast<uint64_t>(-fs_if.status),
               "; nothing can be loaded from the disk\n");
   }
-  L.fs_root = fs_if.root_quota;
-  L.fs_open = fs_if.open;
-  L.fs_read = fs_if.read;
-  L.fs_close = fs_if.close;
-  L.fs_mkdir = fs_if.mkdir;
-  L.fs_derive = fs_if.quota_derive;
-  L.fs_query = fs_if.quota_query;
+  L.fs_root_dir = fs_if.root_dir;
+  L.fs_root_quota = fs_if.root_quota;
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    L.fs_calls[i] = fs_if.call[i];
+  }
   L.offer("fs", fs.sentry);
-  // Disk-quota nodes are paid for by their creator, like the scheduler's:
-  // this quota funds the nodes `init` derives for DISK entries.
-  L.fs_node_funding = L.vm_quota(64 * 1024);
 
   // From here on every service is a file on the disk.
 
@@ -875,17 +787,9 @@ extern "C" int64_t compartment_main(Capability arg) {
   // on its behalf, under the names its clients (the shell, the programs the
   // shell runs) ask for.
   publish("fs", fs.sentry);
-  publish("fs.quota_derive", fs_if.quota_derive);
-  publish("fs.quota_destroy", fs_if.quota_destroy);
-  publish("fs.quota_query", fs_if.quota_query);
-  publish("fs.create", fs_if.create);
-  publish("fs.mkdir", fs_if.mkdir);
-  publish("fs.open", fs_if.open);
-  publish("fs.close", fs_if.close);
-  publish("fs.read", fs_if.read);
-  publish("fs.write", fs_if.write);
-  publish("fs.unlink", fs_if.unlink);
-  publish("fs.list", fs_if.list);
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    publish(init::FS_CALL_NAMES[i], fs_if.call[i]);
+  }
 
   // =========================================================================
   // 6. `sealer`
@@ -1028,10 +932,8 @@ extern "C" int64_t compartment_main(Capability arg) {
   // The shell's manifest asks for its own quotas -- the VM it lives on, the
   // thread memory it and its workers run on, and its CPU bandwidth (half the
   // machine, 50 ms per 100 ms, interactive, as an ADMIN node so it can
-  // sub-divide it for its own threads) -- its place on the disk -- `/home` as
-  // an ADMIN node with everything the system's images leave free, `/bin` as a
-  // budget-less read-only view of the programs (abi.hpp, "File system") --
-  // and the system's root quotas: `init` exits in a moment and scrubs its own
+  // sub-divide it for its own threads) -- the root disk quota, `/home`,
+  // `/apps` and read-only `/bin`. `init` exits in a moment and scrubs its own
   // table (step 11), so the shell is their long-lived holder. All of it is
   // granted by `Launcher::grant` as the image starts; what is left here is
   // its one-time setup and its thread.
@@ -1141,8 +1043,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   rw[init::RW_SLOT_BLK_QUOTA] = blk.quota;
   rw[init::RW_SLOT_BLK_COMP] = blk.comp;
   rw[init::RW_SLOT_BLK_SENTRY] = blk.sentry;
-  rw[init::RW_SLOT_FS_NODE_FUNDING] = L.fs_node_funding;
-  rw[init::RW_SLOT_SHELL_DISK_QUOTA] = L.shell_disk_quota;
   rw[init::RW_SLOT_SEALER_QUOTA] = sealer.quota;
   rw[init::RW_SLOT_SEALER_COMP] = sealer.comp;
   rw[init::RW_SLOT_SEALER_SENTRY] = sealer.sentry;
@@ -1155,12 +1055,14 @@ extern "C" int64_t compartment_main(Capability arg) {
   // 11. Scrub: nothing runs in `init` after this thread exits, so nothing
   //     here may still be able to act. Every seed the kernel gave it -- the
   //     root VM quota, every kernel gate, every IRQ authority,
-  //     the root thread-memory quota and the four sealing authorities -- is
+  //     the root thread-memory quota and the sealing authorities -- is
   //     cleared from the table, and the launcher's copies of everything it
   //     granted with them. What stays is inert without a gate: the handles
   //     recorded in step 10 and `RW_SLOT_SCHED_RUN`, which the kernel reads
   //     next. The locals this thread still holds die with its stack.
   // =========================================================================
+  // init's handles on `/` and the root quota stay open: every fs handle it
+  // granted was opened through them.
   for (size_t s = compartment::RW_SLOT_SEED_BASE; s < init::RW_SLOT_SCHED_RUN;
        ++s) {
     rw[s] = nullptr;

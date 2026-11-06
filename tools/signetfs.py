@@ -15,33 +15,35 @@
 
 """signetfs.py - host-side tool for SignetOS disk images.
 
-The on-disk format is the one `boot/fs.cpp` reads and writes, mirrored
-here field for field:
+The on-disk format is the one `boot/fs.cpp` reads and writes:
 
-  block 0      superblock (magic "SIGNETFS", version 3, geometry)
-  bitmap       one bit per 4 KiB block, LSB first; sized to cover total_blocks
-  inode table  128-byte inodes, sized proportionally to total_blocks at format:
-               flags, nblocks, size, name[32], blocks[16], indirect, parent,
-               reserved[8]
-  data_start+  data blocks and single-indirect blocks; a file is up to 16
-               direct blocks + 1024 indirect blocks (4,160 KiB)
+  block 0      header: magic "SIGCAPFS", version 2, total_blocks
+  1..          entry table, one 128-byte entry per disk block: flags, parent,
+               payer, generation, size, block_count, tree, the name (length,
+               hash, tree, head[20]), blocks[16]
+  data_start+  data blocks, and the blocks and lists of trees
 
-Directories are inodes flagged INODE_DIR with no blocks; an inode's `parent`
-is the number of the directory it is an entry of (ROOT_DIR = 0xFFFFFFFF for
-`/`), so a directory's contents are found by scanning the table. There is no
-ownership on the disk: after a mount every file belongs to the root
-`quota_disk`, and what a holder of a derived quota can reach is decided by
-the directory that quota is rooted at. `init` reads the system's own images
-(`naming.bin`, `sched.bin`, `shell.bin`) out of `/`, where
-nothing but the root quota is rooted; the programs the shell can `run` go in
-`/bin`, which the shell reaches through a read-only quota rooted there.
+A file's first 16 blocks are listed in its entry and the rest are a tree
+(`tree`). A name of up to 20 bytes is all in its entry's `head`; a longer one
+is all in a tree of its own, with its first 20 bytes in `head` as well. A
+tree of one block is just that block; a bigger one hangs from lists of 1024
+block numbers, as many levels of them as its block count needs. So neither
+files nor names have a size limit but the disk.
 
-  signetfs.py put <image> [--size BYTES] [--dir DIR] <file>...
+Entry 0 is `/`, entry 1 the root quota. `parent` is the containing directory
+(for a quota, the quota it was made from); `payer` is the quota that pays for
+an entry. Free blocks are not stored; they follow from the entries. For a
+quota, `blocks` holds what it pays for (`used`, a u64); for a link (flag 16),
+the entry it names, that entry's generation, and rights. This tool leaves
+`used` alone: the file system counts it again at mount.
+
+  signetfs.py put <image> [--size BYTES] [--dir DIR] [--keep] <file>...
       Formats `image` if it does not exist or carries no recognisable file
       system, then adds each file under its basename in directory DIR
       (default `/`; created, with its parents, if missing), replacing a file
       of the same name and leaving every other file alone -- so what the
-      system wrote on earlier boots survives a rebuild.
+      system wrote on earlier boots survives a rebuild. --keep does not
+      replace existing files.
   signetfs.py ls <image>
   signetfs.py format <image> [--size BYTES]
   signetfs.py swap <image> --size BYTES
@@ -58,28 +60,24 @@ import struct
 import sys
 
 BLOCK = 4096
-MAGIC = 0x5349474E45544653  # "SIGNETFS"
-VERSION = 3
-BITS_PER_BLOCK = BLOCK * 8  # 32768 blocks per bitmap block (128 MiB)
+MAGIC = 0x5349474341504653  # "SIGCAPFS"
+VERSION = 2
 DIRECT_BLOCKS = 16
-INDIRECT_SLOTS = BLOCK // 4  # 1024 u32 block numbers per indirect block
-MAX_FILE_BLOCKS = DIRECT_BLOCKS + INDIRECT_SLOTS
-MAX_FILE_BYTES = MAX_FILE_BLOCKS * BLOCK  # 4,160 KiB
-NAME_MAX = 32  # including the NUL
-INODE_USED = 1
-INODE_DIR = 2  # a directory: no blocks, its entries point at it
-ROOT_DIR = 0xFFFFFFFF  # `parent` of an entry of `/`
+NAME_HEAD = 20  # bytes of a name kept in its entry (FS_NAME_INLINE)
+FANOUT = BLOCK // 4  # block numbers per list block
+IN_USE, DIR, QUOTA = 1, 2, 4
+NO_ENTRY = 0xFFFFFFFF  # no entry
+ROOT_DIR, ROOT_QUOTA = 0, 1
 
-# struct Superblock: u64 magic; u32 version, block_bytes; u64 total_blocks,
-# data_start; u32 max_inodes, inode_table_blocks; u64 bitmap_block,
-# inode_block; u32 bitmap_blocks, reserved.
-SUPER = struct.Struct("<QIIQQIIQQII")
-# struct Inode: u32 flags, nblocks; u64 size; char name[32]; u32 blocks[16];
-# u32 indirect, parent; u8 reserved[8].
-INODE = struct.Struct("<IIQ32s16III8s")
-assert INODE.size == 128
-INODES_PER_BLOCK = BLOCK // INODE.size
-INDIRECT_FMT = struct.Struct("<%dI" % INDIRECT_SLOTS)
+# struct DiskHeader: u64 magic, version, total_blocks.
+DISK_HEADER = struct.Struct("<QQQ")
+# struct Entry: u32 flags, parent, payer, generation; u64 size; u32
+# block_count, tree; struct Name { u32 length, hash, tree; char head[20]; };
+# u32 blocks[16].
+ENTRY = struct.Struct("<IIIIQIIIII%ds16I" % NAME_HEAD)
+assert ENTRY.size == 128
+ENTRIES_PER_BLOCK = BLOCK // ENTRY.size
+LIST = struct.Struct("<%dI" % FANOUT)
 
 # The last sector of an image with a swap region: u64 magic; u32 version,
 # sector_bytes; u64 base_sector, sectors (user/abi.hpp, SwapTrailer).
@@ -89,54 +87,61 @@ SWAP_VERSION = 1
 SWAP_TRAILER = struct.Struct("<QIIQQ")
 
 
-def default_geometry(total_blocks):
-    """Computes (bitmap_block, bitmap_blocks, inode_block, inode_table_blocks,
-    max_inodes, data_start) scaled to `total_blocks`."""
-    bitmap_block = 1
-    bitmap_blocks = (total_blocks + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK
-    inode_block = bitmap_block + bitmap_blocks
-    # 1 inode per 64 KiB (16 blocks) of disk, at least 2 inode blocks (64 inodes).
-    want_inodes = max(64, total_blocks // 16)
-    inode_table_blocks = (want_inodes + INODES_PER_BLOCK - 1) // INODES_PER_BLOCK
-    max_inodes = inode_table_blocks * INODES_PER_BLOCK
-    data_start = inode_block + inode_table_blocks
-    return (bitmap_block, bitmap_blocks, inode_block, inode_table_blocks,
-            max_inodes, data_start)
+def geometry(total_blocks):
+    """(entry_count, data_start): one entry per block, table from block 1."""
+    entry_count = -(-total_blocks // ENTRIES_PER_BLOCK) * ENTRIES_PER_BLOCK
+    return entry_count, 1 + entry_count // ENTRIES_PER_BLOCK
 
 
 def name_ok(name):
-    """The rule `fs.cpp` applies to one path component: 1..NAME_MAX-1
+    """The rule `fs.cpp` applies to one path component: one or more
     printable non-blank bytes, no '/', and neither "." nor ".."."""
-    return (0 < len(name) < NAME_MAX and b"/" not in name and
+    return (len(name) > 0 and b"/" not in name and
             all(0x20 < c <= 0x7E for c in name) and name not in (b".", b".."))
 
 
-class Inode:
+def name_hash(name):
+    """FNV-1a, as `fs.cpp` hashes a name."""
+    h = 2166136261
+    for c in name:
+        h = ((h ^ c) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def name_blocks(length):
+    """Blocks of a name of `length` bytes; none if it fits in its entry."""
+    return 0 if length <= NAME_HEAD else -(-length // BLOCK)
+
+
+def levels(count):
+    """Levels of lists in a tree of `count` blocks."""
+    depth, span = 0, 1
+    while span < count:
+        depth, span = depth + 1, span * FANOUT
+    return depth
+
+
+class Entry:
     def __init__(self, raw=None):
-        if raw is None:
-            self.flags, self.nblocks, self.size = 0, 0, 0
-            self.name, self.blocks = b"", [0] * DIRECT_BLOCKS
-            self.indirect, self.parent = 0, 0
-            return
-        flags, nblocks, size, name, *rest = INODE.unpack(raw)
-        self.flags, self.nblocks, self.size = flags, nblocks, size
-        self.name = name.split(b"\0", 1)[0]
-        self.blocks = list(rest[:DIRECT_BLOCKS])
-        self.indirect = rest[DIRECT_BLOCKS]
-        self.parent = rest[DIRECT_BLOCKS + 1]
+        fields = ENTRY.unpack(raw or bytes(ENTRY.size))
+        (self.flags, self.parent, self.payer, self.generation, self.size,
+         self.block_count, self.tree, self.name_length, _hash,
+         self.name_tree, head) = fields[:11]
+        self.blocks = list(fields[11:])
+        # The whole name; a long one is read in by Disk.
+        self.name = head[:min(self.name_length, NAME_HEAD)]
 
-    @property
-    def used(self):
-        return self.flags & INODE_USED != 0
-
-    @property
-    def is_dir(self):
-        return self.flags & INODE_DIR != 0
+    in_use = property(lambda self: self.flags & IN_USE != 0)
+    is_dir = property(lambda self: self.flags & DIR != 0)
+    is_quota = property(lambda self: self.flags & QUOTA != 0)
 
     def pack(self):
-        return INODE.pack(self.flags, self.nblocks, self.size,
-                          self.name.ljust(NAME_MAX, b"\0"), *self.blocks,
-                          self.indirect, self.parent, b"\0" * 8)
+        return ENTRY.pack(self.flags, self.parent, self.payer,
+                          self.generation, self.size, self.block_count,
+                          self.tree, len(self.name), name_hash(self.name),
+                          self.name_tree,
+                          self.name[:NAME_HEAD].ljust(NAME_HEAD, b"\0"),
+                          *self.blocks)
 
 
 class Disk:
@@ -145,38 +150,30 @@ class Disk:
     def __init__(self, f):
         self.f = f
         f.seek(0)
-        sb = f.read(BLOCK)
-        if len(sb) < SUPER.size:
-            raise ValueError("no superblock")
-        (magic, version, block_bytes, total_blocks, data_start, max_inodes,
-         inode_table_blocks, bitmap_block, inode_block, bitmap_blocks,
-         _) = SUPER.unpack_from(sb)
+        header = f.read(BLOCK)
+        if len(header) < DISK_HEADER.size:
+            raise ValueError("no header")
+        magic, version, total_blocks = DISK_HEADER.unpack_from(header)
         f.seek(0, os.SEEK_END)
         capacity_blocks = f.tell() // BLOCK
-        need_bitmap = (total_blocks + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK
-        if (magic != MAGIC or version != VERSION or block_bytes != BLOCK or
-                bitmap_block != 1 or bitmap_blocks < need_bitmap or
-                inode_block != bitmap_block + bitmap_blocks or
-                inode_table_blocks == 0 or
-                max_inodes != inode_table_blocks * INODES_PER_BLOCK or
-                data_start != inode_block + inode_table_blocks or
+        entry_count, data_start = geometry(total_blocks)
+        if (magic != MAGIC or version != VERSION or
                 not data_start < total_blocks <= capacity_blocks):
             raise ValueError("not a SignetFS image")
-        self.total_blocks = total_blocks
-        self.bitmap_block = bitmap_block
-        self.bitmap_blocks = bitmap_blocks
-        self.inode_block = inode_block
-        self.inode_table_blocks = inode_table_blocks
-        self.max_inodes = max_inodes
-        self.data_start = data_start
-        self.bitmap = bytearray(b"".join(
-            self.read_block(bitmap_block + k) for k in range(bitmap_blocks)))
-        table = b"".join(self.read_block(inode_block + k)
-                         for k in range(inode_table_blocks))
-        self.inodes = [Inode(table[i * INODE.size:(i + 1) * INODE.size])
-                       for i in range(max_inodes)]
-        for b in range(data_start):
-            self.bit_set(b)
+        self.total_blocks, self.data_start = total_blocks, data_start
+        table = b"".join(self.read_block(1 + k)
+                         for k in range(entry_count // ENTRIES_PER_BLOCK))
+        self.entries = [Entry(table[i * ENTRY.size:(i + 1) * ENTRY.size])
+                        for i in range(entry_count)]
+        self.blocks_in_use = set(range(data_start))
+        for entry in self.entries:
+            if entry.in_use and entry.name_length > NAME_HEAD:
+                data, _ = self.tree_blocks(entry.name_tree,
+                                           name_blocks(entry.name_length))
+                entry.name = b"".join(self.read_block(b) for b in data)[
+                    :entry.name_length]
+            if entry.in_use:
+                self.blocks_in_use.update(self.blocks_of(entry))
 
     def read_block(self, b):
         self.f.seek(b * BLOCK)
@@ -187,34 +184,77 @@ class Disk:
         self.f.seek(b * BLOCK)
         self.f.write(data.ljust(BLOCK, b"\0"))
 
-    def bit_test(self, b):
-        return (self.bitmap[b >> 3] >> (b & 7)) & 1 != 0
+    def tree_blocks(self, root, count):
+        """(blocks, lists) of the tree `root` of `count` blocks."""
+        if count == 0:
+            return [], []
+        nodes, lists = [root], []
+        for level in reversed(range(levels(count))):
+            lists += nodes
+            children = []
+            for node in nodes:
+                children += LIST.unpack(self.read_block(node))
+            nodes = children[:-(-count // FANOUT ** level)]
+        return nodes, lists
 
-    def bit_set(self, b):
-        self.bitmap[b >> 3] |= 1 << (b & 7)
+    def make_tree(self, blocks):
+        """The root of a new tree of `blocks`, its lists allocated and
+        written: the tree `fs.cpp` builds by adding them one at a time."""
+        nodes = list(blocks)
+        while len(nodes) > 1:
+            lists = self.alloc_blocks(-(-len(nodes) // FANOUT))
+            for k, block in enumerate(lists):
+                chunk = nodes[k * FANOUT:(k + 1) * FANOUT]
+                self.write_block(block, LIST.pack(
+                    *(chunk + [0] * (FANOUT - len(chunk)))))
+            nodes = lists
+        return nodes[0] if nodes else 0
 
-    def bit_clear(self, b):
-        self.bitmap[b >> 3] &= ~(1 << (b & 7)) & 0xFF
+    def blocks_of(self, entry):
+        """Every block `entry` holds: a file's, its lists, and its name's."""
+        held = entry.blocks[:min(entry.block_count, DIRECT_BLOCKS)]
+        if entry.block_count > DIRECT_BLOCKS:
+            data, lists = self.tree_blocks(entry.tree,
+                                           entry.block_count - DIRECT_BLOCKS)
+            held = held + data + lists
+        if entry.name_length > NAME_HEAD:
+            data, lists = self.tree_blocks(entry.name_tree,
+                                           name_blocks(entry.name_length))
+            held = held + data + lists
+        return held
 
     def find(self, parent, name):
-        """The inode number of entry `name` of directory `parent`, or -1."""
-        for i, ino in enumerate(self.inodes):
-            if ino.used and ino.parent == parent and ino.name == name:
+        """The number of entry `name` of directory `parent`, or -1."""
+        for i, entry in enumerate(self.entries):
+            if entry.in_use and entry.parent == parent and entry.name == name:
                 return i
         return -1
 
-    def entries(self, parent):
-        return [i for i, ino in enumerate(self.inodes)
-                if ino.used and ino.parent == parent]
+    def children(self, parent):
+        return [i for i, entry in enumerate(self.entries)
+                if entry.in_use and entry.parent == parent and i > ROOT_QUOTA]
 
-    def free_inode(self):
-        for i, ino in enumerate(self.inodes):
-            if not ino.used:
+    def unused_entry(self):
+        for i, entry in enumerate(self.entries):
+            if i > ROOT_QUOTA and not entry.in_use:
                 return i
-        raise ValueError("inode table full")
+        raise ValueError("entry table full")
+
+    def new_entry(self, flags, parent, name, payer=ROOT_QUOTA, size=0):
+        """A new entry, its name's blocks (for a long one) written."""
+        entry = Entry()
+        entry.flags, entry.parent, entry.name = IN_USE | flags, parent, name
+        entry.payer, entry.size = payer, size
+        entry.name_length = len(name)
+        if len(name) > NAME_HEAD:
+            blocks = self.alloc_blocks(name_blocks(len(name)))
+            for k, block in enumerate(blocks):
+                self.write_block(block, name[k * BLOCK:(k + 1) * BLOCK])
+            entry.name_tree = self.make_tree(blocks)
+        return entry
 
     def mkdir_p(self, path):
-        """The inode number of directory `path` (ROOT_DIR for `/`), creating
+        """The entry number of directory `path` (ROOT_DIR for `/`), creating
         any component that does not exist yet."""
         parent = ROOT_DIR
         for comp in path.strip(b"/").split(b"/") if path.strip(b"/") else []:
@@ -222,105 +262,75 @@ class Disk:
                 raise ValueError("bad directory name %r" % comp)
             i = self.find(parent, comp)
             if i < 0:
-                i = self.free_inode()
-                ino = Inode()
-                ino.flags = INODE_USED | INODE_DIR
-                ino.name, ino.parent = comp, parent
-                self.inodes[i] = ino
-            elif not self.inodes[i].is_dir:
+                i = self.unused_entry()
+                self.entries[i] = self.new_entry(DIR, parent, comp)
+            elif not self.entries[i].is_dir:
                 raise ValueError("%s: not a directory" % comp.decode())
             parent = i
         return parent
 
     def unlink(self, i):
-        ino = self.inodes[i]
-        direct_n = min(ino.nblocks, DIRECT_BLOCKS)
-        for b in ino.blocks[:direct_n]:
-            self.bit_clear(b)
-        if ino.nblocks > DIRECT_BLOCKS and ino.indirect != 0:
-            ind = INDIRECT_FMT.unpack(self.read_block(ino.indirect))
-            for b in ind[:ino.nblocks - DIRECT_BLOCKS]:
-                if b != 0:
-                    self.bit_clear(b)
-            self.bit_clear(ino.indirect)
-        self.inodes[i] = Inode()
+        self.blocks_in_use.difference_update(self.blocks_of(self.entries[i]))
+        self.entries[i] = Entry()
 
-    def alloc_blocks(self, n):
-        got = []
-        for b in range(self.data_start, self.total_blocks):
-            if len(got) == n:
+    def alloc_blocks(self, count):
+        blocks = []
+        for block in range(self.data_start, self.total_blocks):
+            if len(blocks) == count:
                 break
-            if not self.bit_test(b):
-                got.append(b)
-        if len(got) < n:
+            if block not in self.blocks_in_use:
+                blocks.append(block)
+        if len(blocks) < count:
             raise ValueError("disk full")
-        for b in got:
-            self.bit_set(b)
-        return got
+        self.blocks_in_use.update(blocks)
+        return blocks
 
     def put(self, parent, name, data):
         """Writes `data` as file `name` of directory `parent`, replacing a
         file of that name."""
         if not name_ok(name):
             raise ValueError("bad file name %r" % name)
-        if len(data) > MAX_FILE_BYTES:
-            raise ValueError("%s: %d bytes, the limit is %d" %
-                             (name.decode(), len(data), MAX_FILE_BYTES))
         old = self.find(parent, name)
         if old >= 0:
-            if self.inodes[old].is_dir:
+            if self.entries[old].is_dir:
                 raise ValueError("%s: is a directory" % name.decode())
             self.unlink(old)
-        slot = self.free_inode()
-        n = (len(data) + BLOCK - 1) // BLOCK
-        need_meta = 1 if n > DIRECT_BLOCKS else 0
-        alloc = self.alloc_blocks(n + need_meta)
-        data_blocks = alloc[:n]
-        indirect_block = alloc[n] if need_meta else 0
-        for k, b in enumerate(data_blocks):
-            self.write_block(b, data[k * BLOCK:(k + 1) * BLOCK])
-        if indirect_block:
-            ind = [0] * INDIRECT_SLOTS
-            ind[:n - DIRECT_BLOCKS] = data_blocks[DIRECT_BLOCKS:]
-            self.write_block(indirect_block, INDIRECT_FMT.pack(*ind))
-        ino = Inode()
-        ino.flags = INODE_USED
-        ino.nblocks, ino.size, ino.name, ino.parent = n, len(data), name, parent
-        direct_n = min(n, DIRECT_BLOCKS)
-        ino.blocks[:direct_n] = data_blocks[:direct_n]
-        ino.indirect = indirect_block
-        self.inodes[slot] = ino
+        slot = self.unused_entry()
+        count = -(-len(data) // BLOCK)
+        blocks = self.alloc_blocks(count)
+        for k, block in enumerate(blocks):
+            self.write_block(block, data[k * BLOCK:(k + 1) * BLOCK])
+        entry = self.new_entry(0, parent, name, size=len(data))
+        entry.block_count = count
+        entry.blocks[:min(count, DIRECT_BLOCKS)] = blocks[:DIRECT_BLOCKS]
+        if count > DIRECT_BLOCKS:
+            entry.tree = self.make_tree(blocks[DIRECT_BLOCKS:])
+        self.entries[slot] = entry
 
     def save(self):
-        for k in range(self.bitmap_blocks):
-            self.write_block(self.bitmap_block + k,
-                             bytes(self.bitmap[k * BLOCK:(k + 1) * BLOCK]))
-        for k in range(self.inode_table_blocks):
-            chunk = self.inodes[k * INODES_PER_BLOCK:(k + 1) * INODES_PER_BLOCK]
-            self.write_block(self.inode_block + k,
-                             b"".join(i.pack() for i in chunk))
+        for k in range(len(self.entries) // ENTRIES_PER_BLOCK):
+            chunk = self.entries[k * ENTRIES_PER_BLOCK:(k + 1) * ENTRIES_PER_BLOCK]
+            self.write_block(1 + k, b"".join(entry.pack() for entry in chunk))
         self.f.flush()
 
 
 def format_image(path, size):
     """A blank file system over the whole image (created or truncated)."""
+    total_blocks = size // BLOCK
+    entry_count, data_start = geometry(total_blocks)
+    if total_blocks <= data_start:
+        raise ValueError("image too small")
+    table = [Entry() for _ in range(entry_count)]
+    for i, flags, payer in ((ROOT_DIR, DIR, ROOT_QUOTA),
+                            (ROOT_QUOTA, QUOTA, NO_ENTRY)):
+        table[i].flags, table[i].parent, table[i].payer = (
+            IN_USE | flags, NO_ENTRY, payer)
+    table[ROOT_QUOTA].size = (total_blocks - data_start) * BLOCK
     with open(path, "wb") as f:
         f.truncate(size)
-        total_blocks = size // BLOCK
-        (bitmap_block, bitmap_blocks, inode_block, inode_table_blocks,
-         max_inodes, data_start) = default_geometry(total_blocks)
-        if total_blocks <= data_start:
-            raise ValueError("image too small")
-        f.write(SUPER.pack(MAGIC, VERSION, BLOCK, total_blocks, data_start,
-                           max_inodes, inode_table_blocks, bitmap_block,
-                           inode_block, bitmap_blocks, 0))
-        bitmap = bytearray(bitmap_blocks * BLOCK)
-        for b in range(data_start):
-            bitmap[b >> 3] |= 1 << (b & 7)
-        f.seek(bitmap_block * BLOCK)
-        f.write(bitmap)
-        f.seek(inode_block * BLOCK)
-        f.write(b"\0" * (inode_table_blocks * BLOCK))
+        f.write(DISK_HEADER.pack(MAGIC, VERSION, total_blocks))
+        f.seek(BLOCK)
+        f.write(b"".join(entry.pack() for entry in table))
 
 
 def set_swap(path, size):
@@ -360,22 +370,27 @@ def open_or_format(path, size):
 
 def print_tree(disk, parent=ROOT_DIR, prefix=b"", seen=None):
     """Lists every entry under `parent`, one full path per line, directories
-    first and with a trailing '/'."""
+    first and with a trailing '/'; quotas prefixed `quota:`."""
     seen = set() if seen is None else seen
-    items = sorted(disk.entries(parent),
-                   key=lambda i: (not disk.inodes[i].is_dir, disk.inodes[i].name))
+    items = sorted(disk.children(parent),
+                   key=lambda i: (not disk.entries[i].is_dir, disk.entries[i].name))
     for i in items:
         if i in seen:  # a cycle on a damaged image; fs.cpp drops these on mount
             continue
         seen.add(i)
-        ino = disk.inodes[i]
-        path = prefix + ino.name
-        if ino.is_dir:
+        entry = disk.entries[i]
+        path = prefix + entry.name
+        if entry.is_quota:
+            print("%-31s %7d bytes" % ((b"quota:" + path).decode(), entry.size))
+            print_tree(disk, i, path + b"/", seen)
+        elif entry.is_dir:
             print("%-31s %7s" % ((path + b"/").decode(), "dir"))
             print_tree(disk, i, path + b"/", seen)
         else:
             print("%-31s %7d bytes %4d block(s)" %
-                  (path.decode(), ino.size, ino.nblocks))
+                  (path.decode(), entry.size, entry.block_count))
+    if parent == ROOT_DIR:
+        print_tree(disk, ROOT_QUOTA, b"", seen)
 
 
 def main(argv):
@@ -388,8 +403,10 @@ def main(argv):
     p.add_argument("--dir", default="",
                    help="directory to put the files in (default /; created "
                         "if missing)")
+    p.add_argument("--keep", action="store_true",
+                   help="leave a file that is there already as it is")
     p.add_argument("files", nargs="+")
-    p = sub.add_parser("ls", help="list files")
+    p = sub.add_parser("ls", help="list files and quotas")
     p.add_argument("image")
     p = sub.add_parser("format", help="write a blank file system")
     p.add_argument("image")
@@ -412,18 +429,21 @@ def main(argv):
     if args.cmd == "ls":
         with open(args.image, "rb") as f:
             disk = Disk(f)
-        print_tree(disk)
+            print_tree(disk)
         return 0
     disk = open_or_format(args.image, parse_size(args.size))
     directory = args.dir.strip("/")
     parent = disk.mkdir_p(directory.encode())
     for path in args.files:
+        name = os.path.basename(path).encode()
+        if args.keep and disk.find(parent, name) >= 0:
+            continue
         with open(path, "rb") as f:
             data = f.read()
-        disk.put(parent, os.path.basename(path).encode(), data)
+        disk.put(parent, name, data)
         print("%s: /%s%s, %d bytes" % (args.image,
                                        directory + "/" if directory else "",
-                                       os.path.basename(path), len(data)))
+                                       name.decode(), len(data)))
     disk.save()
     disk.f.close()
     return 0

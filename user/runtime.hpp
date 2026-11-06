@@ -108,8 +108,8 @@ inline void print_dec(Capability invoke_gate, Capability uart_sentry,
 }
 
 // Prints one manifest entry the way a launcher reports it: its kind and what
-// identifies it -- `syscall vm_allocate`, `service fs.open`, `disk "" rw
-// 65536/8`, `file motd.txt ro`, `irq 11`, ... -- with no newline.
+// identifies it -- `syscall vm_allocate`, `service fs.open`, `dir home rac-`
+// (rights: read, add, change, link), ... -- with no newline.
 inline void print_manifest_entry(Capability invoke_gate, Capability uart_sentry,
                                  const init::ManifestEntry& e) {
   auto out = [&](const char* s) { print(invoke_gate, uart_sentry, s); };
@@ -125,27 +125,19 @@ inline void print_manifest_entry(Capability invoke_gate, Capability uart_sentry,
       out(" ");
       out(e.name);
       break;
-    case init::MANIFEST_DISK:
-      out(" \"");
-      out(e.name);
-      out((e.perms & perms::Store) != 0 ? "\" rw " : "\" ro ");
-      if (e.amount == init::MANIFEST_ALL) {
-        out("all");
-      } else {
-        dec(e.amount);
-      }
-      out("/");
-      if (e.count == init::MANIFEST_ALL_INODES) {
-        out("all");
-      } else {
-        dec(e.count);
-      }
-      break;
+    case init::MANIFEST_DIR:
     case init::MANIFEST_FILE:
+    case init::MANIFEST_QUOTA_DISK: {
+      const char rights[] = {(e.perms & init::FS_READ) != 0 ? 'r' : '-',
+                             (e.perms & init::FS_ADD) != 0 ? 'a' : '-',
+                             (e.perms & init::FS_CHANGE) != 0 ? 'c' : '-',
+                             (e.perms & init::FS_LINK) != 0 ? 'l' : '-', '\0'};
       out(" ");
       out(e.name);
-      out((e.perms & perms::Store) != 0 ? " rw" : " ro");
+      out(" ");
+      out(rights);
       break;
+    }
     case init::MANIFEST_DMA:
     case init::MANIFEST_QUOTA_THREAD:
       out(" ");

@@ -23,11 +23,11 @@
 // `ca0..ca4` (caller `ca1..ca5`) and return a single register result in `ca0`
 // (`a0`). Operations whose inputs and outputs fit in registers take them
 // directly; operations with wider parameter blocks or multiple outputs
-// (`quota_derive`, `fs.quota_query`, and one-shot `*Interface` boot
+// (`quota_derive`, `fs.stat`, and one-shot `*Interface` boot
 // handshakes) pass a bounded capability to a struct defined below.
 //
-// Entries that return a `Capability` on success (`naming.lookup`, `fs.create`,
-// `fs.open`) return a tagged handle on success and an untagged negative error
+// Entries that return a `Capability` on success (`naming.lookup`, `fs.open`,
+// `fs.create`) return a tagged handle on success and an untagged negative error
 // code (`status_cap(err)`) on failure.
 //
 
@@ -321,108 +321,141 @@ struct alignas(16) BlkInterface {
 // ----------------------------------------------------------------------------
 // File system (`boot/fs.cpp`)
 // ----------------------------------------------------------------------------
-//   int64_t    fs.quota_derive(FsDeriveRequest* req) -> FS_*
-//   int64_t    fs.quota_destroy(Capability quota) -> FS_*
-//   int64_t    fs.quota_query(FsQueryRequest* req) -> FS_*
-//   Capability fs.create(Capability quota, const char* path, uint32_t perms) -> file or status_cap(FS_*)
-//   Capability fs.open(Capability quota, const char* path, uint32_t perms, uint64_t* out_size) -> file or status_cap(FS_*)
-//   int64_t    fs.read(Capability file, Capability buf, uint64_t offset, uint64_t length) -> bytes (>=0) or FS_* (<0)
-//   int64_t    fs.write(Capability file, Capability buf, uint64_t offset, uint64_t length) -> bytes (>=0) or FS_* (<0)
-//   int64_t    fs.close(Capability file) -> FS_*
-//   int64_t    fs.mkdir(Capability quota, const char* path) -> FS_*
-//   int64_t    fs.unlink(Capability quota, const char* path) -> FS_*
-//   int64_t    fs.list(Capability quota, const char* path, Capability entries, uint64_t capacity, uint64_t* out_total) -> count (>=0) or FS_* (<0)
+// A handle names a file, directory or quota and carries FS_* rights. Each kind
+// has its own type: OType::FsFile, OType::FsDir, OType::FsQuota. Every
+// handle is opened through another one (`from`, `dir`, `parent`), with at most
+// its rights, and its memory is paid for by `memory_quota`. fs.close closes a
+// handle and every handle opened through it, and gives their memory back.
+// Paths are relative, with no ".", ".." or leading '/'; "" is the handle
+// itself. A name is one or more printable characters, no blank or '/'.
+// Neither names nor paths have a length limit, and a file can grow until its
+// quota or the disk is full.
+//
+//   int64_t    fs.close(Capability handle)
+//   Capability fs.open(Capability from, const char* path, uint32_t rights, Capability memory_quota)
+//   Capability fs.create(Capability dir, const char* path, Capability payer, uint32_t flags, Capability memory_quota)
+//   Capability fs.quota(Capability parent, const char* name, uint64_t limit, Capability memory_quota)
+//   int64_t    fs.read(Capability file, Capability buf, uint64_t offset, uint64_t length)
+//   int64_t    fs.write(Capability file, Capability buf, uint64_t offset, uint64_t length, Capability payer)
+//   int64_t    fs.list(Capability from, const char* path, Capability buf, uint64_t bytes, uint64_t start) -> entries written
+//   int64_t    fs.remove(Capability from, const char* path)
+//   int64_t    fs.move(Capability from, const char* from_path, Capability dir, const char* path, Capability payer)
+//   int64_t    fs.freeze(Capability file)
+//   int64_t    fs.stat(Capability handle, FsStat* out)
+//   int64_t    fs.link(Capability dir, const char* path, Capability target, uint32_t rights, Capability payer)
+// Errors: status_cap(FS_*), or a negative FS_*. A null `dir` to fs.create
+// makes a temporary, opened through `payer`; it is removed, and `payer`
+// refunded, when the handle fs.create returned is closed, unless it was moved
+// into a directory first. A write that extends a file needs ADD on `payer`,
+// the quota that pays for the file; otherwise `payer` may be null. fs.quota
+// makes quota `name` of `parent`, or sets the limit of the one already there:
+// growing takes from `parent`, shrinking stops at what it has used. It needs
+// CHANGE on `parent`, and ADD too to make or grow one; the handle has
+// `parent`'s rights. fs.remove removes `path` and everything in it; removing a
+// link removes the link, not what it names; a quota can only be removed once
+// it pays for nothing (FS_IN_USE). fs.move moves entry `from_path` of `from`
+// to `path` of `dir`: it needs every right on the directory the entry is in,
+// through `from`, and ADD on the destination (CHANGE too to replace a file
+// there). A temporary is moved with its own handle as `from` and `from_path`
+// "". The entry keeps its payer; a link cannot be moved. A new name longer
+// than FS_NAME_INLINE bytes takes blocks of its own: `payer` pays for them,
+// and needs ADD and to be the quota that pays for the entry. Otherwise
+// `payer` may be null.
+//
+// LISTING: fs.list writes the entries of `path` under `from` into `buf`, from
+// the `start`th on (0 is the first): for each, an FsDirEntry and then its
+// name and a NUL, fs_dir_entry_bytes(name_length) bytes in all, as many whole
+// ones as fit in `bytes`. It returns how many it wrote, 0 once there are no
+// more. If not even the first fits, it writes just that one's FsDirEntry
+// (when `bytes` has room for it), whose `name_length` says what it needs, and
+// returns FS_TOO_LARGE.
+//
+// LINKS: fs.link makes entry `path` of `dir` name `target`, with `rights` (at
+// most the target handle's, never LINK). The target handle needs LINK. Opening
+// through a link gives at most the link's rights.
+//
+// COSTS: an entry costs its payer a block; a name longer than FS_NAME_INLINE
+// bytes, and a file, a block for each FS_BLOCK_BYTES of it, and about one
+// more per 1024 of those for the lists that keep track of them. A quota
+// costs its parent its limit as well.
 
-constexpr size_t   FS_NAME_MAX       = 32;         // one component, including the NUL
-constexpr size_t   FS_PATH_MAX       = 96;         // a path, including the NUL
-constexpr uint64_t FS_BLOCK_BYTES    = 4096;       // allocation unit on disk
-constexpr uint64_t FS_DIRECT_BLOCKS  = 16;
-constexpr uint64_t FS_INDIRECT_SLOTS = FS_BLOCK_BYTES / sizeof(uint32_t);  // 1024
-constexpr uint64_t FS_MAX_FILE_BLOCKS = FS_DIRECT_BLOCKS + FS_INDIRECT_SLOTS;
-constexpr uint64_t FS_MAX_FILE_BYTES = FS_MAX_FILE_BLOCKS * FS_BLOCK_BYTES;  // 4,160 KiB
+constexpr uint64_t FS_BLOCK_BYTES = 4096;  // allocation unit on disk
+constexpr size_t   FS_NAME_INLINE = 20;    // a longer name takes blocks
 
-constexpr int64_t FS_OK            = 0;
-constexpr int64_t FS_BAD_REQUEST   = -1;   // malformed request or path
-constexpr int64_t FS_INVALID_QUOTA = -2;   // not a quota_disk handle
-constexpr int64_t FS_PERMISSION    = -3;   // handle lacks Store, or the file is not its to change
-constexpr int64_t FS_QUOTA         = -4;   // the quota's bytes or inodes are used up
-constexpr int64_t FS_NO_MEMORY     = -5;   // node_funding could not pay; node table or the node's open files full
-constexpr int64_t FS_BUSY          = -6;   // quota has children; directory is a node's root
-constexpr int64_t FS_NOT_FOUND     = -7;   // nothing of that path under the handle's root
-constexpr int64_t FS_EXISTS        = -8;
-constexpr int64_t FS_INVALID_FILE  = -9;   // not an open file handle
-constexpr int64_t FS_TOO_LARGE     = -10;  // beyond FS_MAX_FILE_BYTES
-constexpr int64_t FS_IO_ERROR      = -11;  // the block device failed
-constexpr int64_t FS_DISK_FULL     = -12;  // no free block or inode on the disk
-constexpr int64_t FS_NOT_MOUNTED   = -13;
-constexpr int64_t FS_NOT_DIR       = -14;  // a directory was needed
-constexpr int64_t FS_IS_DIR        = -15;  // a file was needed
-constexpr int64_t FS_NOT_EMPTY     = -16;  // unlink of a directory with entries
+constexpr uint32_t FS_READ   = 1;  // read; list and open inside
+constexpr uint32_t FS_ADD    = 2;  // append; create inside; pay with a quota
+constexpr uint32_t FS_CHANGE = 4;  // overwrite, freeze, delete; split a quota
+constexpr uint32_t FS_ALL    = FS_READ | FS_ADD | FS_CHANGE;
+constexpr uint32_t FS_LINK   = 8;  // may be linked to (fs.link)
 
-constexpr uint64_t FS_DERIVE_ADOPT = 1;
+constexpr uint32_t FS_CREATE_DIR = 1;     // fs.create flag
+constexpr uint64_t FS_APPEND = ~0ULL;     // fs.write offset: at the end
 
-struct alignas(16) FsDeriveRequest {
-  Capability parent;        // in
-  Capability node_funding;  // in: QuotaVm that pays for the node's page
-  Capability out_quota;     // out: handle of the new node, per `perms`
-  Capability out_admin;     // out: its ADMIN handle (the one to destroy it with)
-  char path[FS_PATH_MAX];   // in: the child's root directory, under the parent's
-  uint64_t limit_bytes;     // in: multiple of FS_BLOCK_BYTES
-  uint32_t limit_inodes;    // in
-  uint32_t perms;           // in: perms::Store -> ADMIN handle, else OP handle
-  int64_t status;           // out: FS_*
-  uint64_t flags;           // in: FS_DERIVE_*, or 0
+constexpr int64_t FS_OK          = 0;
+constexpr int64_t FS_BAD_REQUEST = -1;   // malformed request, path or buffer
+constexpr int64_t FS_INVALID     = -2;   // not a live handle
+constexpr int64_t FS_PERMISSION  = -3;   // missing right
+constexpr int64_t FS_QUOTA       = -4;   // disk quota exhausted
+constexpr int64_t FS_NO_MEMORY   = -5;   // memory quota exhausted
+constexpr int64_t FS_NOT_FOUND   = -6;
+constexpr int64_t FS_EXISTS      = -7;
+constexpr int64_t FS_FROZEN      = -8;
+constexpr int64_t FS_TOO_LARGE   = -9;   // past what an entry can record; fs.list: no room
+constexpr int64_t FS_IO_ERROR    = -10;
+constexpr int64_t FS_DISK_FULL   = -11;
+constexpr int64_t FS_NOT_MOUNTED = -12;
+constexpr int64_t FS_NOT_DIR     = -13;  // directory or quota needed
+constexpr int64_t FS_IS_DIR      = -14;  // file needed
+constexpr int64_t FS_BUSY        = -15;  // lock unavailable
+constexpr int64_t FS_IN_USE      = -16;  // a quota that still pays for something
+
+// FsDirEntry and FsStat flags
+constexpr uint32_t FS_ENTRY_DIR    = 2;
+constexpr uint32_t FS_ENTRY_QUOTA  = 4;
+constexpr uint32_t FS_ENTRY_FROZEN = 8;
+constexpr uint32_t FS_ENTRY_LINK   = 16;
+
+// What fs.list writes for an entry; its name and a NUL follow.
+struct FsDirEntry {
+  uint64_t size;            // file: bytes; quota: limit
+  uint32_t flags;           // FS_ENTRY_*
+  uint32_t name_length;     // bytes, not counting the NUL
 };
 
-// fs.quota_query: either handle.
-struct alignas(16) FsQueryRequest {
-  Capability quota;         // in
-  uint64_t limit_bytes;     // out
-  uint64_t used_bytes;      // out: by this node's own files
-  uint64_t delegated_bytes; // out: to children
-  uint32_t limit_inodes;    // out
-  uint32_t used_inodes;     // out
-  uint32_t delegated_inodes;// out
-  uint32_t pad_;
-  int64_t status;           // out
-  uint64_t pad2_;
+// The bytes fs.list writes for an entry with a name of `name_length` bytes:
+// the next entry is that far on, as aligned as the first.
+constexpr uint64_t fs_dir_entry_bytes(uint64_t name_length) {
+  return (sizeof(FsDirEntry) + name_length + 1 + alignof(FsDirEntry) - 1) &
+         ~(alignof(FsDirEntry) - 1);
+}
+
+struct alignas(16) FsStat {
+  uint64_t size;            // file: bytes; quota: limit
+  uint64_t used;            // quota: used; else what it costs
+  uint32_t flags;           // FS_ENTRY_*
+  uint32_t rights;          // FS_*
 };
 
-constexpr size_t FS_OPEN_PER_NODE = 246;
-
-constexpr uint32_t FS_OWNER_OTHER = 0;  // another node's: read-only to this handle
-constexpr uint32_t FS_OWNER_SELF  = 1;  // the listing node's own
-constexpr uint32_t FS_OWNER_CHILD = 2;  // a descendant's
-
-struct alignas(16) FsDirEntry {
-  char name[FS_NAME_MAX];
-  uint64_t size;
-  uint32_t inode;
-  uint32_t owner;           // FS_OWNER_*
-  uint32_t is_dir;
-  uint32_t pad_[3];
+// Order of FsInterface::call.
+enum : uint32_t {
+  FS_CALL_CLOSE, FS_CALL_OPEN, FS_CALL_CREATE, FS_CALL_QUOTA, FS_CALL_READ,
+  FS_CALL_WRITE, FS_CALL_LIST, FS_CALL_REMOVE, FS_CALL_MOVE, FS_CALL_FREEZE,
+  FS_CALL_STAT, FS_CALL_LINK, FS_CALLS
 };
+inline constexpr const char* FS_CALL_NAMES[FS_CALLS] = {
+    "fs.close", "fs.open",   "fs.create", "fs.quota",  "fs.read", "fs.write",
+    "fs.list",  "fs.remove", "fs.move",   "fs.freeze", "fs.stat", "fs.link"};
 
 struct alignas(16) FsInterface {
-  Capability root_quota;    // out: ADMIN handle of the root node
-  Capability quota_derive;  // out: OType::EntryPoint
-  Capability quota_destroy; // out: OType::EntryPoint
-  Capability quota_query;   // out: OType::EntryPoint
-  Capability create;        // out: OType::EntryPoint
-  Capability mkdir;         // out: OType::EntryPoint
-  Capability open;          // out: OType::EntryPoint
-  Capability close;         // out: OType::EntryPoint
-  Capability read;          // out: OType::EntryPoint
-  Capability write;         // out: OType::EntryPoint
-  Capability unlink;        // out: OType::EntryPoint
-  Capability list;          // out: OType::EntryPoint
-  uint64_t capacity_sectors;// in: the device's size (BlkInterface)
-  uint64_t total_bytes;     // out: data bytes the disk can hold
-  uint64_t used_bytes;      // out: in use after mount
-  int64_t status;           // out: FS_*
-  uint32_t total_inodes;    // out
-  uint32_t used_inodes;     // out
-  uint32_t formatted;       // out: 1 if a fresh file system was written
+  Capability memory_quota;    // in: QuotaVm paying for the two handles
+  Capability root_dir;        // out: `/`, FS_ALL
+  Capability root_quota;      // out: root quota, FS_ALL
+  Capability call[FS_CALLS];  // out: OType::EntryPoint
+  uint64_t capacity_sectors;  // in: the device's size (BlkInterface)
+  uint64_t total_bytes;       // out: root quota limit
+  uint64_t used_bytes;        // out: root quota spent
+  int64_t status;             // out: FS_*
+  uint32_t formatted;         // out: 1 if a fresh file system was written
   uint32_t pad_;
 };
 
@@ -467,11 +500,9 @@ constexpr size_t RW_SLOT_SHELL_SCHED_QUOTA   = RW_SLOT_PROVISIONED_BASE + 21;
 constexpr size_t RW_SLOT_BLK_QUOTA           = RW_SLOT_PROVISIONED_BASE + 22;
 constexpr size_t RW_SLOT_BLK_COMP            = RW_SLOT_PROVISIONED_BASE + 23;
 constexpr size_t RW_SLOT_BLK_SENTRY          = RW_SLOT_PROVISIONED_BASE + 24;
-constexpr size_t RW_SLOT_FS_NODE_FUNDING     = RW_SLOT_PROVISIONED_BASE + 25;
-constexpr size_t RW_SLOT_SHELL_DISK_QUOTA    = RW_SLOT_PROVISIONED_BASE + 26;
-constexpr size_t RW_SLOT_SEALER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 27;
-constexpr size_t RW_SLOT_SEALER_COMP         = RW_SLOT_PROVISIONED_BASE + 28;
-constexpr size_t RW_SLOT_SEALER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 29;
+constexpr size_t RW_SLOT_SEALER_QUOTA        = RW_SLOT_PROVISIONED_BASE + 25;
+constexpr size_t RW_SLOT_SEALER_COMP         = RW_SLOT_PROVISIONED_BASE + 26;
+constexpr size_t RW_SLOT_SEALER_SENTRY       = RW_SLOT_PROVISIONED_BASE + 27;
 
 __attribute__((always_inline)) inline constexpr size_t syscall_slot(
     syscall::Id id) {

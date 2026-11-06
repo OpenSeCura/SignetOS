@@ -142,8 +142,8 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 #   - `external/services/`: root-owned system services (`naming`, `sealer`,
 #     `sched`, `shell`) that `init` reads from `fs` out of `/` and
 #     loads.
-#   - `external/apps/`: programs, written to `/bin`, which the shell reaches
-#     through a read-only disk quota rooted there and can `run`.
+#   - `external/apps/`: programs, written to `/bin`, which the shell can
+#     `run` (user/launch.hpp); each one's manifest says what it asks for.
 BOOT_COMPS = init fs uart dma blk
 BOOT_SRCS  = $(patsubst %,boot/%.cpp,$(BOOT_COMPS))
 BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
@@ -268,10 +268,8 @@ signetos.elf: $(OBJS)
 
 # The disk image is a build product like the kernel: it carries the services
 # `init` loads from it and the programs the shell can run, so it is remade
-# whenever one of them changes. Two `put`s: the system
-# images go in `/`, where only the root quota is rooted and so out of the
-# shell's sight; the programs go in `/bin`, which the shell reads through a
-# read-only quota rooted there.
+# whenever one of them changes. System images go in `/` (only `init` has a
+# handle to it) and programs in `/bin`.
 $(DISK_IMG): $(EXT_SERVICE_BINS) $(EXT_APP_BINS) tools/signetfs.py
 	$(SIGNETFS) put $@ --size $(DISK_BYTES) $(EXT_SERVICE_BINS)
 	$(SIGNETFS) put $@ --dir bin $(EXT_APP_BINS)

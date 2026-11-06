@@ -131,9 +131,12 @@ Status launch(Capability system_quota, Capability thread_quota,
   }
   init_seeds[idx++] = thread_quota;
   // The authorities of the user-managed OTypes, for `init` to hand to their
-  // managers: the scheduler, the file system, and the `sealer` (its two).
+  // managers: the scheduler, the file system (its three), and the `sealer`
+  // (its two).
   init_seeds[idx++] = sealing::authority_for(OType::QuotaSched);
-  init_seeds[idx++] = sealing::authority_for(OType::QuotaDisk);
+  init_seeds[idx++] = sealing::authority_for(OType::FsFile);
+  init_seeds[idx++] = sealing::authority_for(OType::FsDir);
+  init_seeds[idx++] = sealing::authority_for(OType::FsQuota);
   init_seeds[idx++] = sealing::authority_for(OType::TypeKey);
   init_seeds[idx++] = sealing::authority_for(OType::SealedObject);
 

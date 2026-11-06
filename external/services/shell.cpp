@@ -32,18 +32,10 @@
  *   `uart.read` sleeps in the scheduler until the UART interrupts (sched.cpp,
  *   DEVICE INTERRUPTS) and hands over what was typed. Commands:
  *     help       list commands
- *     ls [dir], cat, write, append, mkdir, rm, df
- *                files and directories under `/home`, which every path is
- *                relative to: the ADMIN `quota_disk` handle rooted there
- *                that the shell's manifest asks `init` for (SLOT_DISK_QUOTA),
- *                used with the `fs.*` entry points resolved by name
- *     run <f> [args]
- *                a program: a file in `/bin`, read through the second,
- *                read-only handle the manifest asks for (SLOT_BIN_DIR),
- *                loaded into a compartment of its own, given what its own
- *                manifest asks for and this shell's policy allows, and
- *                invoked once on this thread (see "Programs" below and
- *                abi.hpp, "Applications")
+ *     ls [dir], cat, write, append, mkdir, rm, mv, freeze, df
+ *                files (FILES below)
+ *     run <prog> [<request>=<path> ...] [args], link, unlink, quota
+ *                programs from /bin (Programs below, launch.hpp)
  *     pagetest [fill <MiB>]
  *                paging self-test (PAGE TEST below)
  *     sealtest   compartment-minted sealing self-test: the sealer service,
@@ -55,13 +47,13 @@
  *   keyboard: the shell then just exits.
  */
 
+#include "launch.hpp"
 #include "runtime.hpp"
 
 namespace signetos::user {
 namespace {
 
 uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
-constexpr size_t LINE_MAX = 64;
 
 // TODO This obviously isn't a real shell or a good shell, it's just enough to
 // kind of test some things for now
@@ -70,11 +62,9 @@ constexpr size_t LINE_MAX = 64;
 // Its own quotas: the VM it lives on, thread memory for its programs' threads,
 // and its CPU bandwidth -- half the machine, as an ADMIN `quota_sched` node it
 // sub-divides for its programs; the kernel entries a console that starts
-// threads and runs programs is made of; the services it talks to; its
-// place on the disk: `/home` as an ADMIN node with all the space and inodes
-// the system's own images leave free (DISK entries are met in order, so this
-// one takes everything before `/bin` asks for nothing), and `/bin` as a
-// 0-byte read-only view of the programs.
+// threads and runs programs is made of; the services it talks to; and the
+// disk quota, /home, /apps (programs' own) and /bin (read-only), all with
+// LINK, so that what is in them can be linked for a program (launch.hpp).
 #define SHELL_MANIFEST(X)                                                      \
   M_QUOTA_VM(X, VM_QUOTA)                                                      \
   M_QUOTA_THREAD(X, THREAD_QUOTA, 256ULL * 1024 * 1024)                        \
@@ -97,10 +87,13 @@ constexpr size_t LINE_MAX = 64;
   M_SERVICE_OPT(X, PAGING_STOP, "blk.paging_stop")                             \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
   M_SERVICE(X, NAMING_LOOKUP, "naming.lookup")                                 \
-  M_DISK(X, DISK_QUOTA, 0, perms::Load | perms::Store,                         \
-         ::signetos::init::MANIFEST_ALL, ::signetos::init::MANIFEST_ALL_INODES, \
-         "home")                                                               \
-  M_DISK(X, BIN_DIR, 0, perms::Load, 0, 0, "bin")
+  M_QUOTA_DISK(X, DISK, 0, ::signetos::init::FS_ALL, "disk")                   \
+  M_DIR(X, HOME, 0, ::signetos::init::FS_ALL | ::signetos::init::FS_LINK,      \
+        "home")                                                                \
+  M_DIR(X, BIN, 0, ::signetos::init::FS_READ | ::signetos::init::FS_LINK,      \
+        "bin")                                                                 \
+  M_DIR(X, APPS, 0, ::signetos::init::FS_ALL | ::signetos::init::FS_LINK,      \
+        "apps")
 // 1 GiB of address space: the shell's own image and tables, its programs'
 // scheduler nodes, and -- `run <file>` -- the buffer a program is read into
 // plus the VM sub-quota its compartment lives on while it runs. A program's
@@ -123,6 +116,7 @@ Capability s_sched_query = nullptr;
 Capability s_sched_register = nullptr;
 Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
+launch::Starter s_starter{};  // what `run` starts programs with (launch.hpp)
 
 inline uint64_t now_us() {
   uint64_t t;
@@ -151,88 +145,29 @@ void out_dec(const char* prefix, uint64_t value, const char* suffix) {
 
 void yield() { invoke<int64_t>(s_gate_invoke, s_sched_yield); }
 
-// Runs `attempt` until `ok` accepts what it returns, giving what the shell
-// has freed the chance to come back first: it comes back to its quotas only
-// once a sweep has reclaimed it, and sweeps are rate limited (DESIGN.md
-// §4.2). Looking at the completed epoch may sweep, so after a refusal the
-// shell looks and tries again; if that is refused too, it waits for the next
-// sweep, which reclaims everything freed so far, and tries a last time.
+// Runs `attempt` until `ok` accepts what it returns, letting what the shell
+// freed come back first (launch.hpp).
 template <typename Attempt, typename Ok>
 auto with_reclaim(Attempt attempt, Ok ok) {
-  auto result = attempt();
-  if (ok(result) || !capability_is_valid(s_gate_revoke_query)) {
-    return result;
-  }
-  using FnQuery = decltype(&sys_revoke_query);
-  const uint64_t seen = syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
-  result = attempt();
-  if (ok(result)) {
-    return result;
-  }
-  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 1);
-  return attempt();
-}
-
-// A thread paid from the shell's thread quota, or null.
-Capability new_thread(size_t stack, Capability entry, Capability arg) {
-  using FnThreadCreate = decltype(&sys_thread_create);
-  return with_reclaim(
-      [&] {
-        return syscall::call<FnThreadCreate>(s_gate_invoke,
-                                             s_gate_thread_create,
-                                             s_thread_quota, stack, entry, arg);
-      },
-      [](Capability t) { return sealing::is_sealed_as(OType::Thread, t); });
-}
-
-// Derives the scheduler node `req` asks for. Its page is paid from the
-// shell's VM quota.
-void derive_node(init::SchedDeriveRequest* req) {
-  with_reclaim(
-      [&] {
-        req->status = init::SCHED_BAD_REQUEST;
-        invoke<int64_t>(s_gate_invoke, s_sched_derive, bounded(req));
-        return req->status;
-      },
-      [](int64_t status) { return status != init::SCHED_NO_MEMORY; });
-}
-
-// How many threads are registered on the scheduler node `node` and the nodes
-// under it, or a negative SCHED_* status.
-int64_t node_threads(Capability node) {
-  init::SchedQueryRequest req{};
-  req.status = init::SCHED_BAD_REQUEST;
-  invoke<int64_t>(s_gate_invoke, s_sched_query, node, bounded(&req));
-  return req.status == init::SCHED_OK ? static_cast<int64_t>(req.threads)
-                                      : req.status;
-}
-
-// Takes back `node`, a scheduler node derived from the shell's own. A thread
-// still on it stops.
-int64_t destroy_sched_node(Capability node) {
-  return invoke<int64_t>(s_gate_invoke, s_sched_destroy, s_my_quota, node);
+  return launch::with_reclaim(s_starter, attempt, ok);
 }
 
 // --- Files: clients of fs.* ----------------------------------------------------
 
-// The shell's place on the disk, both handles asked of `init` in the manifest
-// (abi.hpp, "File system"): an ADMIN `quota_disk` rooted at `/home`, which
-// every path a file command takes is relative to, and an OP one rooted at
-// `/bin` with no budget -- a read-only view of the programs `run` loads. And
-// the file system's entry points, resolved by name.
-Capability s_disk_quota = nullptr;
-Capability s_bin_quota = nullptr;
-Capability s_fs_derive = nullptr;
-Capability s_fs_destroy = nullptr;
-Capability s_fs_query = nullptr;
-Capability s_fs_create = nullptr;
-Capability s_fs_mkdir = nullptr;
-Capability s_fs_open = nullptr;
-Capability s_fs_close = nullptr;
-Capability s_fs_read = nullptr;
-Capability s_fs_write = nullptr;
-Capability s_fs_unlink = nullptr;
-Capability s_fs_list = nullptr;
+// FILES: paths start at /home, /bin, /apps or /disk (the disk quota); paths
+// without a leading '/' are under /home. The disk quota pays for what the
+// shell writes. Commands close the handles they open.
+struct Root {
+  const char* name;
+  Capability handle;
+};
+Root s_roots[] = {{"home", nullptr}, {"bin", nullptr}, {"apps", nullptr},
+                  {"disk", nullptr}};
+constexpr size_t ROOT_HOME = 0;
+constexpr size_t ROOT_BIN = 1;
+constexpr size_t ROOT_APPS = 2;
+constexpr size_t ROOT_DISK = 3;
+Capability s_fs[init::FS_CALLS];  // fs entry points, indexed by FS_CALL_*
 bool s_fs_ready = false;
 
 // The sealer's entry points (abi.hpp, "Sealing service"), resolved by name:
@@ -244,197 +179,108 @@ Capability s_seal_derive = nullptr;
 Capability s_seal_seal = nullptr;
 Capability s_seal_unseal = nullptr;
 
-// Buffers that cross into `fs` live here rather than on the (narrowed) stack.
-constexpr size_t LIST_MAX = 16;
+// Buffers that cross into `fs` live here rather than on the (narrowed) stack:
+// a chunk of a file for `cat`, a page of a directory for `ls`.
 constexpr size_t DATA_MAX = 8192;
-alignas(16) init::FsDirEntry s_entries[LIST_MAX];
 alignas(16) uint8_t s_data[DATA_MAX];
 
-// Compartments link no C library: a request too large for the compiler to
-// zero inline (`T x{}`) would otherwise become a call to `memset`. The
-// path-carrying `FsDeriveRequest` is that large, so it is zeroed by this loop
-// (which stays a loop under -ffreestanding) and filled field by field.
-void zero_bytes(void* p, size_t n) {
-  auto* d = static_cast<uint8_t*>(p);
-  for (size_t i = 0; i < n; ++i) {
-    d[i] = 0;
-  }
+// Zeroed memory of the shell's, `bytes` of it at least, or null; for what
+// does not fit in `s_data`.
+char* alloc_bytes(size_t bytes) {
+  using FnAlloc = decltype(&sys_vm_allocate);
+  const size_t size = (bytes + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
+  const Capability memory = with_reclaim(
+      [&] {
+        return syscall::call<FnAlloc>(s_starter.invoke, s_starter.vm_allocate,
+                                      s_starter.self, s_starter.vm_quota, size,
+                                      0);
+      },
+      [](Capability result) { return capability_is_valid(result); });
+  return capability_is_valid(memory) ? static_cast<char*>(memory) : nullptr;
 }
 
-// A request's FS_PATH_MAX-byte path field: `path`, truncated if need be, then
-// NULs to the end.
-void set_path(char* dst, const char* path) {
-  size_t i = 0;
-  for (; i + 1 < init::FS_PATH_MAX && path[i] != '\0'; ++i) {
-    dst[i] = path[i];
-  }
-  for (; i < init::FS_PATH_MAX; ++i) {
-    dst[i] = '\0';
-  }
+void free_bytes(char* memory) { launch::release(s_starter, memory); }
+
+// Calls fs entry point `call` (FS_CALL_*).
+template <typename R = int64_t, typename... A>
+R fs(uint32_t call, A... args) {
+  return invoke<R>(s_gate_invoke, s_fs[call], args...);
 }
 
-const char* fs_status_name(int64_t st) {
-  switch (st) {
-    case init::FS_OK: return "OK";
-    case init::FS_BAD_REQUEST: return "bad request";
-    case init::FS_INVALID_QUOTA: return "invalid quota handle";
-    case init::FS_PERMISSION: return "permission denied";
-    case init::FS_QUOTA: return "quota exceeded";
-    case init::FS_NO_MEMORY: return "out of memory";
-    case init::FS_BUSY: return "busy";
-    case init::FS_NOT_FOUND: return "not found";
-    case init::FS_EXISTS: return "already exists";
-    case init::FS_INVALID_FILE: return "invalid file handle";
-    case init::FS_TOO_LARGE: return "file too large";
-    case init::FS_IO_ERROR: return "I/O error";
-    case init::FS_DISK_FULL: return "disk full";
-    case init::FS_NOT_MOUNTED: return "not mounted";
-    case init::FS_NOT_DIR: return "not a directory";
-    case init::FS_IS_DIR: return "is a directory";
-    case init::FS_NOT_EMPTY: return "directory not empty";
-    default: return "unknown status";
-  }
+// FS_OK if `handle` is valid, else the error it carries.
+int64_t status_of(Capability handle) {
+  return capability_is_valid(handle) ? init::FS_OK
+                                     : init::cap_error(handle, init::FS_INVALID);
 }
 
-void fs_fail(const char* what, int64_t st) {
+Capability region(void* start, size_t length) {
+  return capability_set_bounds(reinterpret_cast<Capability>(start), length);
+}
+
+// A handle the shell opened, closed when this goes out of scope.
+struct ScopedHandle {
+  Capability handle = nullptr;
+  ~ScopedHandle() {
+    if (capability_is_valid(handle)) {
+      fs(init::FS_CALL_CLOSE, handle);
+    }
+  }
+};
+
+const char* fs_status_name(int64_t status) {
+  return launch::status_name(status);
+}
+
+void fs_fail(const char* what, int64_t status) {
   out("[shell]    ");
   out(what);
   out(": ");
-  out(fs_status_name(st));
+  out(fs_status_name(status));
   out("\n");
 }
 
-// Every path below is relative to the root directory of the handle it goes
-// with: `/home` for `s_disk_quota`, `/bin` for `s_bin_quota`, wherever a
-// sub-quota was derived at for that sub-quota.
-
-// fs.create or fs.open (`entry` picks which) of `path` under `quota`, for a
-// handle with `file_perms` (perms::Load, or Load | Store); the file's size,
-// if wanted, comes back in `*out_size`.
-int64_t fs_open_with(Capability entry, Capability quota, const char* path,
-                     Capability* out_file, uint64_t* out_size = nullptr,
-                     uint32_t file_perms = perms::Load | perms::Store) {
-  if (out_size != nullptr) {
-    *out_size = 0;
+// The root handle `path` starts at, with the rest of the path in `*rest`.
+Capability resolve(const char* path, const char** rest) {
+  *rest = path;
+  if (*path != '/') {
+    return s_roots[ROOT_HOME].handle;
   }
-  Capability f = invoke<Capability>(
-      s_gate_invoke, entry, quota, ro_str(path), file_perms,
-      out_size != nullptr ? bounded(out_size) : nullptr);
-  if (capability_is_valid(f)) {
-    *out_file = f;
-    return init::FS_OK;
-  }
-  *out_file = nullptr;
-  return init::cap_error(f, init::FS_BAD_REQUEST);
-}
-
-int64_t fs_close(Capability file) {
-  return invoke<int64_t>(s_gate_invoke, s_fs_close, file);
-}
-
-// fs.read or fs.write (`entry`) of `length` bytes at `offset`.
-int64_t fs_io(Capability entry, Capability file, void* buf, uint64_t offset,
-              uint64_t length, uint64_t* done) {
-  Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), length);
-  const int64_t res =
-      invoke<int64_t>(s_gate_invoke, entry, file, b, offset, length);
-  if (res >= 0) {
-    if (done != nullptr) {
-      *done = static_cast<uint64_t>(res);
+  for (const Root& root : s_roots) {
+    size_t length = 0;
+    while (root.name[length] != '\0' && root.name[length] == path[1 + length]) {
+      ++length;
     }
-    return init::FS_OK;
+    if (root.name[length] == '\0' &&
+        (path[1 + length] == '\0' || path[1 + length] == '/')) {
+      *rest = path[1 + length] == '/' ? path + 2 + length : path + 1 + length;
+      return root.handle;
+    }
   }
-  if (done != nullptr) {
-    *done = 0;
+  return nullptr;
+}
+
+// Opens `path` with `rights`, paid for by the shell's memory quota.
+int64_t open_path(const char* path, uint32_t rights, Capability* handle) {
+  const char* rest = nullptr;
+  const Capability from = resolve(path, &rest);
+  if (from == nullptr) {
+    return init::FS_NOT_FOUND;
   }
-  return res;
+  *handle = fs<Capability>(init::FS_CALL_OPEN, from, ro_str(rest), rights,
+                           s_vm_quota);
+  return status_of(*handle);
 }
 
-// fs.unlink or fs.mkdir (`entry`): the two take the same arguments.
-int64_t fs_path_op(Capability entry, Capability quota, const char* path) {
-  return invoke<int64_t>(s_gate_invoke, entry, quota, ro_str(path));
-}
-
-int64_t fs_unlink(Capability quota, const char* path) {
-  return fs_path_op(s_fs_unlink, quota, path);
-}
-
-int64_t fs_mkdir(Capability quota, const char* path) {
-  return fs_path_op(s_fs_mkdir, quota, path);
-}
-
-// Lists the directory `path` under `quota` into `s_entries`; `*total` counts
-// its entries whether or not they fit.
-int64_t fs_list(Capability quota, const char* path, uint64_t* count,
-                uint64_t* total) {
-  *count = 0;
-  *total = 0;
-  Capability ents = capability_set_bounds(
-      reinterpret_cast<Capability>(&s_entries[0]), sizeof(s_entries));
-  const int64_t res = invoke<int64_t>(s_gate_invoke, s_fs_list, quota,
-                                      ro_str(path), ents,
-                                      static_cast<uint64_t>(LIST_MAX),
-                                      bounded(total));
-  if (res < 0) {
-    return res;
+// Creates a file (or a directory with FS_CREATE_DIR), paid by the disk quota.
+int64_t create_path(const char* path, uint32_t flags, Capability* handle) {
+  const char* rest = nullptr;
+  const Capability dir = resolve(path, &rest);
+  if (dir == nullptr) {
+    return init::FS_NOT_FOUND;
   }
-  *count = static_cast<uint64_t>(res);
-  return init::FS_OK;
-}
-
-int64_t fs_query(Capability quota, init::FsQueryRequest& req) {
-  req.quota = quota;
-  req.status = init::FS_BAD_REQUEST;
-  return invoke<int64_t>(s_gate_invoke, s_fs_query, bounded(&req));
-}
-
-// A sub-quota of `parent` rooted at the directory `path` names under the
-// parent's own ("" for the parent's), its node paid for from the shell's own
-// VM quota. ADMIN unless `handle_perms` lacks Store; either way the node's
-// ADMIN handle comes back in `*out_admin` if asked, since that is the only
-// thing it can be destroyed with. `flags`: FS_DERIVE_ADOPT or 0.
-int64_t fs_derive(Capability parent, const char* path, uint64_t bytes,
-                  uint32_t inodes, Capability* out_quota,
-                  uint32_t handle_perms = perms::Load | perms::Store,
-                  Capability* out_admin = nullptr, uint64_t flags = 0) {
-  init::FsDeriveRequest req;
-  zero_bytes(&req, sizeof(req));
-  req.parent = parent;
-  req.node_funding = s_vm_quota;
-  set_path(req.path, path);
-  req.limit_bytes = bytes;
-  req.limit_inodes = inodes;
-  req.perms = handle_perms;
-  req.status = init::FS_BAD_REQUEST;
-  req.flags = flags;
-  invoke<int64_t>(s_gate_invoke, s_fs_derive, bounded(&req));
-  *out_quota = req.out_quota;
-  if (out_admin != nullptr) {
-    *out_admin = req.out_admin;
-  }
-  return req.status;
-}
-
-int64_t fs_destroy(Capability quota) {
-  return invoke<int64_t>(s_gate_invoke, s_fs_destroy, quota);
-}
-
-// The size of the file at `path`; false if the shell cannot open it.
-bool file_size(const char* path, uint64_t* size) {
-  Capability file = nullptr;
-  if (fs_open_with(s_fs_open, s_disk_quota, path, &file, size) != init::FS_OK) {
-    return false;
-  }
-  fs_close(file);
-  return true;
-}
-
-size_t str_len(const char* s) {
-  size_t n = 0;
-  while (s[n] != '\0') {
-    n += 1;
-  }
-  return n;
+  *handle = fs<Capability>(init::FS_CALL_CREATE, dir, ro_str(rest),
+                           s_roots[ROOT_DISK].handle, flags, s_vm_quota);
+  return status_of(*handle);
 }
 
 // --- File commands -------------------------------------------------------------
@@ -466,33 +312,66 @@ bool fs_available() {
   return s_fs_ready;
 }
 
-// `ls [dir]`: the entries of `dir` (the shell's own root, `/home`, when
-// empty). A directory shows with a trailing '/'; a file with its size; and
-// anything that is not the shell's own says so, since in view is not the same
-// as the shell's to change (abi.hpp, FS_OWNER_*).
+// `ls /` lists the roots, `ls /disk` the quotas; the default is /home. A
+// buffer-full of entries at a time, until fs has given them all.
 void cmd_ls(const char* path) {
   if (!fs_available()) {
     return;
   }
-  uint64_t count = 0;
-  uint64_t total = 0;
-  const int64_t st = fs_list(s_disk_quota, path, &count, &total);
-  if (st != init::FS_OK) {
-    fs_fail("ls", st);
+  if (str_eq(path, "/")) {
+    for (const Root& root : s_roots) {
+      out("  ");
+      out(root.name);
+      out("/\n");
+    }
     return;
   }
-  for (uint64_t i = 0; i < count; ++i) {
-    const init::FsDirEntry& e = s_entries[i];
-    out("  ");
-    out(e.name);
-    if (e.is_dir != 0) {
-      out("/");
-    } else {
-      out_dec("  ", e.size, " bytes");
+  const char* rest = nullptr;
+  const Capability from = resolve(path, &rest);
+  char* buf = reinterpret_cast<char*>(s_data);
+  uint64_t bytes = DATA_MAX;
+  char* big = nullptr;  // for an entry whose name does not fit in `s_data`
+  uint64_t total = 0;
+  int64_t status = from == nullptr ? init::FS_NOT_FOUND : init::FS_OK;
+  while (status == init::FS_OK) {
+    const int64_t count = fs(init::FS_CALL_LIST, from, ro_str(rest),
+                             region(buf, bytes), bytes, total);
+    if (count == init::FS_TOO_LARGE) {  // fs wrote what the entry needs
+      bytes = init::fs_dir_entry_bytes(
+          reinterpret_cast<const init::FsDirEntry*>(buf)->name_length);
+      free_bytes(big);
+      big = alloc_bytes(bytes);
+      buf = big;
+      status = big == nullptr ? init::FS_NO_MEMORY : init::FS_OK;
+      continue;
     }
-    out(e.owner == init::FS_OWNER_SELF    ? "\n"
-        : e.owner == init::FS_OWNER_CHILD ? " (sub-quota)\n"
-                                          : " (read-only)\n");
+    if (count <= 0) {
+      status = count;
+      break;
+    }
+    const char* at = buf;
+    for (int64_t i = 0; i < count; ++i) {
+      const auto& entry = *reinterpret_cast<const init::FsDirEntry*>(at);
+      out("  ");
+      out(at + sizeof(init::FsDirEntry));
+      if ((entry.flags & init::FS_ENTRY_DIR) != 0) {
+        out("/");
+      } else if ((entry.flags & init::FS_ENTRY_LINK) != 0) {
+        out("  link");
+      } else if ((entry.flags & init::FS_ENTRY_QUOTA) != 0) {
+        out_dec("  quota of ", entry.size, " bytes");
+      } else {
+        out_dec("  ", entry.size, " bytes");
+      }
+      out((entry.flags & init::FS_ENTRY_FROZEN) != 0 ? " (frozen)\n" : "\n");
+      at += init::fs_dir_entry_bytes(entry.name_length);
+    }
+    total += static_cast<uint64_t>(count);
+  }
+  free_bytes(big);
+  if (status != init::FS_OK) {
+    fs_fail("ls", status);
+    return;
   }
   out_dec("[shell]    ", total, " entries\n");
 }
@@ -505,230 +384,172 @@ void cmd_mkdir(const char* path) {
     out("[shell]    usage: mkdir <dir>\n");
     return;
   }
-  const int64_t st = fs_mkdir(s_disk_quota, path);
-  if (st != init::FS_OK) {
-    fs_fail("mkdir", st);
+  ScopedHandle dir;
+  const int64_t status = create_path(path, init::FS_CREATE_DIR, &dir.handle);
+  if (status != init::FS_OK) {
+    fs_fail("mkdir", status);
   }
 }
 
-void cmd_cat(const char* name) {
-  if (!fs_available()) {
-    return;
-  }
-  if (*name == '\0') {
-    out("[shell]    usage: cat <name>\n");
-    return;
-  }
-  Capability file = nullptr;
-  int64_t st = fs_open_with(s_fs_open, s_disk_quota, name, &file);
-  if (st != init::FS_OK) {
-    fs_fail("cat", st);
-    return;
-  }
-  uint64_t offset = 0;
-  for (;;) {
-    uint64_t got = 0;
-    st = fs_io(s_fs_read, file, s_data, offset, DATA_MAX - 1, &got);
-    if (st != init::FS_OK) {
-      fs_fail("cat", st);
-      break;
-    }
-    if (got == 0) {
-      break;
-    }
-    s_data[got] = '\0';
-    out(reinterpret_cast<const char*>(s_data));
-    offset += got;
-  }
-  fs_close(file);
-}
-
-// `write` replaces the file; `append` adds to its end. Both create it.
-void cmd_write(const char* name, const char* text, bool append) {
-  if (!fs_available()) {
-    return;
-  }
-  if (*name == '\0') {
-    out(append ? "[shell]    usage: append <name> <text>\n"
-               : "[shell]    usage: write <name> <text>\n");
-    return;
-  }
-  uint64_t offset = 0;
-  if (append) {
-    file_size(name, &offset);  // 0 if it does not exist yet
-  } else {
-    fs_unlink(s_disk_quota, name);  // NOT_FOUND is fine
-  }
-  Capability file = nullptr;
-  int64_t st = fs_open_with(s_fs_create, s_disk_quota, name, &file);
-  if (st == init::FS_EXISTS && append) {
-    st = fs_open_with(s_fs_open, s_disk_quota, name, &file);
-  }
-  if (st != init::FS_OK) {
-    fs_fail(append ? "append" : "write", st);
-    return;
-  }
-  size_t len = str_len(text);
-  if (len > DATA_MAX - 1) {
-    len = DATA_MAX - 1;
-  }
-  for (size_t i = 0; i < len; ++i) {
-    s_data[i] = static_cast<uint8_t>(text[i]);
-  }
-  s_data[len++] = '\n';
-  uint64_t done = 0;
-  st = fs_io(s_fs_write, file, s_data, offset, len, &done);
-  if (st != init::FS_OK) {
-    fs_fail(append ? "append" : "write", st);
-  } else {
-    out_dec("[shell]    ", done, " bytes written\n");
-  }
-  fs_close(file);
-}
-
-// A file, or a directory with nothing in it (and no sub-quota rooted at it).
-void cmd_rm(const char* path) {
+void cmd_cat(const char* path) {
   if (!fs_available()) {
     return;
   }
   if (*path == '\0') {
-    out("[shell]    usage: rm <path>\n");
+    out("[shell]    usage: cat <file>\n");
     return;
   }
-  const int64_t st = fs_unlink(s_disk_quota, path);
-  if (st != init::FS_OK) {
-    fs_fail("rm", st);
+  ScopedHandle file;
+  int64_t status = open_path(path, init::FS_READ, &file.handle);
+  for (uint64_t offset = 0; status == init::FS_OK;) {
+    const int64_t bytes_read =
+        fs(init::FS_CALL_READ, file.handle, region(s_data, DATA_MAX - 1),
+           offset, uint64_t{DATA_MAX - 1});
+    if (bytes_read <= 0) {
+      status = bytes_read;
+      break;
+    }
+    s_data[bytes_read] = '\0';
+    out(reinterpret_cast<const char*>(s_data));
+    offset += static_cast<uint64_t>(bytes_read);
+  }
+  if (status != init::FS_OK) {
+    fs_fail("cat", status);
   }
 }
 
-void print_quota(const char* label, const init::FsQueryRequest& q) {
-  out(label);
-  out_dec("", q.used_bytes / 1024, " KiB used + ");
-  out_dec("", q.delegated_bytes / 1024, " KiB delegated of ");
-  out_dec("", q.limit_bytes / 1024, " KiB; ");
-  out_dec("", q.used_inodes, " + ");
-  out_dec("", q.delegated_inodes, " of ");
-  out_dec("", q.limit_inodes, " files\n");
+// `write` replaces the file with a line of text; `append` adds the line. The
+// text is written from the command line itself, its NUL made the newline.
+void cmd_write(const char* path, char* text, bool append) {
+  if (!fs_available()) {
+    return;
+  }
+  if (*path == '\0') {
+    out(append ? "[shell]    usage: append <file> <text>\n"
+               : "[shell]    usage: write <file> <text>\n");
+    return;
+  }
+  ScopedHandle file;
+  int64_t status =
+      open_path(path, append ? init::FS_ADD : init::FS_CHANGE, &file.handle);
+  if (status == init::FS_OK && !append) {
+    // a new one takes its place
+    status = fs(init::FS_CALL_REMOVE, file.handle, ro_str(""));
+    status = status == init::FS_OK ? init::FS_NOT_FOUND : status;
+  }
+  ScopedHandle created;
+  if (status == init::FS_NOT_FOUND) {
+    status = create_path(path, 0, &created.handle);
+  }
+  size_t length = 0;
+  while (text[length] != '\0') {
+    ++length;
+  }
+  text[length++] = '\n';
+  const int64_t written =
+      status != init::FS_OK
+          ? status
+          : fs(init::FS_CALL_WRITE,
+               capability_is_valid(created.handle) ? created.handle
+                                                   : file.handle,
+               region(text, length), init::FS_APPEND, uint64_t{length},
+               s_roots[ROOT_DISK].handle);
+  text[length - 1] = '\0';
+  if (written < 0) {
+    fs_fail(append ? "append" : "write", written);
+  } else {
+    out_dec("[shell]    ", static_cast<uint64_t>(written), " bytes written\n");
+  }
+}
+
+// True for the shell's roots ("/home", "/apps", ...), which rm and mv refuse.
+bool is_root(const char* path) {
+  const char* rest = nullptr;
+  return resolve(path, &rest) != nullptr && *rest == '\0';
+}
+
+// Removes a file, a directory and its contents, a quota, or a link (not what
+// it names).
+void cmd_rm(const char* path) {
+  if (!fs_available()) {
+    return;
+  }
+  if (*path == '\0' || is_root(path)) {
+    out("[shell]    usage: rm <path>, not one of the shell's roots\n");
+    return;
+  }
+  const char* rest = nullptr;
+  const Capability from = resolve(path, &rest);
+  const int64_t status = from == nullptr
+                             ? init::FS_NOT_FOUND
+                             : fs(init::FS_CALL_REMOVE, from, ro_str(rest));
+  if (status != init::FS_OK) {
+    fs_fail("rm", status);
+  }
+}
+
+void cmd_mv(const char* from, const char* to) {
+  if (!fs_available()) {
+    return;
+  }
+  if (*from == '\0' || *to == '\0' || is_root(from)) {
+    out("[shell]    usage: mv <from> <to>, not one of the shell's roots\n");
+    return;
+  }
+  const char* from_rest = nullptr;
+  const Capability from_dir = resolve(from, &from_rest);
+  const char* rest = nullptr;
+  const Capability dir = resolve(to, &rest);
+  // The disk quota pays for a long new name (fs.move, abi.hpp).
+  const int64_t status =
+      from_dir == nullptr || dir == nullptr
+          ? init::FS_NOT_FOUND
+          : fs(init::FS_CALL_MOVE, from_dir, ro_str(from_rest), dir,
+               ro_str(rest), s_roots[ROOT_DISK].handle);
+  if (status != init::FS_OK) {
+    fs_fail("mv", status);
+  }
+}
+
+void cmd_freeze(const char* path) {
+  if (!fs_available()) {
+    return;
+  }
+  ScopedHandle file;
+  int64_t status = open_path(path, init::FS_CHANGE, &file.handle);
+  if (status == init::FS_OK) {
+    status = fs(init::FS_CALL_FREEZE, file.handle);
+  }
+  if (status != init::FS_OK) {
+    fs_fail("freeze", status);
+  }
 }
 
 void cmd_df() {
   if (!fs_available()) {
     return;
   }
-  init::FsQueryRequest q{};
-  const int64_t st = fs_query(s_disk_quota, q);
-  if (st != init::FS_OK) {
-    fs_fail("df", st);
+  init::FsStat stat{};
+  const int64_t status =
+      fs(init::FS_CALL_STAT, s_roots[ROOT_DISK].handle, bounded(&stat));
+  if (status != init::FS_OK) {
+    fs_fail("df", status);
     return;
   }
-  print_quota("[shell]    disk quota: ", q);
+  out_dec("[shell]    disk quota: ", stat.used / 1024, " KiB used of ");
+  out_dec("", stat.size / 1024, " KiB (quotas made out of it count as used)\n");
 }
 
 // --- Programs ------------------------------------------------------------------
 
-// `run <file> [args]`: a file in `/bin`, loaded into a compartment of its own
-// and run once, on a thread of its own (abi.hpp, "Applications"; THE
-// PROGRAM'S THREAD below). In order, each step undone on the way out whatever
-// happens after it:
-//   1. fs.open and fs.read the file -- through `s_bin_quota`, the read-only
-//      handle on `/bin` -- into a page-granular, zeroed allocation of the
-//      shell's: the same shape as a packaged image, so it loads as one (see
-//      `DiskImages` in init.cpp, which does the same);
-//   2. read its manifest (user/manifest.hpp) and make the program its own
-//      quotas: a VM sub-quota of the shell's for it to live on, as large as
-//      the manifest asks within APP_VM_MAX, and a `quota_sched` node of the
-//      shell's for its thread (THE PROGRAM'S THREAD, below);
-//   3. grant the manifest, entry by entry, by the policy below -- this is the
-//      shell acting as a launcher, and the whole of what the program will be
-//      able to reach is decided here;
-//   4. `create_compartment`: compartment, code, entry sentry -- seeded with
-//      `s_app_seeds`, entry i in slot RW_SLOT_SEED_BASE + i. There is no
-//      directory to ask: a program holds what its creator put in its table
-//      and nothing else;
-//   5. start its thread -- entry: the program's entry point, argument: an
-//      `AppRequest` carrying the arguments -- on its node, and sleep until
-//      the thread has ended; its status comes back in the block;
-//   6. destroy the compartment, destroy the quota, release the buffer, and
-//      take back what step 3 granted: destroy the nodes (which removes the
-//      directories and everything the program put in them) and close the
-//      files.
-// Everything a program had is gone when `run` returns, and INIT.2 (the
-// kernel's own test) confirms nothing of it leaked.
-//
-// THE POLICY: what a program may ask this shell for
-//   syscall  `compartment_invoke` only -- the switcher, without which nothing
-//            can be called. No allocation, no sealing, no threads: a program
-//            lives on what the shell gave it, on the one thread `run` makes
-//            for it (THE PROGRAM'S THREAD, below).
-//   service  the console (`uart`) and the file operations: fs.open, read,
-//            write, close, create, mkdir, unlink, list and quota_query.
-//            Not `fs.quota_derive`/`quota_destroy`: a node a program derived
-//            would be paid for from its VM quota, and could keep that quota
-//            -- and its directory -- from being destroyed when it returns.
-//            Not `naming.lookup`, `sched`, `uart.read`: nothing it
-//            could reach further with.
-//   disk     a directory of its own under `/home`: `/home/<prog>` (the file
-//            name without `.bin`), or `/home/<prog>/<name>` if the entry
-//            names a sub-directory. Made if need be, then a node of the
-//            shell's quota derived rooted there, with the limits asked for up
-//            to APP_DISK_MAX_BYTES / APP_DISK_MAX_INODES (MANIFEST_ALL asks
-//            for the maximum), the handle permissions asked for, and the
-//            directory adopted, so that destroying the node when the program
-//            returns removes the directory with it. Ephemeral, then: a
-//            program's files last as long as the program.
-//   file     a file under `/home`, by path, opened through the shell's own
-//            handle with the permissions asked for -- read-only is what a
-//            program is usually handed -- and closed when it returns. A file
-//            the shell could not open is simply not granted.
-//   vm quota the VM sub-quota of step 2, the one it lives on (the ADMIN
-//            handle; the shell destroys it when the program returns).
-//   cpu      its `quota_sched` node of step 2, with the bandwidth its first
-//            QUOTA_SCHED entry asks for, up to APP_BUDGET_US per
-//            APP_PERIOD_US and never above the interactive class. The node
-//            is revocable: the shell takes it back through its own node
-//            whenever it likes, and anything derived under it goes too. The
-//            program cannot reach `sched.*` (above), so it can neither
-//            derive under the node nor register threads on it yet.
-//   anything else (devices, interrupts, exceptions, thread memory, root
-//            quotas, kinds this shell does not know) is refused.
-// A REQUIRED entry refused means the program is not started, and `run` says
-// which entry; an optional one refused is a null slot.
-constexpr int64_t RUN_NOT_RUN = -1;                   // *out_status if it never ran
-constexpr size_t APP_VM_DEFAULT = 64 * 1024;          // a manifest asking for 0
-constexpr size_t APP_VM_MAX = 128 * 1024;             // the most a program may ask
-constexpr uint64_t APP_DISK_MAX_BYTES = 256 * 1024;   // per DISK entry
-constexpr uint32_t APP_DISK_MAX_INODES = 32;
-
-// THE PROGRAM'S THREAD
-//   A program does not run on the shell's thread: `run` makes it a thread of
-//   its own whose entry is the program's own entry point, so the thread
-//   starts inside the program -- its first compartment, depth 0 -- and
-//   everything the program calls nests from there (program -> fs -> blk ->
-//   sched.block is three calls, where on the shell's thread it was four).
-//   When the entry returns the thread ends, and
-//   so does a fault in the program: it ends the program's thread, never the
-//   shell's. The thread is paid from the shell's thread memory and scheduled
-//   under a `quota_sched` node of its own, carved out of the shell's
-//   bandwidth -- what its manifest asks for, at most APP_BUDGET_US per
-//   APP_PERIOD_US (`derive_app_node`): a program is preempted like any
-//   other thread and cannot take more of the CPU than that. The shell sleeps
-//   meanwhile and knows the program is done when nothing is registered on
-//   the node any more (`sched.quota_query`): the scheduler unregisters a
-//   thread when it ends. Then it destroys the node.
-constexpr size_t APP_STACK = 64 * 1024;
-constexpr uint32_t APP_BUDGET_US = 20'000;
-constexpr uint32_t APP_PERIOD_US = 100'000;
-constexpr uint32_t APP_PERIOD_MIN_US = 1'000;      // the periods a manifest
-constexpr uint32_t APP_PERIOD_MAX_US = 1'000'000;  // may ask for
-constexpr uint64_t APP_POLL_US = 5'000;  // how often the shell looks again
-
-// In `.bss`, not on the stack: `sys_compartment_create` refuses a seed array
-// that overlaps the stack it runs on. One slot per manifest entry, and beside
-// it what `run` must take back for that entry when the program returns.
-alignas(16) Capability s_app_seeds[init::MANIFEST_MAX];
-alignas(16) Capability s_app_nodes[init::MANIFEST_MAX];  // DISK: the ADMIN handle
-alignas(16) Capability s_app_files[init::MANIFEST_MAX];  // FILE: the open file
-alignas(16) init::AppRequest s_app_req;
+// `run <prog> [<request>=<path> ...] [args]` starts /bin/<prog>.bin with
+// launch.hpp and waits for it. Each `<request>=<path>` gives the program that
+// file or directory for this run; `link <prog> <request>=<path>` gives it for
+// good, and `unlink` takes it back; `quota <prog> <bytes>` resizes its own
+// quota. A program can be given only what the shell holds: its roots, its
+// quotas, and the services in `s_services` -- the console, fs.* and seal.*.
+// Not `naming.lookup`, `sched`, `uart.read`: nothing it could reach further
+// with.
 bool s_run_ready = false;
 Capability s_self_comp = nullptr;
 Capability s_gate_vm_alloc = nullptr;
@@ -740,6 +561,8 @@ Capability s_gate_comp_destroy = nullptr;
 Capability s_gate_sentry = nullptr;
 Capability s_gate_fault_install = nullptr;
 Capability s_gate_thread_kill = nullptr;
+launch::Service s_services[1 + init::FS_CALLS + 4];
+constexpr size_t PICKS_MAX = 8;
 
 // Sleeps until `us` have passed, or until something wakes the shell first
 // (a keystroke); callers loop on whatever they are waiting for.
@@ -747,476 +570,171 @@ void sleep_us(uint64_t us) {
   invoke<int64_t>(s_gate_invoke, s_sched_block, us);
 }
 
-// A `quota_sched` node of the shell's for one program, or null: what the
-// first QUOTA_SCHED entry of its manifest asks for, held to at most
-// APP_BUDGET_US per APP_PERIOD_US -- the same share of the CPU over any
-// period from APP_PERIOD_MIN_US to APP_PERIOD_MAX_US -- and never above the
-// interactive class; exactly that share, interactive, if it asks for none
-// (or for 0).
-Capability derive_app_node(const init::Manifest& m) {
-  uint32_t period = APP_PERIOD_US;
-  uint64_t budget = APP_BUDGET_US;
-  uint8_t priority = init::PRIORITY_INTERACTIVE;
-  for (uint32_t i = 0; i < m.count; ++i) {
-    const init::ManifestEntry& e = m.entries[i];
-    if (e.kind != init::MANIFEST_QUOTA_SCHED) {
-      continue;
-    }
-    if (e.count != 0) {
-      period = e.count < APP_PERIOD_MIN_US   ? APP_PERIOD_MIN_US
-               : e.count > APP_PERIOD_MAX_US ? APP_PERIOD_MAX_US
-                                             : e.count;
-    }
-    const uint64_t most =
-        static_cast<uint64_t>(APP_BUDGET_US) * period / APP_PERIOD_US;
-    budget = (e.amount == 0 || e.amount > most) ? most : e.amount;
-    if (e.param > priority) {  // a lower class; anything else stays interactive
-      priority = e.param > init::PRIORITY_BATCH
-                     ? init::PRIORITY_BATCH
-                     : static_cast<uint8_t>(e.param);
-    }
-    break;
+// "65536", "64K" or "4M".
+uint64_t parse_bytes(const char* text) {
+  uint64_t value = 0;
+  for (; *text >= '0' && *text <= '9'; ++text) {
+    value = value * 10 + static_cast<uint64_t>(*text - '0');
   }
-  init::SchedDeriveRequest req{};
-  req.parent = s_my_quota;
-  req.node_funding = s_vm_quota;
-  req.budget_us = static_cast<uint32_t>(budget);
-  req.period_us = period;
-  req.term_us = init::SCHED_REVOCABLE;
-  req.priority_class = priority;
-  derive_node(&req);
-  return req.status == init::SCHED_OK ? req.out_quota : nullptr;
+  return *text == 'K' ? value << 10 : *text == 'M' ? value << 20 : value;
 }
 
-// Starts the program's thread at `entry` with `s_app_req`, registered on
-// `node`. False if it could not be started, in which case nothing of it is
-// left running.
-bool start_app_thread(Capability entry, Capability node) {
-  using FnThreadKill = decltype(&sys_thread_kill);
-  // `s_app_req` sits in `.bss`, not on a stack, so it is a global capability
-  // the kernel will take as the initial argument.
-  Capability t = new_thread(APP_STACK, entry, bounded(&s_app_req));
-  if (!sealing::is_sealed_as(OType::Thread, t)) {
-    out("[shell]    run: no thread memory left for a program\n");
+// Whether the word at `text` is `<request>=<path>`.
+bool is_pick(const char* text) {
+  for (const char* cursor = text; *cursor != '\0' && *cursor != ' '; ++cursor) {
+    if (*cursor == '/') {
+      return false;
+    }
+    if (*cursor == '=') {
+      return cursor != text && cursor[1] != '\0' && cursor[1] != ' ';
+    }
+  }
+  return false;
+}
+
+// Splits `<request>=<path>` in place: the request stays in `word`.
+bool split_pick(char* word, char** path) {
+  if (!is_pick(word)) {
     return false;
   }
-  const int64_t tid = invoke<int64_t>(s_gate_invoke, s_sched_register, t, node);
-  if (tid <= 0) {
-    // Never dispatched, so never inside anything: safe to end here.
-    syscall::call<FnThreadKill>(s_gate_invoke, s_gate_thread_kill, t);
-    out("[shell]    run: the scheduler would not take the program's thread\n");
-    return false;
+  char* cursor = word;
+  while (*cursor != '=') {
+    ++cursor;
   }
+  *cursor = '\0';
+  *path = cursor + 1;
   return true;
 }
 
-// Sleeps until the program's thread has ended -- nothing is registered on its
-// node any more -- then destroys the node, and says whether that all worked.
-bool wait_app_thread(Capability node) {
-  int64_t threads = 0;
-  do {
-    sleep_us(APP_POLL_US);
-    threads = node_threads(node);
-  } while (threads > 0);
-  const int64_t st = threads == 0 ? destroy_sched_node(node) : threads;
-  if (st != init::SCHED_OK) {
-    out_dec("[shell]    run: WARNING: the program's scheduler node would "
-            "not go, status -", static_cast<uint64_t>(-st), "\n");
-    return false;
-  }
-  return true;
-}
-
-// Step 1: `name`, in `/bin`, read whole into a fresh page-granular, zeroed
-// allocation of the shell's, or null, the reason already printed under
-// `what`.
-Capability read_image(const char* what, const char* name) {
-  using FnAlloc = decltype(&sys_vm_allocate);
-  using FnDealloc = decltype(&sys_vm_deallocate);
-  Capability file = nullptr;
-  uint64_t size = 0;
-  int64_t st = fs_open_with(s_fs_open, s_bin_quota, name, &file, &size,
-                            perms::Load);
-  if (st != init::FS_OK) {
-    fs_fail(what, st);
-    return nullptr;
-  }
-  bool ok = size >= sizeof(init::CompartmentImageHeader) &&
-            size <= init::FS_MAX_FILE_BYTES;
-  if (!ok) {
-    out("[shell]    ");
-    out(what);
-    out(": not a program (size)\n");
-  }
-  Capability image = nullptr;
-  if (ok) {
-    const size_t bytes =
-        (static_cast<size_t>(size) + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
-    image = with_reclaim(
-        [&] {
-          return syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc,
-                                        s_self_comp, s_vm_quota, bytes, 0);
-        },
-        [](Capability c) { return capability_is_valid(c); });
-    ok = capability_is_valid(image);
-    if (!ok) {
-      out("[shell]    ");
-      out(what);
-      out(": out of memory for the image\n");
-    }
-  }
-  if (ok) {
-    uint64_t got = 0;
-    st = fs_io(s_fs_read, file, image, 0, size, &got);
-    ok = st == init::FS_OK && got == size;
-    if (!ok) {
-      fs_fail(what, st == init::FS_OK ? init::FS_IO_ERROR : st);
-      syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, s_self_comp,
-                               s_vm_quota, image);
-      image = nullptr;
-    }
-  }
-  fs_close(file);
-  return image;
-}
-
-// The file-system and sealing entry points a program may ask for by name, or
-// null.
-Capability program_service(const char* name) {
-  if (str_eq(name, "uart")) return s_uart;
-  if (str_eq(name, "fs.open")) return s_fs_open;
-  if (str_eq(name, "fs.read")) return s_fs_read;
-  if (str_eq(name, "fs.write")) return s_fs_write;
-  if (str_eq(name, "fs.close")) return s_fs_close;
-  if (str_eq(name, "fs.create")) return s_fs_create;
-  if (str_eq(name, "fs.mkdir")) return s_fs_mkdir;
-  if (str_eq(name, "fs.unlink")) return s_fs_unlink;
-  if (str_eq(name, "fs.list")) return s_fs_list;
-  if (str_eq(name, "fs.quota_query")) return s_fs_query;
-  if (str_eq(name, "seal.mint")) return s_seal_mint;
-  if (str_eq(name, "seal.derive")) return s_seal_derive;
-  if (str_eq(name, "seal.seal")) return s_seal_seal;
-  if (str_eq(name, "seal.unseal")) return s_seal_unseal;
-  return nullptr;
-}
-
-// `<prog>` or `<prog>/<sub>` into `dst` (FS_PATH_MAX): the program's file
-// name without a trailing `.bin`, then the entry's own name. False if it
-// would not fit.
-bool program_dir(char* dst, const char* prog, const char* sub) {
-  size_t n = 0;
-  while (prog[n] != '\0') {
-    ++n;
-  }
-  if (n > 4 && prog[n - 4] == '.' && prog[n - 3] == 'b' && prog[n - 2] == 'i' &&
-      prog[n - 1] == 'n') {
-    n -= 4;
-  }
-  size_t pos = 0;
-  for (size_t i = 0; i < n; ++i) {
-    if (pos + 1 >= init::FS_PATH_MAX) return false;
-    dst[pos++] = prog[i];
-  }
-  if (sub[0] != '\0') {
-    if (pos + 1 >= init::FS_PATH_MAX) return false;
-    dst[pos++] = '/';
-    for (size_t i = 0; sub[i] != '\0'; ++i) {
-      if (pos + 1 >= init::FS_PATH_MAX) return false;
-      dst[pos++] = sub[i];
-    }
-  }
-  dst[pos] = '\0';
-  return pos > 0;
-}
-
-// `mkdir -p` of `path` under `/home`: each component in turn, an existing one
-// being fine. False on anything else.
-bool mkdir_path(const char* path) {
-  char buf[init::FS_PATH_MAX];
-  for (size_t i = 0;; ++i) {
-    const char c = path[i];
-    if (c == '/' || c == '\0') {
-      buf[i] = '\0';
-      const int64_t st = fs_mkdir(s_disk_quota, buf);
-      if (st != init::FS_OK && st != init::FS_EXISTS) {
-        return false;
-      }
-      if (c == '\0') {
-        return true;
-      }
-    }
-    buf[i] = c;
-  }
-}
-
-// Step 3, one DISK entry: the directory, and a node of the shell's rooted
-// there. The handle asked for goes to the seed, the ADMIN handle to
-// `s_app_nodes` for the way out.
-Capability grant_disk(const char* prog, const init::ManifestEntry& e,
-                      Capability* out_admin) {
-  *out_admin = nullptr;
-  if ((e.perms & perms::Load) == 0) {
-    return nullptr;
-  }
-  char path[init::FS_PATH_MAX];
-  if (!program_dir(path, prog, e.name) || !mkdir_path(path)) {
-    return nullptr;
-  }
-  uint64_t bytes = e.amount == init::MANIFEST_ALL ? APP_DISK_MAX_BYTES : e.amount;
-  if (bytes > APP_DISK_MAX_BYTES) bytes = APP_DISK_MAX_BYTES;
-  bytes = (bytes + init::FS_BLOCK_BYTES - 1) & ~(init::FS_BLOCK_BYTES - 1);
-  uint32_t inodes =
-      e.count == init::MANIFEST_ALL_INODES ? APP_DISK_MAX_INODES : e.count;
-  if (inodes > APP_DISK_MAX_INODES) inodes = APP_DISK_MAX_INODES;
-  Capability handle = nullptr;
-  const int64_t st = fs_derive(s_disk_quota, path, bytes, inodes, &handle,
-                               e.perms & (perms::Load | perms::Store), out_admin,
-                               init::FS_DERIVE_ADOPT);
-  if (st != init::FS_OK) {
-    fs_fail("run: disk entry", st);
-    return nullptr;
-  }
-  return handle;
-}
-
-// Step 3: the manifest, entry by entry, into `s_app_seeds` by the policy
-// above, `quota` and `node` being the program's own quotas of step 2. True if
-// every REQUIRED entry was met; the first that was not is named on the
-// console. Prints the grants on one line either way.
-bool grant_manifest(const char* prog, const init::Manifest& m,
-                    Capability quota, Capability node) {
-  bool ok = true;
-  out("[shell]    ");
-  out(prog);
-  out(" gets:");
-  for (uint32_t i = 0; i < m.count; ++i) {
-    const init::ManifestEntry& e = m.entries[i];
-    Capability cap = nullptr;
-    s_app_nodes[i] = nullptr;
-    s_app_files[i] = nullptr;
-    switch (e.kind) {
-      case init::MANIFEST_SYSCALL:
-        if (e.count == static_cast<uint32_t>(syscall::Id::compartment_invoke)) {
-          cap = s_gate_invoke;
-        }
-        break;
-      case init::MANIFEST_SERVICE:
-        cap = program_service(e.name);
-        break;
-      case init::MANIFEST_DISK:
-        cap = grant_disk(prog, e, &s_app_nodes[i]);
-        break;
-      case init::MANIFEST_FILE:
-        if ((e.perms & perms::Load) != 0 &&
-            fs_open_with(s_fs_open, s_disk_quota, e.name, &cap, nullptr,
-                         e.perms & (perms::Load | perms::Store)) == init::FS_OK) {
-          s_app_files[i] = cap;
-        } else {
-          cap = nullptr;
-        }
-        break;
-      case init::MANIFEST_QUOTA_VM:
-        cap = quota;
-        break;
-      case init::MANIFEST_QUOTA_SCHED:
-        cap = node;
-        break;
-      default:
-        break;
-    }
-    s_app_seeds[i] = cap;
-    out(" ");
-    print_manifest_entry(s_gate_invoke, s_uart, e);
-    if (!capability_is_valid(cap)) {
-      out((e.flags & init::MANIFEST_REQUIRED) != 0 ? "=REFUSED" : "=none");
-      if ((e.flags & init::MANIFEST_REQUIRED) != 0) {
-        ok = false;
-      }
-    }
-  }
-  out("\n");
-  return ok;
-}
-
-// Step 6, the grants: nodes destroyed (their directories go with them),
-// files closed, slots cleared.
-void revoke_manifest(uint32_t count) {
-  for (uint32_t i = 0; i < count; ++i) {
-    if (capability_is_valid(s_app_files[i])) {
-      fs_close(s_app_files[i]);
-    }
-    if (capability_is_valid(s_app_nodes[i])) {
-      const int64_t st = fs_destroy(s_app_nodes[i]);
-      if (st != init::FS_OK) {
-        fs_fail("run: WARNING: a program's directory would not go", st);
-      }
-    }
-    s_app_files[i] = nullptr;
-    s_app_nodes[i] = nullptr;
-    s_app_seeds[i] = nullptr;
-  }
-}
-
-// Creates a compartment on `quota` from `image`, seeded with the first
-// `count` of `s_app_seeds`. True with both handles filled in.
-bool load_image(Capability quota, uint32_t count, Capability image,
-                Capability* out_comp, Capability* out_entry) {
-  const Capability seeds =
-      count == 0 ? nullptr
-                 : capability_set_bounds(
-                       reinterpret_cast<Capability>(&s_app_seeds[0]),
-                       static_cast<size_t>(count) * sizeof(Capability));
-  return create_compartment(s_gate_invoke, s_gate_comp_create,
-                            s_gate_comp_destroy, s_gate_vm_alloc,
-                            s_gate_sentry, s_gate_fault_install, quota, seeds,
-                            image, out_comp, out_entry);
-}
-
-bool cmd_run(const char* name, const char* args, int64_t* out_status) {
-  *out_status = RUN_NOT_RUN;
-  if (!fs_available()) {
-    return false;
-  }
+bool run_available() {
   if (!s_run_ready) {
-    out("[shell]    run: programs are disabled (see the warning at start)\n");
-    return false;
+    out("[shell]    programs are disabled (see the warning at start)\n");
   }
+  return fs_available() && s_run_ready;
+}
+
+void cmd_run(char* line) {
+  if (!run_available()) {
+    return;
+  }
+  char* rest = nullptr;
+  const char* name = first_word(line, &rest);
   if (*name == '\0') {
-    out("[shell]    usage: run <file> [args]\n");
-    return false;
+    out("[shell]    usage: run <prog> [<request>=<path> ...] [args]\n");
+    return;
   }
-  using FnDealloc = decltype(&sys_vm_deallocate);
-  using FnQuotaDerive = decltype(&sys_quota_vm_derive);
-  using FnQuotaDestroy = decltype(&sys_quota_vm_destroy);
-  using FnCompDestroy = decltype(&sys_compartment_destroy);
+  launch::Pick picks[PICKS_MAX];
+  ScopedHandle handles[PICKS_MAX];
+  size_t pick_count = 0;
+  for (; pick_count < PICKS_MAX && is_pick(rest); ++pick_count) {
+    char* request = first_word(rest, &rest);
+    char* path = nullptr;
+    split_pick(request, &path);
+    const int64_t status =
+        open_path(path, init::FS_ALL, &handles[pick_count].handle);
+    if (status != init::FS_OK) {
+      fs_fail(path, status);
+      return;
+    }
+    picks[pick_count] = launch::Pick{request, handles[pick_count].handle};
+  }
+  int64_t exit_status = launch::NOT_RUN;
+  launch::run(s_starter, name, picks, pick_count, rest, &exit_status);
+}
 
-  // 1. The file, into memory of the shell's.
-  Capability image = read_image("run", name);
-  bool ok = capability_is_valid(image);
+void cmd_link(char* args) {
+  if (!run_available()) {
+    return;
+  }
+  char* rest = nullptr;
+  const char* program = first_word(args, &rest);
+  char* request = first_word(rest, &rest);
+  char* path = nullptr;
+  if (*program == '\0' || !split_pick(request, &path)) {
+    out("[shell]    usage: link <prog> <request>=<path>\n");
+    return;
+  }
+  ScopedHandle target;
+  int64_t status =
+      open_path(path, init::FS_ALL | init::FS_LINK, &target.handle);
+  if (status == init::FS_OK) {
+    status = launch::link(s_starter, program, request, target.handle);
+  }
+  if (status != init::FS_OK) {
+    fs_fail("link", status);
+    return;
+  }
+  out("[shell]    ");
+  out(program);
+  out(": ");
+  out(request);
+  out(" linked to ");
+  out(path);
+  out("\n");
+}
 
-  // 2. What it asks for, and its own quotas: the VM it lives on and the node
-  //    its thread runs under (THE PROGRAM'S THREAD, above).
-  init::Manifest manifest{};
-  if (ok) {
-    const init::CompartmentImageHeader* hdr = init::image_header(image);
-    ok = hdr != nullptr && init::manifest_of(image, hdr, &manifest);
-    if (!ok) {
-      out("[shell]    run: not a program (no header, or a malformed "
-          "manifest)\n");
-    }
+void cmd_unlink(char* args) {
+  if (!run_available()) {
+    return;
   }
-  Capability quota = nullptr;
-  if (ok) {
-    size_t vm_bytes = manifest.vm_bytes == 0
-                          ? APP_VM_DEFAULT
-                          : static_cast<size_t>(manifest.vm_bytes);
-    if (vm_bytes > APP_VM_MAX) vm_bytes = APP_VM_MAX;
-    quota = with_reclaim(
-        [&] {
-          return syscall::call<FnQuotaDerive>(s_gate_invoke, s_gate_q_derive,
-                                              s_vm_quota, vm_bytes,
-                                              perms::Load | perms::Store);
-        },
-        [](Capability q) { return sealing::is_sealed_as(OType::QuotaVm, q); });
-    ok = sealing::is_sealed_as(OType::QuotaVm, quota);
-    if (!ok) {
-      out("[shell]    run: no VM quota left for a program\n");
-    }
+  char* request = nullptr;
+  const char* program = first_word(args, &request);
+  if (*program == '\0' || *request == '\0') {
+    out("[shell]    usage: unlink <prog> <request>\n");
+    return;
   }
-  Capability node = nullptr;
-  if (ok) {
-    node = derive_app_node(manifest);
-    ok = capability_is_valid(node);
-    if (!ok) {
-      out("[shell]    run: no CPU bandwidth left for a program\n");
-    }
+  const int64_t status = launch::unlink(s_starter, program, request);
+  if (status != init::FS_OK) {
+    fs_fail("unlink", status);
+    return;
   }
+  out("[shell]    ");
+  out(program);
+  out(": ");
+  out(request);
+  out(" unlinked\n");
+}
 
-  // 3. What it gets.
-  if (ok) {
-    ok = grant_manifest(name, manifest, quota, node);
-    if (!ok) {
-      out("[shell]    run: ");
-      out(name);
-      out(" needs what this shell will not give; not started\n");
-    }
+void cmd_quota(char* args) {
+  if (!run_available()) {
+    return;
   }
-
-  // 4. The program's compartment. The seeds are all it will ever hold.
-  Capability comp = nullptr;
-  Capability entry = nullptr;
-  if (ok) {
-    ok = load_image(quota, manifest.count, image, &comp, &entry);
-    if (!ok) {
-      out("[shell]    run: not a program (the image was refused)\n");
-    }
+  char* size = nullptr;
+  const char* program = first_word(args, &size);
+  if (*program == '\0' || *size < '0' || *size > '9') {
+    out("[shell]    usage: quota <prog> <bytes>, e.g. 64K or 4M\n");
+    return;
   }
-
-  // 5. Run it, on a thread of its own (THE PROGRAM'S THREAD, above), and
-  //    sleep until that thread has ended.
-  if (ok) {
-    size_t i = 0;
-    for (; i + 1 < init::APP_ARGS_MAX && args[i] != '\0'; ++i) {
-      s_app_req.args[i] = args[i];
-    }
-    for (; i < init::APP_ARGS_MAX; ++i) {
-      s_app_req.args[i] = '\0';
-    }
-    s_app_req.status = RUN_NOT_RUN;
-    s_app_req.ticks_per_us = s_ticks_per_us;
-    ok = start_app_thread(entry, node);
+  const uint64_t bytes = parse_bytes(size);
+  const int64_t status = launch::resize_quota(s_starter, program, bytes);
+  if (status != init::FS_OK) {
+    fs_fail("quota", status);
+    return;
   }
-  if (ok) {
-    ok = wait_app_thread(node);
-    node = nullptr;  // destroyed by the wait, or left as it would not go
-    *out_status = s_app_req.status;
-  }
-  if (capability_is_valid(node)) {
-    destroy_sched_node(node);  // never had a thread on it
-  }
-
-  // 6. Take it all down again, in the reverse order it was built.
-  if (capability_is_valid(comp)) {
-    syscall::call<FnCompDestroy>(s_gate_invoke, s_gate_comp_destroy, comp);
-  }
-  if (capability_is_valid(quota) &&
-      syscall::call<FnQuotaDestroy>(s_gate_invoke, s_gate_q_destroy, quota) !=
-          0) {
-    out("[shell]    run: WARNING: the program's VM quota would not destroy\n");
-  }
-  revoke_manifest(manifest.count);
-  if (capability_is_valid(image)) {
-    syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, s_self_comp,
-                             s_vm_quota, image);
-  }
-
-  if (ok) {
-    out("[shell]    ");
-    out(name);
-    if (*out_status == RUN_NOT_RUN) {
-      out(" returned without a status\n");
-    } else if (*out_status < 0) {
-      out_dec(" exited with status -", static_cast<uint64_t>(-*out_status),
-              "\n");
-    } else {
-      out_dec(" exited with status ", static_cast<uint64_t>(*out_status),
-              "\n");
-    }
-  }
-  return ok;
+  out("[shell]    ");
+  out(program);
+  out_dec("'s quota is now ", bytes / 1024, " KiB\n");
 }
 
 void print_help() {
   out("  help       this text\n"
-      "  ls [dir]   list a directory (paths are under /home, the shell's root)\n"
+      "  ls [dir]   list a directory; paths start at /home, /bin, /apps or\n"
+      "             /disk (the disk quota), and are under /home otherwise\n"
       "  cat <f>    print a file\n"
       "  write <f> <text>   replace a file with a line of text\n"
       "  append <f> <text>  add a line of text to a file\n"
       "  mkdir <d>  make a directory\n"
-      "  rm <p>     remove a file or an empty directory\n"
-      "  df         the shell's disk quota: used, delegated, limit\n"
-      "  run <f> [args]     load a program from /bin into a compartment "
-      "of its own and run it\n"
+      "  rm <p>     remove a file, a directory and all in it, a link, or a quota\n"
+      "             that pays for nothing\n"
+      "  mv <p> <q> move or rename\n"
+      "  freeze <f> make a file read-only for good\n"
+      "  df         the disk quota: used and limit\n"
+      "  run <prog> [<request>=<path> ...] [args]\n"
+      "             run a program with its own /apps/<id>/own and quota <id>,\n"
+      "             its links, and each <path> as <request> for this run\n"
+      "  link <prog> <request>=<path>  give it <path> as <request> for good\n"
+      "  unlink <prog> <request>       take that back\n"
+      "  quota <prog> <bytes>          resize its own quota (64K, 4M)\n"
       "  pagetest [fill <MiB>]  paging self-test\n"
       "  sealtest   compartment-minted sealing self-test (the sealer service)\n"
       "  shutdown   power the machine off\n");
@@ -1304,8 +822,9 @@ void cmd_sealtest() {
   out(ok ? "[sealtest] lifetime OK; now the program\n"
          : "[sealtest] lifetime FAILED; now the program\n");
 
-  int64_t status = RUN_NOT_RUN;
-  if (!cmd_run("sealtest.bin", "", &status) || status != 0) {
+  int64_t status = launch::NOT_RUN;
+  if (!launch::run(s_starter, "sealtest.bin", nullptr, 0, "", &status) ||
+      status != 0) {
     out("[sealtest] FAILED: run sealtest.bin did not pass\n");
     ok = false;
   }
@@ -1608,13 +1127,22 @@ bool execute(char* line) {
     cmd_mkdir(rest);
   } else if (str_eq(cmd, "rm")) {
     cmd_rm(rest);
+  } else if (str_eq(cmd, "mv")) {
+    char* to = nullptr;
+    const char* from = first_word(rest, &to);
+    cmd_mv(from, to);
+  } else if (str_eq(cmd, "freeze")) {
+    cmd_freeze(rest);
   } else if (str_eq(cmd, "df")) {
     cmd_df();
   } else if (str_eq(cmd, "run")) {
-    char* args = nullptr;
-    const char* name = first_word(rest, &args);
-    int64_t status = RUN_NOT_RUN;
-    cmd_run(name, args, &status);
+    cmd_run(rest);
+  } else if (str_eq(cmd, "link")) {
+    cmd_link(rest);
+  } else if (str_eq(cmd, "unlink")) {
+    cmd_unlink(rest);
+  } else if (str_eq(cmd, "quota")) {
+    cmd_quota(rest);
   } else if (str_eq(cmd, "sealtest")) {
     cmd_sealtest();
   } else if (str_eq(cmd, "pagetest")) {
@@ -1643,10 +1171,38 @@ void echo(char c) {
   out(s);
 }
 
+// The line being typed: a small buffer of the shell's at first, then memory
+// twice the size whenever it fills up.
+char s_first_line[256];
+char* s_line = s_first_line;
+size_t s_line_size = sizeof(s_first_line);
+
+// Room in `s_line`, which holds `length` characters, for one more and a NUL;
+// false if there is no memory for it.
+bool line_room(size_t length) {
+  if (length + 2 <= s_line_size) {
+    return true;
+  }
+  const size_t size =
+      s_line_size < vm::PAGE_SIZE ? vm::PAGE_SIZE : 2 * s_line_size;
+  char* const bigger = alloc_bytes(size);
+  if (bigger == nullptr) {
+    return false;
+  }
+  for (size_t i = 0; i < length; ++i) {
+    bigger[i] = s_line[i];
+  }
+  if (s_line != s_first_line) {
+    free_bytes(s_line);
+  }
+  s_line = bigger;
+  s_line_size = size;
+  return true;
+}
+
 // Line editing is Enter and Backspace; the terminal is in raw mode under
 // QEMU, so Enter arrives as '\r'. Returns when `shutdown` is entered.
 void console_loop() {
-  char line[LINE_MAX];
   size_t len = 0;
   out("SignetOS> ");
   for (;;) {
@@ -1660,8 +1216,8 @@ void console_loop() {
       const char c = in[i];
       if (c == '\r' || c == '\n') {
         out("\n");
-        line[len] = '\0';
-        if (len > 0 && !execute(line)) {
+        s_line[len] = '\0';
+        if (len > 0 && !execute(s_line)) {
           return;
         }
         len = 0;
@@ -1671,8 +1227,8 @@ void console_loop() {
           len -= 1;
           out("\b \b");
         }
-      } else if (c >= 0x20 && c < 0x7f && len + 1 < LINE_MAX) {
-        line[len++] = c;
+      } else if (c >= 0x20 && c < 0x7f && line_room(len)) {
+        s_line[len++] = c;
         echo(c);
       }
     }
@@ -1763,34 +1319,26 @@ extern "C" int64_t compartment_main(Capability arg) {
   }
   out("[shell]    Running on the scheduler; sched.* resolved by name\n");
 
-  // The file system: its entry points by name, and the two handles the
-  // manifest asked for -- the shell's quota at `/home` and the read-only view
-  // of `/bin`. Anything missing just turns the file commands off.
-  s_disk_quota = rw[SLOT_DISK_QUOTA];
-  s_bin_quota = rw[SLOT_BIN_DIR];
-  s_fs_derive = lookup_name(gate_invoke, naming_lookup, "fs.quota_derive");
-  s_fs_destroy = lookup_name(gate_invoke, naming_lookup, "fs.quota_destroy");
-  s_fs_query = lookup_name(gate_invoke, naming_lookup, "fs.quota_query");
-  s_fs_create = lookup_name(gate_invoke, naming_lookup, "fs.create");
-  s_fs_mkdir = lookup_name(gate_invoke, naming_lookup, "fs.mkdir");
-  s_fs_open = lookup_name(gate_invoke, naming_lookup, "fs.open");
-  s_fs_close = lookup_name(gate_invoke, naming_lookup, "fs.close");
-  s_fs_read = lookup_name(gate_invoke, naming_lookup, "fs.read");
-  s_fs_write = lookup_name(gate_invoke, naming_lookup, "fs.write");
-  s_fs_unlink = lookup_name(gate_invoke, naming_lookup, "fs.unlink");
-  s_fs_list = lookup_name(gate_invoke, naming_lookup, "fs.list");
-  s_fs_ready =
-      sealing::is_sealed_as(OType::QuotaDisk, s_disk_quota) &&
-      capability_is_valid(s_fs_derive) && capability_is_valid(s_fs_destroy) &&
-      capability_is_valid(s_fs_query) && capability_is_valid(s_fs_create) &&
-      capability_is_valid(s_fs_mkdir) && capability_is_valid(s_fs_open) &&
-      capability_is_valid(s_fs_close) && capability_is_valid(s_fs_read) &&
-      capability_is_valid(s_fs_write) && capability_is_valid(s_fs_unlink) &&
-      capability_is_valid(s_fs_list);
+  // The file system. Anything missing turns the file commands off.
+  s_roots[ROOT_HOME].handle = rw[SLOT_HOME];
+  s_roots[ROOT_BIN].handle = rw[SLOT_BIN];
+  s_roots[ROOT_APPS].handle = rw[SLOT_APPS];
+  s_roots[ROOT_DISK].handle = rw[SLOT_DISK];
+  s_fs_ready = true;
+  for (const Root& root : s_roots) {
+    const OType type =
+        &root == &s_roots[ROOT_DISK] ? OType::FsQuota : OType::FsDir;
+    s_fs_ready = s_fs_ready && sealing::is_sealed_as(type, root.handle);
+  }
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    s_fs[i] = lookup_name(gate_invoke, naming_lookup, init::FS_CALL_NAMES[i]);
+    s_fs_ready = s_fs_ready && capability_is_valid(s_fs[i]);
+  }
   out(s_fs_ready
-          ? "[shell]    fs.* resolved by name; quota at /home received\n"
-          : "[shell]    WARNING: no file system (fs.* or the /home quota is "
-            "missing); file commands disabled\n");
+          ? "[shell]    fs.* resolved by name; /home, /bin, /apps and the disk "
+            "quota received\n"
+          : "[shell]    WARNING: no file system (fs.* or a handle is missing); "
+            "file commands disabled\n");
 
   // The sealer: granted to programs that ask, and used by `sealtest`. Not
   // having it costs nothing else.
@@ -1819,8 +1367,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
   s_gate_page_test = rw[SLOT_SYS_PAGE_TEST];
-  s_run_ready = sealing::is_sealed_as(OType::QuotaDisk, s_bin_quota) &&
-                sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
+  s_run_ready = sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&
                 capability_is_valid(s_sched_derive) &&
                 capability_is_valid(s_sched_register) &&
@@ -1838,6 +1385,48 @@ extern "C" int64_t compartment_main(Capability arg) {
     out("[shell]    WARNING: the /bin view or a kernel entry `run` needs is "
         "missing; programs disabled\n");
   }
+  size_t service_count = 0;
+  s_services[service_count++] = launch::Service{"uart", s_uart};
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    s_services[service_count++] =
+        launch::Service{init::FS_CALL_NAMES[i], s_fs[i]};
+  }
+  s_services[service_count++] = launch::Service{"seal.mint", s_seal_mint};
+  s_services[service_count++] = launch::Service{"seal.derive", s_seal_derive};
+  s_services[service_count++] = launch::Service{"seal.seal", s_seal_seal};
+  s_services[service_count++] = launch::Service{"seal.unseal", s_seal_unseal};
+  launch::Starter& starter = s_starter;
+  starter.invoke = gate_invoke;
+  starter.self = self_comp;
+  starter.vm_quota = vm_quota;
+  starter.thread_quota = thread_quota;
+  starter.sched_quota = sched_quota;
+  starter.vm_allocate = gate_vm_alloc;
+  starter.vm_deallocate = gate_vm_dealloc;
+  starter.quota_vm_derive = gate_q_derive;
+  starter.quota_vm_destroy = gate_q_destroy;
+  starter.compartment_create = gate_comp_create;
+  starter.compartment_destroy = gate_comp_destroy;
+  starter.sentry = gate_sentry;
+  starter.fault_install = gate_fault_install;
+  starter.thread_create = gate_thread_create;
+  starter.thread_kill = s_gate_thread_kill;
+  starter.revoke_query = s_gate_revoke_query;
+  starter.sched_block = s_sched_block;
+  starter.sched_derive = s_sched_derive;
+  starter.sched_query = s_sched_query;
+  starter.sched_destroy = s_sched_destroy;
+  starter.sched_register = s_sched_register;
+  starter.uart = uart_sentry;
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    starter.fs[i] = s_fs[i];
+  }
+  starter.bin = s_roots[ROOT_BIN].handle;
+  starter.apps = s_roots[ROOT_APPS].handle;
+  starter.disk = s_roots[ROOT_DISK].handle;
+  starter.services = s_services;
+  starter.service_count = service_count;
+  starter.ticks_per_us = s_ticks_per_us;
 
   // Nobody to talk to -- no `uart.read` was seeded -- so
   // do what a person would and leave; an interactive session could never end.

@@ -120,13 +120,15 @@ const char* otype_name(uint64_t ct) {
         case OType::QuotaThreadMem: return "QuotaThreadMem";
         case OType::QuotaHeap:      return "QuotaHeap";
         case OType::QuotaSched:     return "QuotaSched";
-        case OType::QuotaDisk:      return "QuotaDisk";
+        case OType::FsFile:         return "FsFile";
         case OType::Compartment:    return "Compartment";
         case OType::Thread:         return "Thread";
         case OType::TypeKey:        return "TypeKey";
         case OType::SealedObject:   return "SealedObject";
         case OType::EntryPoint:     return "EntryPoint";
         case OType::Trap:           return "Trap";
+        case OType::FsQuota:        return "FsQuota";
+        case OType::FsDir:          return "FsDir";
     }
     return "unknown";
 }

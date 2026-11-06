@@ -283,10 +283,17 @@ manifest (memory size, syscalls, named services, file/disk handles, MMIO and DMA
 memory, interrupts, quotas etc); unmet required entries prevent launch, while unmet
 optional entries become null capabilities.
 
-**The manifest is a request.** The launcher (`init` or the
-shell or some other launcher) applies its own policy, derives each grant from what it holds itself,
-builds the compartment inside the child's quota, and installs its entry point
-and fault handler.
+**The manifest is a request.** The launcher (`init`, or anything that starts
+programs with `user/launch.hpp`, such as the shell) applies its own policy,
+derives each grant from what it holds itself, builds the compartment inside
+the child's quota, and installs its entry point and fault handler.
+
+**A program's files.** `launch.hpp` gives each program an ID the first time it
+needs one (`/apps/list` maps names to IDs), its own directory `/apps/<id>/own`
+and its own disk quota `<id>`, made the first time with the size its manifest
+asks for. Anything else it asks for is picked for one run, or given for good
+as a link `/apps/<id>/<request>`. Handles are never stored: after a reboot the same
+directories, quota and links give it the same handles again.
 
 ---
 
@@ -419,12 +426,19 @@ filesystem, network traffic in the network service):
   **Revocable** (at any time), **Fixed term**
   (until expiry), or **Permanent** (never). Destroying a child node requires
   the *parent* handle, so a holder cannot revoke its own node.
-* **Disk quotas:** bound bytes and inodes under one root directory, which paths
-  cannot climb out of. Each file belongs to, and is charged to, the node it was
-  created under. An ADMIN handle (`Load|Store`) can create files and write or
-  delete those its node or a descendant owns; an OP handle (`Load`) can only
-  open, read and list. A file handle is a record in the page of the node it was
-  opened through, so it dies with that node.
+* **Disk quotas:** bound bytes only, and give access to nothing: access is a
+  separate handle on a file or directory, whose read, add, change and link
+  rights only shrink, down to everything under a directory (`boot/fs.cpp`).
+  Each file is paid for by the quota its creator named, and growing it needs
+  that quota too. Every entry costs a block. Each quota keeps what it pays for
+  in `used` on disk: a charge is written before the change it pays for and a
+  refund after, so a crash can only leave it too high, and nothing is counted
+  at run time.
+  A handle with change on a quota can split it, resize the parts (growing takes
+  from it, shrinking stops at `used`) or remove one that pays for nothing. A handle is a record paid for by the memory quota of
+  whoever opened it; closing it closes every handle opened through it. A link
+  names a file or directory with rights; only a handle with link can be linked
+  to.
 * **Network quotas:** bound bytes sent, bytes received and open sockets, within
   a reach (an IPv4 prefix, port ranges and protocols) that a child can only
   narrow.

@@ -18,27 +18,15 @@
  * hello.cpp - A program: a compartment image that lives on the disk
  *
  * Not part of the system. `external/apps/hello.bin` is written to `/bin` on
- * the disk image (`tools/signetfs.py put --dir bin`, see the Makefile); the shell
- * holds a read-only disk quota rooted there, and its `run hello.bin [args]`
- * reads the file through it, makes a compartment of it, invokes
- * `compartment_main` once with an `AppRequest` (abi.hpp, "Applications") and
- * destroys the compartment when it returns.
+ * the disk image (`tools/signetfs.py put --dir bin`, see the Makefile); the
+ * shell's `run hello [args]` reads it from there, makes a compartment of it,
+ * invokes `compartment_main` once with an `AppRequest` (abi.hpp,
+ * "Applications") and destroys the compartment when it returns.
  *
- * WHAT IT HOLDS
- *   Exactly what its manifest (below; user/manifest.hpp) asked for and the
- *   shell's policy granted: the switcher, the console, a `quota_disk` node of
- *   its own -- a directory the shell makes for it under `/home`, 64 KiB and 8
- *   inodes of the shell's own allowance, removed again with everything in it
- *   when the program returns -- the file-system entry points to use it with,
- *   and, if the shell has one to give, a read-only handle on `/home/motd.txt`.
- *   It writes a note into its directory, reads it back, says how much of its
- *   allowance that took, and prints the message of the day if there is one.
- *
- *   The directory is the whole of the disk as far as this program is
- *   concerned: the handle is rooted there, so `/home` itself, the shell's
- *   files, `/bin`, are not in view, let alone writable. And there is nothing
- *   to ask for more with: a program is a compartment like any other, with
- *   nothing it was not given.
+ * It holds only what its manifest asks for: its own directory and quota
+ * (launch.hpp), and `motd` if one is picked or linked for it. Each run appends a
+ * line to `visits.txt` in its directory and prints the count, which survives
+ * restarts.
  */
 
 #include "runtime.hpp"
@@ -46,127 +34,110 @@
 namespace signetos::user {
 namespace {
 
-// --- What `hello` asks the shell for (user/manifest.hpp) ----------------------
-// HOME is required: this program is about having a directory, so without one
-// it is not started. The message of the day is not: a null slot means the
-// shell had no `motd.txt` to give, or chose not to, and either is fine.
-#define HELLO_MANIFEST(X)                                                   \
-  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)                         \
-  M_SERVICE(X, UART_SENTRY, "uart")                                         \
-  M_DISK(X, HOME, ::signetos::init::MANIFEST_REQUIRED,                      \
-         perms::Load | perms::Store, 64 * 1024, 8, "")                      \
-  M_SERVICE(X, FS_CREATE, "fs.create")                                      \
-  M_SERVICE(X, FS_WRITE, "fs.write")                                        \
-  M_SERVICE(X, FS_READ, "fs.read")                                          \
-  M_SERVICE(X, FS_CLOSE, "fs.close")                                        \
-  M_SERVICE(X, FS_QUERY, "fs.quota_query")                                  \
-  M_FILE(X, MOTD, 0, perms::Load, "motd.txt")
+// --- What `hello` asks for (user/manifest.hpp) --------------------------------
+// Its own directory and a 64 KiB quota; MOTD, a file, if it is given one.
+#define HELLO_MANIFEST(X)                                                  \
+  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)                        \
+  M_SERVICE(X, UART_SENTRY, "uart")                                        \
+  M_SERVICE(X, FS_OPEN, "fs.open")                                         \
+  M_SERVICE(X, FS_CREATE, "fs.create")                                     \
+  M_SERVICE(X, FS_READ, "fs.read")                                         \
+  M_SERVICE(X, FS_WRITE, "fs.write")                                       \
+  M_SERVICE(X, FS_STAT, "fs.stat")                                         \
+  M_QUOTA_VM(X, VM_QUOTA)                                                  \
+  M_OWN_DIR(X, HOME)                                                       \
+  M_OWN_DISK(X, DISK, 64 * 1024)                                           \
+  M_FILE(X, MOTD, 0, ::signetos::init::FS_READ, "motd")
 SIGNETOS_MANIFEST(HELLO_MANIFEST, 64 * 1024)
 
 Capability s_invoke = nullptr;
 Capability s_uart = nullptr;
 
-char s_text[128];  // what goes into the note, and what comes back out
+char s_text[128];  // what goes into the file, and what comes back out
 
 void out(const char* msg) { print(s_invoke, s_uart, msg); }
-void out_dec(const char* p, uint64_t v, const char* s) {
-  print_dec(s_invoke, s_uart, p, v, s);
+void out_dec(const char* prefix, uint64_t value, const char* suffix) {
+  print_dec(s_invoke, s_uart, prefix, value, suffix);
 }
 void out_status(const char* what, int64_t status) {
   out(what);
   out_dec(": status -", static_cast<uint64_t>(-status), "\n");
 }
 
-// No libc: a request struct is cleared by hand, and a string copied by hand.
-void zero_bytes(void* p, size_t n) {
-  auto* d = static_cast<uint8_t*>(p);
-  for (size_t i = 0; i < n; ++i) {
-    d[i] = 0;
+// No libc: a string copied by hand.
+size_t append(char* dst, size_t length, size_t capacity, const char* src) {
+  while (length + 1 < capacity && *src != '\0') {
+    dst[length++] = *src++;
   }
-}
-size_t append(char* dst, size_t pos, size_t cap, const char* src) {
-  while (pos + 1 < cap && *src != '\0') {
-    dst[pos++] = *src++;
-  }
-  dst[pos] = '\0';
-  return pos;
+  dst[length] = '\0';
+  return length;
 }
 
-// Invokes a file-system entry point with a request block of ours.
-template <typename T>
-void call(Capability entry, T* req) {
-  using FnInvoke = decltype(&sys_compartment_invoke);
-  Capability cap =
-      capability_set_bounds(reinterpret_cast<Capability>(req), sizeof(T));
-  reinterpret_cast<FnInvoke>(s_invoke)(entry, cap);
+Capability region(void* start, size_t length) {
+  return capability_set_bounds(reinterpret_cast<Capability>(start), length);
 }
 
-// Reads up to `cap - 1` bytes of `file` into `buf` and NUL-terminates them;
-// returns 0 on success or a negative `FS_*` status.
-int64_t read_into(Capability fs_read, Capability file, char* buf, size_t cap) {
-  Capability b = capability_set_bounds(reinterpret_cast<Capability>(buf), cap - 1);
-  const int64_t n =
-      invoke<int64_t>(s_invoke, fs_read, file, b, 0ULL, static_cast<uint64_t>(cap - 1));
-  if (n < 0) {
-    buf[0] = '\0';
-    return n;
-  }
-  buf[n] = '\0';
-  return init::FS_OK;
+// Reads `file` at `offset` into `s_text`; returns bytes read or an FS_* error.
+int64_t read_text(Capability* rw, Capability file, uint64_t offset) {
+  const int64_t bytes_read =
+      invoke<int64_t>(s_invoke, rw[SLOT_FS_READ], file,
+                      region(s_text, sizeof(s_text) - 1), offset,
+                      uint64_t{sizeof(s_text) - 1});
+  s_text[bytes_read > 0 ? bytes_read : 0] = '\0';
+  return bytes_read;
 }
 
-// The exercise: a file of our own, in a directory of our own.
-void leave_a_note(Capability* rw, const char* args) {
-  Capability home = rw[SLOT_HOME];
-  if (!sealing::is_sealed(home)) {
-    out("[hello]    no directory of my own\n");  // not what REQUIRED means
-    return;
-  }
-
+// Appends a line to visits.txt, then prints the visit count and quota use.
+void record_visit(Capability* rw, const char* args) {
+  const Capability home = rw[SLOT_HOME];
+  const Capability memory_quota = rw[SLOT_VM_QUOTA];  // pays for the file's handle
   Capability file = invoke<Capability>(
-      s_invoke, rw[SLOT_FS_CREATE], home, ro_str("note.txt"),
-      static_cast<uint32_t>(perms::Load | perms::Store));
+      s_invoke, rw[SLOT_FS_OPEN], home, ro_str("visits.txt"),
+      init::FS_READ | init::FS_ADD, memory_quota);
+  if (init::cap_error(file, 0) == init::FS_NOT_FOUND) {  // the first visit
+    file = invoke<Capability>(s_invoke, rw[SLOT_FS_CREATE], home,
+                              ro_str("visits.txt"), rw[SLOT_DISK], 0u,
+                              memory_quota);
+  }
   if (!capability_is_valid(file)) {
-    out_status("[hello]    could not create note.txt",
+    out_status("[hello]    could not open visits.txt",
                init::cap_error(file, init::FS_BAD_REQUEST));
     return;
   }
 
-  size_t len = append(s_text, 0, sizeof(s_text), "hello was here");
+  size_t length = append(s_text, 0, sizeof(s_text), "hello was here");
   if (args[0] != '\0') {
-    len = append(s_text, len, sizeof(s_text), " with: ");
-    len = append(s_text, len, sizeof(s_text), args);
+    length = append(s_text, length, sizeof(s_text), " with: ");
+    length = append(s_text, length, sizeof(s_text), args);
   }
-  len = append(s_text, len, sizeof(s_text), "\n");
+  length = append(s_text, length, sizeof(s_text), "\n");
+  const int64_t written = invoke<int64_t>(
+      s_invoke, rw[SLOT_FS_WRITE], file, region(s_text, length),
+      init::FS_APPEND, uint64_t{length}, rw[SLOT_DISK]);
+  if (written < 0) {
+    out_status("[hello]    could not write visits.txt", written);
+    return;
+  }
 
-  Capability text_cap =
-      capability_set_bounds(reinterpret_cast<Capability>(s_text), len);
-  const int64_t wr = invoke<int64_t>(s_invoke, rw[SLOT_FS_WRITE], file,
-                                     text_cap, 0ULL, static_cast<uint64_t>(len));
-  if (wr < 0) {
-    out_status("[hello]    could not write note.txt", wr);
-  } else {
-    const int64_t st = read_into(rw[SLOT_FS_READ], file, s_text, sizeof(s_text));
-    if (st != init::FS_OK) {
-      out_status("[hello]    could not read note.txt back", st);
-    } else {
-      out("[hello]    note.txt reads: ");
-      out(s_text);
+  uint64_t visits = 0;
+  int64_t bytes_read = 0;
+  for (uint64_t offset = 0; (bytes_read = read_text(rw, file, offset)) > 0;) {
+    for (int64_t i = 0; i < bytes_read; ++i) {
+      visits += s_text[i] == '\n' ? 1 : 0;
     }
+    offset += static_cast<uint64_t>(bytes_read);
   }
+  if (bytes_read < 0) {
+    out_status("[hello]    could not read visits.txt back", bytes_read);
+    return;
+  }
+  out_dec("[hello]    visit number ", visits, " (visits.txt keeps count)\n");
 
-  invoke<int64_t>(s_invoke, rw[SLOT_FS_CLOSE], file);
-
-  init::FsQueryRequest q;
-  zero_bytes(&q, sizeof(q));
-  q.quota = home;
-  q.status = init::FS_BAD_REQUEST;
-  call(rw[SLOT_FS_QUERY], &q);
-  if (q.status == init::FS_OK) {
-    out_dec("[hello]    my directory: ", q.used_bytes, " of ");
-    out_dec("", q.limit_bytes, " bytes, ");
-    out_dec("", q.used_inodes, " of ");
-    out_dec("", q.limit_inodes, " inodes used\n");
+  init::FsStat stat{};
+  if (invoke<int64_t>(s_invoke, rw[SLOT_FS_STAT], rw[SLOT_DISK],
+                      region(&stat, sizeof(stat))) == init::FS_OK) {
+    out_dec("[hello]    my disk quota: ", stat.used, " of ");
+    out_dec("", stat.size, " bytes used\n");
   }
 }
 
@@ -189,39 +160,36 @@ extern "C" int64_t compartment_main(Capability arg) {
     out("[hello]    not invoked with an AppRequest\n");
     return -1;
   }
-  auto* req = reinterpret_cast<init::AppRequest*>(arg);
-  req->args[init::APP_ARGS_MAX - 1] = '\0';  // a string, whatever was sent
+  auto* request = reinterpret_cast<init::AppRequest*>(arg);
+  request->args[init::APP_ARGS_MAX - 1] = '\0';  // a string, whatever was sent
 
   out("[hello]    Hello from a program loaded off the disk into a "
       "compartment of its own\n");
-  if (req->args[0] != '\0') {
+  if (request->args[0] != '\0') {
     out("[hello]    arguments: ");
-    out(req->args);
+    out(request->args);
     out("\n");
   } else {
     out("[hello]    no arguments\n");
   }
 
-  leave_a_note(rw, req->args);
+  record_visit(rw, request->args);
 
-  // The message of the day, if the shell gave us one to read. The handle is
-  // the shell's to close, not ours.
-  Capability motd = rw[SLOT_MOTD];
-  if (sealing::is_sealed(motd)) {
-    if (read_into(rw[SLOT_FS_READ], motd, s_text, sizeof(s_text)) == init::FS_OK) {
-      out("[hello]    motd: ");
-      out(s_text);
-      size_t n = 0;
-      while (s_text[n] != '\0') {
-        ++n;
-      }
-      if (n == 0 || s_text[n - 1] != '\n') {
-        out("\n");
-      }
+  // The message of the day, if we were given one to read.
+  const Capability motd = rw[SLOT_MOTD];
+  if (sealing::is_sealed(motd) && read_text(rw, motd, 0) >= 0) {
+    out("[hello]    motd: ");
+    out(s_text);
+    size_t length = 0;
+    while (s_text[length] != '\0') {
+      ++length;
+    }
+    if (length == 0 || s_text[length - 1] != '\n') {
+      out("\n");
     }
   }
 
-  req->status = 0;
+  request->status = 0;
   return 0;
 }
 

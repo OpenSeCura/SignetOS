@@ -119,8 +119,8 @@ void assert_user_capability(Capability cap, const char* site) {
   //    those out except as the authorities below.
   //    Delegated raw Zyseal authorities must be unsealed, carry no
   //    memory/execute/ASR permission, and cover only one of the user-managed
-  //    OTypes -- `QuotaSched`, `QuotaDisk`, `TypeKey`, `SealedObject` -- or
-  //    spare OTypes above `OType::Trap`. Never one the kernel authenticates
+  //    OTypes -- `QuotaSched`, `FsFile`, `TypeKey`, `SealedObject` -- or
+  //    OTypes above `OType::Trap`. Never one the kernel authenticates
   //    its own objects with.
   if ((perms & (perms::Seal | perms::Unseal)) != 0) {
     constexpr uint64_t kFirstUserOType = static_cast<uint64_t>(OType::Trap) + 1;
@@ -129,7 +129,7 @@ void assert_user_capability(Capability cap, const char* site) {
                                     perms::AccessSystemRegs;
     const bool user_otype =
         (base == static_cast<uint64_t>(OType::QuotaSched) && len == 1) ||
-        (base == static_cast<uint64_t>(OType::QuotaDisk) && len == 1) ||
+        (base == static_cast<uint64_t>(OType::FsFile) && len == 1) ||
         (base == static_cast<uint64_t>(OType::TypeKey) && len == 1) ||
         (base == static_cast<uint64_t>(OType::SealedObject) && len == 1) ||
         base >= kFirstUserOType;
@@ -195,7 +195,7 @@ void assert_user_capability(Capability cap, const char* site) {
   //    dereferenced without `g_type_root`; their bounds are a kernel descriptor
   //    in dynamic memory or `.bss` and nothing more needs checking.
   const bool user_sealed = ct == static_cast<uint64_t>(OType::QuotaSched) ||
-                           ct == static_cast<uint64_t>(OType::QuotaDisk) ||
+                           ct == static_cast<uint64_t>(OType::FsFile) ||
                            ct == static_cast<uint64_t>(OType::TypeKey) ||
                            ct == static_cast<uint64_t>(OType::SealedObject) ||
                            ct > static_cast<uint64_t>(OType::Trap);

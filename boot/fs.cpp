@@ -15,139 +15,31 @@
  */
 
 /*
- * fs.cpp - SignetOS User-Space File System Compartment
+ * fs.cpp - SignetOS file system
  *
- * A hierarchical file system on the `blk` device, with every byte of disk
- * space handed out through a tree of `quota_disk` nodes, each rooted at a
- * directory, so that no holder of a quota -- nor anything derived from it --
- * can use more of the disk than it was given, or reach anything above the
- * directory it was given.
+ * Files, directories and disk quotas are reached only through handles:
+ * sealed pointers to records holding an entry and rights (user/abi.hpp).
+ * File, directory and quota handles each have their own OType. Each
+ * handle is opened through another, paid for by the caller's memory quota,
+ * and closed with everything opened through it; a temporary goes with the
+ * handle that made it. Rights only shrink; paths only go down, or through a
+ * link, which can only take rights away.
  *
- * ON DISK (4 KiB blocks, eight 512-byte sectors each)
- *   block 0       Superblock: magic, version 3, geometry scaled to the disk.
- *   bitmap        One bit per block of the disk (`bitmap_blocks` blocks
- *                 starting at `bitmap_block = 1`, 1 block per 128 MiB of
- *                 disk). Bits `[0, data_start)` for the metadata blocks are
- *                 always set.
- *   inode table   `inode_table_blocks` blocks starting at `inode_block`,
- *                 32 inodes of 128 bytes per block (sized at format time to
- *                 1 inode per 64 KiB of disk, minimum 64 inodes). An inode
- *                 holds a name, the inode number of the directory it is in
- *                 (`ROOT_DIR` for `/`), a size, 16 direct block numbers and
- *                 1 single-indirect block number (1,024 additional block
- *                 numbers), so a file can grow up to 1,040 blocks (4,160
- *                 KiB). A directory is an inode flagged INODE_DIR with no
- *                 blocks: its entries are the inodes whose `parent` it is,
- *                 found by scanning the table (one inode per 64 KiB of disk
- *                 keeps that cheap), so there are no directory data blocks
- *                 and no dirent format to keep consistent.
- *   data_start+   Data blocks and single-indirect blocks.
- *   The bitmap, inode table and per-inode owner array are allocated from
- *   `fs`'s VM quota at mount time to match the superblock geometry, and
- *   written through one block at a time after every change.
+ * On disk: a header, the entry table (one 128-byte entry per disk block),
+ * data. A directory or quota has no blocks; its children point at it with
+ * `parent`. A link names a file or directory, with rights. Entry 0 is `/`,
+ * entry 1 the root quota. A file's blocks past its first DIRECT_BLOCKS, and
+ * a name too long to fit in its entry, are trees of blocks that grow another
+ * level whenever they fill up (TREES), so neither has a limit but the disk.
+ * Paths are read from the caller's buffer a name at a time, so they have
+ * none either.
  *
- * QUOTAS
- *   quota_disk    One page per node, paid for by the caller's `node_funding`
- *                 VM quota, hardware-sealed with `OType::QuotaDisk`:
- *                 `Load|Store` for the ADMIN handle
- *                 (derive/destroy/create/mkdir/unlink/write) and `Load` for
- *                 the OP handle (open/read/list/query). A node
- *                 has a limit, a use and a delegation, in bytes and in
- *                 inodes, always `used + delegated <= limit`, and a root
- *                 directory. The root node is the data area of the disk and
- *                 all inodes, rooted at `/`.
- *   Paths         Every path a handle names is relative to its node's root
- *                 directory and cannot climb out of it (no "..", no leading
- *                 '/'), so what a holder can reach is settled when the node
- *                 is derived: `fs.quota_derive` takes the directory the child
- *                 is rooted at, which must lie under the parent's own.
- *   Ownership     Every file belongs to the node it was created under, and
- *                 the blocks it grows into are charged to that node and to
- *                 no other: an ancestor writing to it does not pay. Like the
- *                 scheduler's tree, ownership lives in memory only: after a
- *                 reboot every file on the disk belongs to the root again and
- *                 `init` re-derives what it hands out -- with
- *                 FS_DERIVE_ADOPT, so that the shell's node starts out owning
- *                 whatever was left in `/home`, charges and all, instead of
- *                 merely seeing it. Adoption moves only what the parent owns
- *                 at or under the child's root. `rm disk.img` starts from
- *                 a blank disk -- minus the system's own images, so rebuild
- *                 it with `make disk.img` (see below).
- *   Visibility    A handle sees everything under its root directory, whoever
- *                 owns it; it can write to and remove only what its own node
- *                 or a descendant owns (abi.hpp has the table). So two nodes
- *                 rooted at one directory see each other's files and cannot
- *                 touch them, and an ancestor can place a file in a child's
- *                 directory that the child can read but not remove. There is
- *                 no "public" bit: where an inode sits and who holds a handle
- *                 rooted above it is the whole of the rule. Destroying a node
- *                 unlinks the files it owns and the directories of its that
- *                 are then empty and hands its limits back
- *                 to the parent; a directory still holding other nodes' files,
- *                 or that another node is rooted at, passes to the parent with
- *                 them. Only its own children stand in a node's way.
- *   Layout        `init` makes `/home` and `/bin`. The shell's node is rooted
- *                 at `/home` with all the space the system's images leave,
- *                 and a second, OP-only, 0-byte node rooted at `/bin` lets it
- *                 read the programs the build put there and nothing else. The
- *                 system's own images sit in `/`, where only the root handle
- *                 is rooted, so nothing the shell holds can so much as name
- *                 them.
+ * Each quota keeps what it pays for in `used`. A charge is written before
+ * the change it pays for and a refund after it, so a crash can only leave
+ * `used` too high. Mount rebuilds the free-block map and `used`.
  *
- * THE DISK IS ALSO WHERE THE SYSTEM LIVES
- *   `fs` is part of the boot set (`kernel/boot_images.S`): it comes up before
- *   `naming`, `sched` and the shell, because `init` reads those
- *   out of this file system (`tools/signetfs.py` writes them into the disk
- *   image at build time) and loads them. Two things follow.
- *   The entry points below are handed back to `init` in the `FsInterface`
- *   handshake rather than published here, since there is nothing to publish
- *   them with yet; `init` publishes them as "fs.*" once `naming` is running.
- *   And the first reads go through a `blk` that polls: the scheduler it
- *   would sleep in is one of the files being read.
- *
- * ENTRY POINTS (each a separate `OType::EntryPoint`; `init` publishes them)
- *   fs.quota_derive   (FsDeriveRequest*)                   ADMIN on parent;
- * child rooted at `path`; returns the handle asked for and the child's ADMIN
- * handle (to destroy it with); FS_DERIVE_ADOPT moves the parent's files there
- * to the child fs.quota_destroy  (quota)                              ADMIN;
- * BUSY while children remain fs.quota_query    (FsQueryRequest*) either
- *   fs.create         (quota, path, perms)                 ADMIN: a new file
- * owned by the node fs.mkdir          (quota, path) ADMIN: a new directory
- * owned by the node fs.open           (quota, path, perms, out_size) either;
- * writable iff asked, ADMIN and owned fs.close          (file) fs.read (file,
- * buf, offset, length) fs.write          (file, buf, offset, length) writable
- * handle; grows the file fs.unlink         (quota, path) ADMIN of the owner or
- * of an ancestor fs.list           (quota, path, entries, cap, out_tot) either;
- * one directory's entries
- *
- * FILE HANDLES
- *   A hardware-sealed capability (`OType::QuotaDisk`) over an `OpenFile`
- *   record in the page of the node the file was opened through
- *   (the part of the page after the `QuotaDisk` struct: FS_OPEN_PER_NODE
- *   records). TODO: ideally transition to a dedicated sealing key/OType for
- *   file handles rather than sharing `OType::QuotaDisk`. So the records are the
- *   holder's own memory, bought with the node: a holder that opens too much
- *   exhausts its node and nobody else's, and when a node is destroyed every
- *   handle opened through it dies with the page. Closing clears `in_use`; a
- *   record reused by a later open through the same node is indistinguishable
- *   from the old one to a stale handle, as with any object named by its
- *   address -- but that later open is the same holder's.
- *   TODO: change this! This fs is just a dumb toy version to make progress
- *   but clearly such a limited number of files makes no sense.
- *
- * ONE CALLER AT A TIME
- *   Every entry point holds `s_lock` (runtime.hpp, `lock`) while it uses the
- *   tables. Its caller can be preempted, or parked in `sched.block` inside
- *   `blk` while a disk request is in flight, half way through an update; a
- *   second caller waits for the lock rather than see the half-updated tables,
- *   and lends the holder its time meanwhile; a kill never cuts a call short,
- *   so a killed holder releases the lock too. A holder can still end with the
- *   lock held (the kernel ends a thread that has no room to take a trap, or
- *   whose every frame is in a destroyed compartment); the next caller then
- *   gets it with SCHED_OWNER_DEAD and is warned that the tables may be
- *   half-updated (`LockScope`). `init` hands over the
- *   scheduler's lock entries once there is a scheduler; until then it is the
- *   only thread there is.
+ * Started before naming: init gets the entry points from the handshake and
+ * publishes them. Every entry point holds `s_lock`.
  */
 
 #include "runtime.hpp"
@@ -155,135 +47,120 @@
 namespace signetos::user {
 namespace {
 
-// TODO this isn't a real or good or robust fs, a better one is needed, this is
-// for early testing
-
-// --- What `fs` asks `init` for (user/manifest.hpp) ----------------------------
-// `blk.read` / `blk.write` are asked for here and nowhere else: `fs` is the
-// only compartment that can touch the disk, and it only ever does so on behalf
-// of a `quota_disk` handle. They are optional because a machine without a
-// block device still boots -- the file system then reports itself unmounted.
-// No `naming` entry: `fs` hands its entry points back in the `FsInterface`
-// handshake and `init` publishes them. Its VM quota is what its in-memory
-// tables and the root quota node are allocated from.
-#define FS_MANIFEST(X)                                \
-  M_QUOTA_VM(X, VM_QUOTA)                             \
-  M_OTYPE(X, SEAL_AUTH, ::signetos::OType::QuotaDisk) \
-  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)             \
-  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)         \
-  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)   \
-  M_SYSCALL(X, SYS_SENTRY, sentry)                    \
-  M_SERVICE(X, UART_SENTRY, "uart")                   \
-  M_SERVICE_OPT(X, BLK_READ, "blk.read")              \
+// blk.* are optional: without a disk, fs reports itself unmounted.
+#define FS_MANIFEST(X)                               \
+  M_QUOTA_VM(X, VM_QUOTA)                            \
+  M_OTYPE(X, SEAL_FILE, ::signetos::OType::FsFile)   \
+  M_OTYPE(X, SEAL_DIR, ::signetos::OType::FsDir)     \
+  M_OTYPE(X, SEAL_QUOTA, ::signetos::OType::FsQuota) \
+  M_SYSCALL(X, SYS_VM_ALLOC, vm_allocate)            \
+  M_SYSCALL(X, SYS_VM_DEALLOC, vm_deallocate)        \
+  M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)  \
+  M_SYSCALL(X, SYS_SENTRY, sentry)                   \
+  M_SERVICE(X, UART_SENTRY, "uart")                  \
+  M_SERVICE_OPT(X, BLK_READ, "blk.read")             \
   M_SERVICE_OPT(X, BLK_WRITE, "blk.write")
-// 128 KiB for code, stack, `.bss` and the root quota node; `init` adds what
-// the in-memory tables need for the disk it found (see init.cpp, step 4).
+// init adds the size of the in-memory tables (init.cpp, step 4).
 SIGNETOS_MANIFEST(FS_MANIFEST, 128 * 1024)
 
-// --- On-disk format -----------------------------------------------------------
+// --- On disk ----------------------------------------------------------------
 
-constexpr uint64_t MAGIC   = 0x5349474e45544653ULL;  // "SIGNETFS"
-constexpr uint32_t VERSION = 3;
+constexpr uint64_t MAGIC = 0x5349474341504653ULL;  // "SIGCAPFS"
+constexpr uint64_t VERSION = 2;
+constexpr uint64_t BLOCK = init::FS_BLOCK_BYTES;
+constexpr uint64_t SECTORS_PER_BLOCK = BLOCK / init::BLK_SECTOR_BYTES;
+constexpr uint32_t DIRECT_BLOCKS = 16;                // a file's first blocks
+constexpr uint32_t NAME_HEAD = init::FS_NAME_INLINE;  // name bytes in an entry
+// A list block (TREES) holds FANOUT block numbers.
+constexpr uint32_t FANOUT_BITS = 10;
+constexpr uint32_t FANOUT = 1u << FANOUT_BITS;
+static_assert(FANOUT * sizeof(uint32_t) == BLOCK);
+// Levels of lists enough for as many blocks as a uint32_t counts.
+constexpr uint32_t MAX_LEVELS = (32 + FANOUT_BITS - 1) / FANOUT_BITS;
+constexpr uint32_t MAX_COUNT = 0xFFFFFFFFu;  // blocks, or bytes of a name
 
-constexpr uint64_t BLOCK_BYTES        = init::FS_BLOCK_BYTES;
-constexpr uint64_t SECTORS_PER_BLOCK  = BLOCK_BYTES / init::BLK_SECTOR_BYTES;
-constexpr uint64_t BITS_PER_BLOCK     = BLOCK_BYTES * 8;
-constexpr uint32_t DIRECT_BLOCKS      = static_cast<uint32_t>(init::FS_DIRECT_BLOCKS);
-constexpr uint32_t INDIRECT_SLOTS     = static_cast<uint32_t>(init::FS_INDIRECT_SLOTS);
-constexpr uint32_t MAX_FILE_BLOCKS    = static_cast<uint32_t>(init::FS_MAX_FILE_BLOCKS);
-constexpr uint64_t SUPER_BLOCK        = 0;
-
-struct Superblock {
+// Block 0. The entry table follows, then data.
+struct DiskHeader {
   uint64_t magic;
-  uint32_t version;
-  uint32_t block_bytes;
+  uint64_t version;
   uint64_t total_blocks;
-  uint64_t data_start;
-  uint32_t max_inodes;
-  uint32_t inode_table_blocks;
-  uint64_t bitmap_block;
-  uint64_t inode_block;
-  uint32_t bitmap_blocks;
-  uint32_t reserved;
 };
-static_assert(sizeof(Superblock) <= BLOCK_BYTES);
 
-constexpr uint32_t INODE_USED = 1;
-// A directory: no blocks of its own; its entries are the inodes whose
-// `parent` names it.
-constexpr uint32_t INODE_DIR = 2;
-// `Inode::parent` of an entry of `/`, which is not itself an inode.
-constexpr uint32_t ROOT_DIR = 0xFFFFFFFFu;
+// Entry flags. DIR, QUOTA, FROZEN and LINK are also FS_ENTRY_*. REMOVING and
+// CHANGED are memory only.
+constexpr uint32_t IN_USE = 1;
+constexpr uint32_t DIR = init::FS_ENTRY_DIR;
+constexpr uint32_t QUOTA = init::FS_ENTRY_QUOTA;
+constexpr uint32_t FROZEN = init::FS_ENTRY_FROZEN;
+constexpr uint32_t LINK = init::FS_ENTRY_LINK;
+constexpr uint32_t REMOVING = 1u << 30;
+constexpr uint32_t CHANGED = 1u << 31;  // to be written
 
-struct Inode {
-  uint32_t flags;                 // INODE_USED | INODE_DIR, or 0
-  uint32_t nblocks;               // number of data blocks in the file
-  uint64_t size;                  // bytes; <= nblocks * BLOCK_BYTES
-  char name[init::FS_NAME_MAX];   // NUL-terminated
-  uint32_t blocks[DIRECT_BLOCKS];
-  uint32_t indirect;              // block holding u32[INDIRECT_SLOTS], or 0
-  uint32_t parent;                // the directory this is an entry of, or ROOT_DIR
-  uint8_t reserved[8];
+constexpr uint32_t NO_ENTRY = 0xFFFFFFFFu;
+constexpr uint32_t ROOT_DIR = 0;
+constexpr uint32_t ROOT_QUOTA = 1;
+
+// A name of `length` bytes. One of up to NAME_HEAD bytes is all in `head`. A
+// longer one is all in the tree `tree`, BLOCK bytes to a block, with its
+// first NAME_HEAD bytes in `head` as well: most names compared differ there,
+// or in length or hash, without a block being read.
+struct Name {
+  uint32_t length;          // no NUL; 0 for none (`/`, the root quota, a temporary)
+  uint32_t hash;            // of all of it (hash_step)
+  uint32_t tree;            // a longer name's blocks, or 0
+  char head[NAME_HEAD];
 };
-static_assert(sizeof(Inode) == 128);
-constexpr uint32_t INODES_PER_BLOCK =
-    static_cast<uint32_t>(BLOCK_BYTES / sizeof(Inode));
-static_assert(static_cast<uint64_t>(MAX_FILE_BLOCKS) * BLOCK_BYTES ==
-              init::FS_MAX_FILE_BYTES);
 
-// --- In-memory objects ----------------------------------------------------------
-
-constexpr size_t MAX_NODES = 32;
-
-// One node per page. The rest of the page, after this
-// struct, holds the node's open-file records (`node_files`).
-struct alignas(16) QuotaDisk {
-  struct {
-    QuotaDisk* parent;
-    QuotaDisk* first_child;
-    QuotaDisk* next_sibling;
-    QuotaDisk* prev_sibling;
-    uint64_t child_count;
-  } tree;
-
-  uint64_t limit_bytes;
-  uint64_t used_bytes;        // by this node's own files, whole blocks
-  uint64_t delegated_bytes;   // the sum of the children's limits
-  uint32_t limit_inodes;
-  uint32_t used_inodes;
-  uint32_t delegated_inodes;
-  uint32_t root_dir;          // the directory every path is relative to
-  uint32_t file_cursor;       // where the next open-file slot search starts
-  uint32_t pad_;
-
-  Capability node_page;       // this page, as returned by sys_vm_allocate
-  Capability node_funding;    // the QuotaVm that paid for it
+// A file, directory, quota or link.
+struct Entry {
+  uint32_t flags;
+  uint32_t parent;          // directory; for a quota, its parent quota
+  uint32_t payer;           // quota paying for a file, directory or link
+  uint32_t generation;      // bumped on free: kills old handles
+  union {
+    uint64_t size;          // file: bytes
+    uint64_t limit;         // quota
+  };
+  uint32_t block_count;     // file: blocks
+  uint32_t tree;            // file: its blocks past DIRECT_BLOCKS, or 0
+  Name name;
+  union {
+    uint32_t blocks[DIRECT_BLOCKS];  // file: its first blocks
+    uint64_t used;                   // quota: what it pays for, its quotas included
+    struct {
+      uint32_t entry;
+      uint32_t generation;
+      uint32_t rights;
+    } target;                        // link: what it names, and with what rights
+  };
 };
-static_assert(sizeof(QuotaDisk) % 16 == 0);
+static_assert(sizeof(Entry) == 128);
+constexpr uint32_t ENTRIES_PER_BLOCK = static_cast<uint32_t>(BLOCK / sizeof(Entry));
 
-// An open file. The records sit in the page of the node the file was opened
-// through, so a holder that opens too much runs out of its own node's page and
-// nobody else's, and its handles die with the node.
-struct alignas(16) OpenFile {
-  uint32_t inode;
-  uint32_t in_use;
-  uint32_t writable;  // opened through an ADMIN handle (or by create)
-  uint32_t pad_;
+// --- Handles ----------------------------------------------------------------
+
+// A file, directory or quota handle points at one of these. Each is its own
+// allocation, paid for by `memory_quota`.
+struct Handle {
+  Capability self;          // this allocation
+  Capability memory_quota;  // the memory quota it goes back to
+  Handle* parent;           // the handle it was opened through; null for a root
+  Handle* first_child;      // the handles opened through this one
+  Handle* next_sibling;     // the next child of `parent`
+  uint32_t entry;
+  uint32_t generation;
+  uint32_t rights;
+  uint32_t is_open;
+  uint32_t temporary;       // made the temporary it names (fs.create, no dir)
 };
-static_assert(sizeof(OpenFile) == 16);
 
-constexpr size_t FILES_PER_NODE =
-    (vm::PAGE_SIZE - sizeof(QuotaDisk)) / sizeof(OpenFile);
-static_assert(FILES_PER_NODE == init::FS_OPEN_PER_NODE,
-              "abi.hpp FS_OPEN_PER_NODE must match the page layout");
-static_assert(sizeof(QuotaDisk) + FILES_PER_NODE * sizeof(OpenFile) <=
-              vm::PAGE_SIZE);
-
-// --- State -------------------------------------------------------------------------
+// --- State ------------------------------------------------------------------
 
 Capability s_self_comp = nullptr;
 Capability s_vm_quota = nullptr;
-Capability s_seal_auth = nullptr;
+Capability s_seal_file = nullptr;    // OType::FsFile authority
+Capability s_seal_dir = nullptr;     // OType::FsDir authority
+Capability s_seal_quota = nullptr;   // OType::FsQuota authority
 Capability s_gate_alloc = nullptr;
 Capability s_gate_dealloc = nullptr;
 Capability s_gate_invoke = nullptr;
@@ -291,102 +168,81 @@ Capability s_uart = nullptr;
 Capability s_blk_read = nullptr;
 Capability s_blk_write = nullptr;
 
-QuotaDisk* s_root = nullptr;
-QuotaDisk* s_nodes[MAX_NODES];
-size_t s_node_count = 0;
-
-// Metadata tables sized from the superblock at mount time and allocated from
-// `s_vm_quota`.
-uint8_t* s_bitmap = nullptr;
-Inode* s_inodes = nullptr;
-QuotaDisk** s_owner = nullptr;
-
-alignas(16) uint8_t s_io[BLOCK_BYTES];        // data block in flight
-alignas(16) uint32_t s_indirect[INDIRECT_SLOTS];  // cached indirect block
-uint32_t s_indirect_blk = 0;                  // block cached in s_indirect (0 = none)
-
+Entry* s_entries = nullptr;     // the whole entry table
+uint32_t s_entry_count = 0;
+uint8_t* s_block_map = nullptr;  // one bit per block: in use
 uint64_t s_total_blocks = 0;
-uint64_t s_bitmap_block = 1;
-uint32_t s_bitmap_blocks = 0;
-uint64_t s_inode_block = 0;
-uint32_t s_inode_table_blocks = 0;
-uint32_t s_max_inodes = 0;
 uint64_t s_data_start = 0;
+uint64_t s_free_blocks = 0;
+uint64_t s_next_block = 0;      // where to look for a free block next
+
+alignas(16) uint8_t s_block_buf[BLOCK];
+alignas(16) uint8_t s_name_buf[BLOCK];  // a block of a long name
+// The lists of the tree walked last, one per level (TREES).
+alignas(16) uint32_t s_list[MAX_LEVELS][FANOUT];
+uint32_t s_list_block[MAX_LEVELS];  // the block held at each level, or 0
+bool s_list_changed[MAX_LEVELS];    // changed since it was read or written
 
 bool s_mounted = false;
 bool s_first_call_done = false;
 bool s_second_call_done = false;
 
-// ONE CALLER AT A TIME, above.
 uint64_t s_lock = 0;
 Capability s_lock_wait = nullptr;  // sched.lock_wait
 Capability s_lock_wake = nullptr;  // sched.lock_wake
 
-// --- Small helpers -------------------------------------------------------------------
+// --- Small helpers ----------------------------------------------------------
+
+// Returns `expr` if it is not FS_OK.
+#define TRY(expr)                        \
+  do {                                   \
+    const int64_t st_ = (expr);          \
+    if (st_ != init::FS_OK) return st_;  \
+  } while (false)
 
 void out(const char* msg) { print(s_gate_invoke, s_uart, msg); }
-void out_dec(const char* p, uint64_t v, const char* s) {
-  print_dec(s_gate_invoke, s_uart, p, v, s);
+void out_dec(const char* prefix, uint64_t value, const char* suffix) {
+  print_dec(s_gate_invoke, s_uart, prefix, value, suffix);
 }
 
-template <typename T>
-Capability bounded(T* p) {
-  return capability_set_bounds(reinterpret_cast<Capability>(p), sizeof(T));
-}
-
-void zero_bytes(void* p, size_t n) {
-  auto* d = static_cast<uint8_t*>(p);
-  for (size_t i = 0; i < n; ++i) {
-    d[i] = 0;
+void zero_bytes(void* dst, size_t count) {
+  auto* bytes = static_cast<uint8_t*>(dst);
+  for (size_t i = 0; i < count; ++i) {
+    bytes[i] = 0;
   }
 }
 
-void copy_bytes(void* dst, const void* src, size_t n) {
-  auto* d = static_cast<uint8_t*>(dst);
-  const auto* s = static_cast<const uint8_t*>(src);
-  for (size_t i = 0; i < n; ++i) {
-    d[i] = s[i];
+void copy_bytes(void* dst, const void* src, size_t count) {
+  auto* to = static_cast<uint8_t*>(dst);
+  const auto* from = static_cast<const uint8_t*>(src);
+  for (size_t i = 0; i < count; ++i) {
+    to[i] = from[i];
   }
 }
 
-// Bytes addressable from `cap`'s current address to the end of its bounds.
-uint64_t room(Capability cap) {
+// Bytes from `cap`'s address to the end of its bounds.
+uint64_t bytes_left(Capability cap) {
   const uint64_t base = capability_get_base(cap);
   const uint64_t end = base + capability_get_length(cap);
   const uint64_t addr = capability_get_address(cap);
   return (addr < base || addr > end) ? 0 : end - addr;
 }
 
-// A request must be writable (we report status through it) and whole.
-template <typename T>
-T* open_request(Capability arg) {
-  if (!capability_is_valid(arg) || sealing::is_sealed(arg) ||
-      !capability_has_perms(arg, perms::Load | perms::Store) ||
-      room(arg) < sizeof(T)) {
-    return nullptr;
-  }
-  return reinterpret_cast<T*>(arg);
-}
-
-// A caller's data buffer: unsealed, with `need` permissions and `bytes` of
-// room from its address.
-bool buffer_ok(Capability buf, uint64_t need, uint64_t bytes) {
+bool buffer_ok(Capability buf, uint64_t perms_needed, uint64_t bytes) {
   return capability_is_valid(buf) && !sealing::is_sealed(buf) &&
-         capability_has_perms(buf, need) && room(buf) >= bytes;
+         capability_has_perms(buf, perms_needed) && bytes_left(buf) >= bytes;
 }
 
-// Holds `s_lock` while in scope (ONE CALLER AT A TIME). `taken` is false if
-// the scheduler would not let the caller wait, which only a misuse of the
-// lock causes.
+// Holds `s_lock` while in scope.
 struct LockScope {
   bool taken;
   LockScope() {
-    const int64_t st = lock(s_gate_invoke, s_lock_wait, &s_lock);
-    if (st == init::SCHED_OWNER_DEAD) {
+    const int64_t status = lock(s_gate_invoke, s_lock_wait, &s_lock);
+    if (status == init::SCHED_OWNER_DEAD) {
       out("[fs]       WARNING: a thread ended holding the fs lock; the tables "
           "may be half-updated\n");
     }
-    taken = st == init::SCHED_OK || st == init::SCHED_OWNER_DEAD;
+    taken = status == init::SCHED_OK || status == init::SCHED_OWNER_DEAD;
   }
   ~LockScope() {
     if (taken) {
@@ -395,72 +251,108 @@ struct LockScope {
   }
 };
 
-// --- Names ---------------------------------------------------------------------------
+// Held by every entry point.
+struct CallGuard {
+  LockScope lock;
+  int64_t status() const {
+    return !lock.taken    ? init::FS_BUSY
+           : !s_mounted   ? init::FS_NOT_MOUNTED
+                          : init::FS_OK;
+  }
+};
 
-// 1..FS_NAME_MAX-1 printable, non-blank characters, no '/', NUL-terminated
-// inside the FS_NAME_MAX-byte field.
-bool name_ok(const char* name) {
-  size_t len = 0;
-  while (len < init::FS_NAME_MAX && name[len] != '\0') {
-    const char c = name[len];
-    if (c <= ' ' || c > '~' || c == '/') {
-      return false;
+// --- Names and paths --------------------------------------------------------
+
+// A name is one or more printable characters, no blank or '/', and not "."
+// or "..".
+bool name_char(char c) { return c > ' ' && c <= '~' && c != '/'; }
+
+bool is_dot_or_dotdot(const char* name, uint64_t length) {
+  return name[0] == '.' && (length == 1 || (length == 2 && name[1] == '.'));
+}
+
+// A name's hash (FNV-1a): HASH_SEED, then hash_step for each byte.
+constexpr uint32_t HASH_SEED = 2166136261u;
+uint32_t hash_step(uint32_t hash, char c) {
+  return (hash ^ static_cast<uint8_t>(c)) * 16777619u;
+}
+
+// A name in a caller's buffer: `length` bytes at `chars`, as they were when
+// checked and hashed. The caller can change them since: whatever compares or
+// keeps them reads them again, and what is kept is checked again.
+struct Text {
+  const char* chars = nullptr;
+  uint64_t length = 0;
+  uint32_t hash = HASH_SEED;
+};
+
+// A caller's path: the `length` bytes at `chars` before its NUL. Read where
+// it is, as it is followed, so it can be as long as the caller likes.
+struct Path {
+  const char* chars = nullptr;
+  uint64_t length = 0;
+};
+
+int64_t read_path(Capability path_cap, Path* path) {
+  if (!buffer_ok(path_cap, perms::Load, 1)) {
+    return init::FS_BAD_REQUEST;
+  }
+  const uint64_t max = bytes_left(path_cap);
+  const auto* chars = static_cast<const char*>(path_cap);
+  for (uint64_t i = 0; i < max; ++i) {
+    if (chars[i] == '\0') {
+      *path = Path{chars, i};
+      return init::FS_OK;
     }
-    len += 1;
   }
-  return len != 0 && len < init::FS_NAME_MAX;
+  return init::FS_BAD_REQUEST;
 }
 
-// A path component: a name that is neither "." nor "..", the only two names
-// that would mean something other than an entry.
-bool component_ok(const char* comp) {
-  if (!name_ok(comp)) {
-    return false;
-  }
-  if (comp[0] == '.' &&
-      (comp[1] == '\0' || (comp[1] == '.' && comp[2] == '\0'))) {
-    return false;
-  }
-  return true;
-}
-
-bool names_equal(const char* a, const char* b) {
-  for (size_t i = 0; i < init::FS_NAME_MAX; ++i) {
-    if (a[i] != b[i]) {
-      return false;
+// The name at `*at` in `path`, checked and hashed; `*at` moves past it and
+// the '/' after it. FS_BAD_REQUEST for a bad name or a trailing '/'.
+int64_t next_name(const Path& path, uint64_t* at, Text* name) {
+  Text found{path.chars + *at, 0, HASH_SEED};
+  uint64_t end = *at;
+  for (; end < path.length; ++end) {
+    const char c = path.chars[end];
+    if (c == '/') {
+      break;
     }
-    if (a[i] == '\0') {
-      return true;
+    if (!name_char(c)) {
+      return init::FS_BAD_REQUEST;
     }
+    found.hash = hash_step(found.hash, c);
   }
-  return true;
+  found.length = end - *at;
+  if (found.length == 0 || is_dot_or_dotdot(found.chars, found.length)) {
+    return init::FS_BAD_REQUEST;
+  }
+  if (found.length > MAX_COUNT) {
+    return init::FS_TOO_LARGE;  // more than an entry can record
+  }
+  if (end < path.length && ++end == path.length) {
+    return init::FS_BAD_REQUEST;  // trailing '/'
+  }
+  *at = end;
+  *name = found;
+  return init::FS_OK;
 }
 
-void copy_name(char* dst, const char* src) {
-  size_t i = 0;
-  for (; i + 1 < init::FS_NAME_MAX && src[i] != '\0'; ++i) {
-    dst[i] = src[i];
-  }
-  for (; i < init::FS_NAME_MAX; ++i) {
-    dst[i] = '\0';
-  }
-}
+// --- The disk ---------------------------------------------------------------
 
-// --- Block device --------------------------------------------------------------------
-
-// Moves one 4 KiB block between `buf` and the disk through `blk`. The buffer
-// handed over is bounded to the block and, for a write, read-only.
-int64_t blk_io(Capability entry, uint64_t block, void* buf, bool write) {
-  if (!capability_is_valid(entry)) {
+// One block to or from the disk. `blk` gets a buffer bounded to the block,
+// read-only for a write.
+int64_t blk_io(Capability blk_entry, uint64_t block, void* buf, bool write) {
+  if (!capability_is_valid(blk_entry)) {
     return init::FS_IO_ERROR;
   }
-  Capability b =
-      capability_set_bounds(reinterpret_cast<Capability>(buf), BLOCK_BYTES);
-  Capability cap_buf = write ? capability_and_perms(b, perms::Load) : b;
-  const int64_t st = invoke<int64_t>(s_gate_invoke, entry, cap_buf,
-                                     block * SECTORS_PER_BLOCK,
-                                     SECTORS_PER_BLOCK);
-  return st == init::BLK_OK ? init::FS_OK : init::FS_IO_ERROR;
+  Capability bounded =
+      capability_set_bounds(reinterpret_cast<Capability>(buf), BLOCK);
+  Capability buffer = write ? capability_and_perms(bounded, perms::Load) : bounded;
+  const int64_t status = invoke<int64_t>(s_gate_invoke, blk_entry, buffer,
+                                         block * SECTORS_PER_BLOCK,
+                                         SECTORS_PER_BLOCK);
+  return status == init::BLK_OK ? init::FS_OK : init::FS_IO_ERROR;
 }
 
 int64_t read_block(uint64_t block, void* buf) {
@@ -471,1469 +363,1648 @@ int64_t write_block(uint64_t block, const void* buf) {
   return blk_io(s_blk_write, block, const_cast<void*>(buf), true);
 }
 
-int64_t write_bitmap() {
-  for (uint32_t k = 0; k < s_bitmap_blocks; ++k) {
-    const int64_t st =
-        write_block(s_bitmap_block + k, s_bitmap + k * BLOCK_BYTES);
-    if (st != init::FS_OK) {
-      return st;
-    }
+bool block_in_use(uint64_t block) {
+  return ((s_block_map[block / 8] >> (block % 8)) & 1) != 0;
+}
+
+void set_block_used(uint64_t block, bool used) {
+  const auto bit = static_cast<uint8_t>(1u << (block % 8));
+  s_block_map[block / 8] = static_cast<uint8_t>(
+      used ? s_block_map[block / 8] | bit : s_block_map[block / 8] & ~bit);
+}
+
+// The caller has checked `s_free_blocks`.
+uint32_t alloc_block() {
+  while (block_in_use(s_next_block)) {
+    s_next_block =
+        s_next_block + 1 < s_total_blocks ? s_next_block + 1 : s_data_start;
+  }
+  set_block_used(s_next_block, true);
+  s_free_blocks -= 1;
+  return static_cast<uint32_t>(s_next_block);
+}
+
+void free_block(uint32_t block) {
+  if (block >= s_data_start && block < s_total_blocks && block_in_use(block)) {
+    set_block_used(block, false);
+    s_free_blocks += 1;
+  }
+}
+
+// --- Trees ------------------------------------------------------------------
+//
+// A file's blocks past DIRECT_BLOCKS, and a long name's blocks, are a tree: a
+// root and a count of blocks. A tree of one block is just that block. A
+// bigger one hangs from lists of FANOUT block numbers, as many levels of them
+// as the count needs (`levels`): level 0 lists blocks, level k lists lists of
+// level k-1, and the root is the one list at the top. Block `index` is in
+// slot `slot_at(index, k)` of the list on its way down at level k. A tree only
+// grows at its end, gaining a level on top when it is full, so the count says
+// which slots mean anything; a slot past it is left over, and never read.
+
+// Levels of lists in a tree of `count` blocks.
+uint32_t levels(uint32_t count) {
+  uint32_t depth = 0;
+  for (uint64_t span = 1; span < count; span <<= FANOUT_BITS) {
+    ++depth;
+  }
+  return depth;
+}
+
+// Lists in a tree of `count` blocks.
+uint64_t list_count(uint32_t count) {
+  uint64_t lists = 0;
+  const uint32_t depth = levels(count);
+  for (uint32_t level = 1; level <= depth; ++level) {
+    const uint64_t span = uint64_t{1} << (FANOUT_BITS * level);
+    lists += (count + span - 1) / span;
+  }
+  return lists;
+}
+
+uint32_t slot_at(uint32_t index, uint32_t level) {
+  return (index >> (FANOUT_BITS * level)) & (FANOUT - 1);
+}
+
+// Whether block `index` is the first under its list at `level`.
+bool starts_list(uint32_t index, uint32_t level) {
+  const uint64_t span = uint64_t{1} << (FANOUT_BITS * (level + 1));
+  return (index & (span - 1)) == 0;
+}
+
+// Writes the list held at `level` if it changed.
+int64_t flush_list(uint32_t level) {
+  if (s_list_changed[level]) {
+    TRY(write_block(s_list_block[level], s_list[level]));
+    s_list_changed[level] = false;
   }
   return init::FS_OK;
 }
 
-// Writes the inode-table block holding inode `ino`.
-int64_t write_inode_block(uint32_t ino) {
-  const uint32_t block = ino / INODES_PER_BLOCK;
-  return write_block(s_inode_block + block,
-                     &s_inodes[block * INODES_PER_BLOCK]);
-}
-
-int64_t load_indirect(uint32_t blk) {
-  if (blk == 0) {
-    return init::FS_IO_ERROR;
+int64_t flush_lists() {
+  for (uint32_t level = 0; level < MAX_LEVELS; ++level) {
+    TRY(flush_list(level));
   }
-  if (s_indirect_blk == blk) {
-    return init::FS_OK;
-  }
-  const int64_t st = read_block(blk, s_indirect);
-  if (st == init::FS_OK) {
-    s_indirect_blk = blk;
-  }
-  return st;
-}
-
-int64_t save_indirect(uint32_t blk) {
-  s_indirect_blk = blk;
-  return write_block(blk, s_indirect);
-}
-
-// Resolves block index `bi` (0 .. in.nblocks-1) of `in` to its disk block.
-int64_t inode_block_at(const Inode& in, uint32_t bi, uint32_t* out_blk) {
-  if (bi >= in.nblocks) {
-    return init::FS_IO_ERROR;
-  }
-  if (bi < DIRECT_BLOCKS) {
-    *out_blk = in.blocks[bi];
-    return init::FS_OK;
-  }
-  const int64_t st = load_indirect(in.indirect);
-  if (st != init::FS_OK) {
-    return st;
-  }
-  *out_blk = s_indirect[bi - DIRECT_BLOCKS];
   return init::FS_OK;
 }
 
-// Total disk blocks (data + indirect metadata block if present) charged to
-// an inode with `nblocks` data blocks.
-inline uint64_t charged_blocks_for(uint32_t nblocks) {
-  return static_cast<uint64_t>(nblocks) + (nblocks > DIRECT_BLOCKS ? 1 : 0);
+// Forgets the lists held, changed or not: once their tree is freed, or a
+// change to it failed.
+void drop_lists() {
+  for (uint32_t level = 0; level < MAX_LEVELS; ++level) {
+    s_list_block[level] = 0;
+    s_list_changed[level] = false;
+  }
 }
 
-// --- Block bitmap ----------------------------------------------------------------------
+// Holds list `block` at `level`, reading it unless it is held already.
+int64_t load_list(uint32_t level, uint32_t block) {
+  if (block == 0) {
+    return init::FS_IO_ERROR;
+  }
+  if (block != s_list_block[level]) {
+    TRY(flush_list(level));
+    s_list_block[level] = 0;
+    TRY(read_block(block, s_list[level]));
+    s_list_block[level] = block;
+  }
+  return init::FS_OK;
+}
 
-inline bool bit_test(uint64_t b) {
-  return ((s_bitmap[b >> 3] >> (b & 7)) & 1u) != 0;
-}
-inline void bit_set(uint64_t b) {
-  s_bitmap[b >> 3] = static_cast<uint8_t>(s_bitmap[b >> 3] | (1u << (b & 7)));
-}
-inline void bit_clear(uint64_t b) {
-  s_bitmap[b >> 3] = static_cast<uint8_t>(s_bitmap[b >> 3] & ~(1u << (b & 7)));
+// Holds `block`, just allocated, at `level` as an empty list.
+int64_t start_list(uint32_t level, uint32_t block) {
+  TRY(flush_list(level));
+  zero_bytes(s_list[level], BLOCK);
+  s_list_block[level] = block;
+  s_list_changed[level] = true;
+  return init::FS_OK;
 }
 
-// Claims one free block after `start_from` into `*out`.
-bool claim_one_block(uint64_t* cursor, uint32_t* out) {
-  for (uint64_t b = *cursor; b < s_total_blocks; ++b) {
-    if (!bit_test(b)) {
-      bit_set(b);
-      *out = static_cast<uint32_t>(b);
-      *cursor = b + 1;
-      return true;
+// Block `index` of the tree `root` of `count` blocks; 0 on error.
+uint32_t tree_block(uint32_t root, uint32_t count, uint32_t index) {
+  uint32_t block = root;
+  for (uint32_t level = levels(count); level-- > 0;) {
+    if (load_list(level, block) != init::FS_OK) {
+      return 0;
+    }
+    block = s_list[level][slot_at(index, level)];
+  }
+  return block;
+}
+
+// Puts `block` at the end of the tree `*root` of `*count` blocks, allocating
+// the lists that takes: the caller has checked there are blocks for them
+// (`list_count`). The lists changed are written by `flush_lists`.
+int64_t tree_append(uint32_t* root, uint32_t* count, uint32_t block) {
+  const uint32_t index = *count;
+  if (index == 0) {
+    *root = block;
+    *count = 1;
+    return init::FS_OK;
+  }
+  uint32_t depth = levels(index);
+  if (levels(index + 1) > depth) {  // full: a new root, over the old one
+    const uint32_t old_root = *root;
+    *root = alloc_block();
+    TRY(start_list(depth, *root));
+    s_list[depth][0] = old_root;
+    depth += 1;
+  }
+  uint32_t list = *root;
+  for (uint32_t level = depth - 1; level > 0; --level) {
+    TRY(load_list(level, list));
+    uint32_t& slot = s_list[level][slot_at(index, level)];
+    if (starts_list(index, level - 1)) {  // the list below is new
+      slot = alloc_block();
+      s_list_changed[level] = true;
+      TRY(start_list(level - 1, slot));
+    }
+    list = slot;
+  }
+  TRY(load_list(0, list));
+  s_list[0][slot_at(index, 0)] = block;
+  s_list_changed[0] = true;
+  *count = index + 1;
+  return init::FS_OK;
+}
+
+// Frees the tree `root` of `count` blocks, lists and all. What hangs from a
+// list that cannot be read stays taken until the next mount.
+void tree_free(uint32_t root, uint32_t count) {
+  const uint32_t depth = levels(count);
+  for (uint32_t index = 0; index < count; ++index) {
+    uint32_t block = root;
+    for (uint32_t level = depth; block != 0 && level-- > 0;) {
+      if (starts_list(index, level)) {
+        free_block(block);  // a list, reached here first
+      }
+      block = load_list(level, block) == init::FS_OK
+                  ? s_list[level][slot_at(index, level)]
+                  : 0;
+    }
+    free_block(block);
+  }
+  drop_lists();
+}
+
+// --- Names on disk ----------------------------------------------------------
+
+// A name compared is not the same (positive, so TRY passes it on).
+constexpr int64_t DIFFERENT = 1;
+
+// Blocks a name of `length` bytes takes, lists included; none if it fits in
+// its entry.
+uint32_t name_blocks(uint32_t length) {
+  return length <= NAME_HEAD
+             ? 0
+             : static_cast<uint32_t>((uint64_t{length} + BLOCK - 1) / BLOCK);
+}
+
+uint64_t name_cost(uint32_t length) {
+  const uint32_t blocks = name_blocks(length);
+  return blocks + list_count(blocks);
+}
+
+// Calls `use(chunk, start, n)` for each block of long name `name` in turn,
+// read into `buf`: its `n` bytes, from byte `start` of the name. Stops at an
+// error, or at anything `use` returns that is not FS_OK.
+template <typename Use>
+int64_t each_name_block(const Name& name, uint8_t* buf, Use use) {
+  const uint32_t count = name_blocks(name.length);
+  for (uint32_t k = 0; k < count; ++k) {
+    const uint32_t block = tree_block(name.tree, count, k);
+    if (block == 0) {
+      return init::FS_IO_ERROR;
+    }
+    TRY(read_block(block, buf));
+    const uint64_t start = uint64_t{k} * BLOCK;
+    const uint64_t n = name.length - start < BLOCK ? name.length - start : BLOCK;
+    TRY(use(reinterpret_cast<const char*>(buf), start, n));
+  }
+  return init::FS_OK;
+}
+
+uint32_t head_bytes(uint32_t length) {
+  return length < NAME_HEAD ? length : NAME_HEAD;
+}
+
+// FS_OK if `name` is `text`, DIFFERENT if not, or an I/O error.
+int64_t compare_text(const Name& name, const Text& text) {
+  if (name.length != text.length || name.hash != text.hash) {
+    return DIFFERENT;
+  }
+  for (uint32_t i = 0; i < head_bytes(name.length); ++i) {
+    if (name.head[i] != text.chars[i]) {
+      return DIFFERENT;
     }
   }
-  return false;
+  return each_name_block(
+      name, s_name_buf, [&](const char* chunk, uint64_t start, uint64_t n) {
+        for (uint64_t i = 0; i < n; ++i) {
+          if (chunk[i] != text.chars[start + i]) {
+            return DIFFERENT;
+          }
+        }
+        return init::FS_OK;
+      });
 }
 
-// --- Quota nodes ------------------------------------------------------------------------
-
-inline uint64_t avail_bytes(const QuotaDisk* q) {
-  const uint64_t taken = q->used_bytes + q->delegated_bytes;
-  return taken >= q->limit_bytes ? 0 : q->limit_bytes - taken;
-}
-
-inline uint32_t avail_inodes(const QuotaDisk* q) {
-  const uint32_t taken = q->used_inodes + q->delegated_inodes;
-  return taken >= q->limit_inodes ? 0 : q->limit_inodes - taken;
-}
-
-// True if `q` is `ancestor` or is derived from it.
-bool is_within(const QuotaDisk* ancestor, const QuotaDisk* q) {
-  for (; q != nullptr; q = q->tree.parent) {
-    if (q == ancestor) {
-      return true;
+// FS_OK if names `a` and `b` are the same, DIFFERENT if not, or an I/O error.
+int64_t compare_names(const Name& a, const Name& b) {
+  if (a.length != b.length || a.hash != b.hash) {
+    return DIFFERENT;
+  }
+  for (uint32_t i = 0; i < head_bytes(a.length); ++i) {
+    if (a.head[i] != b.head[i]) {
+      return DIFFERENT;
     }
   }
-  return false;
-}
-
-QuotaDisk* node_for_page(uint64_t page_addr) {
-  for (size_t i = 0; i < s_node_count; ++i) {
-    if (capability_get_base(s_nodes[i]->node_page) == page_addr) {
-      return s_nodes[i];
+  const uint32_t count = name_blocks(a.length);
+  for (uint32_t k = 0; k < count; ++k) {
+    const uint32_t block_a = tree_block(a.tree, count, k);
+    if (block_a == 0) {
+      return init::FS_IO_ERROR;
     }
-  }
-  return nullptr;
-}
-
-// True if a node other than `except` is rooted at directory `dir`.
-bool node_rooted_at(uint32_t dir, const QuotaDisk* except) {
-  for (size_t i = 0; i < s_node_count; ++i) {
-    if (s_nodes[i] != except && s_nodes[i]->root_dir == dir) {
-      return true;
+    TRY(read_block(block_a, s_block_buf));
+    const uint32_t block_b = tree_block(b.tree, count, k);
+    if (block_b == 0) {
+      return init::FS_IO_ERROR;
     }
-  }
-  return false;
-}
-
-struct QuotaRef {
-  QuotaDisk* node;  // nullptr: not one of our handles
-  bool admin;       // Load|Store on the handle
-};
-
-// Unseals a quota handle and checks its permissions.
-QuotaRef open_quota(Capability handle) {
-  QuotaRef ref{nullptr, false};
-  Capability payload = sealing::unseal_with(s_seal_auth, handle);
-  if (!capability_is_valid(payload) ||
-      capability_get_length(payload) != vm::PAGE_SIZE ||
-      (capability_get_perms(payload) & perms::Load) == 0) {
-    return ref;
-  }
-  ref.node = node_for_page(capability_get_base(payload));
-  ref.admin = (capability_get_perms(payload) & perms::Store) != 0;
-  return ref;
-}
-
-Capability seal_node(QuotaDisk* node, bool admin) {
-  const uint64_t p = admin ? (perms::Load | perms::Store) : perms::Load;
-  Capability obj = capability_and_perms(node->node_page, p);
-  return sealing::seal_with(s_seal_auth, obj);
-}
-
-// A node under `parent` (or the root, for nullptr), rooted where the parent
-// is until the caller says otherwise.
-QuotaDisk* alloc_node(Capability funding, QuotaDisk* parent) {
-  if (s_node_count >= MAX_NODES) {
-    return nullptr;
-  }
-  using FnAlloc = decltype(&sys_vm_allocate);
-  Capability page = syscall::call<FnAlloc>(s_gate_invoke, s_gate_alloc,
-                                           s_self_comp, funding, vm::PAGE_SIZE,
-                                           0);
-  if (!capability_is_valid(page)) {
-    return nullptr;
-  }
-  QuotaDisk* n = reinterpret_cast<QuotaDisk*>(page);
-  n->node_page = page;
-  n->node_funding = funding;
-  n->tree.parent = parent;
-  n->tree.first_child = nullptr;
-  n->tree.prev_sibling = nullptr;
-  n->tree.next_sibling = nullptr;
-  n->tree.child_count = 0;
-  n->limit_bytes = 0;
-  n->used_bytes = 0;
-  n->delegated_bytes = 0;
-  n->limit_inodes = 0;
-  n->used_inodes = 0;
-  n->delegated_inodes = 0;
-  n->root_dir = parent != nullptr ? parent->root_dir : ROOT_DIR;
-  n->file_cursor = 0;  // the records after the struct are zero (allocations are)
-  if (parent != nullptr) {
-    n->tree.next_sibling = parent->tree.first_child;
-    if (parent->tree.first_child != nullptr) {
-      parent->tree.first_child->tree.prev_sibling = n;
-    }
-    parent->tree.first_child = n;
-    parent->tree.child_count += 1;
-  }
-  s_nodes[s_node_count++] = n;
-  return n;
-}
-
-// The open-file records in `n`'s page, after the struct.
-inline OpenFile* node_files(QuotaDisk* n) {
-  return reinterpret_cast<OpenFile*>(reinterpret_cast<uint8_t*>(n) +
-                                     sizeof(QuotaDisk));
-}
-
-void release_file(OpenFile* f);
-
-// Unlinks `n` from the tree, returns its limits to the parent and frees its
-// page -- and with it every file opened through it. The caller has already
-// dealt with the files it owned.
-void free_node(QuotaDisk* n) {
-  QuotaDisk* parent = n->tree.parent;
-  if (parent != nullptr) {
-    if (n->tree.prev_sibling != nullptr) {
-      n->tree.prev_sibling->tree.next_sibling = n->tree.next_sibling;
-    } else {
-      parent->tree.first_child = n->tree.next_sibling;
-    }
-    if (n->tree.next_sibling != nullptr) {
-      n->tree.next_sibling->tree.prev_sibling = n->tree.prev_sibling;
-    }
-    parent->tree.child_count -= 1;
-    parent->delegated_bytes = (parent->delegated_bytes >= n->limit_bytes)
-                                  ? parent->delegated_bytes - n->limit_bytes
-                                  : 0;
-    parent->delegated_inodes = (parent->delegated_inodes >= n->limit_inodes)
-                                   ? parent->delegated_inodes - n->limit_inodes
-                                   : 0;
-  }
-  for (size_t i = 0; i < s_node_count; ++i) {
-    if (s_nodes[i] == n) {
-      s_nodes[i] = s_nodes[s_node_count - 1];
-      s_nodes[s_node_count - 1] = nullptr;
-      s_node_count -= 1;
-      break;
-    }
-  }
-  OpenFile* files = node_files(n);
-  for (size_t i = 0; i < FILES_PER_NODE; ++i) {
-    if (files[i].in_use != 0) {
-      release_file(&files[i]);
-    }
-  }
-  Capability page = n->node_page;
-  Capability funding = n->node_funding;
-  // The page is quarantined by the kernel, not reused; scrub what we can.
-  n->node_page = nullptr;
-  n->node_funding = nullptr;
-  using FnDealloc = decltype(&sys_vm_deallocate);
-  syscall::call<FnDealloc>(s_gate_invoke, s_gate_dealloc, s_self_comp, funding,
-                           page);
-}
-
-// --- Open files ---------------------------------------------------------------------------
-
-// Unseals a file handle to its record, or nullptr. The record is in the page
-// of the node the file was opened through, so the page must be a live node's
-// and the offset one of its records; a handle into a destroyed node's page
-// finds no node and is dead.
-OpenFile* open_file(Capability handle) {
-  Capability payload = sealing::unseal_with(s_seal_auth, handle);
-  if (!capability_is_valid(payload) ||
-      capability_get_length(payload) != sizeof(OpenFile)) {
-    return nullptr;
-  }
-  const uint64_t base = capability_get_base(payload);
-  const uint64_t off = base & (vm::PAGE_SIZE - 1);
-  if (off < sizeof(QuotaDisk)) {
-    return nullptr;
-  }
-  const uint64_t rec = off - sizeof(QuotaDisk);
-  if (rec % sizeof(OpenFile) != 0 || rec / sizeof(OpenFile) >= FILES_PER_NODE) {
-    return nullptr;
-  }
-  QuotaDisk* n = node_for_page(base - off);
-  if (n == nullptr) {
-    return nullptr;
-  }
-  OpenFile* f = &node_files(n)[rec / sizeof(OpenFile)];
-  return f->in_use != 0 ? f : nullptr;
-}
-
-// A free record of `n`'s, scanning on from the last one handed out so that a
-// record is not reused the moment it is closed. nullptr when the node's page
-// is full: that holder's problem, and only that holder's.
-OpenFile* alloc_file(QuotaDisk* n) {
-  OpenFile* files = node_files(n);
-  for (size_t k = 0; k < FILES_PER_NODE; ++k) {
-    const size_t i = (n->file_cursor + k) % FILES_PER_NODE;
-    if (files[i].in_use == 0) {
-      n->file_cursor = static_cast<uint32_t>((i + 1) % FILES_PER_NODE);
-      return &files[i];
-    }
-  }
-  return nullptr;
-}
-
-Capability seal_file(OpenFile* f) {
-  Capability obj = capability_set_bounds(reinterpret_cast<Capability>(f),
-                                         sizeof(OpenFile));
-  return sealing::seal_with(s_seal_auth, obj);
-}
-
-void release_file(OpenFile* f) {
-  f->inode = 0;
-  f->writable = 0;
-  f->in_use = 0;
-}
-
-// Closes every handle on inode `ino`, whichever node it was opened through.
-void invalidate_open(uint32_t ino) {
-  for (size_t j = 0; j < s_node_count; ++j) {
-    OpenFile* files = node_files(s_nodes[j]);
-    for (size_t i = 0; i < FILES_PER_NODE; ++i) {
-      if (files[i].in_use != 0 && files[i].inode == ino) {
-        release_file(&files[i]);
+    TRY(read_block(block_b, s_name_buf));
+    const uint64_t start = uint64_t{k} * BLOCK;
+    const uint64_t n = a.length - start < BLOCK ? a.length - start : BLOCK;
+    for (uint64_t i = 0; i < n; ++i) {
+      if (s_block_buf[i] != s_name_buf[i]) {
+        return DIFFERENT;
       }
     }
   }
+  return init::FS_OK;
 }
 
-// --- Inodes and directories ---------------------------------------------------------------
-
-inline bool inode_used(uint32_t ino) {
-  return (s_inodes[ino].flags & INODE_USED) != 0;
+// Copies name `name`, and a NUL, to `out`.
+int64_t copy_name(const Name& name, char* out) {
+  copy_bytes(out, name.head, head_bytes(name.length));
+  TRY(each_name_block(
+      name, s_name_buf, [&](const char* chunk, uint64_t start, uint64_t n) {
+        copy_bytes(out + start, chunk, n);
+        return init::FS_OK;
+      }));
+  out[name.length] = '\0';
+  return init::FS_OK;
 }
 
-inline bool inode_is_dir(uint32_t ino) {
-  return (s_inodes[ino].flags & INODE_DIR) != 0;
-}
-
-// The entry called `name` of directory `dir` (ROOT_DIR for `/`), or -1.
-int find_in_dir(uint32_t dir, const char* name) {
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    if (inode_used(i) && s_inodes[i].parent == dir &&
-        names_equal(s_inodes[i].name, name)) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-bool dir_empty(uint32_t dir) {
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    if (inode_used(i) && s_inodes[i].parent == dir) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// True if inode `ino` is directory `dir` or lies somewhere below it; under
-// ROOT_DIR is everything. The walk up is bounded so a damaged parent chain
-// cannot loop.
-bool under_dir(uint32_t ino, uint32_t dir) {
-  if (dir == ROOT_DIR) {
-    return true;
-  }
-  uint32_t d = ino;
-  for (uint32_t steps = 0; d != ROOT_DIR && steps <= s_max_inodes; ++steps) {
-    if (d == dir) {
-      return true;
-    }
-    d = d < s_max_inodes ? s_inodes[d].parent : ROOT_DIR;
-  }
-  return false;
-}
-
-int find_free_inode() {
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    if (!inode_used(i)) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-// A path followed from directory `start`. `dir` is the directory the last
-// component is an entry of and `leaf` that component; `ino` is its inode
-// when `found`. The empty path names `start` itself: `leaf` is "", `found`
-// and `ino` is `start`.
-struct Walk {
-  uint32_t dir;
-  uint32_t ino;
-  bool found;
-  char leaf[init::FS_NAME_MAX];
-};
-
-// FS_BAD_REQUEST for a malformed path (abi.hpp, "Paths"); FS_NOT_FOUND when a
-// directory on the way is missing or is a file; FS_OK otherwise, `out->found`
-// saying whether the last component exists. A handle's paths all start at
-// its node's root and only ever go down, so whatever a walk reaches is under
-// that root by construction: that is the whole of the visibility check.
-int64_t walk(uint32_t start, const char* path, Walk* out) {
-  out->dir = start;
-  out->ino = start;
-  out->found = true;
-  out->leaf[0] = '\0';
-  size_t len = 0;
-  while (len < init::FS_PATH_MAX && path[len] != '\0') {
-    len += 1;
-  }
-  if (len >= init::FS_PATH_MAX) {
+// Keeps `text` as `*name`: read once more, checked and hashed as it is
+// copied. A long name's blocks are allocated and written here, and the caller
+// has paid for them (`name_cost`). On failure `*name` is empty and the blocks
+// are given back, but after an I/O error, which leaves them taken until the
+// next mount.
+int64_t store_name(Name* name, const Text& text) {
+  zero_bytes(name, sizeof(Name));
+  if (text.length == 0 || text.length > MAX_COUNT) {
     return init::FS_BAD_REQUEST;
   }
-  if (len == 0) {
-    return init::FS_OK;
-  }
-  uint32_t dir = start;
-  size_t pos = 0;
-  while (pos < len) {
-    size_t end = pos;
-    while (end < len && path[end] != '/') {
-      end += 1;
+  const bool is_long = text.length > NAME_HEAD;
+  uint32_t hash = HASH_SEED;
+  uint32_t tree = 0;
+  uint32_t count = 0;
+  int64_t status = init::FS_OK;
+  for (uint64_t start = 0; status == init::FS_OK && start < text.length;
+       start += BLOCK) {
+    const uint64_t n = text.length - start < BLOCK ? text.length - start : BLOCK;
+    for (uint64_t i = 0; i < n; ++i) {
+      const char c = text.chars[start + i];
+      status = name_char(c) ? status : init::FS_BAD_REQUEST;
+      hash = hash_step(hash, c);
+      s_name_buf[i] = static_cast<uint8_t>(c);
     }
-    const size_t clen = end - pos;
-    if (clen == 0 || clen >= init::FS_NAME_MAX) {
-      return init::FS_BAD_REQUEST;  // a leading, doubled or trailing '/'
+    if (start == 0) {
+      copy_bytes(name->head, s_name_buf, head_bytes(static_cast<uint32_t>(n)));
     }
-    char comp[init::FS_NAME_MAX];
-    for (size_t i = 0; i < clen; ++i) {
-      comp[i] = path[pos + i];
-    }
-    comp[clen] = '\0';
-    if (!component_ok(comp)) {
-      return init::FS_BAD_REQUEST;
-    }
-    const int ino = find_in_dir(dir, comp);
-    if (end == len) {
-      out->dir = dir;
-      copy_name(out->leaf, comp);
-      out->found = ino >= 0;
-      out->ino = ino >= 0 ? static_cast<uint32_t>(ino) : 0;
-      return init::FS_OK;
-    }
-    if (ino < 0 || !inode_is_dir(static_cast<uint32_t>(ino))) {
-      return init::FS_NOT_FOUND;
-    }
-    dir = static_cast<uint32_t>(ino);
-    pos = end + 1;
-  }
-  return init::FS_BAD_REQUEST;  // a trailing '/'
-}
-
-// Frees everything inode `ino` holds, refunds its owner, invalidates any open
-// handle on it and writes both metadata blocks through. Returns the status
-// of those writes; the in-memory tables are updated either way. A directory
-// holds no blocks, so for one this is the inode and the refund.
-int64_t unlink_inode(uint32_t ino) {
-  Inode& in = s_inodes[ino];
-  QuotaDisk* owner = s_owner[ino];
-  const uint32_t nblocks =
-      in.nblocks < MAX_FILE_BLOCKS ? in.nblocks : MAX_FILE_BLOCKS;
-  const uint32_t direct_n = nblocks < DIRECT_BLOCKS ? nblocks : DIRECT_BLOCKS;
-  for (uint32_t i = 0; i < direct_n; ++i) {
-    bit_clear(in.blocks[i]);
-  }
-  if (nblocks > DIRECT_BLOCKS && in.indirect != 0) {
-    if (load_indirect(in.indirect) == init::FS_OK) {
-      const uint32_t ind_n = nblocks - DIRECT_BLOCKS;
-      for (uint32_t i = 0; i < ind_n; ++i) {
-        if (s_indirect[i] != 0) {
-          bit_clear(s_indirect[i]);
-        }
+    if (status == init::FS_OK && is_long) {
+      zero_bytes(s_name_buf + n, BLOCK - n);
+      const uint32_t block = alloc_block();
+      status = write_block(block, s_name_buf);
+      if (status == init::FS_OK) {
+        status = tree_append(&tree, &count, block);
+      } else {
+        free_block(block);  // in no tree yet
       }
     }
-    if (s_indirect_blk == in.indirect) {
-      s_indirect_blk = 0;
+  }
+  if (status == init::FS_OK && is_long) {
+    status = flush_lists();
+  }
+  if (status == init::FS_OK && is_dot_or_dotdot(name->head, text.length)) {
+    status = init::FS_BAD_REQUEST;
+  }
+  if (status != init::FS_OK) {
+    if (status == init::FS_BAD_REQUEST && count != 0) {
+      tree_free(tree, count);
     }
-    bit_clear(in.indirect);
+    drop_lists();
+    zero_bytes(name, sizeof(Name));
+    return status;
   }
-  const uint64_t bytes = charged_blocks_for(nblocks) * BLOCK_BYTES;
-  if (owner != nullptr) {
-    owner->used_bytes = owner->used_bytes >= bytes ? owner->used_bytes - bytes : 0;
-    if (owner->used_inodes > 0) {
-      owner->used_inodes -= 1;
+  name->length = static_cast<uint32_t>(text.length);
+  name->hash = hash;
+  name->tree = tree;
+  return init::FS_OK;
+}
+
+void free_name(const Name& name) {
+  if (name.length > NAME_HEAD) {
+    tree_free(name.tree, name_blocks(name.length));
+  }
+}
+
+// --- Entries ----------------------------------------------------------------
+
+bool entry_in_use(uint32_t entry) { return (s_entries[entry].flags & IN_USE) != 0; }
+
+bool has_flag(uint32_t entry, uint32_t flags) {
+  return (s_entries[entry].flags & flags) != 0;
+}
+
+// Whether `entry` is a temporary: made in no directory, and not moved into one.
+bool is_temporary(uint32_t entry) {
+  return entry > ROOT_QUOTA && entry_in_use(entry) &&
+         s_entries[entry].parent == NO_ENTRY;
+}
+
+// Entry `entry`, marked to be written by `write_changes`.
+Entry& modify(uint32_t entry) {
+  s_entries[entry].flags |= CHANGED;
+  return s_entries[entry];
+}
+
+// Writes block `table_block` of the entry table, leaving out the memory-only
+// flags.
+int64_t write_entry_block(uint32_t table_block) {
+  auto* copy = reinterpret_cast<Entry*>(s_block_buf);
+  for (uint32_t i = 0; i < ENTRIES_PER_BLOCK; ++i) {
+    Entry& entry = s_entries[table_block * ENTRIES_PER_BLOCK + i];
+    entry.flags &= ~CHANGED;
+    copy_bytes(&copy[i], &entry, sizeof(Entry));
+    copy[i].flags &= ~REMOVING;
+  }
+  return write_block(1 + table_block, s_block_buf);
+}
+
+// Writes the blocks of the entry table that hold changed entries.
+int64_t write_changes() {
+  int64_t status = init::FS_OK;
+  for (uint32_t table_block = 0; table_block < s_entry_count / ENTRIES_PER_BLOCK;
+       ++table_block) {
+    bool changed = false;
+    for (uint32_t i = table_block * ENTRIES_PER_BLOCK;
+         i < (table_block + 1) * ENTRIES_PER_BLOCK; ++i) {
+      changed = changed || has_flag(i, CHANGED);
+    }
+    if (changed && write_entry_block(table_block) != init::FS_OK) {
+      status = init::FS_IO_ERROR;
     }
   }
-  s_owner[ino] = nullptr;
-  invalidate_open(ino);
-  zero_bytes(&in, sizeof(Inode));
-  const int64_t st_bitmap = write_bitmap();
-  const int64_t st_inode = write_inode_block(ino);
-  return st_bitmap != init::FS_OK ? st_bitmap : st_inode;
+  return status;
 }
 
-// A new inode called `name` in directory `dir`, owned by and charged to
-// `owner`, written through. The caller has checked the name is free and the
-// owner has an inode to spare. Returns the inode number, or a negative FS_*.
-int64_t new_inode(QuotaDisk* owner, uint32_t dir, const char* name,
-                  uint32_t flags) {
-  const int ino = find_free_inode();
-  if (ino < 0) {
-    return init::FS_DISK_FULL;
-  }
-  Inode& in = s_inodes[ino];
-  zero_bytes(&in, sizeof(Inode));
-  in.flags = INODE_USED | flags;
-  in.parent = dir;
-  copy_name(in.name, name);
-  const int64_t st = write_inode_block(static_cast<uint32_t>(ino));
-  if (st != init::FS_OK) {
-    zero_bytes(&in, sizeof(Inode));
-    return st;
-  }
-  s_owner[ino] = owner;
-  owner->used_inodes += 1;
-  return ino;
+// Charges `quota` `bytes`, written before the change it pays for.
+int64_t charge(uint32_t quota, uint64_t bytes) {
+  s_entries[quota].used += bytes;
+  return write_entry_block(quota / ENTRIES_PER_BLOCK);
 }
 
-// --- Mount ---------------------------------------------------------------------------------
-
-// Computes default geometry scaled to `total_blocks`, matching
-// `default_geometry()` in `tools/signetfs.py`.
-void default_geometry(uint64_t total_blocks) {
-  s_total_blocks = total_blocks;
-  s_bitmap_block = 1;
-  s_bitmap_blocks = static_cast<uint32_t>(
-      (total_blocks + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK);
-  s_inode_block = s_bitmap_block + s_bitmap_blocks;
-  uint64_t want_inodes = total_blocks / 16;
-  if (want_inodes < 64) {
-    want_inodes = 64;
-  }
-  s_inode_table_blocks = static_cast<uint32_t>(
-      (want_inodes + INODES_PER_BLOCK - 1) / INODES_PER_BLOCK);
-  s_max_inodes = s_inode_table_blocks * INODES_PER_BLOCK;
-  s_data_start = s_inode_block + s_inode_table_blocks;
+// Gives `quota` back `bytes`, written after the change.
+int64_t refund(uint32_t quota, uint64_t bytes) {
+  TRY(write_changes());
+  modify(quota).used -= bytes;
+  return write_changes();
 }
 
-// Allocates `s_bitmap`, `s_inodes` and `s_owner` from `s_vm_quota` once the
-// geometry is known.
-bool alloc_metadata_tables() {
-  using FnAlloc = decltype(&sys_vm_allocate);
-  const size_t bitmap_bytes = static_cast<size_t>(s_bitmap_blocks) * BLOCK_BYTES;
-  const size_t inode_bytes =
-      static_cast<size_t>(s_inode_table_blocks) * BLOCK_BYTES;
-  const size_t owner_raw = static_cast<size_t>(s_max_inodes) * sizeof(QuotaDisk*);
-  const size_t owner_bytes =
-      (owner_raw + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
-
-  Capability bm = syscall::call<FnAlloc>(
-      s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, bitmap_bytes,
-      0);
-  Capability in = syscall::call<FnAlloc>(
-      s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, inode_bytes,
-      0);
-  Capability ow = syscall::call<FnAlloc>(
-      s_gate_invoke, s_gate_alloc, s_self_comp, s_vm_quota, owner_bytes,
-      0);
-  if (!capability_is_valid(bm) || !capability_is_valid(in) ||
-      !capability_is_valid(ow)) {
-    return false;
-  }
-  s_bitmap = reinterpret_cast<uint8_t*>(bm);
-  s_inodes = reinterpret_cast<Inode*>(in);
-  s_owner = reinterpret_cast<QuotaDisk**>(ow);
-  return true;
-}
-
-// Writes a blank file system over `s_total_blocks` blocks: an empty `/`.
-int64_t format() {
-  zero_bytes(s_io, BLOCK_BYTES);
-  auto* sb = reinterpret_cast<Superblock*>(s_io);
-  sb->magic = MAGIC;
-  sb->version = VERSION;
-  sb->block_bytes = static_cast<uint32_t>(BLOCK_BYTES);
-  sb->total_blocks = s_total_blocks;
-  sb->data_start = s_data_start;
-  sb->max_inodes = s_max_inodes;
-  sb->inode_table_blocks = s_inode_table_blocks;
-  sb->bitmap_block = s_bitmap_block;
-  sb->inode_block = s_inode_block;
-  sb->bitmap_blocks = s_bitmap_blocks;
-  sb->reserved = 0;
-  int64_t st = write_block(SUPER_BLOCK, s_io);
-  if (st != init::FS_OK) {
-    return st;
-  }
-  zero_bytes(s_bitmap, static_cast<size_t>(s_bitmap_blocks) * BLOCK_BYTES);
-  for (uint64_t b = 0; b < s_data_start; ++b) {
-    bit_set(b);
-  }
-  st = write_bitmap();
-  if (st != init::FS_OK) {
-    return st;
-  }
-  zero_bytes(s_inodes, static_cast<size_t>(s_inode_table_blocks) * BLOCK_BYTES);
-  for (uint32_t k = 0; k < s_inode_table_blocks; ++k) {
-    st = write_inode_block(k * INODES_PER_BLOCK);
-    if (st != init::FS_OK) {
-      return st;
+// Entry `name` of directory or quota `dir`, into `*found` (NO_ENTRY if none).
+int64_t find_child(uint32_t dir, const Text& name, uint32_t* found) {
+  *found = NO_ENTRY;
+  for (uint32_t i = 2; i < s_entry_count; ++i) {
+    if (entry_in_use(i) && s_entries[i].parent == dir) {
+      const int64_t status = compare_text(s_entries[i].name, name);
+      if (status != DIFFERENT) {
+        *found = status == init::FS_OK ? i : NO_ENTRY;
+        return status;
+      }
     }
   }
   return init::FS_OK;
 }
 
-// An inode the table can be trusted on: in bounds, blocks allocated, name
-// well formed, in a chain of directories that leads to `/` without looping,
-// and not a second entry of that name in its directory. Anything else is
-// dropped at mount rather than accounted for.
-bool inode_sane(uint32_t ino) {
-  const Inode& in = s_inodes[ino];
-  if ((in.flags & ~(INODE_USED | INODE_DIR)) != 0 ||
-      in.nblocks > MAX_FILE_BLOCKS ||
-      in.size > static_cast<uint64_t>(in.nblocks) * BLOCK_BYTES ||
-      !name_ok(in.name)) {
-    return false;
-  }
-  if ((in.flags & INODE_DIR) != 0 &&
-      (in.nblocks != 0 || in.size != 0 || in.indirect != 0)) {
-    return false;
-  }
-  const uint32_t direct_n =
-      in.nblocks < DIRECT_BLOCKS ? in.nblocks : DIRECT_BLOCKS;
-  for (uint32_t i = 0; i < direct_n; ++i) {
-    const uint64_t b = in.blocks[i];
-    if (b < s_data_start || b >= s_total_blocks || !bit_test(b)) {
-      return false;
-    }
-  }
-  if (in.nblocks > DIRECT_BLOCKS) {
-    if (in.indirect < s_data_start || in.indirect >= s_total_blocks ||
-        !bit_test(in.indirect) || load_indirect(in.indirect) != init::FS_OK) {
-      return false;
-    }
-    const uint32_t ind_n = in.nblocks - DIRECT_BLOCKS;
-    for (uint32_t i = 0; i < ind_n; ++i) {
-      const uint64_t b = s_indirect[i];
-      if (b < s_data_start || b >= s_total_blocks || !bit_test(b)) {
-        return false;
+// An entry of `dir` named `name`, other than `self`, into `*found`.
+int64_t find_namesake(uint32_t dir, const Name& name, uint32_t self,
+                      uint32_t* found) {
+  *found = NO_ENTRY;
+  for (uint32_t i = 2; i < s_entry_count; ++i) {
+    if (i != self && entry_in_use(i) && s_entries[i].parent == dir) {
+      const int64_t status = compare_names(s_entries[i].name, name);
+      if (status != DIFFERENT) {
+        *found = status == init::FS_OK ? i : NO_ENTRY;
+        return status;
       }
     }
   }
-  // Its place: directories all the way up to `/`, and no further steps than
-  // there are inodes (a loop would go on for ever).
-  uint32_t steps = 0;
-  for (uint32_t p = in.parent; p != ROOT_DIR; p = s_inodes[p].parent) {
-    if (p >= s_max_inodes || p == ino || !inode_used(p) || !inode_is_dir(p) ||
-        ++steps > s_max_inodes) {
-      return false;
+  return init::FS_OK;
+}
+
+// Blocks a file of `blocks` blocks takes: those, and its tree's lists.
+uint64_t file_cost(uint32_t blocks) {
+  return blocks + (blocks > DIRECT_BLOCKS ? list_count(blocks - DIRECT_BLOCKS) : 0);
+}
+
+// What an entry costs whoever pays for it: a block for the entry, and its
+// name's blocks and a file's; and a quota its limit too.
+uint64_t cost_of(const Entry& entry) {
+  const uint64_t blocks =
+      1 + name_cost(entry.name.length) + file_cost(entry.block_count);
+  return BLOCK * blocks + ((entry.flags & QUOTA) != 0 ? entry.limit : 0);
+}
+
+// Rebuilds every quota's `used` from the table: a quota costs its parent,
+// anything else its payer, `cost_of` it.
+void recount_quotas() {
+  for (uint32_t i = 1; i < s_entry_count; ++i) {
+    if (entry_in_use(i) && has_flag(i, QUOTA)) {
+      modify(i).used = 0;
     }
   }
-  for (uint32_t j = 0; j < ino; ++j) {
-    if (inode_used(j) && s_inodes[j].parent == in.parent &&
-        names_equal(s_inodes[j].name, in.name)) {
+  for (uint32_t i = 2; i < s_entry_count; ++i) {
+    const Entry& entry = s_entries[i];
+    if (entry_in_use(i)) {
+      s_entries[has_flag(i, QUOTA) ? entry.parent : entry.payer].used +=
+          cost_of(entry);
+    }
+  }
+}
+
+bool has_room(uint32_t quota, uint64_t bytes) {
+  const uint64_t limit = s_entries[quota].limit;
+  return bytes <= limit && s_entries[quota].used <= limit - bytes;
+}
+
+// Makes entry `index` new, keeping its generation. It has no name yet.
+void init_entry(uint32_t index, uint32_t flags, uint32_t parent,
+                uint32_t payer) {
+  Entry& entry = s_entries[index];
+  const uint32_t generation = entry.generation;
+  zero_bytes(&entry, sizeof(entry));
+  entry.flags = IN_USE | CHANGED | flags;
+  entry.parent = parent;
+  entry.payer = payer;
+  entry.generation = generation;
+}
+
+uint32_t new_entry(uint32_t flags, uint32_t parent, uint32_t payer) {
+  for (uint32_t i = 2; i < s_entry_count; ++i) {
+    if (!entry_in_use(i)) {
+      init_entry(i, flags, parent, payer);
+      return i;
+    }
+  }
+  return NO_ENTRY;
+}
+
+// Empties entry `index`; the new generation kills its handles.
+void clear_entry(uint32_t index) {
+  const uint32_t generation = s_entries[index].generation + 1;
+  zero_bytes(&s_entries[index], sizeof(Entry));
+  s_entries[index].generation = generation;
+  s_entries[index].flags = CHANGED;
+}
+
+// Frees entry `index`: its blocks, its name's, and the entry.
+void free_entry(uint32_t index) {
+  const Entry& entry = s_entries[index];
+  const uint32_t direct =
+      entry.block_count < DIRECT_BLOCKS ? entry.block_count : DIRECT_BLOCKS;
+  for (uint32_t i = 0; i < direct; ++i) {
+    free_block(entry.blocks[i]);
+  }
+  if (entry.block_count > DIRECT_BLOCKS) {
+    tree_free(entry.tree, entry.block_count - DIRECT_BLOCKS);
+  }
+  free_name(entry.name);
+  clear_entry(index);
+}
+
+// Gives entry `index`, paid for and out of sight so far (no parent), the name
+// `text` in directory or quota `dir`. FS_EXISTS if `dir` has an entry of that
+// name already, compared as kept: the caller could have changed its buffer
+// since `text` was looked up.
+int64_t place_entry(uint32_t index, uint32_t dir, const Text& text) {
+  Name& name = s_entries[index].name;
+  TRY(store_name(&name, text));
+  uint32_t namesake = NO_ENTRY;
+  TRY(find_namesake(dir, name, index, &namesake));
+  if (namesake != NO_ENTRY) {
+    return init::FS_EXISTS;
+  }
+  s_entries[index].parent = dir;
+  return init::FS_OK;
+}
+
+// Removes `removed`, a file, directory or link, and everything in it.
+int64_t remove_tree(uint32_t removed) {
+  // Mark the subtree.
+  s_entries[removed].flags |= REMOVING;
+  for (bool more = true; more;) {
+    more = false;
+    for (uint32_t i = 2; i < s_entry_count; ++i) {
+      const uint32_t parent = s_entries[i].parent;
+      if (entry_in_use(i) && !has_flag(i, REMOVING) && parent != NO_ENTRY &&
+          has_flag(parent, REMOVING)) {
+        s_entries[i].flags |= REMOVING;
+        more = true;
+      }
+    }
+  }
+  // Freed, then refunded, one payer at a time.
+  for (;;) {
+    uint32_t payer = NO_ENTRY;
+    for (uint32_t i = 2; i < s_entry_count && payer == NO_ENTRY; ++i) {
+      payer = has_flag(i, REMOVING) ? s_entries[i].payer : NO_ENTRY;
+    }
+    if (payer == NO_ENTRY) {
+      return write_changes();
+    }
+    uint64_t freed = 0;
+    for (uint32_t i = 2; i < s_entry_count; ++i) {
+      if (has_flag(i, REMOVING) && s_entries[i].payer == payer) {
+        freed += cost_of(s_entries[i]);
+        free_entry(i);
+      }
+    }
+    TRY(refund(payer, freed));
+  }
+}
+
+// The disk block holding block `index` of `file`; 0 on error.
+uint32_t file_block(const Entry& file, uint32_t index) {
+  return index < DIRECT_BLOCKS
+             ? file.blocks[index]
+             : tree_block(file.tree, file.block_count - DIRECT_BLOCKS,
+                          index - DIRECT_BLOCKS);
+}
+
+// Grows `file` to `blocks` zeroed blocks, paid for by its payer. On failure
+// the file is left as it was; the blocks it took stay taken, and paid for,
+// until the next mount.
+int64_t grow_file(uint32_t file, uint32_t blocks) {
+  Entry& entry = s_entries[file];
+  if (blocks <= entry.block_count) {
+    return init::FS_OK;
+  }
+  const uint64_t new_blocks = file_cost(blocks) - file_cost(entry.block_count);
+  if (!has_room(entry.payer, new_blocks * BLOCK)) {
+    return init::FS_QUOTA;
+  }
+  if (new_blocks > s_free_blocks) {
+    return init::FS_DISK_FULL;
+  }
+  TRY(charge(entry.payer, new_blocks * BLOCK));
+  modify(file);
+  const uint32_t old_count = entry.block_count;
+  const uint32_t old_tree = entry.tree;
+  zero_bytes(s_block_buf, BLOCK);
+  int64_t status = init::FS_OK;
+  while (status == init::FS_OK && entry.block_count < blocks) {
+    const uint32_t block = alloc_block();
+    status = write_block(block, s_block_buf);
+    if (status == init::FS_OK && entry.block_count < DIRECT_BLOCKS) {
+      entry.blocks[entry.block_count++] = block;
+    } else if (status == init::FS_OK) {
+      uint32_t count = entry.block_count - DIRECT_BLOCKS;
+      status = tree_append(&entry.tree, &count, block);
+      entry.block_count = DIRECT_BLOCKS + count;
+    }
+  }
+  if (status == init::FS_OK) {
+    status = flush_lists();
+  }
+  if (status != init::FS_OK) {
+    // What it was on disk: no list written here is reachable from that.
+    drop_lists();
+    for (uint32_t i = old_count; i < DIRECT_BLOCKS; ++i) {
+      entry.blocks[i] = 0;
+    }
+    entry.block_count = old_count;
+    entry.tree = old_tree;
+  }
+  return status;
+}
+
+// Copies `length` bytes at `offset` between `buf` and `file`, which has the
+// blocks.
+int64_t copy_data(Entry& file, uint8_t* buf, uint64_t offset, uint64_t length,
+                  bool writing) {
+  for (uint64_t done = 0; done < length;) {
+    const uint64_t offset_in_block = (offset + done) % BLOCK;
+    const uint64_t count = BLOCK - offset_in_block < length - done
+                               ? BLOCK - offset_in_block
+                               : length - done;
+    const uint32_t block =
+        file_block(file, static_cast<uint32_t>((offset + done) / BLOCK));
+    if (block == 0) {
+      return init::FS_IO_ERROR;
+    }
+    if (!writing || count < BLOCK) {
+      TRY(read_block(block, s_block_buf));
+    }
+    if (writing) {
+      copy_bytes(s_block_buf + offset_in_block, buf + done, count);
+      TRY(write_block(block, s_block_buf));
+    } else {
+      copy_bytes(buf + done, s_block_buf + offset_in_block, count);
+    }
+    done += count;
+  }
+  return init::FS_OK;
+}
+
+// What `link` names, or NO_ENTRY if that is gone.
+uint32_t link_target(uint32_t link) {
+  const uint32_t target = s_entries[link].target.entry;
+  return target < s_entry_count && entry_in_use(target) &&
+                 !has_flag(target, LINK | QUOTA) &&
+                 s_entries[target].generation == s_entries[link].target.generation
+             ? target
+             : NO_ENTRY;
+}
+
+// `entry` (NO_ENTRY if missing) is entry `last` of `parent`. The path "" gives
+// the start entry. Links passed through only take rights away from those the
+// start was given: `parent_rights` is what is left for `parent`, `rights` for
+// `entry`.
+struct Lookup {
+  int64_t status;
+  uint32_t parent = NO_ENTRY;
+  uint32_t entry = NO_ENTRY;
+  uint32_t name_count = 0;
+  Text last{};
+  uint32_t parent_rights = ~0u;
+  uint32_t rights = ~0u;
+};
+
+// Follows `path` down from entry `start`, held with `rights`, through links,
+// and through one at the end too if `follow_last_link`. Looking inside a
+// directory needs READ on it.
+Lookup look_up(uint32_t start, uint32_t rights, const Path& path,
+               bool follow_last_link) {
+  Lookup found{init::FS_OK, NO_ENTRY, start, 0, Text{}, rights, rights};
+  for (uint64_t at = 0; at < path.length;) {
+    Text name;
+    if (const int64_t status = next_name(path, &at, &name);
+        status != init::FS_OK) {
+      return Lookup{status};
+    }
+    const bool last = at == path.length;
+    if (found.entry == NO_ENTRY) {
+      return Lookup{init::FS_NOT_FOUND};
+    }
+    if (!has_flag(found.entry, DIR | QUOTA)) {
+      return Lookup{init::FS_NOT_DIR};
+    }
+    if (!last && (found.rights & init::FS_READ) == 0) {
+      return Lookup{init::FS_PERMISSION};
+    }
+    uint32_t child = NO_ENTRY;
+    if (const int64_t status = find_child(found.entry, name, &child);
+        status != init::FS_OK) {
+      return Lookup{status};
+    }
+    found = Lookup{init::FS_OK, found.entry, child, found.name_count + 1,
+                   name, found.rights, found.rights};
+    if (child != NO_ENTRY && has_flag(child, LINK) &&
+        (!last || follow_last_link)) {
+      found.rights &= s_entries[child].target.rights;
+      found.entry = link_target(child);
+      if (found.entry == NO_ENTRY) {
+        return Lookup{init::FS_NOT_FOUND};  // what it named is gone
+      }
+    }
+  }
+  return found;
+}
+
+// --- Handles ----------------------------------------------------------------
+
+// Kinds of handle; a call takes any mix of them.
+constexpr uint32_t KIND_FILE = 1;
+constexpr uint32_t KIND_DIR = 2;
+constexpr uint32_t KIND_QUOTA = 4;
+constexpr uint32_t KIND_ANY = KIND_FILE | KIND_DIR | KIND_QUOTA;
+
+// The open record behind `handle`, a file, directory or quota handle, or
+// null. `*kind` says which (KIND_*).
+Handle* open_record(Capability handle, uint32_t* kind) {
+  Capability seal = nullptr;
+  if (sealing::is_sealed_as(OType::FsFile, handle)) {
+    *kind = KIND_FILE;
+    seal = s_seal_file;
+  } else if (sealing::is_sealed_as(OType::FsDir, handle)) {
+    *kind = KIND_DIR;
+    seal = s_seal_dir;
+  } else if (sealing::is_sealed_as(OType::FsQuota, handle)) {
+    *kind = KIND_QUOTA;
+    seal = s_seal_quota;
+  } else {
+    return nullptr;
+  }
+  Handle* record = static_cast<Handle*>(sealing::unseal_with(seal, handle));
+  return record != nullptr && record->is_open != 0 ? record : nullptr;
+}
+
+// The record behind `handle`, if it is a handle of one of `kinds` and what it
+// names still exists, and whether it has the rights in `needed`.
+int64_t check_handle(Capability handle, uint32_t kinds, uint32_t needed,
+                     Handle** out) {
+  uint32_t kind = 0;
+  Handle* record = open_record(handle, &kind);
+  if (record == nullptr || !entry_in_use(record->entry) ||
+      s_entries[record->entry].generation != record->generation) {
+    return init::FS_INVALID;
+  }
+  if ((kinds & kind) == 0) {
+    return kinds == KIND_FILE  ? init::FS_IS_DIR    // a file was needed
+           : kind == KIND_FILE ? init::FS_NOT_DIR   // a file was given
+                               : init::FS_BAD_REQUEST;
+  }
+  *out = record;
+  return (record->rights & needed) == needed ? init::FS_OK : init::FS_PERMISSION;
+}
+
+// A new handle on `entry` with `rights`, opened through `parent` (null for a
+// root) and paid for by `memory_quota`; or a status. `temporary`: it is the
+// handle fs.create made the temporary `entry` with.
+Capability make_handle(Handle* parent, uint32_t entry, uint32_t rights,
+                       Capability memory_quota, bool temporary = false) {
+  if (!sealing::is_sealed_as(OType::QuotaVm, memory_quota)) {
+    return init::status_cap(init::FS_BAD_REQUEST);
+  }
+  // A VM quota hands out whole pages; an allocator quota could hand out just
+  // sizeof(Handle).
+  using FnAlloc = decltype(&sys_vm_allocate);
+  Capability self =
+      syscall::call<FnAlloc>(s_gate_invoke, s_gate_alloc, s_self_comp,
+                             memory_quota, vm::PAGE_SIZE, 0);
+  if (!capability_is_valid(self)) {
+    return init::status_cap(init::FS_NO_MEMORY);
+  }
+  Handle* handle = static_cast<Handle*>(self);
+  *handle = Handle{self, memory_quota, parent, nullptr,
+                   parent != nullptr ? parent->first_child : nullptr,
+                   entry, s_entries[entry].generation, rights, 1,
+                   temporary ? 1u : 0u};
+  if (parent != nullptr) {
+    parent->first_child = handle;
+  }
+  const Capability seal = has_flag(entry, QUOTA) ? s_seal_quota
+                          : has_flag(entry, DIR) ? s_seal_dir
+                                                 : s_seal_file;
+  return sealing::seal_with(seal, capability_set_bounds(self, sizeof(Handle)));
+}
+
+// Takes `handle` out of its parent's list of children.
+void detach(Handle* handle) {
+  if (handle->parent == nullptr) {
+    return;
+  }
+  Handle** next = &handle->parent->first_child;
+  while (*next != handle) {
+    next = &(*next)->next_sibling;
+  }
+  *next = handle->next_sibling;
+}
+
+// Closes `top` and every handle opened through it, children first, and gives
+// their memory back. Zeroed first: until the sweep revokes them, stale copies
+// read as closed. A temporary is removed, and its payer refunded, with the
+// handle that made it: every handle on it was opened through that one, so
+// nothing can reach it after. FS_OK, or the status of a removal that failed;
+// every handle is closed either way.
+int64_t close_with_children(Handle* top) {
+  using FnDealloc = decltype(&sys_vm_deallocate);
+  int64_t status = init::FS_OK;
+  for (Handle* handle = top;;) {
+    if (handle->first_child != nullptr) {
+      handle = handle->first_child;
+      continue;
+    }
+    Handle* const parent = handle->parent;
+    const bool is_top = handle == top;
+    const uint32_t entry = handle->entry;
+    const bool temporary = handle->temporary != 0 && is_temporary(entry) &&
+                           s_entries[entry].generation == handle->generation;
+    detach(handle);
+    const Capability self = handle->self;
+    const Capability memory_quota = handle->memory_quota;
+    zero_bytes(self, sizeof(Handle));
+    syscall::call<FnDealloc>(s_gate_invoke, s_gate_dealloc, s_self_comp,
+                             memory_quota, self);
+    if (temporary) {
+      const int64_t removed = remove_tree(entry);
+      status = status == init::FS_OK ? removed : status;
+    }
+    if (is_top) {
+      return status;
+    }
+    handle = parent;
+  }
+}
+
+Capability handle_or_status(int64_t status, const Capability* handle) {
+  return status == init::FS_OK ? *handle : init::status_cap(status);
+}
+
+// --- Mount ------------------------------------------------------------------
+
+// Page-rounded memory from our VM quota.
+void* alloc_table(uint64_t bytes) {
+  using FnAlloc = decltype(&sys_vm_allocate);
+  const size_t size = (bytes + vm::PAGE_SIZE - 1) & ~(vm::PAGE_SIZE - 1);
+  Capability memory = syscall::call<FnAlloc>(s_gate_invoke, s_gate_alloc,
+                                             s_self_comp, s_vm_quota, size, 0);
+  return capability_is_valid(memory) ? memory : nullptr;
+}
+
+// Marks `block` used, unless it is out of range or taken.
+bool claim_block(uint32_t block) {
+  if (block < s_data_start || block >= s_total_blocks || block_in_use(block)) {
+    return false;
+  }
+  set_block_used(block, true);
+  s_free_blocks -= 1;
+  return true;
+}
+
+// Claims the tree `root` of `count` blocks, as read from disk, lists and
+// all, each before it is read: false if one is out of range or taken.
+bool tree_claim(uint32_t root, uint32_t count) {
+  const uint32_t depth = levels(count);
+  for (uint32_t index = 0; index < count; ++index) {
+    uint32_t block = root;
+    for (uint32_t level = depth; level-- > 0;) {
+      if ((starts_list(index, level) && !claim_block(block)) ||
+          load_list(level, block) != init::FS_OK) {
+        return false;
+      }
+      block = s_list[level][slot_at(index, level)];
+    }
+    if (!claim_block(block)) {
       return false;
     }
   }
   return true;
 }
 
-// Reads the metadata into the caches, formatting first if the disk does not
-// carry a file system we recognise. FS_NOT_MOUNTED if there is no usable
-// device, FS_IO_ERROR if it failed, FS_OK otherwise.
-int64_t mount(uint64_t capacity_sectors, uint32_t* formatted) {
-  *formatted = 0;
-  const uint64_t blocks = capacity_sectors / SECTORS_PER_BLOCK;
-  if (blocks <= 4) {
+// Whether `name`, as read from disk, is a good name, with its blocks
+// claimed, and its hash and head what its bytes say.
+bool name_is_valid(const Name& name) {
+  if (name.length == 0 || (name.length <= NAME_HEAD) != (name.tree == 0)) {
+    return false;
+  }
+  uint32_t hash = HASH_SEED;
+  bool ok = true;
+  auto check = [&](const char* chunk, uint64_t start, uint64_t n) {
+    for (uint64_t i = 0; i < n; ++i) {
+      ok = ok && name_char(chunk[i]) &&
+           (start + i >= NAME_HEAD || chunk[i] == name.head[start + i]);
+      hash = hash_step(hash, chunk[i]);
+    }
+    return init::FS_OK;
+  };
+  if (name.length <= NAME_HEAD) {
+    check(name.head, 0, name.length);
+  } else if (!tree_claim(name.tree, name_blocks(name.length)) ||
+             each_name_block(name, s_name_buf, check) != init::FS_OK) {
+    return false;
+  }
+  return ok && hash == name.hash && !is_dot_or_dotdot(name.head, name.length);
+}
+
+// Whether entry `index`, as read from disk, is consistent: known flags, a
+// valid unique name (its blocks claimed), parents up to its root, a payer,
+// blocks of its own (claimed), and for a link, something to name.
+bool entry_is_valid(uint32_t index) {
+  Entry& entry = s_entries[index];
+  const uint32_t kind = entry.flags & (DIR | QUOTA | LINK);
+  if ((entry.flags & ~(IN_USE | DIR | QUOTA | FROZEN | LINK)) != 0 ||
+      (kind & (kind - 1)) != 0 || !name_is_valid(entry.name)) {
+    return false;
+  }
+  const uint32_t parent_kind = kind == QUOTA ? QUOTA : DIR;
+  const uint32_t root = parent_kind == QUOTA ? ROOT_QUOTA : ROOT_DIR;
+  uint32_t steps = 0;
+  for (uint32_t parent = entry.parent; parent != root;
+       parent = s_entries[parent].parent) {
+    if (parent >= s_entry_count || !entry_in_use(parent) ||
+        (s_entries[parent].flags & (DIR | QUOTA)) != parent_kind ||
+        ++steps > s_entry_count) {
+      return false;
+    }
+  }
+  for (uint32_t other = 2; other < index; ++other) {
+    if (entry_in_use(other) && s_entries[other].parent == entry.parent &&
+        compare_names(s_entries[other].name, entry.name) != DIFFERENT) {
+      return false;  // the same name, or one that cannot be read
+    }
+  }
+  if (kind == QUOTA) {
+    return entry.block_count == 0 && entry.tree == 0;
+  }
+  if (entry.payer >= s_entry_count || !entry_in_use(entry.payer) ||
+      !has_flag(entry.payer, QUOTA)) {
+    return false;
+  }
+  if (kind == DIR) {
+    return entry.block_count == 0 && entry.tree == 0 && entry.size == 0;
+  }
+  if (kind == LINK) {
+    return entry.block_count == 0 && entry.tree == 0 &&
+           entry.size == 0 && (entry.flags & FROZEN) == 0 &&
+           (entry.target.rights & ~init::FS_ALL) == 0 &&
+           link_target(index) != NO_ENTRY;
+  }
+  if (entry.size > uint64_t{entry.block_count} * BLOCK ||
+      (entry.block_count > DIRECT_BLOCKS) != (entry.tree != 0)) {
+    return false;
+  }
+  const uint32_t direct =
+      entry.block_count < DIRECT_BLOCKS ? entry.block_count : DIRECT_BLOCKS;
+  for (uint32_t n = 0; n < direct; ++n) {
+    if (!claim_block(entry.blocks[n])) {
+      return false;
+    }
+  }
+  return entry.block_count <= DIRECT_BLOCKS ||
+         tree_claim(entry.tree, entry.block_count - DIRECT_BLOCKS);
+}
+
+// Loads the entry table, formatting the disk first if it has no header of
+// ours.
+int64_t mount(uint64_t sectors, uint32_t* formatted) {
+  const uint64_t blocks = sectors / SECTORS_PER_BLOCK;
+  TRY(read_block(0, s_block_buf));
+  DiskHeader header = *reinterpret_cast<const DiskHeader*>(s_block_buf);
+  const bool already_formatted = header.magic == MAGIC &&
+                                 header.version == VERSION &&
+                                 header.total_blocks <= blocks;
+  if (!already_formatted) {
+    header = DiskHeader{MAGIC, VERSION, blocks};
+  }
+  // One entry per disk block, in a table from block 1.
+  s_total_blocks = header.total_blocks;
+  s_entry_count = static_cast<uint32_t>(
+      (s_total_blocks + ENTRIES_PER_BLOCK - 1) / ENTRIES_PER_BLOCK *
+      ENTRIES_PER_BLOCK);
+  s_data_start = 1 + s_entry_count / ENTRIES_PER_BLOCK;
+  if (s_data_start >= s_total_blocks) {
     return init::FS_NOT_MOUNTED;
   }
-  int64_t st = read_block(SUPER_BLOCK, s_io);
-  if (st != init::FS_OK) {
-    return st;
+  s_entries = static_cast<Entry*>(alloc_table(uint64_t{s_entry_count} * sizeof(Entry)));
+  s_block_map = static_cast<uint8_t*>(alloc_table((s_total_blocks + 7) / 8));
+  if (s_entries == nullptr || s_block_map == nullptr) {
+    return init::FS_NO_MEMORY;
   }
-  const auto* sb = reinterpret_cast<const Superblock*>(s_io);
-  const uint64_t need_bitmap =
-      (sb->total_blocks + BITS_PER_BLOCK - 1) / BITS_PER_BLOCK;
-  const bool recognised =
-      sb->magic == MAGIC && sb->version == VERSION &&
-      sb->block_bytes == BLOCK_BYTES && sb->bitmap_block == 1 &&
-      sb->bitmap_blocks >= need_bitmap && sb->bitmap_blocks > 0 &&
-      sb->inode_block == sb->bitmap_block + sb->bitmap_blocks &&
-      sb->inode_table_blocks > 0 &&
-      sb->max_inodes == sb->inode_table_blocks * INODES_PER_BLOCK &&
-      sb->data_start == sb->inode_block + sb->inode_table_blocks &&
-      sb->total_blocks > sb->data_start && sb->total_blocks <= blocks;
-  if (recognised) {
-    s_total_blocks = sb->total_blocks;
-    s_bitmap_block = sb->bitmap_block;
-    s_bitmap_blocks = sb->bitmap_blocks;
-    s_inode_block = sb->inode_block;
-    s_inode_table_blocks = sb->inode_table_blocks;
-    s_max_inodes = sb->max_inodes;
-    s_data_start = sb->data_start;
-    if (!alloc_metadata_tables()) {
-      return init::FS_NO_MEMORY;
-    }
-    for (uint32_t k = 0; k < s_bitmap_blocks && st == init::FS_OK; ++k) {
-      st = read_block(s_bitmap_block + k, s_bitmap + k * BLOCK_BYTES);
-    }
-    for (uint32_t k = 0; k < s_inode_table_blocks && st == init::FS_OK; ++k) {
-      st = read_block(s_inode_block + k, &s_inodes[k * INODES_PER_BLOCK]);
-    }
-    if (st != init::FS_OK) {
-      return st;
-    }
-  } else {
-    default_geometry(blocks);
-    if (s_total_blocks <= s_data_start) {
-      return init::FS_NOT_MOUNTED;
-    }
-    if (!alloc_metadata_tables()) {
-      return init::FS_NO_MEMORY;
-    }
-    st = format();
-    if (st != init::FS_OK) {
-      return st;
-    }
+  // Read the table, or write a blank one.
+  for (uint32_t table_block = 0; table_block < s_entry_count / ENTRIES_PER_BLOCK;
+       ++table_block) {
+    Entry* first = &s_entries[table_block * ENTRIES_PER_BLOCK];
+    TRY(already_formatted ? read_block(1 + table_block, first)
+                          : write_block(1 + table_block, first));
+  }
+  if (!already_formatted) {
+    zero_bytes(s_block_buf, BLOCK);
+    *reinterpret_cast<DiskHeader*>(s_block_buf) = header;
+    TRY(write_block(0, s_block_buf));
     *formatted = 1;
   }
-  for (uint64_t b = 0; b < s_data_start; ++b) {
-    bit_set(b);  // never hand out the metadata blocks, whatever the bitmap says
-  }
-  // Dropping an inode can orphan the entries of a directory it was, so go
-  // round until a pass drops nothing.
+  init_entry(ROOT_DIR, DIR, NO_ENTRY, ROOT_QUOTA);
+  init_entry(ROOT_QUOTA, QUOTA, NO_ENTRY, NO_ENTRY);
+  s_entries[ROOT_QUOTA].limit = (s_total_blocks - s_data_start) * BLOCK;
+  // Drop bad entries (temporaries included) until none are left: dropping one
+  // can orphan others.
   uint32_t dropped = 0;
   for (bool again = true; again;) {
     again = false;
-    for (uint32_t i = 0; i < s_max_inodes; ++i) {
-      if (inode_used(i) && !inode_sane(i)) {
-        zero_bytes(&s_inodes[i], sizeof(Inode));
+    zero_bytes(s_block_map, (s_total_blocks + 7) / 8);
+    for (uint64_t block = 0; block < s_data_start; ++block) {
+      set_block_used(block, true);
+    }
+    s_free_blocks = s_total_blocks - s_data_start;
+    for (uint32_t i = 2; i < s_entry_count; ++i) {
+      if (entry_in_use(i) && !entry_is_valid(i)) {
+        clear_entry(i);
         dropped += 1;
         again = true;
       }
     }
   }
   if (dropped != 0) {
-    out_dec("[fs]       WARNING: dropped ", dropped,
-            " inconsistent inode(s) from the table\n");
+    out_dec("[fs]       dropped ", dropped,
+            " temporary or damaged entries\n");
   }
+  recount_quotas();  // every entry is read anyway; fixes what a crash left
+  s_next_block = s_data_start;
+  return write_changes();
+}
+
+// --- Entry points that return a handle --------------------------------------
+
+int64_t open_handle(Capability from_cap, Capability path_cap, uint32_t rights,
+                    Capability memory_quota, Capability* out) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(path_cap, &path));
+  Handle* from = nullptr;
+  TRY(check_handle(from_cap, KIND_ANY, path.length != 0 ? init::FS_READ : 0, &from));
+  const Lookup found = look_up(from->entry, from->rights, path, true);
+  TRY(found.status);
+  if (found.entry == NO_ENTRY) {
+    return init::FS_NOT_FOUND;
+  }
+  if (found.name_count != 0 && (found.parent_rights & init::FS_READ) == 0) {
+    return init::FS_PERMISSION;
+  }
+  *out = make_handle(from, found.entry, rights & from->rights & found.rights,
+                     memory_quota);
   return init::FS_OK;
 }
 
-// Reads a NUL-terminated path from a Load capability into `out`.
-bool read_path(Capability path_cap, char (&out)[init::FS_PATH_MAX]) {
-  if (!capability_is_valid(path_cap) || sealing::is_sealed(path_cap) ||
-      !capability_has_perms(path_cap, perms::Load)) {
-    return false;
+// A null `dir_cap` makes a temporary, opened through `payer_cap`: removed when
+// the handle made here is closed, unless it was moved into a directory first,
+// and at the next mount if it is still there.
+int64_t create_handle(Capability dir_cap, Capability path_cap,
+                      Capability payer_cap, uint32_t flags,
+                      Capability memory_quota, Capability* out) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(path_cap, &path));
+  if ((flags & ~init::FS_CREATE_DIR) != 0) {
+    return init::FS_BAD_REQUEST;
   }
-  const uint64_t avail = room(path_cap);
-  if (avail == 0) {
-    return false;
-  }
-  const size_t limit = avail < init::FS_PATH_MAX ? static_cast<size_t>(avail)
-                                                 : init::FS_PATH_MAX;
-  const auto* src = reinterpret_cast<const char*>(path_cap);
-  for (size_t i = 0; i < limit; ++i) {
-    out[i] = src[i];
-    if (out[i] == '\0') {
-      return true;
+  Handle* payer = nullptr;
+  TRY(check_handle(payer_cap, KIND_QUOTA, init::FS_ADD, &payer));
+  Handle* opened_through = payer;
+  Lookup found{init::FS_OK};  // a temporary: no directory, no name
+  if (dir_cap != nullptr) {
+    TRY(check_handle(dir_cap, KIND_DIR, init::FS_ADD, &opened_through));
+    found = look_up(opened_through->entry, opened_through->rights, path, false);
+    TRY(found.status);
+    if (found.name_count == 0) {
+      return init::FS_BAD_REQUEST;
+    }
+    if (found.entry != NO_ENTRY) {
+      return init::FS_EXISTS;
+    }
+    if (!has_flag(found.parent, DIR)) {
+      return init::FS_NOT_DIR;
+    }
+    if ((found.parent_rights & init::FS_ADD) == 0) {
+      return init::FS_PERMISSION;
     }
   }
-  return false;
+  const uint64_t name_blocks_needed =
+      name_cost(static_cast<uint32_t>(found.last.length));
+  const uint64_t cost = BLOCK * (1 + name_blocks_needed);
+  if (!has_room(payer->entry, cost)) {
+    return init::FS_QUOTA;
+  }
+  if (name_blocks_needed > s_free_blocks) {
+    return init::FS_DISK_FULL;
+  }
+  // Out of sight, in no directory, until it has its name: what a fault
+  // leaves of it then is a temporary, gone at the next mount.
+  const uint32_t created = new_entry(
+      (flags & init::FS_CREATE_DIR) != 0 ? DIR : 0, NO_ENTRY, payer->entry);
+  if (created == NO_ENTRY) {
+    return init::FS_DISK_FULL;
+  }
+  if (const int64_t status = charge(payer->entry, cost); status != init::FS_OK) {
+    clear_entry(created);
+    return status;
+  }
+  if (dir_cap != nullptr) {
+    if (const int64_t status = place_entry(created, found.parent, found.last);
+        status != init::FS_OK) {
+      free_entry(created);
+      refund(payer->entry, cost);
+      return status;
+    }
+  }
+  // Every right on what you make; LINK only if the directory had it.
+  const uint32_t linkable =
+      opened_through->rights & found.parent_rights & init::FS_LINK;
+  *out = make_handle(opened_through, created, init::FS_ALL | linkable,
+                     memory_quota, dir_cap == nullptr);
+  if (!capability_is_valid(*out)) {
+    free_entry(created);  // no handle, no file
+    return refund(payer->entry, cost);
+  }
+  return write_changes();
+}
+
+// Quota `name` of `parent`, made with `limit` bytes, or set to `limit` if it
+// is there already. Growing takes from `parent`; shrinking stops at what the
+// quota has used. Needs CHANGE on `parent`, and ADD as well to make or grow
+// one, which is paying with `parent`. The handle has `parent`'s rights.
+int64_t make_or_resize_quota(Capability parent_cap, Capability name_cap,
+                             uint64_t limit, Capability memory_quota,
+                             Capability* out) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(name_cap, &path));
+  Handle* parent = nullptr;
+  TRY(check_handle(parent_cap, KIND_QUOTA, init::FS_CHANGE, &parent));
+  uint64_t at = 0;
+  Text name;
+  TRY(next_name(path, &at, &name));
+  if (at != path.length) {
+    return init::FS_BAD_REQUEST;  // a name, not a path
+  }
+  uint32_t quota = NO_ENTRY;
+  TRY(find_child(parent->entry, name, &quota));
+  const bool is_new = quota == NO_ENTRY;
+  if ((is_new || limit > s_entries[quota].limit) &&
+      (parent->rights & init::FS_ADD) == 0) {
+    return init::FS_PERMISSION;
+  }
+  if (limit > s_entries[parent->entry].limit) {
+    return init::FS_QUOTA;  // and the cost below cannot overflow
+  }
+  if (is_new) {
+    const uint64_t name_blocks_needed =
+        name_cost(static_cast<uint32_t>(name.length));
+    const uint64_t cost = limit + BLOCK * (1 + name_blocks_needed);
+    if (!has_room(parent->entry, cost)) {
+      return init::FS_QUOTA;
+    }
+    if (name_blocks_needed > s_free_blocks) {
+      return init::FS_DISK_FULL;
+    }
+    quota = new_entry(QUOTA, NO_ENTRY, NO_ENTRY);  // out of sight, as above
+    if (quota == NO_ENTRY) {
+      return init::FS_DISK_FULL;
+    }
+    s_entries[quota].limit = limit;
+    if (const int64_t status = charge(parent->entry, cost);
+        status != init::FS_OK) {
+      clear_entry(quota);
+      return status;
+    }
+    if (const int64_t status = place_entry(quota, parent->entry, name);
+        status != init::FS_OK) {
+      free_entry(quota);
+      refund(parent->entry, cost);
+      return status;
+    }
+  } else {
+    const uint64_t old_limit = s_entries[quota].limit;
+    if (limit > old_limit) {
+      if (!has_room(parent->entry, limit - old_limit)) {
+        return init::FS_QUOTA;
+      }
+      TRY(charge(parent->entry, limit - old_limit));
+      modify(quota).limit = limit;
+    } else if (limit < old_limit) {
+      if (limit < s_entries[quota].used) {
+        return init::FS_QUOTA;
+      }
+      modify(quota).limit = limit;
+      TRY(refund(parent->entry, old_limit - limit));
+    }
+  }
+  *out = make_handle(parent, quota, parent->rights, memory_quota);
+  if (is_new && !capability_is_valid(*out)) {
+    const uint64_t cost = cost_of(s_entries[quota]);
+    free_entry(quota);
+    return refund(parent->entry, cost);
+  }
+  return write_changes();
 }
 
 }  // namespace
 
-SIGNETOS_DEFAULT_FAULT_HANDLER("fs")
-
-// --- Entry points ------------------------------------------------------------------------------
-
-extern "C" int64_t fs_quota_derive_entry(Capability arg) {
-  auto* req = open_request<init::FsDeriveRequest>(arg);
-  if (req == nullptr) {
-    return init::FS_BAD_REQUEST;
+// The default handler (runtime.hpp), which unwinds -- past ~LockScope. A lock
+// left with the faulting thread would keep every later caller waiting for good,
+// so it is let go first. What faults is most likely a caller's buffer, which is
+// touched only where nothing is left half-changed: paths are read as they are
+// followed (look_up) and a new name as it is kept (store_name), into an entry
+// still out of sight or no entry yet, with its blocks paid for; data in
+// copy_data; fs.list and fs.stat write to it. A fault in store_name leaves its
+// blocks taken, and the entry a temporary, until the next mount.
+SIGNETOS_FAULT_HANDLER compartment_error_handler(
+    ::signetos::fault::ErrorState* state) {
+  const Capability* table = rw_table();
+  const bool held = (__atomic_load_n(&s_lock, __ATOMIC_SEQ_CST) &
+                     ~init::LOCK_WAITERS) == self_tid();
+  if (held) {
+    unlock(table[SLOT_SYS_COMP_INVOKE], s_lock_wake, &s_lock);
   }
-  req->out_quota = nullptr;
-  req->out_admin = nullptr;
-  if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return req->status;
+  const uint64_t action = report_fault_and_unwind(
+      "fs", *state, table[SLOT_SYS_COMP_INVOKE], table[SLOT_UART_SENTRY]);
+  if (held) {
+    print(table[SLOT_SYS_COMP_INVOKE], table[SLOT_UART_SENTRY],
+          "[fs]       released the fs lock the faulting call held\n");
   }
-  LockScope locked;
-  if (!locked.taken) {
-    req->status = init::FS_BUSY;
-    return req->status;
-  }
-  const QuotaRef parent = open_quota(req->parent);
-  if (parent.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return req->status;
-  }
-  if (!parent.admin) {
-    req->status = init::FS_PERMISSION;
-    return req->status;
-  }
-  if (!sealing::is_sealed_as(OType::QuotaVm, req->node_funding) ||
-      req->limit_bytes > ~0ULL - (BLOCK_BYTES - 1) ||
-      (req->flags & ~init::FS_DERIVE_ADOPT) != 0) {
-    req->status = init::FS_BAD_REQUEST;
-    return req->status;
-  }
-  // The child's root: a directory under the parent's own ("" being the
-  // parent's own).
-  Walk w;
-  const int64_t st = walk(parent.node->root_dir, req->path, &w);
-  if (st != init::FS_OK) {
-    req->status = st;
-    return req->status;
-  }
-  if (!w.found) {
-    req->status = init::FS_NOT_FOUND;
-    return req->status;
-  }
-  if (w.leaf[0] != '\0' && !inode_is_dir(w.ino)) {
-    req->status = init::FS_NOT_DIR;
-    return req->status;
-  }
-  // Space is handed out in whole blocks.
-  const uint64_t limit_bytes =
-      (req->limit_bytes + BLOCK_BYTES - 1) & ~(BLOCK_BYTES - 1);
-  // Adoption: what the parent owns at or under the child's root becomes the
-  // child's, charges included, so it has to fit the child's limits. Counted
-  // first, moved last, so that nothing is half done on any failure.
-  const bool adopt = (req->flags & init::FS_DERIVE_ADOPT) != 0;
-  uint64_t adopt_bytes = 0;
-  uint32_t adopt_inodes = 0;
-  if (adopt) {
-    for (uint32_t i = 0; i < s_max_inodes; ++i) {
-      if (inode_used(i) && s_owner[i] == parent.node && under_dir(i, w.ino)) {
-        adopt_bytes += charged_blocks_for(s_inodes[i].nblocks) * BLOCK_BYTES;
-        adopt_inodes += 1;
-      }
-    }
-    if (adopt_bytes > limit_bytes || adopt_inodes > req->limit_inodes) {
-      req->status = init::FS_QUOTA;
-      return req->status;
-    }
-  }
-  // The child's limits come out of what the parent has left -- counting what
-  // it is about to adopt, which leaves the parent's use as the limits enter
-  // its delegation: a parent with nothing to spare can still hand down, whole,
-  // a directory it has spent everything on.
-  if (limit_bytes > avail_bytes(parent.node) + adopt_bytes ||
-      req->limit_inodes > avail_inodes(parent.node) + adopt_inodes) {
-    req->status = init::FS_QUOTA;
-    return req->status;
-  }
-  QuotaDisk* n = alloc_node(req->node_funding, parent.node);
-  if (n == nullptr) {
-    req->status = init::FS_NO_MEMORY;
-    return req->status;
-  }
-  n->root_dir = w.ino;
-  n->limit_bytes = limit_bytes;
-  n->limit_inodes = req->limit_inodes;
-  parent.node->delegated_bytes += limit_bytes;
-  parent.node->delegated_inodes += req->limit_inodes;
-  // The handle asked for, and the ADMIN one for the creator to keep (one and
-  // the same when ADMIN was asked for).
-  const bool admin = (req->perms & perms::Store) != 0;
-  Capability admin_handle = seal_node(n, true);
-  Capability handle = admin ? admin_handle : seal_node(n, false);
-  if (!capability_is_valid(handle) || !capability_is_valid(admin_handle)) {
-    free_node(n);  // refunds the parent
-    req->status = init::FS_NO_MEMORY;
-    return req->status;
-  }
-  if (adopt) {
-    for (uint32_t i = 0; i < s_max_inodes; ++i) {
-      if (inode_used(i) && s_owner[i] == parent.node && under_dir(i, w.ino)) {
-        s_owner[i] = n;
-      }
-    }
-    parent.node->used_bytes -= adopt_bytes;
-    parent.node->used_inodes -= adopt_inodes;
-    n->used_bytes = adopt_bytes;
-    n->used_inodes = adopt_inodes;
-  }
-  req->out_quota = handle;
-  req->out_admin = admin_handle;
-  req->status = init::FS_OK;
-  return req->status;
+  return action;
 }
 
-extern "C" int64_t fs_quota_destroy_entry(Capability quota) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
+// --- Entry points (user/abi.hpp) --------------------------------------------
+
+// Works on the handle of something since removed too: its memory comes back.
+extern "C" int64_t fs_close_entry(Capability handle_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  uint32_t kind = 0;
+  Handle* handle = open_record(handle_cap, &kind);
+  if (handle == nullptr) {
+    return init::FS_INVALID;
   }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::FS_INVALID_QUOTA;
-  }
-  if (!q.admin || q.node == s_root) {
-    return init::FS_PERMISSION;
-  }
-  if (q.node->tree.child_count != 0) {
-    return init::FS_BUSY;
-  }
-  // Cascade: the files it owns go, then its directories as they
-  // empty out; one still holding other nodes' files, or that another node is
-  // rooted at, passes to the parent along with the limits (`free_node`).
-  // Only its own children keep a node from going: were another node's root
-  // enough, whoever can see a directory of mine could pin my node for good.
-  int64_t status = init::FS_OK;
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    if (inode_used(i) && s_owner[i] == q.node && !inode_is_dir(i)) {
-      const int64_t st = unlink_inode(i);
-      if (st != init::FS_OK) {
-        status = st;
-      }
-    }
-  }
-  for (bool again = true; again;) {
-    again = false;
-    for (uint32_t i = 0; i < s_max_inodes; ++i) {
-      if (inode_used(i) && s_owner[i] == q.node && dir_empty(i) &&
-          !node_rooted_at(i, q.node)) {
-        const int64_t st = unlink_inode(i);
-        if (st != init::FS_OK) {
-          status = st;
-        }
-        again = true;
-      }
-    }
-  }
-  QuotaDisk* parent = q.node->tree.parent;
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    if (inode_used(i) && s_owner[i] == q.node) {
-      s_owner[i] = parent;
-      parent->used_inodes += 1;
-    }
-  }
-  free_node(q.node);  // and the parent gets the limits back
-  return status;
+  return close_with_children(handle);
 }
 
-extern "C" int64_t fs_quota_query_entry(Capability arg) {
-  auto* req = open_request<init::FsQueryRequest>(arg);
-  if (req == nullptr) {
-    return init::FS_BAD_REQUEST;
-  }
-  req->limit_bytes = 0;
-  req->used_bytes = 0;
-  req->delegated_bytes = 0;
-  req->limit_inodes = 0;
-  req->used_inodes = 0;
-  req->delegated_inodes = 0;
-  if (!s_mounted) {
-    req->status = init::FS_NOT_MOUNTED;
-    return req->status;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    req->status = init::FS_BUSY;
-    return req->status;
-  }
-  const QuotaRef q = open_quota(req->quota);
-  if (q.node == nullptr) {
-    req->status = init::FS_INVALID_QUOTA;
-    return req->status;
-  }
-  req->limit_bytes = q.node->limit_bytes;
-  req->used_bytes = q.node->used_bytes;
-  req->delegated_bytes = q.node->delegated_bytes;
-  req->limit_inodes = q.node->limit_inodes;
-  req->used_inodes = q.node->used_inodes;
-  req->delegated_inodes = q.node->delegated_inodes;
-  req->status = init::FS_OK;
-  return req->status;
+extern "C" Capability fs_open_entry(Capability from, Capability path,
+                                    uint32_t rights, Capability memory_quota) {
+  Capability handle = nullptr;
+  return handle_or_status(open_handle(from, path, rights, memory_quota, &handle),
+                          &handle);
 }
 
-extern "C" Capability fs_create_entry(Capability quota, Capability path_cap,
-                                      uint32_t perms) {
-  if (!s_mounted) {
-    return init::status_cap(init::FS_NOT_MOUNTED);
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::status_cap(init::FS_BUSY);
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::status_cap(init::FS_INVALID_QUOTA);
-  }
-  if ((perms & perms::Load) == 0) {
-    return init::status_cap(init::FS_BAD_REQUEST);
-  }
-  if (!q.admin) {
-    return init::status_cap(init::FS_PERMISSION);
-  }
-  char path[init::FS_PATH_MAX];
-  if (!read_path(path_cap, path)) {
-    return init::status_cap(init::FS_BAD_REQUEST);
-  }
-  Walk w;
-  const int64_t st = walk(q.node->root_dir, path, &w);
-  if (st != init::FS_OK) {
-    return init::status_cap(st);
-  }
-  if (w.leaf[0] == '\0') {
-    return init::status_cap(init::FS_BAD_REQUEST);  // "" is the root directory itself
-  }
-  if (w.found) {
-    return init::status_cap(init::FS_EXISTS);
-  }
-  if (avail_inodes(q.node) == 0) {
-    return init::status_cap(init::FS_QUOTA);
-  }
-  OpenFile* f = alloc_file(q.node);
-  if (f == nullptr) {
-    return init::status_cap(init::FS_NO_MEMORY);
-  }
-  const int64_t ino = new_inode(q.node, w.dir, w.leaf, 0);
-  if (ino < 0) {
-    return init::status_cap(ino);
-  }
-  f->inode = static_cast<uint32_t>(ino);
-  f->writable = (perms & perms::Store) != 0 ? 1 : 0;
-  f->in_use = 1;
-  Capability handle = seal_file(f);
-  if (!capability_is_valid(handle)) {
-    unlink_inode(static_cast<uint32_t>(ino));  // releases the slot too
-    return init::status_cap(init::FS_NO_MEMORY);
-  }
-  return handle;
+extern "C" Capability fs_create_entry(Capability dir, Capability path,
+                                      Capability payer, uint32_t flags,
+                                      Capability memory_quota) {
+  Capability handle = nullptr;
+  return handle_or_status(
+      create_handle(dir, path, payer, flags, memory_quota, &handle), &handle);
 }
 
-extern "C" int64_t fs_mkdir_entry(Capability quota, Capability path_cap) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::FS_INVALID_QUOTA;
-  }
-  if (!q.admin) {
-    return init::FS_PERMISSION;
-  }
-  char path[init::FS_PATH_MAX];
-  if (!read_path(path_cap, path)) {
-    return init::FS_BAD_REQUEST;
-  }
-  Walk w;
-  const int64_t st = walk(q.node->root_dir, path, &w);
-  if (st != init::FS_OK) {
-    return st;
-  }
-  if (w.leaf[0] == '\0') {
-    return init::FS_BAD_REQUEST;
-  }
-  if (w.found) {
-    return init::FS_EXISTS;
-  }
-  if (avail_inodes(q.node) == 0) {
-    return init::FS_QUOTA;
-  }
-  const int64_t ino = new_inode(q.node, w.dir, w.leaf, INODE_DIR);
-  return ino < 0 ? ino : init::FS_OK;
+extern "C" Capability fs_quota_entry(Capability parent, Capability name,
+                                     uint64_t limit, Capability memory_quota) {
+  Capability handle = nullptr;
+  return handle_or_status(
+      make_or_resize_quota(parent, name, limit, memory_quota, &handle), &handle);
 }
 
-extern "C" Capability fs_open_entry(Capability quota, Capability path_cap,
-                                    uint32_t perms, Capability out_size_cap) {
-  if (buffer_ok(out_size_cap, perms::Store, sizeof(uint64_t))) {
-    *reinterpret_cast<uint64_t*>(out_size_cap) = 0;
-  }
-  if (!s_mounted) {
-    return init::status_cap(init::FS_NOT_MOUNTED);
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::status_cap(init::FS_BUSY);
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::status_cap(init::FS_INVALID_QUOTA);
-  }
-  if ((perms & perms::Load) == 0) {
-    return init::status_cap(init::FS_BAD_REQUEST);
-  }
-  char path[init::FS_PATH_MAX];
-  if (!read_path(path_cap, path)) {
-    return init::status_cap(init::FS_BAD_REQUEST);
-  }
-  Walk w;
-  const int64_t st = walk(q.node->root_dir, path, &w);
-  if (st != init::FS_OK) {
-    return init::status_cap(st);
-  }
-  if (w.leaf[0] == '\0') {
-    return init::status_cap(init::FS_IS_DIR);
-  }
-  if (!w.found) {
-    return init::status_cap(init::FS_NOT_FOUND);
-  }
-  if (inode_is_dir(w.ino)) {
-    return init::status_cap(init::FS_IS_DIR);
-  }
-  // Under the handle's root, so there to read; the handle's own (or a
-  // descendant's) and ADMIN, so there to write -- if writing was asked for.
-  const bool owned = is_within(q.node, s_owner[w.ino]);
-  const bool wants_write = (perms & perms::Store) != 0;
-  OpenFile* f = alloc_file(q.node);
-  if (f == nullptr) {
-    return init::status_cap(init::FS_NO_MEMORY);
-  }
-  f->inode = w.ino;
-  f->writable = (wants_write && q.admin && owned) ? 1 : 0;
-  f->in_use = 1;
-  Capability handle = seal_file(f);
-  if (!capability_is_valid(handle)) {
-    release_file(f);
-    return init::status_cap(init::FS_NO_MEMORY);
-  }
-  if (buffer_ok(out_size_cap, perms::Store, sizeof(uint64_t))) {
-    *reinterpret_cast<uint64_t*>(out_size_cap) = s_inodes[w.ino].size;
-  }
-  return handle;
-}
-
-extern "C" int64_t fs_close_entry(Capability file) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  OpenFile* f = open_file(file);
-  if (f == nullptr) {
-    return init::FS_INVALID_FILE;
-  }
-  release_file(f);
-  return init::FS_OK;
-}
-
-extern "C" int64_t fs_read_entry(Capability file, Capability buf,
+extern "C" int64_t fs_read_entry(Capability file_cap, Capability buf,
                                  uint64_t offset, uint64_t length) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  OpenFile* f = open_file(file);
-  if (f == nullptr) {
-    return init::FS_INVALID_FILE;
-  }
-  const Inode& in = s_inodes[f->inode];
-  if (length == 0 || offset >= in.size) {
-    return 0;  // nothing to read past the end
-  }
-  uint64_t n = in.size - offset;
-  if (n > length) {
-    n = length;
-  }
-  if (!buffer_ok(buf, perms::Store, n)) {
-    return init::FS_BAD_REQUEST;
-  }
-  auto* dst = reinterpret_cast<uint8_t*>(buf);
-  uint64_t done = 0;
-  int64_t status = init::FS_OK;
-  while (done < n) {
-    const uint64_t pos = offset + done;
-    const uint32_t bi = static_cast<uint32_t>(pos / BLOCK_BYTES);
-    const uint64_t within = pos % BLOCK_BYTES;
-    uint64_t chunk = BLOCK_BYTES - within;
-    if (chunk > n - done) {
-      chunk = n - done;
-    }
-    uint32_t blk = 0;
-    status = inode_block_at(in, bi, &blk);
-    if (status != init::FS_OK) {
-      break;
-    }
-    status = read_block(blk, s_io);
-    if (status != init::FS_OK) {
-      break;
-    }
-    copy_bytes(dst + done, s_io + within, chunk);
-    done += chunk;
-  }
-  return status != init::FS_OK ? status : static_cast<int64_t>(done);
-}
-
-extern "C" int64_t fs_write_entry(Capability file, Capability buf,
-                                  uint64_t offset, uint64_t length) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  OpenFile* f = open_file(file);
-  if (f == nullptr) {
-    return init::FS_INVALID_FILE;
-  }
-  if (f->writable == 0) {
-    return init::FS_PERMISSION;
-  }
-  if (length == 0) {
+  CallGuard guard;
+  TRY(guard.status());
+  Handle* handle = nullptr;
+  TRY(check_handle(file_cap, KIND_FILE, init::FS_READ, &handle));
+  Entry& file = s_entries[handle->entry];
+  if (offset >= file.size) {
     return 0;
   }
-  if (offset > init::FS_MAX_FILE_BYTES ||
-      length > init::FS_MAX_FILE_BYTES - offset) {
+  if (length > file.size - offset) {
+    length = file.size - offset;
+  }
+  if (!buffer_ok(buf, perms::Store, length)) {
+    return init::FS_BAD_REQUEST;
+  }
+  TRY(copy_data(file, static_cast<uint8_t*>(buf), offset, length, false));
+  return static_cast<int64_t>(length);
+}
+
+extern "C" int64_t fs_write_entry(Capability file_cap, Capability buf,
+                                  uint64_t offset, uint64_t length,
+                                  Capability payer_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Handle* handle = nullptr;
+  TRY(check_handle(file_cap, KIND_FILE, 0, &handle));
+  Entry& file = s_entries[handle->entry];
+  if (has_flag(handle->entry, FROZEN)) {
+    return init::FS_FROZEN;
+  }
+  if (offset == init::FS_APPEND) {
+    offset = file.size;
+  }
+  // As far as an offset reaches, and a block count counts: the quota or the
+  // disk runs out long before.
+  if (length > ~uint64_t{0} - offset) {
     return init::FS_TOO_LARGE;
+  }
+  const uint64_t end = offset + length;
+  const uint64_t blocks = end / BLOCK + (end % BLOCK != 0 ? 1 : 0);
+  if (blocks > MAX_COUNT) {
+    return init::FS_TOO_LARGE;
+  }
+  // Overwriting needs CHANGE, extending needs ADD.
+  const bool overwrites = offset < file.size;
+  const bool extends = end > file.size;
+  const uint32_t needed =
+      (overwrites ? init::FS_CHANGE : 0) | (extends ? init::FS_ADD : 0);
+  if ((handle->rights & needed) != needed) {
+    return init::FS_PERMISSION;
+  }
+  // Extending also needs ADD on the quota that pays for the file.
+  if (extends) {
+    Handle* payer = nullptr;
+    TRY(check_handle(payer_cap, KIND_QUOTA, init::FS_ADD, &payer));
+    if (payer->entry != file.payer) {
+      return init::FS_PERMISSION;
+    }
   }
   if (!buffer_ok(buf, perms::Load, length)) {
     return init::FS_BAD_REQUEST;
   }
-  Inode& in = s_inodes[f->inode];
-  QuotaDisk* owner = s_owner[f->inode];
-  const uint64_t end = offset + length;
-
-  // 1. Grow first, charging the owner (including the indirect block if the
-  //    file crosses DIRECT_BLOCKS): FS_QUOTA / FS_DISK_FULL leaves the file
-  //    untouched.
-  const uint32_t old_nblocks = in.nblocks;
-  const uint32_t need = static_cast<uint32_t>((end + BLOCK_BYTES - 1) / BLOCK_BYTES);
-  if (need > old_nblocks) {
-    const uint64_t old_charged = charged_blocks_for(old_nblocks);
-    const uint64_t new_charged = charged_blocks_for(need);
-    const uint64_t cost = (new_charged - old_charged) * BLOCK_BYTES;
-    if (owner == nullptr || cost > avail_bytes(owner)) {
-      return init::FS_QUOTA;
-    }
-    const bool need_new_indirect =
-        (old_nblocks <= DIRECT_BLOCKS && need > DIRECT_BLOCKS);
-    if (!need_new_indirect && need > DIRECT_BLOCKS) {
-      const int64_t st_ind = load_indirect(in.indirect);
-      if (st_ind != init::FS_OK) {
-        return st_ind;
-      }
-    } else if (need_new_indirect) {
-      zero_bytes(s_indirect, sizeof(s_indirect));
-      s_indirect_blk = 0;
-    }
-
-    uint64_t cursor = s_data_start;
-    uint32_t new_indirect_blk = in.indirect;
-    bool ok = true;
-    if (need_new_indirect) {
-      ok = claim_one_block(&cursor, &new_indirect_blk);
-    }
-    for (uint32_t bi = old_nblocks; ok && bi < need; ++bi) {
-      uint32_t b = 0;
-      ok = claim_one_block(&cursor, &b);
-      if (ok) {
-        if (bi < DIRECT_BLOCKS) {
-          in.blocks[bi] = b;
-        } else {
-          s_indirect[bi - DIRECT_BLOCKS] = b;
-        }
-      } else {
-        // Roll back any data blocks already claimed in this call.
-        for (uint32_t r = old_nblocks; r < bi; ++r) {
-          const uint32_t rb =
-              (r < DIRECT_BLOCKS) ? in.blocks[r] : s_indirect[r - DIRECT_BLOCKS];
-          bit_clear(rb);
-          if (r < DIRECT_BLOCKS) {
-            in.blocks[r] = 0;
-          } else {
-            s_indirect[r - DIRECT_BLOCKS] = 0;
-          }
-        }
-        if (need_new_indirect && new_indirect_blk != 0) {
-          bit_clear(new_indirect_blk);
-        }
-        return init::FS_DISK_FULL;
-      }
-    }
-
-    // Zero-fill newly claimed data blocks so holes read as zeros.
-    zero_bytes(s_io, BLOCK_BYTES);
-    int64_t st = init::FS_OK;
-    for (uint32_t bi = old_nblocks; bi < need && st == init::FS_OK; ++bi) {
-      const uint32_t b =
-          (bi < DIRECT_BLOCKS) ? in.blocks[bi] : s_indirect[bi - DIRECT_BLOCKS];
-      st = write_block(b, s_io);
-    }
-    if (st == init::FS_OK && need > DIRECT_BLOCKS) {
-      st = save_indirect(new_indirect_blk);
-    }
-    if (st == init::FS_OK) {
-      st = write_bitmap();
-    }
-    if (st != init::FS_OK) {
-      for (uint32_t r = old_nblocks; r < need; ++r) {
-        const uint32_t rb =
-            (r < DIRECT_BLOCKS) ? in.blocks[r] : s_indirect[r - DIRECT_BLOCKS];
-        bit_clear(rb);
-        if (r < DIRECT_BLOCKS) {
-          in.blocks[r] = 0;
-        } else {
-          s_indirect[r - DIRECT_BLOCKS] = 0;
-        }
-      }
-      if (need_new_indirect && new_indirect_blk != 0) {
-        bit_clear(new_indirect_blk);
-        s_indirect_blk = 0;
-      }
-      return st;
-    }
-    in.indirect = new_indirect_blk;
-    in.nblocks = need;
-    owner->used_bytes += cost;
+  TRY(grow_file(handle->entry, static_cast<uint32_t>(blocks)));
+  TRY(copy_data(file, static_cast<uint8_t*>(buf), offset, length, true));
+  if (extends) {
+    modify(handle->entry).size = end;
   }
-
-  // 2. The data, one block at a time, read-modify-write for partial blocks.
-  const auto* src = reinterpret_cast<const uint8_t*>(buf);
-  uint64_t done = 0;
-  int64_t status = init::FS_OK;
-  while (done < length) {
-    const uint64_t pos = offset + done;
-    const uint32_t bi = static_cast<uint32_t>(pos / BLOCK_BYTES);
-    const uint64_t within = pos % BLOCK_BYTES;
-    uint64_t chunk = BLOCK_BYTES - within;
-    if (chunk > length - done) {
-      chunk = length - done;
-    }
-    uint32_t blk = 0;
-    status = inode_block_at(in, bi, &blk);
-    if (status != init::FS_OK) {
-      break;
-    }
-    if (chunk < BLOCK_BYTES) {
-      status = read_block(blk, s_io);
-      if (status != init::FS_OK) {
-        break;
-      }
-    }
-    copy_bytes(s_io + within, src + done, chunk);
-    status = write_block(blk, s_io);
-    if (status != init::FS_OK) {
-      break;
-    }
-    done += chunk;
-  }
-
-  // 3. The inode: new size (as far as the data got) and any new blocks.
-  const uint64_t reached = offset + done;
-  if (reached > in.size) {
-    in.size = reached;
-  }
-  const int64_t st_inode = write_inode_block(f->inode);
-  if (status != init::FS_OK) {
-    return status;
-  }
-  if (st_inode != init::FS_OK) {
-    return st_inode;
-  }
-  return static_cast<int64_t>(done);
+  TRY(write_changes());
+  return static_cast<int64_t>(length);
 }
 
-extern "C" int64_t fs_unlink_entry(Capability quota, Capability path_cap) {
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::FS_INVALID_QUOTA;
-  }
-  if (!q.admin) {
-    return init::FS_PERMISSION;
-  }
-  char path[init::FS_PATH_MAX];
-  if (!read_path(path_cap, path)) {
-    return init::FS_BAD_REQUEST;
-  }
-  Walk w;
-  const int64_t st = walk(q.node->root_dir, path, &w);
-  if (st != init::FS_OK) {
-    return st;
-  }
-  if (w.leaf[0] == '\0') {
-    return init::FS_BAD_REQUEST;  // the root directory itself
-  }
-  if (!w.found) {
+extern "C" int64_t fs_list_entry(Capability from_cap, Capability path_cap,
+                                 Capability buf_cap, uint64_t bytes,
+                                 uint64_t start) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(path_cap, &path));
+  Handle* from = nullptr;
+  TRY(check_handle(from_cap, KIND_DIR | KIND_QUOTA, init::FS_READ, &from));
+  const Lookup found = look_up(from->entry, from->rights, path, true);
+  TRY(found.status);
+  if (found.entry == NO_ENTRY) {
     return init::FS_NOT_FOUND;
   }
-  // In view, but another node's: there to be seen, not this handle's to
-  // remove.
-  if (!is_within(q.node, s_owner[w.ino])) {
-    return init::FS_PERMISSION;
-  }
-  if (inode_is_dir(w.ino)) {
-    if (!dir_empty(w.ino)) {
-      return init::FS_NOT_EMPTY;
-    }
-    if (node_rooted_at(w.ino, nullptr)) {
-      return init::FS_BUSY;
-    }
-  }
-  return unlink_inode(w.ino);
-}
-
-extern "C" int64_t fs_list_entry(Capability quota, Capability path_cap,
-                                 Capability entries_cap, uint64_t capacity,
-                                 Capability out_total_cap) {
-  if (buffer_ok(out_total_cap, perms::Store, sizeof(uint64_t))) {
-    *reinterpret_cast<uint64_t*>(out_total_cap) = 0;
-  }
-  if (!s_mounted) {
-    return init::FS_NOT_MOUNTED;
-  }
-  LockScope locked;
-  if (!locked.taken) {
-    return init::FS_BUSY;
-  }
-  const QuotaRef q = open_quota(quota);
-  if (q.node == nullptr) {
-    return init::FS_INVALID_QUOTA;
-  }
-  char path[init::FS_PATH_MAX];
-  if (!read_path(path_cap, path)) {
-    return init::FS_BAD_REQUEST;
-  }
-  Walk w;
-  const int64_t st = walk(q.node->root_dir, path, &w);
-  if (st != init::FS_OK) {
-    return st;
-  }
-  if (!w.found) {
-    return init::FS_NOT_FOUND;
-  }
-  if (w.leaf[0] != '\0' && !inode_is_dir(w.ino)) {
+  if (!has_flag(found.entry, DIR | QUOTA)) {
     return init::FS_NOT_DIR;
   }
-  const uint32_t dir = w.ino;
-  if (capacity > s_max_inodes) {
-    capacity = s_max_inodes;  // never more entries than that
+  if ((found.rights & init::FS_READ) == 0) {
+    return init::FS_PERMISSION;
   }
-  if (capacity != 0 &&
-      !buffer_ok(entries_cap, perms::Store,
-                 capacity * sizeof(init::FsDirEntry))) {
+  if (bytes != 0 && !buffer_ok(buf_cap, perms::Store, bytes)) {
     return init::FS_BAD_REQUEST;
   }
-  auto* entries = reinterpret_cast<init::FsDirEntry*>(entries_cap);
-  uint64_t count = 0;
-  uint64_t total = 0;
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    const Inode& in = s_inodes[i];
-    if ((in.flags & INODE_USED) == 0 || in.parent != dir) {
+  auto* out = static_cast<char*>(buf_cap);
+  uint64_t used = 0;
+  uint64_t position = 0;
+  int64_t written = 0;
+  for (uint32_t i = 2; i < s_entry_count; ++i) {
+    if (!entry_in_use(i) || s_entries[i].parent != found.entry ||
+        position++ < start) {
       continue;
     }
-    total += 1;
-    if (count < capacity) {
-      init::FsDirEntry& e = entries[count];
-      copy_name(e.name, in.name);
-      e.size = in.size;
-      e.inode = i;
-      e.owner = (s_owner[i] == q.node)          ? init::FS_OWNER_SELF
-                : is_within(q.node, s_owner[i]) ? init::FS_OWNER_CHILD
-                                                : init::FS_OWNER_OTHER;
-      e.is_dir = (in.flags & INODE_DIR) != 0 ? 1 : 0;
-      e.pad_[0] = 0;
-      e.pad_[1] = 0;
-      e.pad_[2] = 0;
-      count += 1;
+    const Entry& entry = s_entries[i];
+    const init::FsDirEntry item{entry.size,
+                                entry.flags & (DIR | QUOTA | FROZEN | LINK),
+                                entry.name.length};
+    const uint64_t need = init::fs_dir_entry_bytes(entry.name.length);
+    if (need > bytes - used) {
+      if (written == 0 && bytes >= sizeof(item)) {
+        copy_bytes(out, &item, sizeof(item));  // what it needs
+      }
+      return written == 0 ? init::FS_TOO_LARGE : written;
+    }
+    // Byte by byte: the caller's buffer need not be aligned.
+    char* const record = out + used;
+    copy_bytes(record, &item, sizeof(item));
+    TRY(copy_name(entry.name, record + sizeof(item)));
+    const uint64_t name_end = sizeof(item) + entry.name.length + 1;
+    zero_bytes(record + name_end, need - name_end);
+    used += need;
+    written += 1;
+  }
+  return written;
+}
+
+// `path` under `from` and everything in it. A quota only once it pays for
+// nothing.
+extern "C" int64_t fs_remove_entry(Capability from_cap, Capability path_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(path_cap, &path));
+  Handle* from = nullptr;
+  TRY(check_handle(from_cap, KIND_ANY, init::FS_CHANGE, &from));
+  const Lookup found = look_up(from->entry, from->rights, path, false);
+  TRY(found.status);
+  if (found.entry == NO_ENTRY) {
+    return init::FS_NOT_FOUND;
+  }
+  if ((found.parent_rights & init::FS_CHANGE) == 0) {
+    return init::FS_PERMISSION;
+  }
+  const uint32_t removed = found.entry;
+  if (removed == ROOT_DIR || removed == ROOT_QUOTA) {
+    return init::FS_PERMISSION;
+  }
+  if (has_flag(removed, QUOTA)) {
+    // Its files and the quotas made from it go first.
+    if (s_entries[removed].used != 0) {
+      return init::FS_IN_USE;
+    }
+    const uint32_t parent = s_entries[removed].parent;
+    const uint64_t cost = cost_of(s_entries[removed]);
+    free_entry(removed);
+    return refund(parent, cost);
+  }
+  return remove_tree(removed);
+}
+
+// Entry `from_path` of `from` to `path` under `dir`. Needs every right on the
+// directory it is in, through `from`, or a move could take it from whoever
+// shares that directory, or put it where others have more. A temporary, in no
+// directory, is moved through its own handle with `from_path` "". It keeps its
+// payer, which pays for a new name that takes blocks: in full before it is
+// kept, the old name's blocks refunded after. A link is not moved: that would
+// grant what it names somewhere new, which takes LINK on it.
+extern "C" int64_t fs_move_entry(Capability from_cap, Capability from_path_cap,
+                                 Capability dir_cap, Capability path_cap,
+                                 Capability payer_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path from_path;
+  TRY(read_path(from_path_cap, &from_path));
+  Path path;
+  TRY(read_path(path_cap, &path));
+  Handle* from = nullptr;
+  TRY(check_handle(from_cap, KIND_FILE | KIND_DIR, init::FS_ALL, &from));
+  const Lookup source = look_up(from->entry, from->rights, from_path, false);
+  TRY(source.status);
+  if (source.entry == NO_ENTRY) {
+    return init::FS_NOT_FOUND;
+  }
+  const uint32_t moved = source.entry;
+  if (source.name_count == 0 ? !is_temporary(moved) : has_flag(moved, LINK)) {
+    return init::FS_BAD_REQUEST;
+  }
+  if ((source.parent_rights & init::FS_ALL) != init::FS_ALL) {
+    return init::FS_PERMISSION;  // a link on the way took a right away
+  }
+  Handle* dir = nullptr;
+  TRY(check_handle(dir_cap, KIND_DIR, init::FS_ADD, &dir));
+  const Lookup found = look_up(dir->entry, dir->rights, path, false);
+  TRY(found.status);
+  if (found.name_count == 0) {
+    return init::FS_BAD_REQUEST;
+  }
+  if (!has_flag(found.parent, DIR)) {
+    return init::FS_NOT_DIR;
+  }
+  if ((found.parent_rights & init::FS_ADD) == 0) {
+    return init::FS_PERMISSION;
+  }
+  for (uint32_t ancestor = found.parent; ancestor != NO_ENTRY;
+       ancestor = s_entries[ancestor].parent) {
+    if (ancestor == moved) {
+      return init::FS_BAD_REQUEST;  // into itself
     }
   }
-  if (buffer_ok(out_total_cap, perms::Store, sizeof(uint64_t))) {
-    *reinterpret_cast<uint64_t*>(out_total_cap) = total;
+  const uint32_t payer = s_entries[moved].payer;
+  const uint64_t name_blocks_needed =
+      name_cost(static_cast<uint32_t>(found.last.length));
+  if (name_blocks_needed != 0) {
+    Handle* paying = nullptr;
+    TRY(check_handle(payer_cap, KIND_QUOTA, init::FS_ADD, &paying));
+    if (paying->entry != payer) {
+      return init::FS_PERMISSION;
+    }
+    if (!has_room(payer, BLOCK * name_blocks_needed)) {
+      return init::FS_QUOTA;
+    }
+    if (name_blocks_needed > s_free_blocks) {
+      return init::FS_DISK_FULL;
+    }
+    TRY(charge(payer, BLOCK * name_blocks_needed));
   }
-  return static_cast<int64_t>(count);
+  // The new name, kept before anything moves; and what has it there already,
+  // compared as kept: itself (nothing to do), or a file it replaces, which
+  // needs CHANGE on the destination; its payer is refunded.
+  Name fresh;
+  int64_t status = store_name(&fresh, found.last);
+  uint32_t there = NO_ENTRY;
+  if (status == init::FS_OK) {
+    status = find_namesake(found.parent, fresh, NO_ENTRY, &there);
+  }
+  if (status == init::FS_OK && there != NO_ENTRY && there != moved) {
+    if (has_flag(there, DIR) || has_flag(moved, DIR)) {
+      status = init::FS_EXISTS;
+    } else if ((dir->rights & found.parent_rights & init::FS_CHANGE) == 0) {
+      status = init::FS_PERMISSION;
+    }
+  }
+  if (status != init::FS_OK || there == moved) {
+    free_name(fresh);
+    if (name_blocks_needed != 0) {
+      refund(payer, BLOCK * name_blocks_needed);
+    }
+    return status;
+  }
+  uint32_t replaced_payer = NO_ENTRY;
+  uint64_t replaced_cost = 0;
+  if (there != NO_ENTRY) {
+    replaced_payer = s_entries[there].payer;
+    replaced_cost = cost_of(s_entries[there]);
+    free_entry(there);
+  }
+  Entry& entry = modify(moved);
+  const uint64_t old_name_cost = BLOCK * name_cost(entry.name.length);
+  free_name(entry.name);
+  entry.parent = found.parent;
+  copy_bytes(&entry.name, &fresh, sizeof(Name));
+  TRY(old_name_cost != 0 ? refund(payer, old_name_cost) : write_changes());
+  return replaced_payer != NO_ENTRY ? refund(replaced_payer, replaced_cost)
+                                    : init::FS_OK;
+}
+
+extern "C" int64_t fs_freeze_entry(Capability file_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Handle* file = nullptr;
+  TRY(check_handle(file_cap, KIND_FILE, init::FS_CHANGE, &file));
+  modify(file->entry).flags |= FROZEN;
+  return write_changes();
+}
+
+extern "C" int64_t fs_stat_entry(Capability handle_cap, Capability stat_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Handle* handle = nullptr;
+  TRY(check_handle(handle_cap, KIND_ANY, 0, &handle));
+  if (!buffer_ok(stat_cap, perms::Store, sizeof(init::FsStat))) {
+    return init::FS_BAD_REQUEST;
+  }
+  const Entry& entry = s_entries[handle->entry];
+  auto* stat = static_cast<init::FsStat*>(stat_cap);
+  stat->size = entry.size;
+  stat->used = has_flag(handle->entry, QUOTA) ? entry.used : cost_of(entry);
+  stat->flags = entry.flags & (DIR | QUOTA | FROZEN);
+  stat->rights = handle->rights;
+  return init::FS_OK;
+}
+
+extern "C" int64_t fs_link_entry(Capability dir_cap, Capability path_cap,
+                                 Capability target_cap, uint32_t rights,
+                                 Capability payer_cap) {
+  CallGuard guard;
+  TRY(guard.status());
+  Path path;
+  TRY(read_path(path_cap, &path));
+  Handle* payer = nullptr;
+  TRY(check_handle(payer_cap, KIND_QUOTA, init::FS_ADD, &payer));
+  Handle* target = nullptr;
+  TRY(check_handle(target_cap, KIND_FILE | KIND_DIR, init::FS_LINK, &target));
+  if (is_temporary(target->entry)) {
+    return init::FS_BAD_REQUEST;  // a temporary
+  }
+  Handle* dir = nullptr;
+  TRY(check_handle(dir_cap, KIND_DIR, init::FS_ADD, &dir));
+  const Lookup found = look_up(dir->entry, dir->rights, path, false);
+  TRY(found.status);
+  if (found.name_count == 0) {
+    return init::FS_BAD_REQUEST;
+  }
+  if (found.entry != NO_ENTRY) {
+    return init::FS_EXISTS;
+  }
+  if (!has_flag(found.parent, DIR)) {
+    return init::FS_NOT_DIR;
+  }
+  if ((found.parent_rights & init::FS_ADD) == 0) {
+    return init::FS_PERMISSION;
+  }
+  const uint64_t name_blocks_needed =
+      name_cost(static_cast<uint32_t>(found.last.length));
+  const uint64_t cost = BLOCK * (1 + name_blocks_needed);
+  if (!has_room(payer->entry, cost)) {
+    return init::FS_QUOTA;
+  }
+  if (name_blocks_needed > s_free_blocks) {
+    return init::FS_DISK_FULL;
+  }
+  const uint32_t link = new_entry(LINK, NO_ENTRY, payer->entry);  // out of sight
+  if (link == NO_ENTRY) {
+    return init::FS_DISK_FULL;
+  }
+  Entry& entry = s_entries[link];
+  entry.target.entry = target->entry;
+  entry.target.generation = target->generation;
+  entry.target.rights = rights & target->rights & init::FS_ALL;
+  if (const int64_t status = charge(payer->entry, cost); status != init::FS_OK) {
+    clear_entry(link);
+    return status;
+  }
+  if (const int64_t status = place_entry(link, found.parent, found.last);
+      status != init::FS_OK) {
+    free_entry(link);
+    refund(payer->entry, cost);
+    return status;
+  }
+  return write_changes();
 }
 
 extern "C" int64_t compartment_main(Capability arg, Capability arg1) {
@@ -1941,10 +2012,8 @@ extern "C" int64_t compartment_main(Capability arg, Capability arg1) {
   s_gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   s_uart = rw[SLOT_UART_SENTRY];
 
-  // One-shot handshake: the first call with a writable argument of
-  // `FsInterface`'s size is `init` bringing us up. The second, also from
-  // `init`, hands over `sched.lock_wait` and `sched.lock_wake` once there is a
-  // scheduler (ONE CALLER AT A TIME). Anything later is a status enquiry.
+  // Called by init: first the FsInterface handshake, then with the
+  // scheduler's lock entries. Later calls print status.
   if (s_first_call_done && !s_second_call_done) {
     s_second_call_done = true;
     if (!sealing::is_sealed_as(OType::EntryPoint, arg) ||
@@ -1960,25 +2029,31 @@ extern "C" int64_t compartment_main(Capability arg, Capability arg1) {
       out("[fs]       not mounted\n");
       return init::FS_NOT_MOUNTED;
     }
-    out_dec("[fs]       mounted: ", s_root->used_bytes / 1024, " KiB used of ");
-    out_dec("", s_root->limit_bytes / 1024, " KiB, ");
-    out_dec("", s_root->used_inodes, " inode(s) in use\n");
+    LockScope locked;
+    out_dec("[fs]       mounted: ", s_entries[ROOT_QUOTA].used / 1024,
+            " KiB used of ");
+    out_dec("", s_entries[ROOT_QUOTA].limit / 1024, " KiB\n");
     return init::FS_OK;
   }
   s_first_call_done = true;
 
   s_self_comp = rw[compartment::SLOT_SELF];
   s_vm_quota = rw[SLOT_VM_QUOTA];
-  s_seal_auth = rw[SLOT_SEAL_AUTH];
+  s_seal_file = rw[SLOT_SEAL_FILE];
+  s_seal_dir = rw[SLOT_SEAL_DIR];
+  s_seal_quota = rw[SLOT_SEAL_QUOTA];
   Capability gate_sentry = rw[SLOT_SYS_SENTRY];
   s_gate_alloc = rw[SLOT_SYS_VM_ALLOC];
   s_gate_dealloc = rw[SLOT_SYS_VM_DEALLOC];
   s_blk_read = rw[SLOT_BLK_READ];
   s_blk_write = rw[SLOT_BLK_WRITE];
 
+  const auto seal_and_unseal = perms::Seal | perms::Unseal;
   if (!sealing::is_sealed_as(OType::Compartment, s_self_comp) ||
       !sealing::is_sealed_as(OType::QuotaVm, s_vm_quota) ||
-      !capability_has_perms(s_seal_auth, perms::Seal | perms::Unseal)) {
+      !capability_has_perms(s_seal_file, seal_and_unseal) ||
+      !capability_has_perms(s_seal_dir, seal_and_unseal) ||
+      !capability_has_perms(s_seal_quota, seal_and_unseal)) {
     out("[fs]       missing seeds; file system disabled\n");
     return init::FS_BAD_REQUEST;
   }
@@ -1988,103 +2063,67 @@ extern "C" int64_t compartment_main(Capability arg, Capability arg1) {
     out("[fs]       no FsInterface handshake; file system disabled\n");
     return init::FS_BAD_REQUEST;
   }
-  auto* iface = reinterpret_cast<init::FsInterface*>(arg);
+  auto* iface = static_cast<init::FsInterface*>(arg);
+  iface->root_dir = nullptr;
   iface->root_quota = nullptr;
-  iface->quota_derive = nullptr;
-  iface->quota_destroy = nullptr;
-  iface->quota_query = nullptr;
-  iface->create = nullptr;
-  iface->mkdir = nullptr;
-  iface->open = nullptr;
-  iface->close = nullptr;
-  iface->read = nullptr;
-  iface->write = nullptr;
-  iface->unlink = nullptr;
-  iface->list = nullptr;
   iface->total_bytes = 0;
   iface->used_bytes = 0;
-  iface->total_inodes = 0;
-  iface->used_inodes = 0;
   iface->formatted = 0;
   iface->status = init::FS_NOT_MOUNTED;
 
-  // 1. Entry points, handed back whether or not the mount below succeeds: a
-  //    client that reaches them gets FS_NOT_MOUNTED, not nothing. There is no
-  //    naming service yet to publish them with (`naming` is loaded from this
-  //    very disk); `init` publishes them as "fs.*" once there is.
-  auto entry = [&](const void* fn) {
-    return mint_entry(s_gate_invoke, gate_sentry, s_self_comp, fn);
+  // 1. Entry points, even if the mount fails (callers then get NOT_MOUNTED).
+  auto address = [](auto* function) {
+    return reinterpret_cast<const void*>(function);
   };
-  iface->quota_derive = entry(reinterpret_cast<const void*>(&fs_quota_derive_entry));
-  iface->quota_destroy = entry(reinterpret_cast<const void*>(&fs_quota_destroy_entry));
-  iface->quota_query = entry(reinterpret_cast<const void*>(&fs_quota_query_entry));
-  iface->create = entry(reinterpret_cast<const void*>(&fs_create_entry));
-  iface->mkdir = entry(reinterpret_cast<const void*>(&fs_mkdir_entry));
-  iface->open = entry(reinterpret_cast<const void*>(&fs_open_entry));
-  iface->close = entry(reinterpret_cast<const void*>(&fs_close_entry));
-  iface->read = entry(reinterpret_cast<const void*>(&fs_read_entry));
-  iface->write = entry(reinterpret_cast<const void*>(&fs_write_entry));
-  iface->unlink = entry(reinterpret_cast<const void*>(&fs_unlink_entry));
-  iface->list = entry(reinterpret_cast<const void*>(&fs_list_entry));
+  const void* const entry_points[init::FS_CALLS] = {
+      address(&fs_close_entry),  address(&fs_open_entry),
+      address(&fs_create_entry), address(&fs_quota_entry),
+      address(&fs_read_entry),   address(&fs_write_entry),
+      address(&fs_list_entry),   address(&fs_remove_entry),
+      address(&fs_move_entry),   address(&fs_freeze_entry),
+      address(&fs_stat_entry),   address(&fs_link_entry)};
+  for (uint32_t i = 0; i < init::FS_CALLS; ++i) {
+    iface->call[i] =
+        mint_entry(s_gate_invoke, gate_sentry, s_self_comp, entry_points[i]);
+  }
 
-  // 3. The disk.
+  // 2. The disk.
   if (iface->capacity_sectors == 0 || !capability_is_valid(s_blk_read) ||
       !capability_is_valid(s_blk_write)) {
     out("[fs]       no block device; file system not mounted\n");
     return iface->status;
   }
   uint32_t formatted = 0;
-  const int64_t st = mount(iface->capacity_sectors, &formatted);
-  if (st != init::FS_OK) {
-    out_dec("[fs]       mount failed, status -", static_cast<uint64_t>(-st),
+  const int64_t status = mount(iface->capacity_sectors, &formatted);
+  if (status != init::FS_OK) {
+    out_dec("[fs]       mount failed, status -", static_cast<uint64_t>(-status),
             "; file system not mounted\n");
-    iface->status = st;
+    iface->status = status;
     return iface->status;
   }
 
-  // 4. Root node: the whole data area, rooted at `/`, funded from our own VM
-  //    quota. Every inode already on the disk belongs to it (file comment,
-  //    Ownership).
-  s_root = alloc_node(s_vm_quota, nullptr);
-  if (s_root == nullptr) {
-    out("[fs]       could not allocate the root quota node\n");
-    iface->status = init::FS_NO_MEMORY;
-    return iface->status;
-  }
-  s_root->limit_bytes = (s_total_blocks - s_data_start) * BLOCK_BYTES;
-  s_root->limit_inodes = s_max_inodes;
-  for (uint32_t i = 0; i < s_max_inodes; ++i) {
-    s_owner[i] = nullptr;
-    if (inode_used(i)) {
-      s_owner[i] = s_root;
-      s_root->used_bytes +=
-          charged_blocks_for(s_inodes[i].nblocks) * BLOCK_BYTES;
-      s_root->used_inodes += 1;
-    }
-  }
-  Capability root_handle = seal_node(s_root, true);
-  if (!capability_is_valid(root_handle)) {
-    out("[fs]       could not seal the root quota handle\n");
-    free_node(s_root);
-    s_root = nullptr;
+  // 3. `/` and the root quota for init, paid for by `memory_quota`: every
+  //    other handle is opened through these two.
+  iface->root_dir = make_handle(nullptr, ROOT_DIR, init::FS_ALL | init::FS_LINK,
+                                iface->memory_quota);
+  iface->root_quota = make_handle(nullptr, ROOT_QUOTA,
+                                  init::FS_ALL | init::FS_LINK,
+                                  iface->memory_quota);
+  if (!capability_is_valid(iface->root_dir) ||
+      !capability_is_valid(iface->root_quota)) {
+    out("[fs]       no memory for init's handles; file system not mounted\n");
     iface->status = init::FS_NO_MEMORY;
     return iface->status;
   }
   s_mounted = true;
-
-  iface->root_quota = root_handle;
-  iface->total_bytes = s_root->limit_bytes;
-  iface->used_bytes = s_root->used_bytes;
-  iface->total_inodes = s_max_inodes;
-  iface->used_inodes = s_root->used_inodes;
+  iface->total_bytes = s_entries[ROOT_QUOTA].limit;
+  iface->used_bytes = s_entries[ROOT_QUOTA].used;
   iface->formatted = formatted;
   iface->status = init::FS_OK;
 
   out_dec(formatted ? "[fs]       Formatted and mounted: " : "[fs]       Mounted: ",
-          s_root->limit_bytes / 1024, " KiB of data space, ");
-  out_dec("", s_root->used_bytes / 1024, " KiB used, ");
-  out_dec("", s_root->used_inodes, " of ");
-  out_dec("", s_max_inodes, " inode(s)\n");
+          iface->total_bytes / 1024, " KiB, ");
+  out_dec("", iface->used_bytes / 1024, " KiB used\n");
   return iface->status;
 }
 
