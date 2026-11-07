@@ -57,8 +57,9 @@
 //
 //     ... rw[SLOT_UART_SENTRY] ...
 //
-//   MANIFEST_COUNT is the number of entries, and so the first slot after the
-//   seeds -- where an image keeps whatever it mints at run time.
+//   MANIFEST_COUNT is the number of entries, so the first slot after the
+//   seeds is `RW_SLOT_SEED_BASE + MANIFEST_COUNT` -- where an image keeps
+//   whatever it mints at run time.
 //
 
 #include <signetos/compartment.hpp>
@@ -71,7 +72,9 @@
 namespace signetos::init {
 
 constexpr uint64_t MANIFEST_MAGIC = 0x5349474e4d4e4654ULL;  // "SIGNMNFT"
-constexpr uint32_t MANIFEST_VERSION = 1;
+// 2: seeds start at `compartment::RW_SLOT_SEED_BASE` (7) instead of slot 1,
+// so an image built for version 1 would read the wrong slots and is refused.
+constexpr uint32_t MANIFEST_VERSION = 2;
 constexpr uint32_t MANIFEST_MAX = 64;  // entries; the table is one page
 constexpr size_t MANIFEST_NAME_BYTES = 96;  // ManifestEntry::name, NUL included
 

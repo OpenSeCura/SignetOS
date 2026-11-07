@@ -21,8 +21,8 @@
 //
 // Included by standalone user-space compartments in `boot/` and `external/`.
 // Provides zero-overhead inline accessors for the compartment's capability
-// table (`cgp`), console output via the `uart` compartment sentry, and image
-// loading with `__cap_relocs` relocation.
+// table (`cgp`), console output via the `uart` compartment sentry, and
+// making a compartment from an image (`create_compartment`).
 //
 // Every helper that reaches the kernel takes the compartment's switcher
 // (`invoke_gate`, the `compartment_invoke` slot) as its first argument: a
@@ -330,79 +330,16 @@ inline void revoke_wait(Capability invoke_gate, Capability query_gate,
   }
 }
 
-// Copies a standalone compartment binary image (`img_cap`) into a fresh
-// allocation inside `target_comp` funded by `target_quota`, resolves its
-// internal `__cap_relocs` entries into `.got`, and mints its `OType::EntryPoint`
-// (`CT = 18`) entry sentry. `alloc_gate`, `sentry_gate` and `fault_gate` are
-// the `vm_allocate`, `sentry` and `fault_install` kernel entries, reached
-// through the switcher `invoke_gate`.
-inline Capability load_compartment_image(Capability invoke_gate,
-                                         Capability alloc_gate,
-                                         Capability sentry_gate,
-                                         Capability fault_gate,
-                                         Capability target_comp,
-                                         Capability target_quota,
-                                         Capability img_cap) {
-  if (!capability_is_valid(invoke_gate) || !capability_is_valid(alloc_gate) ||
-      !capability_is_valid(sentry_gate) || !capability_is_valid(fault_gate) ||
-      !capability_is_valid(target_comp) || !capability_is_valid(target_quota)) {
-    return nullptr;
-  }
-  const init::CompartmentImageHeader* hdr = init::image_header(img_cap);
-  if (hdr == nullptr) {
-    return nullptr;
-  }
-
-  using FnAlloc = decltype(&sys_vm_allocate);
-  using FnSentry = decltype(&sys_sentry);
-  using FnFaultInstall = decltype(&sys_fault_install);
-
-  Capability code_mem = syscall::call<FnAlloc>(
-      invoke_gate, alloc_gate, target_comp, target_quota,
-      init::image_alloc_size(hdr, img_cap), 0);
-  if (!capability_is_valid(code_mem)) {
-    return nullptr;
-  }
-
-  init::image_install(code_mem, img_cap, hdr);
-
-  // Entry (and so the compartment's `pcc`) covers `[0, got_end)` only.
-  Capability code = init::image_code_window(code_mem, hdr);
-  if (!capability_is_valid(code)) {
-    return nullptr;
-  }
-  Capability entry =
-      syscall::call<FnSentry>(invoke_gate, sentry_gate, target_comp, code);
-  if (!capability_is_valid(entry)) {
-    return nullptr;
-  }
-
-  // The image's fault handler (fault.hpp), if it defines one: kept in the
-  // compartment's descriptor, never handed back. Any failure fails the load
-  // -- a compartment that asked for a handler must not run without it -- and
-  // the caller destroys the compartment.
-  Capability handler_code = nullptr;
-  if (!init::image_fault_handler(code, hdr->fault_handler, &handler_code)) {
-    return nullptr;
-  }
-  if (handler_code != nullptr &&
-      syscall::call<FnFaultInstall>(invoke_gate, fault_gate, target_comp,
-                                    handler_code) !=
-          static_cast<uint64_t>(Status::Ok)) {
-    return nullptr;
-  }
-  return entry;
-}
-
 // Creates a compartment funded by `vm_quota` with `seeds` (matching `img_cap`'s
-// manifest count), loads `img_cap` into it, and mints its entry sentry. Rolls
-// back via `destroy_gate` if loading fails.
+// manifest count) that loads `img_cap` itself (compartment.hpp, LOADING
+// ITSELF), and runs its loader once, on this thread. `*out_entry` is the
+// image's entry point, and `*out_comp` the handle the caller keeps, which can
+// only destroy the compartment. Destroys it via `destroy_gate` if loading
+// fails. `img_cap` can be released as soon as this returns.
 inline bool create_compartment(Capability invoke_gate, Capability create_gate,
-                               Capability destroy_gate, Capability alloc_gate,
-                               Capability sentry_gate, Capability fault_gate,
-                               Capability vm_quota, Capability seeds,
-                               Capability img_cap, Capability* out_comp,
-                               Capability* out_entry) {
+                               Capability destroy_gate, Capability vm_quota,
+                               Capability seeds, Capability img_cap,
+                               Capability* out_comp, Capability* out_entry) {
   *out_comp = nullptr;
   *out_entry = nullptr;
   const init::CompartmentImageHeader* hdr = init::image_header(img_cap);
@@ -416,17 +353,19 @@ inline bool create_compartment(Capability invoke_gate, Capability create_gate,
     return false;
   }
 
+  // The kernel writes the loader's entry point into `loader`.
+  Capability loader = nullptr;
+  const Capability loader_out = capability_set_bounds(
+      reinterpret_cast<Capability>(&loader), sizeof(Capability));
   using FnCompCreate = decltype(&sys_compartment_create);
-  const Capability comp =
-      syscall::call<FnCompCreate>(invoke_gate, create_gate, vm_quota, seeds);
+  const Capability comp = syscall::call<FnCompCreate>(
+      invoke_gate, create_gate, vm_quota, seeds, img_cap, loader_out);
   if (!capability_is_valid(comp)) {
     return false;
   }
 
-  Capability entry =
-      load_compartment_image(invoke_gate, alloc_gate, sentry_gate, fault_gate,
-                             comp, vm_quota, img_cap);
-  if (!capability_is_valid(entry)) {
+  const Capability entry = invoke<Capability>(invoke_gate, loader);
+  if (!sealing::is_sealed_as(OType::EntryPoint, entry)) {
     using FnCompDestroy = decltype(&sys_compartment_destroy);
     syscall::call<FnCompDestroy>(invoke_gate, destroy_gate, comp);
     return false;

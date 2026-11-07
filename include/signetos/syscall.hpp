@@ -73,6 +73,10 @@ extern "C" {
 
 // --- Virtual memory --------------------------------------------------------
 
+// Every call here that takes a `comp` changes what is in it, so `comp` must
+// be a handle with Permit_Store (compartment.hpp, WHO HOLDS WHICH HANDLE): a
+// compartment's own, not the destroy-only one its creator holds.
+
 // Allocates `size` bytes (rounded to page granularity), debits `mem_quota`,
 // tags the mapping to `comp`. Returns a bounded capability, or NULL.
 capability_t sys_vm_allocate(
@@ -161,17 +165,36 @@ int sys_quota_thread_mem_destroy(
 
 // Creates a protection domain funded from `mem_quota` and seeds its capability
 // table from `initial_capabilities`: slot 0 is the new compartment's own
-// handle, and seed i lands in slot 1 + i, copied as it is (what each seed is
-// is between the creator and the image; `mem_quota` itself is not put in the
-// table unless it is passed as a seed). The array's bounds set both the count
-// and the table's size: up to 239 seeds fit the one-page minimum, a longer
-// array (pad it with nulls to reserve room) buys a table of as many pages as
-// it needs, up to `compartment::MAX_COMPARTMENT_PAGES`, from the same quota.
+// handle, and seed i lands in slot `compartment::RW_SLOT_SEED_BASE + i`,
+// copied as it is (what each seed is is between the creator and the image;
+// `mem_quota` itself is not put in the table unless it is passed as a seed).
+// The array's bounds set both the count and the table's size: up to 233 seeds
+// fit the one-page minimum, a longer array (pad it with nulls to reserve room)
+// buys a table of as many pages as it needs, up to
+// `compartment::MAX_COMPARTMENT_PAGES`, from the same quota.
+//
+// With an `image` (a capability the caller can read a compartment image
+// through), the compartment loads it itself (compartment.hpp, LOADING
+// ITSELF). The kernel does not check the image; the loader does, when it
+// reads it. The loader's entry point is written to `*out_loader`, which must
+// be 16-byte aligned memory the caller could store a capability to, in a
+// thread stack or an allocation, and the handle returned can only destroy the
+// compartment. Invoke the loader once: it returns the image's entry point, or
+// null if `image` is not one. The image's memory is paid from `mem_quota`
+// too. A bad `out_loader` is refused before anything is charged; if
+// `*out_loader` is not in RAM (vm.hpp, KERNEL ACCESS) the compartment is
+// destroyed again and the call returns null: touch it and call again.
+//
+// Without one (`image` null), the handle returned is the full handle and the
+// caller fills the compartment itself; `out_loader` is not used.
 capability_compartment_t sys_compartment_create(
     capability_quota_vm_t mem_quota,
-    capability_data_t     initial_capabilities
+    capability_data_t     initial_capabilities,
+    capability_data_t     image,
+    capability_data_t     out_loader
 );
 
+// Destroys `comp`. Any genuine handle will do, the destroy-only one included.
 void sys_compartment_destroy(
     capability_compartment_t comp
 );
@@ -195,7 +218,7 @@ uint64_t sys_compartment_invoke(
 // Mints an entry point for `comp`: records `{code, comp}` in one of `comp`'s
 // entry pages and returns a sealed pointer to that record. `code` must lie in
 // memory owned by `comp`. A new entry page is billed to `comp`'s quota when
-// the existing ones are full.
+// the existing ones are full. `comp` needs Permit_Store.
 Sentry sys_sentry(
     capability_compartment_t comp,
     capability_exec_t        code
@@ -204,7 +227,8 @@ Sentry sys_sentry(
 // Makes `code` `comp`'s fault handler (fault.hpp), replacing any installed
 // before. `code` must lie in memory owned by `comp`, as for `sys_sentry`. The
 // handler is kept in `comp`'s descriptor and never handed out: only the trap
-// dispatcher enters it. Returns a `Status` (0 = installed).
+// dispatcher enters it. Returns a `Status` (0 = installed). `comp` needs
+// Permit_Store.
 uint64_t sys_fault_install(
     capability_compartment_t comp,
     capability_exec_t        code
@@ -357,11 +381,13 @@ constexpr size_t kSyscallCount = static_cast<size_t>(Id::Count);
 // so their records say 0.
 //
 // Measured (pattern-fill the slice in `__signetos_switcher_prepare`, scan it in
-// `__signetos_switcher_return`, test image + production demo, -O2): the deepest
-// entry is `thread_create` at 672 bytes, then `sentry` 576, the two quota
-// derives 544, `vm_allocate` 496, `compartment_create` 464; everything else is
-// under 400 and `thread_tid` touches none. 4096 is six times the worst case.
-// Re-measure before adding a syscall with large locals.
+// `__signetos_switcher_return`; the default build booted, then `run hello`,
+// `run fault.bin unwind`, `sealtest` and `run logo`; -O2): the deepest entry
+// is `compartment_create` at 1056 bytes, then `thread_create` 912,
+// `vm_allocate` 816, `page_setup` 800, the two quota derives 784,
+// `revoke_query` 768 and `page_next` 704; everything else is under 400. 4096
+// is nearly four times the worst case. Re-measure before adding a syscall
+// with large locals.
 constexpr uint64_t SYSCALL_STACK_BYTES = 4096;
 
 // Builds the kernel's entry records from the running kernel PCC. Called once

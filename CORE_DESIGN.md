@@ -113,7 +113,7 @@ a weaker handle has to come from the manager.
 | Handle | Rights | Held by |
 | --- | --- | --- |
 | **Entry point** | Invoke one syscall, or one entry a compartment exported over its own code (§4). | entry points may be held by any compartment (depending on policies). |
-| **Compartment** | Identify it to the syscalls that act on it: allocate its memory, export entry points, install its fault handler, revoke its sub-ranges (§3), destroy it. Kernel does not track compartments. | the compartment itself (slot 0) and its launcher |
+| **Compartment** | Identify it to the syscalls that act on it: allocate its memory, export entry points, install its fault handler, revoke its sub-ranges (§3), destroy it. All but destroy need `Store`. Kernel does not track compartments. | the compartment itself (slot 0, with `Store`) and its launcher (without `Store`: it can only destroy it) |
 | **Thread** | Name it to the syscalls that act on it: switch to it, kill it. | its creator; the scheduler, once registered |
 
 **User-space object handles** name an object a user-space manager keeps. A
@@ -259,7 +259,8 @@ holds:
 | Table slot | Contents |
 | --- | --- |
 | `0` | The compartment's own handle. Effectively the compartment ID. Sealed as a compartment type. |
-| seeded slots | Initial capabilities in the order supplied by the creator. |
+| `1` to `6` | What the loader needs (§3.2), filled by the kernel and emptied by the loader as it starts. Reserved for the loader for the compartment's whole life. |
+| seeded slots (from `7`) | Initial capabilities in the order supplied by the creator. |
 | remaining slots | Free for the compartment's own use. It can store anything it wants in the table. |
 
 The vm quota pays for the compartment's metadata pages.
@@ -285,8 +286,17 @@ optional entries become null capabilities.
 
 **The manifest is a request.** The launcher (`init`, or anything that starts
 programs with `user/launch.hpp`, such as the shell) applies its own policy,
-derives each grant from what it holds itself, builds the compartment inside
-the child's quota, and installs its entry point and fault handler.
+derives each grant from what it holds itself, and builds the compartment
+inside the child's quota.
+
+**A compartment loads itself.** The launcher passes the image to
+`sys_compartment_create` and gets back a handle that can only destroy the
+compartment, plus the entry point of the loader (`boot/loader.cpp`). It calls
+the loader once. The loader is kernel-provided code that runs with the new
+compartment's own table: it allocates the compartment's memory, copies the
+image in, makes its entry point and fault handler, and returns the entry
+point. So the launcher never holds a capability to the child's memory. The
+kernel loads `init`, the first compartment, itself.
 
 **A program's files.** `launch.hpp` gives each program an ID the first time it
 needs one (`/apps/list` maps names to IDs), its own directory `/apps/<id>/own`
@@ -566,12 +576,13 @@ do. As granted by `init` today:
 | Gate(s) | Held by | What it allows |
 | --- | --- | --- |
 | `compartment_invoke` | everyone | The switcher gate itself. |
-| `sentry` | every service; no program | Create entry points to export. |
+| `sentry` | `uart`, `blk`, `fs`, `naming`, `sealer`, `sched`; no program | Create entry points to export. |
 | `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
 | `thread_switch`, `thread_tid` | `sched` | The only compartment that can run a thread. |
 | `thread_kill` | `sched` | End a thread it holds a handle to. |
 | `trap_wait` | `sched` | The interrupt handler's wait. Refused to anyone but the hart's installed handler while it handles an interrupt. |
-| `compartment_create`, `compartment_destroy`, `thread_create`, `fault_install`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. |
+| `compartment_create`, `compartment_destroy`, `thread_create`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. A compartment it makes from an image loads itself (§3.2), so the shell holds only a handle that can destroy it. |
+| `vm_allocate`, `sentry`, `fault_install` (in slots 1 to 6) | each compartment made from an image, while its loader runs | Load the image (§3.2). The loader takes them out of the table as it starts, so the image never sees them. |
 | `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Still evolving WIP.|
 | `revoke_query` | `shell` | Ask for a rate-limited sweep. |
 | `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: installing the interrupt handler thread, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |

@@ -70,11 +70,11 @@
 // (as for any entry point). The kernel keeps it in `comp`'s descriptor as a
 // plain code sentry: it is not an entry record and no handle to it exists,
 // so nothing but the fault path can enter it. Installing again replaces it.
-// The loader installs it from the image header (`compartment_error_handler`;
-// user/entry.S) before the compartment's first instruction, if the image
-// defines one: a handler is optional. Most use the runtime's default
-// (`SIGNETOS_DEFAULT_FAULT_HANDLER`, user/runtime.hpp), which prints one line
-// describing the fault and unwinds.
+// The loader (loader.hpp) installs it from the image header
+// (`compartment_error_handler`; user/entry.S) before any of the image's code
+// runs, if the image defines one: a handler is optional. Most use the
+// runtime's default (`SIGNETOS_DEFAULT_FAULT_HANDLER`, user/runtime.hpp),
+// which prints one line describing the fault and unwinds.
 //
 
 #include <stdint.h>

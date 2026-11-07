@@ -147,8 +147,6 @@ struct Launcher {
   Capability gate_vm_dealloc;
   Capability gate_comp_create;
   Capability gate_comp_destroy;
-  Capability gate_sentry;
-  Capability gate_fault_install;
 
   // Device windows (step 0), one per MMIO name a manifest can use.
   Capability uart_mmio;
@@ -464,7 +462,6 @@ struct Launcher {
                            reinterpret_cast<Capability>(&s_seeds[0]),
                            static_cast<size_t>(m.count) * sizeof(Capability));
     if (!create_compartment(invoke, gate_comp_create, gate_comp_destroy,
-                            gate_vm_alloc, gate_sentry, gate_fault_install,
                             r.quota, seeds, image, &r.comp, &r.sentry)) {
       warn(who, "could not be loaded");
       close_fs_seeds(m);
@@ -551,8 +548,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   L.gate_vm_dealloc = rw[init::syscall_slot(syscall::Id::vm_deallocate)];
   L.gate_comp_create = rw[init::syscall_slot(syscall::Id::compartment_create)];
   L.gate_comp_destroy = rw[init::syscall_slot(syscall::Id::compartment_destroy)];
-  L.gate_sentry = rw[init::syscall_slot(syscall::Id::sentry)];
-  L.gate_fault_install = rw[init::syscall_slot(syscall::Id::fault_install)];
   Capability gate_thread_create =
       rw[init::syscall_slot(syscall::Id::thread_create)];
   Capability gate_thread_exit = rw[init::syscall_slot(syscall::Id::thread_exit)];

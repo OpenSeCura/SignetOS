@@ -34,12 +34,14 @@
  *
  * At boot, `init::launch()` loads `_boot_img_init` into the `init` compartment
  * and hands `init` read-only capabilities to the remaining packaged images
- * via `BootManifest`.
+ * via `BootManifest`. `_boot_img_loader` is the exception: it is not a
+ * compartment of its own but the code every compartment made from an image
+ * runs first (`loader::init`, loader.hpp).
  *
- * Only `boot/` is packaged here: `init` and what it needs to reach the
- * disk (`uart` to report, `dma` to set the device up, `blk` and `fs` to
- * read). Every external service (`external/services/` -- `naming`, `sched`,
- * `shell`) and program (`external/apps/`) is a file on the disk
+ * Only `boot/` is packaged here: `init`, the loader, and what `init` needs to
+ * reach the disk (`uart` to report, `dma` to set the device up, `blk` and
+ * `fs` to read). Every external service (`external/services/` -- `naming`,
+ * `sched`, `shell`) and program (`external/apps/`) is a file on the disk
  * image (`tools/signetfs.py` puts them there at build time) that `init` or
  * the shell reads through `fs` and loads via `user::create_compartment`.
  */
@@ -58,6 +60,7 @@ _boot_img_\name:
 .endm
 
 BOOT_IMAGE init,     "boot/init.bin"
+BOOT_IMAGE loader,   "boot/loader.bin"
 BOOT_IMAGE uart,     "boot/uart.bin"
 BOOT_IMAGE dma,      "boot/dma.bin"
 BOOT_IMAGE blk,      "boot/blk.bin"

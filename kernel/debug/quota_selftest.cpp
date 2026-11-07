@@ -348,6 +348,58 @@ void run(Capability root) {
           "something to scan, too soon after the last sweep: not yet");
     settle();
   }
+
+  // 12. A compartment made from an image (compartment.hpp, LOADING ITSELF):
+  //     the image waits in the loader's slot, and the handle its creator
+  //     keeps can destroy it and change nothing in it, while the
+  //     compartment's own handle (slot 0) can.
+  {
+    // The loader is not run here, and the kernel does not look at the
+    // image, so any readable capability will do.
+    alignas(16) static const uint8_t image_bytes[16] = {};
+    const Capability image = capability_and_perms(
+        reinterpret_cast<Capability>(const_cast<uint8_t*>(image_bytes)),
+        perms::Load);
+    Capability q = derive(root, 64 * PAGE, RW);
+    Capability loader = nullptr;
+    Capability comp =
+        compartment::create_from_image(q, nullptr, image, &loader);
+    check(capability_is_valid(comp) && capability_is_valid(loader),
+          "create a compartment from an image");
+    const Capability* table =
+        reinterpret_cast<const Capability*>(compartment::table_writable(comp));
+    check(capability_is_valid(table[compartment::SLOT_LOADER_IMAGE]),
+          "the image waits in the loader's slot");
+    Status st = Status::Ok;
+    check(!capability_is_valid(compartment::allocate(comp, q, PAGE, 0, &st)) &&
+              st == Status::InvalidCapability,
+          "the creator's handle cannot allocate");
+    const Capability own = table[compartment::SLOT_SELF];
+    Capability arena = compartment::allocate(own, q, 4 * PAGE, FLAG_REVOCABLE);
+    check(capability_is_valid(arena), "the compartment's own handle can");
+    check(compartment::deallocate(comp, q, arena) == Status::InvalidCapability,
+          "the creator's handle cannot free");
+    check(!capability_is_valid(compartment::cow(comp, q, arena, PAGE, &st)) &&
+              st == Status::InvalidCapability,
+          "the creator's handle cannot copy memory in");
+    check(!capability_is_valid(
+              sentry::create(comp, arena, perms::CodeRx, &st)) &&
+              st == Status::InvalidCapability,
+          "the creator's handle cannot add an entry point");
+    check(compartment::install_fault_handler(comp, arena) ==
+              Status::InvalidCapability,
+          "the creator's handle cannot install a fault handler");
+    Capability inside = capability_set_bounds(
+        capability_set_address(arena, capability_get_base(arena) + 256), 64);
+    check(revoke::revoke(comp, inside) == Status::InvalidCapability,
+          "the creator's handle cannot revoke");
+    check(compartment::destroy(comp) == Status::Ok,
+          "the creator's handle can destroy");
+    check(destroy(q) == Status::Ok, "destroy its quota");
+    settle();
+    check(available_of(root) == root_before, "root restored after the image");
+    check(live_nodes() == nodes, "no nodes leaked after the image");
+  }
   uart::print("[quota]    self-test passed\n");
 }
 

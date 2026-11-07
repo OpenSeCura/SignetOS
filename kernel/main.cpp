@@ -25,6 +25,7 @@
 #include <signetos/frame.hpp>
 #include <signetos/debug/report.hpp>
 #include <signetos/init.hpp>
+#include <signetos/loader.hpp>
 #include <signetos/hw/platform.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/revoke.hpp>
@@ -89,6 +90,7 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
   sentry::init(root_data_cap);
   syscall::init();
   compartment::init();
+  loader::init(system_quota);
   thread::init();
   thread::init_hart(hartid);
   irq::init_hart();

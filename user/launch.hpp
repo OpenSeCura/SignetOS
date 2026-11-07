@@ -56,8 +56,6 @@ struct Starter {
   Capability quota_vm_destroy;
   Capability compartment_create;
   Capability compartment_destroy;
-  Capability sentry;
-  Capability fault_install;
   Capability thread_create;
   Capability thread_kill;
   Capability revoke_query;
@@ -906,9 +904,8 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
                   reinterpret_cast<Capability>(&s_seeds[0]),
                   static_cast<size_t>(manifest.count) * sizeof(Capability));
     ok = create_compartment(starter.invoke, starter.compartment_create,
-                            starter.compartment_destroy, starter.vm_allocate,
-                            starter.sentry, starter.fault_install, quota, seeds,
-                            image, &compartment, &entry_point);
+                            starter.compartment_destroy, quota, seeds, image,
+                            &compartment, &entry_point);
     if (!ok) {
       out(starter, "[run]      not a program (the image was refused)\n");
     }

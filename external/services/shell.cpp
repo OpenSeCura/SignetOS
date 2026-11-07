@@ -79,8 +79,6 @@ uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
   M_SYSCALL(X, SYS_COMP_DESTROY, compartment_destroy)                          \
   M_SYSCALL(X, SYS_THREAD_CREATE, thread_create)                               \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)                                   \
-  M_SYSCALL(X, SYS_SENTRY, sentry)                                             \
-  M_SYSCALL(X, SYS_FAULT_INSTALL, fault_install)                               \
   M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
   M_SYSCALL(X, SYS_PAGE_TEST, page_test)                                       \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
@@ -558,8 +556,6 @@ Capability s_gate_q_derive = nullptr;
 Capability s_gate_q_destroy = nullptr;
 Capability s_gate_comp_create = nullptr;
 Capability s_gate_comp_destroy = nullptr;
-Capability s_gate_sentry = nullptr;
-Capability s_gate_fault_install = nullptr;
 Capability s_gate_thread_kill = nullptr;
 launch::Service s_services[1 + init::FS_CALLS + 4];
 constexpr size_t PICKS_MAX = 8;
@@ -861,8 +857,10 @@ bool arena_open(PageArena* a, size_t bytes) {
       },
       [](Capability q) { return sealing::is_sealed_as(OType::QuotaVm, q); });
   if (sealing::is_sealed_as(OType::QuotaVm, a->quota)) {
+    // No image: an empty compartment, with the full handle, for the shell to
+    // allocate into itself.
     a->comp = syscall::call<FnCompCreate>(s_gate_invoke, s_gate_comp_create,
-                                          a->quota, nullptr);
+                                          a->quota, nullptr, nullptr, nullptr);
   }
   if (!capability_is_valid(a->comp)) {
     out("[pagetest] no compartment to allocate for\n");
@@ -1252,8 +1250,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   Capability thread_quota = rw[SLOT_THREAD_QUOTA];
   Capability gate_invoke = rw[SLOT_SYS_COMP_INVOKE];
   Capability gate_thread_create = rw[SLOT_SYS_THREAD_CREATE];
-  Capability gate_sentry = rw[SLOT_SYS_SENTRY];
-  Capability gate_fault_install = rw[SLOT_SYS_FAULT_INSTALL];
   Capability uart_sentry = rw[SLOT_UART_SENTRY];
   Capability naming_lookup = rw[SLOT_NAMING_LOOKUP];
   Capability uart_read = rw[SLOT_UART_READ];
@@ -1362,8 +1358,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_q_destroy = gate_q_destroy;
   s_gate_comp_create = gate_comp_create;
   s_gate_comp_destroy = gate_comp_destroy;
-  s_gate_sentry = gate_sentry;
-  s_gate_fault_install = gate_fault_install;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
   s_gate_page_test = rw[SLOT_SYS_PAGE_TEST];
@@ -1378,9 +1372,7 @@ extern "C" int64_t compartment_main(Capability arg) {
                 sealing::is_sealed_as(OType::EntryPoint, gate_q_derive) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_q_destroy) &&
                 sealing::is_sealed_as(OType::EntryPoint, gate_comp_create) &&
-                sealing::is_sealed_as(OType::EntryPoint, gate_comp_destroy) &&
-                sealing::is_sealed_as(OType::EntryPoint, gate_sentry) &&
-                sealing::is_sealed_as(OType::EntryPoint, gate_fault_install);
+                sealing::is_sealed_as(OType::EntryPoint, gate_comp_destroy);
   if (!s_run_ready) {
     out("[shell]    WARNING: the /bin view or a kernel entry `run` needs is "
         "missing; programs disabled\n");
@@ -1407,8 +1399,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   starter.quota_vm_destroy = gate_q_destroy;
   starter.compartment_create = gate_comp_create;
   starter.compartment_destroy = gate_comp_destroy;
-  starter.sentry = gate_sentry;
-  starter.fault_install = gate_fault_install;
   starter.thread_create = gate_thread_create;
   starter.thread_kill = s_gate_thread_kill;
   starter.revoke_query = s_gate_revoke_query;

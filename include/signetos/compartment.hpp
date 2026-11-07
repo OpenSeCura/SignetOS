@@ -40,6 +40,40 @@
 // `sizeof(Compartment)` and carries `self_page` at offset 0 so the kernel can
 // load the full page capability directly from the unsealed struct.
 //
+// WHO HOLDS WHICH HANDLE
+//
+// A handle with Permit_Store can change what is in the compartment: allocate
+// memory into it and free it, add entry points, install its fault handler,
+// revoke part of its memory. A handle without it can only destroy the
+// compartment.
+//
+//   - The compartment's own handle, in slot 0, has Permit_Store.
+//   - The creator of a compartment made from an image (`create_from_image`)
+//     gets a handle without it: the compartment loads the image itself, and
+//     its creator can destroy it but never reach into it.
+//   - The creator of a compartment made without an image (`create`) gets
+//     the full handle and fills the compartment itself. That is for a
+//     compartment that only holds memory for its creator, such as the
+//     shell's `pagetest`, and for `init`, which the kernel loads.
+//
+// LOADING ITSELF
+//
+// A compartment made from an image starts with one entry point, the loader
+// (loader.hpp), which runs with the compartment's own table. Its creator
+// calls it once. It allocates the compartment's memory, copies the image in,
+// makes the image's entry point and fault handler, and returns the entry
+// point. Slots 1 to 6 are what the kernel gives the loader for that: the
+// kernel entries it calls, the image (read-only, and not checked by the
+// kernel: only the loader can tell whether it is one), and the quota the
+// memory is paid from. The loader takes them all out of the table before it
+// does anything else, so the image ends up holding what its creator seeded
+// and nothing more.
+//
+// Slots 1 to 6 stay the loader's for the compartment's whole life, and the
+// image must not use them: the loader's entry point lasts as long as the
+// compartment, so whoever holds it can call it again, and a call empties
+// them.
+//
 
 #include <stdint.h>
 #include <stddef.h>
@@ -96,14 +130,23 @@ constexpr size_t pages_for_slots(size_t slots) {
 constexpr size_t CAP_SLOTS     = slots_in_pages(COMPARTMENT_PAGES);
 constexpr size_t MAX_CAP_SLOTS = slots_in_pages(MAX_COMPARTMENT_PAGES);
 
-// Slot 0 is the compartment's identity, the one slot the kernel fills. Slots 1
-// and up receive the `initial_capabilities` array passed to
-// `sys_compartment_create`, copied in order and uninterpreted: what each seed
-// is -- which of its quotas a compartment holds, and where -- is agreed
-// between the creator and the image (user/manifest.hpp), not by the kernel.
-// The whole table is the compartment's own capability table (`cgp` on entry).
-constexpr size_t SLOT_SELF         = 0;  // this compartment's sealed handle
-constexpr size_t RW_SLOT_SEED_BASE = 1;  // first seed slot in the table
+// Slot 0 is the compartment's identity. Slots 1 to 6 are the loader's (LOADING
+// ITSELF above): filled by the kernel for a compartment made from an image,
+// emptied by the loader as it starts, and never used for anything else. The
+// slots from `RW_SLOT_SEED_BASE` up receive the `initial_capabilities` array
+// passed to `sys_compartment_create`, copied in order and uninterpreted: what
+// each seed is -- which of its quotas a compartment holds, and where -- is
+// agreed between the creator and the image (user/manifest.hpp), not by the
+// kernel. The whole table is the compartment's own capability table (`cgp` on
+// entry).
+constexpr size_t SLOT_SELF                 = 0;  // this compartment's sealed handle
+constexpr size_t SLOT_LOADER_INVOKE        = 1;  // the switcher
+constexpr size_t SLOT_LOADER_VM_ALLOCATE   = 2;  // the kernel entries the
+constexpr size_t SLOT_LOADER_SENTRY        = 3;  //   loader calls
+constexpr size_t SLOT_LOADER_FAULT_INSTALL = 4;
+constexpr size_t SLOT_LOADER_IMAGE         = 5;  // the image, read-only
+constexpr size_t SLOT_LOADER_QUOTA         = 6;  // pays for the image's memory
+constexpr size_t RW_SLOT_SEED_BASE         = 7;  // first seed slot in the table
 
 // Set while the compartment is in use, cleared by destroy. This is what refuses
 // a stale handle: a destroyed compartment's page is quarantined, not unmapped
@@ -236,12 +279,11 @@ static_assert(sizeof(PageHeader) + RANGES_PER_PAGE * sizeof(Range) ==
 void init();
 
 // Charges the pages to `mem_quota`, builds the struct and the table, and
-// returns the sealed handle.
+// returns the full sealed handle (WHO HOLDS WHICH HANDLE above).
 //
 // `initial_capabilities` is copied into the capability table starting at
-// `RW_SLOT_SEED_BASE` (slot 1, directly after `SLOT_SELF`), in order and
-// uninterpreted. Its length is taken from its own bounds, so there is no count
-// argument. Pass null for none.
+// `RW_SLOT_SEED_BASE`, in order and uninterpreted. Its length is taken from
+// its own bounds, so there is no count argument. Pass null for none.
 //
 // `mem_quota` needs Permit_Load. It pays for the pages and is kept for their
 // refund, but it is not put in the table: a creator that wants the
@@ -249,18 +291,33 @@ void init();
 Capability create(Capability mem_quota, Capability initial_capabilities,
                   Status* out_status = nullptr);
 
+// As create(), for a compartment that loads `image` itself (LOADING ITSELF
+// above). Puts the loader's entry point in `*out_loader` and returns the
+// handle the creator gets, which can only destroy the compartment. `image` is
+// not checked here: if it is not an image, the loader loads nothing and
+// returns null. The image's memory is paid from `mem_quota`, like the table.
+Capability create_from_image(Capability mem_quota,
+                             Capability initial_capabilities, Capability image,
+                             Capability* out_loader,
+                             Status* out_status = nullptr);
+
 // The capability table, slots 0..CAP_SLOTS. Null if the handle is not genuine.
+// Kernel use only: any genuine handle will do, the creator's destroy-only one
+// included, so no system call may pass it a caller's handle.
 Capability table_writable(Capability handle);
 
 // Records `code` as an entry point of `comp` and returns a kernel capability
 // bounded to the new sentry::EntryRecord (for sentry::create to seal), or null.
 // The record gets `min_stack` and no flags (a compartment entry is never
-// trusted), and its `owner` is `comp`'s canonical handle (`handle_of`).
+// trusted), and its `owner` is `comp`'s canonical handle, minted afresh with
+// every permission `open` needs. `comp` needs Permit_Store (WHO HOLDS WHICH
+// HANDLE above).
 //
 // If `require_owned`, `code`'s bounds must lie inside one allocation in
 // `comp`'s range chain; otherwise the caller could run arbitrary code with
 // `comp`'s capability table in `cgp`. Only kernel-internal callers minting
-// entry points over kernel text pass false.
+// entry points over code no compartment owns -- kernel text, the loader --
+// pass false.
 //
 // Takes a fresh entry page when the chain is full, charged to the
 // compartment's funding quota.
@@ -274,16 +331,10 @@ Capability add_entry(Capability comp, Capability code, bool require_owned,
 // liveness check is never skipped.
 const Compartment* open(Capability handle);
 
-// The canonical sealed handle of the compartment behind `handle`: minted
-// afresh from its page with every permission `open` needs, whatever was
-// stripped from the copy presented. Null if `handle` does not `open`. What
-// entry records keep as their `owner`.
-Capability handle_of(Capability handle);
-
 // Makes `code` `comp`'s fault handler (fault.hpp): `code` must be a valid
 // entry's code (`sentry::entry_code`) lying inside one allocation in `comp`'s
 // range chain, as an entry point's must. Replaces any handler installed
-// before.
+// before. `comp` needs Permit_Store.
 Status install_fault_handler(Capability comp, Capability code);
 
 // What the trap dispatcher enters `comp`'s fault handler with: its sentry,
@@ -296,7 +347,7 @@ size_t entry_pages(Capability comp);
 
 // Allocates `size` bytes rounded up to whole pages, charges them to
 // `mem_quota`, and records the range in `comp`'s chain. Returns a capability
-// bounded to exactly that range, or null.
+// bounded to exactly that range, or null. `comp` needs Permit_Store.
 //
 // Every 127th allocation also takes a fresh range page, charged to the same
 // `mem_quota`. That is the only variable cost, and it is paid by the caller
@@ -315,7 +366,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
 
 // Frees an allocation and credits the bytes back. The range is quarantined, not
 // unmapped (see vm.hpp): capabilities to it that are still tagged keep reaching
-// its data until the revocation sweep.
+// its data until the revocation sweep. `comp` needs Permit_Store.
 //
 // `mem_capability` is used only for its BASE, to find the record in `comp`'s
 // chain; the range is then freed through a capability rebuilt from the record,
@@ -331,6 +382,7 @@ Status deallocate(Capability comp, Capability mem_quota,
 // allocation owned by `comp` and funded by `mem_quota`. `len` must be a
 // non-zero multiple of `vm::PAGE_SIZE`, and `src_memory` must be an unsealed
 // capability with `Permit_Load` whose bounds cover `[addr, addr + len)`.
+// `comp` needs Permit_Store, as for `allocate`.
 //
 // NOTE: Implemented for now as a synchronous up-front memory copy; we will
 // return later to make this lazy page-table copy-on-write.
@@ -341,7 +393,8 @@ Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
 // chain, every page of the chain, and finally its own page. Each refund goes to
 // the quota that paid for that particular item.
 //
-// The handle is the only authority required. Holding it is what permits this.
+// The handle is the only authority required, with or without Permit_Store.
+// Holding it is what permits this.
 //
 // Succeeds whatever threads are inside the compartment: started in it and not
 // yet ended, called into it and not yet returned, or running one of its trap
@@ -372,7 +425,7 @@ bool query_range(Capability comp, uint64_t va, Range* out_copy,
 // True if `comp` is a genuine live compartment and `[base, base + len)` lies
 // wholly inside one allocation recorded in `comp`'s range chain, without
 // including that allocation's first byte: what `revoke::revoke` may queue
-// (revoke.hpp, WHO MAY REVOKE).
+// (revoke.hpp, WHO MAY REVOKE). `comp` needs Permit_Store.
 bool owns_inside(Capability comp, uint64_t base, uint64_t len,
                  Status* out_status = nullptr);
 

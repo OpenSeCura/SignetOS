@@ -191,6 +191,8 @@ seal and unseal them:
 **Permission convention on handles:** `Permit_Load` is the *operational*
 right (use it) and `Permit_Store` the *administrative* right (derive from it,
 destroy it, kill it). Quotas, threads and type keys all follow it.
+Compartment handles differ: any genuine handle can destroy its compartment,
+and `Permit_Store` is what lets the holder change what is in it (§2.2).
 
 #### Global vs. local capabilities
 
@@ -232,19 +234,35 @@ TODO: a capability table is currently 1 page!!!! That's not really very useful r
 | Slot | Contents |
 | --- | --- |
 | 0 | The compartment's own handle. |
-| seeds (from 1) | The `initial_capabilities` array, in order, exactly as the creator supplied it. By convention seed *i* is manifest entry *i* (§2.8). |
+| 1 to 6 | For the loader (§2.8): the kernel entries it calls, the image and the quota that pays for it. The loader empties them as it starts. Reserved for the loader for the compartment's whole life (its entry point lasts that long), so never used for anything else; empty in a compartment made without an image. |
+| seeds (from 7, `RW_SLOT_SEED_BASE`) | The `initial_capabilities` array, in order, exactly as the creator supplied it. By convention seed *i* is manifest entry *i* (§2.8). |
 | after the seeds | Free for the compartment's own use. |
 
-Slot 0 is the only slot the kernel fills. It copies the seeds without giving
-them any meaning: which quotas a compartment holds, and where, is agreed
-between its creator and its image (§2.8). The funding quota pays for the
-table but is not put in it. A compartment that allocates asks for its VM
+Slots 0 to 6 are the only slots the kernel fills. It copies the seeds without
+giving them any meaning: which quotas a compartment holds, and where, is
+agreed between its creator and its image (§2.8). The funding quota pays for
+the table but is not put in it. A compartment that allocates asks for its VM
 quota in its manifest (`QUOTA_VM`), as it asks for thread memory
 (`QUOTA_THREAD`) and CPU bandwidth (`QUOTA_SCHED`), and its creator derives
 each one from its own.
 
 The whole table is one writable region reached through `cgp`. Slot 0 is not
 write-protected yet.
+
+#### Who holds which handle
+
+A compartment handle with `Permit_Store` can change what is in the
+compartment: allocate and free its memory, mint its entry points, install its
+fault handler, revoke part of its memory. Without `Permit_Store` a handle can
+only destroy it.
+
+* The compartment's own handle, in slot 0, has `Permit_Store`.
+* The creator of a compartment made from an image gets a handle without it.
+  The compartment loads the image itself (§2.8), so its creator never holds a
+  capability to its memory.
+* The creator of a compartment made without an image gets the full handle and
+  fills it itself. That is for compartments that only hold memory for their
+  creator (the shell's `pagetest`) and for `init`, which the kernel loads.
 
 #### Ownership tracking
 
@@ -255,8 +273,11 @@ chains only grow while the compartment lives.
 
 #### Lifecycle
 
-* `sys_compartment_create(quota, seeds)` fills slot 0 and the seeds,
-  assigns the UID and bills the pages to `quota`.
+* `sys_compartment_create(quota, seeds, image, &loader)` fills slot 0 and
+  the seeds, assigns the UID and bills the pages to `quota`. With an `image`
+  it also fills the loader's slots, writes the loader's entry point to
+  `loader` and returns the destroy-only handle (§2.8); without one it returns
+  the full handle.
 * `sys_compartment_destroy(comp)` marks the compartment as no longer live
   (its handle stops working at once), then:
   * **Succeeds whatever threads are inside.** Their code and table are
@@ -674,7 +695,7 @@ handlers (0 for none).
 * The trampoline (`user/entry.S`) sets up `cgp` and globals, then calls
   `compartment_main(Capability arg)`.
 * Installing an image copies it and resolves its capability relocations;
-  targets in read-only data get read-only capabilities.
+  targets in the part the PCC covers (below) get read-only capabilities.
 * W^X: the PCC covers text, read-only data, relocations and GOT, page-padded
   so the bounds are exact. `.data` and `.bss` lie outside the PCC and are
   never executable.
@@ -687,7 +708,7 @@ handlers (0 for none).
 
 #### The manifest (`user/manifest.hpp`)
 
-A compartment holds exactly what the loader put in its capability table and
+A compartment holds exactly what its creator seeded in its capability table and
 nothing else. An image therefore has to state what it wants in a form the
 launcher can read before anything exists: the `.manifest` block, which the
 header points to.
@@ -724,20 +745,41 @@ file. The launcher (`init` for services, the shell's `run` for programs)
 applies its own policy to every entry and derives every grant from what it
 holds itself.
 
-#### The loader (`user::create_compartment` in `user/runtime.hpp`)
+#### The loader (`boot/loader.cpp`, `user::create_compartment`)
 
-Compartment construction is a library helper linked into any launcher (`init`
-or `shell`) that holds the required syscall gates (`compartment_create`,
-`compartment_destroy`, `vm_allocate`, `sentry`, `fault_install`). Given a VM
-quota, a seed array and an image, `user::create_compartment`:
+A compartment made from an image loads it itself, so its creator never holds
+a capability to its memory, only a handle that can destroy it (§2.2).
+
+The code that does the loading is `boot/loader.cpp`. It is built like a
+compartment image and embedded in the kernel, which installs one copy of it
+at boot in memory nothing can write. It has no `.data` or `.bss`, because
+every compartment runs that same copy.
+
+`user::create_compartment` (`user/runtime.hpp`) is what a launcher (`init` or
+the shell) calls. It needs only the `compartment_create` and
+`compartment_destroy` gates. Given a VM quota, a seed array and an image, it:
 
 1. checks the manifest is well formed and matches the seeds;
-2. creates the compartment;
-3. installs the image into memory allocated from the same quota;
-4. mints the entry point and installs the image's fault handler, if any
-   (`user::load_compartment_image`; a failed install destroys the compartment
-   and fails the load);
-5. returns the compartment and entry-point handles.
+2. calls `sys_compartment_create` with the image. The kernel refuses a bad
+   out-pointer before it charges anything, then creates the compartment and
+   puts in slots 1 to 6 what the loader needs: the `compartment_invoke`,
+   `vm_allocate`, `sentry` and `fault_install` gates, a read-only copy of the
+   image, and the quota. The kernel does not look at the image: only the
+   loader can tell whether it is one. It returns the destroy-only handle and
+   the loader's entry point;
+3. invokes the loader, once, on its own thread. The loader runs with the new
+   compartment's table. It takes the image out of its slot (so the image is
+   loaded only once) and empties slots 1 to 6, keeping what was in them on
+   its own stack. Then it checks the image's header, allocates the
+   compartment's memory from the quota, copies the image in and resolves its
+   relocations, mints the entry point, installs the image's fault handler if
+   it has one, and returns the entry point;
+4. returns the handle and the entry point. If the loader failed, it destroys
+   the compartment instead.
+
+After that the launcher uses the entry point as before: it starts a program's
+thread on it, or calls a service through it. The image can be released as
+soon as `user::create_compartment` returns.
 
 Failures are silent (null outputs). Dependency resolution, such as looking
 services up in `naming`, is the launcher's job when it builds the seeds.
@@ -791,18 +833,22 @@ The launcher decides what the new compartment gets and calls
 `user::create_compartment` directly:
 
 ```
-Launcher (init / shell)                                                 Kernel
+Launcher (init / shell)          Loader (in the new compartment)        Kernel
   |-- read image, parse .manifest                                         |
   |-- build seeds[] by policy                                             |
   |   (sys_quota_vm_derive, fs.quota_derive, naming.lookup, ...)          |
   |-- user::create_compartment(...)                                       |
-  |     |-- sys_compartment_create(q, seeds) ---------------------------->|
-  |     |<-- comp --------------------------------------------------------|
-  |     |-- sys_vm_allocate(comp, q, size) ------------------------------>|
-  |     |<-- zeroed RW memory --------------------------------------------|
-  |     |   [copy image, resolve cap_relocs, derive PCC view: W^X]        |
-  |     |-- sys_sentry(comp, pcc) --------------------------------------->|
-  |     |<-- EntryPoint --------------------------------------------------|
+  |     |-- sys_compartment_create(q, seeds, image, &loader) ------------>|
+  |     |<-- destroy-only handle, loader entry ---------------------------|
+  |     |-- invoke(loader) -->|                                           |
+  |     |                     |   [take slots 1 to 6, leave them empty]   |
+  |     |                     |-- sys_vm_allocate(self, q, size) -------->|
+  |     |                     |<-- zeroed RW memory ----------------------|
+  |     |                     |   [copy image, resolve cap_relocs,        |
+  |     |                     |    derive PCC view: W^X]                  |
+  |     |                     |-- sys_sentry(self, pcc) ----------------->|
+  |     |                     |<-- EntryPoint ----------------------------|
+  |     |<-- EntryPoint ------|                                           |
 ```
 
 1. **Derive the VM quota.** The launcher derives a quota from its own for the
@@ -811,13 +857,15 @@ Launcher (init / shell)                                                 Kernel
    up the grant (sub-quotas, disk nodes, service entry points) or leaves a
    null.
 3. **Create the compartment.** `user::create_compartment` invokes
-   `sys_compartment_create`; the compartment's pages are billed to the new
-   quota (§2.2).
-4. **Allocate and install.** It allocates zeroed memory owned by the new
-   compartment, copies the image, resolves relocations and derives the W^X
-   views (§2.8).
-5. **Mint the entry.** `sys_sentry` returns the `EntryPoint` (and
-   `sys_fault_install` installs any image fault handler).
+   `sys_compartment_create` with the image; the compartment's pages are
+   billed to the new quota (§2.2). The launcher gets back a handle that can
+   only destroy the compartment, and the loader's entry point.
+4. **Load.** The launcher invokes the loader once. Running in the new
+   compartment, it allocates zeroed memory from the same quota, copies the
+   image, resolves relocations and derives the W^X views (§2.8).
+5. **Mint the entry.** The loader's `sys_sentry` makes the `EntryPoint` (and
+   `sys_fault_install` installs any image fault handler), and the loader
+   returns it to the launcher.
 
 ### 3.3 Executing a compartment and thread scheduling
 
@@ -1272,11 +1320,11 @@ status.
 
 | Syscall | Behaviour |
 | --- | --- |
-| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 1, uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. |
-| `void sys_compartment_destroy(comp)` | §2.2. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
+| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities, image, out_loader)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 7 (`RW_SLOT_SEED_BASE`), uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. With an `image`, the compartment loads it itself (§2.8): the loader's entry point is written to `*out_loader` and the handle returned can only destroy the compartment. Without one, the full handle is returned. |
+| `void sys_compartment_destroy(comp)` | §2.2. Any genuine handle will do. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
-| `Sentry sys_sentry(comp, code)` | §2.5. Returns the `EntryPoint` handle. |
-| `uint64_t sys_fault_install(comp, code)` | Makes `code` (in `comp`'s own memory) `comp`'s fault handler, replacing any earlier one. Returns a `Status` (§3.6). |
+| `Sentry sys_sentry(comp, code)` | §2.5. Returns the `EntryPoint` handle. `comp` needs `Permit_Store`. |
+| `uint64_t sys_fault_install(comp, code)` | Makes `code` (in `comp`'s own memory) `comp`'s fault handler, replacing any earlier one. `comp` needs `Permit_Store`. Returns a `Status` (§3.6). |
 
 Compartment-minted sealing types (§2.7) are not kernel calls: the `sealer`
 service's `seal.mint`, `seal.derive`, `seal.seal` and `seal.unseal` entry

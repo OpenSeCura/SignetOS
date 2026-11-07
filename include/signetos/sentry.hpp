@@ -93,7 +93,7 @@ struct alignas(16) EntryRecord {
   Capability cgp;      // the owning compartment's writable capability table slice
                        // (null for a kernel entry: kernel code never uses cgp)
   Capability owner;    // the owning compartment's canonical sealed handle
-                       // (`compartment::handle_of`), read through
+                       // (`compartment::add_entry`), read through
                        // `compartment::open`: which compartment the record
                        // belongs to. Null for a kernel entry: the kernel is not
                        // a compartment.
@@ -138,8 +138,8 @@ Capability create(Capability comp, Capability code_cap,
                   Status* out_status = nullptr);
 
 // Kernel-internal only: as create(), but skips the ownership check so an entry
-// point can be minted over kernel text (tests, boot). Never reachable from a
-// syscall.
+// point can be minted over code no compartment owns: kernel text (tests,
+// boot) and the loader (loader.hpp). Never reachable from a syscall.
 Capability create_kernel(Capability comp, Capability code_cap,
                          uint64_t perms_mask = perms::CodeRx,
                          Status* out_status = nullptr);

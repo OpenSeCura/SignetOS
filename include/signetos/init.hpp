@@ -151,7 +151,8 @@ inline size_t image_alloc_size(const CompartmentImageHeader* hdr,
 // 5 x uint64_t = 40 bytes) into `.got`, so that `.rodata` string literals and
 // `.data`/`.bss` objects are reachable through tagged, tightly-bounded
 // capabilities before the entry capability is narrowed to `CodeRx`.
-// Shared by the kernel (`init::launch`) and the user runtime loader.
+// Shared by the kernel (`init::launch`, `loader::init`) and the loader
+// (`boot/loader.cpp`).
 inline void image_install(Capability code_mem, Capability img_cap,
                           const CompartmentImageHeader* hdr) {
   const size_t img_len = capability_get_length(img_cap);
@@ -184,7 +185,10 @@ inline void image_install(Capability code_mem, Capability img_cap,
           target = capability_set_bounds(target, obj_size);
         }
         target = capability_set_address(target, alloc_base + obj_base + addend);
-        if (obj_base < hdr->rodata_end) {
+        // Nothing in the executable prefix (`image_code_window`) may be
+        // written: a compartment must not be able to change what it can
+        // execute, and the loader's one copy is run by every compartment.
+        if (obj_base < hdr->got_end) {
           target = capability_and_perms(target, perms::ReadOnly);
         }
         *slot = target;

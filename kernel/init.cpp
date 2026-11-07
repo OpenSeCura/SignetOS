@@ -61,8 +61,9 @@ Capability boot_image_cap(const uint8_t* img_sym) {
 
 // Loads a standalone compartment image (`img_cap`) into `target_comp` funded
 // by `target_quota` and mints its `OType::EntryPoint` (`CT = 18`) sentry.
-// Same steps as `user::load_compartment_image`, but calling the kernel
-// entry points directly instead of through syscall gates.
+// Same steps as the loader every other compartment runs (`boot/loader.cpp`),
+// but calling the kernel directly: `init` is the one compartment the kernel
+// loads itself.
 Capability load_image_kernel(Capability target_comp, Capability target_quota,
                              Capability img_cap, Status* out_status) {
   const CompartmentImageHeader* hdr = image_header(img_cap);
@@ -89,8 +90,7 @@ Capability load_image_kernel(Capability target_comp, Capability target_quota,
     return fail_with(out_status, Status::SentryFailed);
   }
 
-  // The image's fault handler, if it defines one (as
-  // `user::load_compartment_image`).
+  // The image's fault handler, if it defines one (as `boot/loader.cpp`).
   Capability handler_code = nullptr;
   if (!image_fault_handler(code, hdr->fault_handler, &handler_code)) {
     return fail_with(out_status, Status::InvalidCapability);

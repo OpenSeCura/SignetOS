@@ -135,7 +135,8 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 # flat binaries using the shared runtime in `user/`.
 #
 # `boot/` (`BOOT_COMPS`): embedded into the kernel via `kernel/boot_images.S`
-# -- `init` and what it needs to reach the disk (`uart`, `blk`, `fs`).
+# -- `init` and what it needs to reach the disk (`uart`, `blk`, `fs`), and
+# the loader every compartment made from an image runs first (loader.hpp).
 #
 # `external/` (`EXT_SERVICES` and `EXT_APPS`): written into `disk.img` at build
 # time by `tools/signetfs.py` (never linked into the kernel image).
@@ -144,7 +145,7 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 #     loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell can
 #     `run` (user/launch.hpp); each one's manifest says what it asks for.
-BOOT_COMPS = init fs uart dma blk
+BOOT_COMPS = init loader fs uart dma blk
 BOOT_SRCS  = $(patsubst %,boot/%.cpp,$(BOOT_COMPS))
 BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))
@@ -198,6 +199,7 @@ CXX_SRCS = kernel/vm.cpp \
            kernel/frame.cpp \
            kernel/quota.cpp \
            kernel/compartment.cpp \
+           kernel/loader.cpp \
            kernel/revoke.cpp \
            kernel/sentry.cpp \
            kernel/switcher.cpp \

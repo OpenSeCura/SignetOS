@@ -37,6 +37,7 @@
 #include <signetos/thread.hpp>
 #include <signetos/trap.hpp>
 #include <signetos/vm.hpp>
+#include <signetos/debug/inspect.hpp>
 #include <signetos/debug/report.hpp>
 
 namespace signetos::syscall {
@@ -60,6 +61,49 @@ constexpr uint64_t stack_for(Id id) {
 }
 
 }  // namespace
+
+// True if the kernel may store a capability at `where`, a capability the
+// caller passed for a call's second result: the caller could have stored a
+// capability there itself, it is 16-byte aligned, it is in the dynamic range
+// (where every thread stack and allocation is, so never a device register),
+// and it is outside the slice of the caller's stack this call runs on (the
+// kernel's own frame is there). Checked before the call does anything else,
+// so that a bad `where` costs the caller nothing.
+static bool can_store_at(Capability where) {
+  if (!capability_is_valid(where) || sealing::is_sealed(where) ||
+      !capability_has_perms(where, perms::Store | perms::StoreCapability)) {
+    return false;
+  }
+  const uint64_t addr = capability_get_address(where);
+  const uint64_t base = capability_get_base(where);
+  const uint64_t len = capability_get_length(where);
+  if (addr % sizeof(Capability) != 0 || addr < base || addr - base > len ||
+      len - (addr - base) < sizeof(Capability)) {
+    return false;
+  }
+  if (addr < vm::DYNAMIC_BASE || addr > vm::DYNAMIC_TOP - sizeof(Capability)) {
+    return false;
+  }
+  const Capability sp = __builtin_cheri_stack_get();
+  const uint64_t sp_base = capability_get_base(sp);
+  const uint64_t sp_top = sp_base + capability_get_length(sp);
+  if (addr < sp_top && sp_base < addr + sizeof(Capability)) {
+    return false;
+  }
+  return true;
+}
+
+// Stores `value` at `where`, which `can_store_at` accepted, if it is in RAM
+// (vm.hpp, KERNEL ACCESS). Stores nothing and returns false if it is not.
+static bool store_at(Capability where, Capability value) {
+  const vm::ResidentHold hold(capability_get_address(where), sizeof(Capability));
+  if (!hold.ok()) {
+    return false;
+  }
+  inspect::assert_user_capability(value, "syscall::store_at");
+  *reinterpret_cast<Capability*>(where) = value;
+  return true;
+}
 
 void init() {
   // The kernel's live PCC: `boot.S` bounded it to `[_kernel_start, _got_end)`
@@ -205,11 +249,35 @@ extern "C" int sys_quota_thread_mem_destroy(
 
 // --- Compartments and entry points -----------------------------------------
 
-// Marshalling only. This call has no status channel, so the detailed
-// reason is discarded and the caller sees NULL.
+// This call has no status channel, so the detailed reason for a refusal is
+// discarded and the caller sees NULL.
 extern "C" capability_compartment_t sys_compartment_create(
-    capability_quota_vm_t mem_quota, capability_data_t initial_capabilities) {
-  return ::signetos::compartment::create(mem_quota, initial_capabilities);
+    capability_quota_vm_t mem_quota, capability_data_t initial_capabilities,
+    capability_data_t image, capability_data_t out_loader) {
+  // Null, not merely untagged: an image whose tag was cleared (a revoked
+  // buffer, say) still makes a compartment that loads itself (and finds
+  // nothing to load), never one with the full handle.
+  if (image == nullptr) {
+    return ::signetos::compartment::create(mem_quota, initial_capabilities);
+  }
+  if (!::signetos::syscall::can_store_at(out_loader)) {
+    return nullptr;
+  }
+  capability_t loader = nullptr;
+  const capability_compartment_t comp =
+      ::signetos::compartment::create_from_image(
+          mem_quota, initial_capabilities, image, &loader);
+  if (!::signetos::capability_is_valid(comp)) {
+    return nullptr;
+  }
+  // The caller cannot use the compartment without its loader, so if the
+  // loader cannot be handed over (`out_loader` is not in RAM) the
+  // compartment is not kept either.
+  if (!::signetos::syscall::store_at(out_loader, loader)) {
+    ::signetos::compartment::destroy(comp);
+    return nullptr;
+  }
+  return comp;
 }
 
 // Marshalling only. This call has no status channel either, so a

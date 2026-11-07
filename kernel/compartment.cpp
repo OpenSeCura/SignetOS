@@ -22,6 +22,7 @@
 
 #include <signetos/compartment.hpp>
 #include <signetos/debug/inspect.hpp>
+#include <signetos/loader.hpp>
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
@@ -182,10 +183,33 @@ Capability unseal(Capability handle) {
 // The compartment's sealed handle, minted from its page: bounded to the
 // struct (so unsealing it cannot reach the table) and carrying every
 // permission of the page, which includes all that `unseal` asks for. `create`
-// hands this out, and `handle_of` mints it again for entry records.
+// hands this out, and entry records and fault entries keep it as their owner
+// (`add_entry`, `fault_entry`); it never leaves the kernel from there.
 Capability canonical_handle(Capability page) {
   Capability handle = capability_set_bounds(page, sizeof(Compartment));
   return sealing::seal_as(OType::Compartment, handle);
+}
+
+// The handle `create_from_image` gives the creator: the canonical handle with
+// only the permissions `unseal` needs, and so without Permit_Store. It can
+// destroy the compartment and nothing else (compartment.hpp, WHO HOLDS WHICH
+// HANDLE).
+Capability creator_handle(Capability page) {
+  Capability handle = capability_set_bounds(page, sizeof(Compartment));
+  handle = capability_and_perms(
+      handle, perms::Load | perms::LoadCapability | perms::LoadMutable);
+  return sealing::seal_as(OType::Compartment, handle);
+}
+
+// `unseal`, for a call that changes what is in the compartment: memory
+// allocated into it or freed from it, an entry point or a fault handler
+// added, part of its memory revoked. Only a handle with Permit_Store may do
+// that; any other is refused as if it were not genuine.
+Capability unseal_to_change(Capability handle) {
+  if (!capability_has_perms(handle, perms::Store)) {
+    return nullptr;
+  }
+  return unseal(handle);
 }
 
 // A capability covering slots [first, first + count) of the table in `page`.
@@ -249,10 +273,11 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
     }
   }
 
-  // Slot 0 holds `SLOT_SELF`; the seeds follow. The table is as many pages
-  // as that takes (one for up to `CAP_SLOTS` slots), and a seed array that
-  // would need more than `MAX_COMPARTMENT_PAGES` is refused, which also
-  // bounds how much a creator can ask the kernel to copy.
+  // Slot 0 holds `SLOT_SELF`, slots 1 to 6 are the loader's, and the seeds
+  // follow. The table is as many pages as that takes (one for up to
+  // `CAP_SLOTS` slots), and a seed array that would need more than
+  // `MAX_COMPARTMENT_PAGES` is refused, which also bounds how much a creator
+  // can ask the kernel to copy.
   const size_t pages = pages_for_slots(RW_SLOT_SEED_BASE + seed_count);
   if (pages > MAX_COMPARTMENT_PAGES) {
     return fail_with(out_status, Status::TooManyCapabilities);
@@ -350,6 +375,28 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   return handle;
 }
 
+Capability create_from_image(Capability mem_quota,
+                             Capability initial_capabilities, Capability image,
+                             Capability* out_loader, Status* out_status) {
+  *out_loader = nullptr;
+  const Capability own = create(mem_quota, initial_capabilities, out_status);
+  if (!capability_is_valid(own)) {
+    return nullptr;
+  }
+  const Capability loader = loader::prepare(own, mem_quota, image, out_status);
+  if (!capability_is_valid(loader)) {
+    destroy(own);
+    return nullptr;  // `prepare` has said why
+  }
+  const Capability handle = creator_handle(unseal(own));
+  if (!capability_is_valid(handle)) {
+    destroy(own);
+    return fail_with(out_status, Status::SealFailed);
+  }
+  *out_loader = loader;
+  return handle;
+}
+
 Capability table_writable(Capability handle) {
   Capability page = unseal(handle);
   if (!capability_is_valid(page)) {
@@ -361,7 +408,7 @@ Capability table_writable(Capability handle) {
 
 Capability add_entry(Capability comp, Capability code, bool require_owned,
                      uint64_t min_stack, Status* out_status) {
-  Capability comp_page = unseal(comp);
+  Capability comp_page = unseal_to_change(comp);
   if (!capability_is_valid(comp_page) || !capability_is_valid(code)) {
     return fail_with(out_status, Status::InvalidCapability);
   }
@@ -424,14 +471,6 @@ const Compartment* open(Capability handle) {
   return reinterpret_cast<const Compartment*>(unseal(handle));
 }
 
-Capability handle_of(Capability handle) {
-  Capability page = unseal(handle);
-  if (!capability_is_valid(page)) {
-    return nullptr;
-  }
-  return canonical_handle(page);
-}
-
 Status install_fault_handler(Capability comp, Capability code) {
   Status status = Status::Ok;
   const Capability rx = sentry::entry_code(code, &status);
@@ -442,7 +481,7 @@ Status install_fault_handler(Capability comp, Capability code) {
   if (!capability_is_valid(handler)) {
     return Status::SealFailed;
   }
-  Capability comp_page = unseal(comp);
+  Capability comp_page = unseal_to_change(comp);
   if (!capability_is_valid(comp_page)) {
     return Status::InvalidCapability;
   }
@@ -504,7 +543,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   }
 
   // Whose chain this range will be recorded in.
-  Capability comp_page = unseal(comp);
+  Capability comp_page = unseal_to_change(comp);
   if (!capability_is_valid(comp_page)) {
     return fail_with(out_status, Status::InvalidCapability);
   }
@@ -610,7 +649,7 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
 
 Status deallocate(Capability comp, Capability mem_quota,
                   Capability mem_capability) {
-  Capability comp_page = unseal(comp);
+  Capability comp_page = unseal_to_change(comp);
   if (!capability_is_valid(comp_page)) {
     return Status::InvalidCapability;
   }
@@ -838,7 +877,7 @@ bool query_range(Capability comp, uint64_t va, Range* out_copy,
 
 bool owns_inside(Capability comp, uint64_t base, uint64_t len,
                  Status* out_status) {
-  Capability comp_page = unseal(comp);
+  Capability comp_page = unseal_to_change(comp);
   if (!capability_is_valid(comp_page)) {
     if (out_status != nullptr) {
       *out_status = Status::InvalidCapability;
