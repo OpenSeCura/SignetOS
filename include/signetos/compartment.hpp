@@ -154,9 +154,10 @@ constexpr size_t RW_SLOT_SEED_BASE         = 7;  // first seed slot in the table
 // revocation sweep clears its tag.
 constexpr uint32_t FLAG_LIVE = (1u << 0);
 
-// Set at creation if paging was not on yet, and never changed: none of the
-// compartment's memory ever leaves RAM (vm.hpp, PAGING).
-constexpr uint32_t FLAG_PINNED = (1u << 1);
+// Set at creation if the creator asked (`create`), and never changed: what
+// the compartment allocates may go to swap (vm.hpp, PAGING). Without it none
+// of its memory ever leaves RAM.
+constexpr uint32_t FLAG_PAGEABLE = (1u << 1);
 
 using Status = signetos::Status;
 using signetos::status_name;
@@ -288,8 +289,11 @@ void init();
 // `mem_quota` needs Permit_Load. It pays for the pages and is kept for their
 // refund, but it is not put in the table: a creator that wants the
 // compartment to hold it passes it as a seed.
+//
+// `flags` is 0 or COMPARTMENT_PAGEABLE (syscall.hpp), which makes the
+// compartment FLAG_PAGEABLE. Any other flag is refused (InvalidSize).
 Capability create(Capability mem_quota, Capability initial_capabilities,
-                  Status* out_status = nullptr);
+                  uint32_t flags, Status* out_status = nullptr);
 
 // As create(), for a compartment that loads `image` itself (LOADING ITSELF
 // above). Puts the loader's entry point in `*out_loader` and returns the
@@ -298,7 +302,7 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
 // returns null. The image's memory is paid from `mem_quota`, like the table.
 Capability create_from_image(Capability mem_quota,
                              Capability initial_capabilities, Capability image,
-                             Capability* out_loader,
+                             uint32_t flags, Capability* out_loader,
                              Status* out_status = nullptr);
 
 // The capability table, slots 0..CAP_SLOTS. Null if the handle is not genuine.
@@ -345,7 +349,8 @@ bool fault_entry(Capability comp, sentry::Entry* out);
 // Number of entry pages in `comp`'s chain. 0 for a bad handle.
 size_t entry_pages(Capability comp);
 
-// Allocates `size` bytes rounded up to whole pages, charges them to
+// Allocates `size` bytes rounded up to whole pages, and then to a size a
+// capability can be bounded to exactly (vm::round_up_pages), charges them to
 // `mem_quota`, and records the range in `comp`'s chain. Returns a capability
 // bounded to exactly that range, or null. `comp` needs Permit_Store.
 //
@@ -354,13 +359,13 @@ size_t entry_pages(Capability comp);
 // that made the chain grow.
 //
 // Every allocation is zeroed and at fresh addresses, and pageable (vm.hpp,
-// PAGING) unless it has FLAG_DMA or `comp` is pinned (FLAG_PINNED). With FLAG_DMA
-// (syscall.hpp) it must also be one physically contiguous run -- every
-// allocation is today: alloc_pages maps one frame run linearly; the check is
-// still made page by page -- and its physical base is written into its first
-// 8 bytes. With FLAG_REVOCABLE it also comes with its revocation bitmap
-// pages (vm.hpp, REVOCATION BITMAP), charged to `mem_quota` with it. Any
-// other flag is refused (InvalidSize).
+// PAGING) if `comp` is (FLAG_PAGEABLE), paging is on, and it has not FLAG_DMA.
+// With FLAG_DMA (syscall.hpp) it is also one physically contiguous run, the
+// only memory that is: alloc_pages is asked for one (vm::Backing::OneRun),
+// and the check is still made page by page -- and its physical base
+// is written into its first 8 bytes. With FLAG_REVOCABLE it also comes with
+// its revocation bitmap pages (vm.hpp, REVOCATION BITMAP), charged to
+// `mem_quota` with it. Any other flag is refused (InvalidSize).
 Capability allocate(Capability comp, Capability mem_quota, size_t size,
                     uint32_t flags, Status* out_status = nullptr);
 

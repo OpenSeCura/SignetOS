@@ -307,6 +307,7 @@ constexpr int64_t BLK_BUSY         = -5;  // a request is already in flight
 struct alignas(16) BlkInterface {
   Capability read;          // out: OType::EntryPoint -> blk_read_entry
   Capability write;         // out: OType::EntryPoint -> blk_write_entry
+  // The pager's two: null in a build without paging (SIGNETOS_PAGING).
   Capability paging;        // out: OType::EntryPoint -> blk_paging_entry
   Capability paging_stop;   // out: OType::EntryPoint -> blk_paging_stop_entry
   Capability buf;           // in: DmaInterface::buf

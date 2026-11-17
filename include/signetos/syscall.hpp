@@ -69,6 +69,15 @@ constexpr uint32_t FLAG_DMA = (1u << 0);
 // for anything up to 512KB.
 constexpr uint32_t FLAG_REVOCABLE = (1u << 1);
 
+// --- sys_compartment_create flags ------------------------------------------
+
+// COMPARTMENT_PAGEABLE: what the compartment allocates may be moved to swap
+// and back (vm.hpp, PAGING), FLAG_DMA memory excepted. Without it all of its
+// memory stays in RAM, as it does in a kernel built without paging, which
+// takes the flag and does nothing with it. Not for anything the pager
+// depends on (vm.hpp, WHAT MUST NOT WAIT).
+constexpr uint32_t COMPARTMENT_PAGEABLE = (1u << 0);
+
 extern "C" {
 
 // --- Virtual memory --------------------------------------------------------
@@ -77,8 +86,11 @@ extern "C" {
 // be a handle with Permit_Store (compartment.hpp, WHO HOLDS WHICH HANDLE): a
 // compartment's own, not the destroy-only one its creator holds.
 
-// Allocates `size` bytes (rounded to page granularity), debits `mem_quota`,
-// tags the mapping to `comp`. Returns a bounded capability, or NULL.
+// Allocates `size` bytes, rounded up to whole pages and, where no capability
+// can be bounded to exactly that, on to the next size one can. Debits
+// `mem_quota` for what it allocates, and tags the mapping to `comp`. Returns
+// a capability bounded to exactly the allocation, or NULL: if `mem_quota`
+// cannot cover the rounded size, say.
 capability_t sys_vm_allocate(
     capability_compartment_t  comp,
     capability_quota_vm_t     mem_quota,
@@ -187,11 +199,14 @@ int sys_quota_thread_mem_destroy(
 //
 // Without one (`image` null), the handle returned is the full handle and the
 // caller fills the compartment itself; `out_loader` is not used.
+//
+// `flags` is 0 or COMPARTMENT_PAGEABLE; anything else is refused.
 capability_compartment_t sys_compartment_create(
     capability_quota_vm_t mem_quota,
     capability_data_t     initial_capabilities,
     capability_data_t     image,
-    capability_data_t     out_loader
+    capability_data_t     out_loader,
+    uint32_t              flags
 );
 
 // Destroys `comp`. Any genuine handle will do, the destroy-only one included.
@@ -242,6 +257,8 @@ uint64_t sys_fault_install(
 
 // --- Threads ---------------------------------------------------------------
 
+// The stack is `stack_size` bytes, rounded up as `sys_vm_allocate` rounds a
+// size; `thread_mem_quota` is charged for that and for the thread's state.
 capability_thread_t sys_thread_create(
     capability_quota_thread_mem_t thread_mem_quota,
     size_t                        stack_size,
@@ -305,6 +322,8 @@ uint64_t sys_trap_wait(
 );
 
 // --- Paging (vm.hpp, PAGING) -------------------------------------------------
+// Only in a kernel built with paging (SIGNETOS_PAGING).
+#if defined(SIGNETOS_PAGING)
 
 // Turns paging on, once, for `slots` pages of swap. `init` calls it after it
 // has started what paging depends on. A `Status` (vm::setup_paging).
@@ -328,9 +347,23 @@ uint64_t sys_page_test(
     capability_t cap
 );
 
+#endif  // SIGNETOS_PAGING
+
 } // extern "C"
 
 namespace signetos::syscall {
+
+// The paging calls come last, so every other call has the same id with and
+// without them.
+#if defined(SIGNETOS_PAGING)
+#define SIGNETOS_PAGING_SYSCALLS(X) \
+  X(page_setup)                     \
+  X(page_next)                      \
+  X(page_done)                      \
+  X(page_test)
+#else
+#define SIGNETOS_PAGING_SYSCALLS(X)
+#endif
 
 // Every syscall in declaration order. This single list drives
 // the `Id` enum, the kernel entry record table in syscall.cpp, and (by
@@ -359,10 +392,7 @@ namespace signetos::syscall {
   X(thread_tid)                   \
   X(trap_install)                 \
   X(trap_wait)                    \
-  X(page_setup)                   \
-  X(page_next)                    \
-  X(page_done)                    \
-  X(page_test)
+  SIGNETOS_PAGING_SYSCALLS(X)
 
 enum class Id : uint32_t {
 #define SIGNETOS_SYSCALL_ID(n) n,

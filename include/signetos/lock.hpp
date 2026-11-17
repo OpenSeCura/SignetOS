@@ -32,9 +32,9 @@
  *   3. `revoke::s_lock`     protects the revocation marks (revoke.hpp,
  *                           MARKING RANGES) and the epochs, and serializes
  *                           sweeps.
- *   4. `vm::s_lock`         protects the Sv39 page tables and the per-region
- *                           mapped-page counts (never held while zeroing an
- *                           allocation).
+ *   4. `vm::s_lock`         protects the Sv39 page tables, the per-region
+ *                           mapped-page counts and paging's state (never
+ *                           held while zeroing an allocation).
  *   5. `frame::s_lock`      leaf lock protecting the physical frame bitmap.
  *   6. `uart::s_lock`       leaf lock protecting console line output.
  *

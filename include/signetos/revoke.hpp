@@ -113,6 +113,13 @@ Status revoke(Capability comp, Capability mem_cap,
 // Highest epoch for which the sweep has finished.
 uint64_t completed_epoch();
 
+// THE BASE RULE: whether the capability with the bits of `cap`, tagged or
+// not, is revoked. The sweep asks it of every capability in memory, and
+// paging of every one it brings back from disk (SWAP). It takes no lock:
+// paging reads the marks without revoke's, and one set or cleared meanwhile
+// is one no sweep relies on yet, or any more.
+bool is_revoked(Capability cap);
+
 // The least time between the end of one sweep and the start of the next
 // (WHEN A SWEEP RUNS). Policy, and a guess: a heap must hold this long's
 // worth of freed memory, and the machine stalls once per this long at most.

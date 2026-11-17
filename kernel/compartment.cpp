@@ -26,7 +26,7 @@
 #include <signetos/quota.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
-#include <signetos/syscall.hpp>  // FLAG_DMA, FLAG_REVOCABLE
+#include <signetos/syscall.hpp>  // FLAG_DMA, FLAG_REVOCABLE, COMPARTMENT_PAGEABLE
 
 namespace signetos::compartment {
 namespace {
@@ -242,8 +242,11 @@ void init() {
 size_t live_count() { return __atomic_load_n(&s_live_count, __ATOMIC_RELAXED); }
 
 Capability create(Capability mem_quota, Capability initial_capabilities,
-                  Status* out_status) {
+                  uint32_t flags, Status* out_status) {
   // Every early exit goes through here so the status is never forgotten.
+  if ((flags & ~COMPARTMENT_PAGEABLE) != 0) {
+    return fail_with(out_status, Status::InvalidSize);
+  }
 
   // How many capabilities to seed. The count comes from the array's own
   // bounds, which is why sys_compartment_create needs no count argument.
@@ -332,7 +335,8 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
   c->fault_handler = nullptr;  // none until the loader installs one
   c->uid = uid;
   c->table_slots = slots;
-  c->flags = FLAG_LIVE | (vm::paging_on() ? 0 : FLAG_PINNED);
+  c->flags =
+      FLAG_LIVE | ((flags & COMPARTMENT_PAGEABLE) != 0 ? FLAG_PAGEABLE : 0);
   c->lock = SpinLock{};
 
   // The table is filled through the same view the compartment itself gets
@@ -377,9 +381,11 @@ Capability create(Capability mem_quota, Capability initial_capabilities,
 
 Capability create_from_image(Capability mem_quota,
                              Capability initial_capabilities, Capability image,
-                             Capability* out_loader, Status* out_status) {
+                             uint32_t flags, Capability* out_loader,
+                             Status* out_status) {
   *out_loader = nullptr;
-  const Capability own = create(mem_quota, initial_capabilities, out_status);
+  const Capability own =
+      create(mem_quota, initial_capabilities, flags, out_status);
   if (!capability_is_valid(own)) {
     return nullptr;
   }
@@ -555,18 +561,27 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
   if (size == 0 || size > MAX_REQUEST) {
     return fail_with(out_status, Status::InvalidSize);
   }
-  Compartment* c = reinterpret_cast<Compartment*>(comp_page);
-  const bool pageable =
-      (flags & FLAG_DMA) == 0 &&
-      (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_PINNED) == 0;
-  size_t pages = (size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
-  if (pageable) {
-    pages = vm::round_up_pageable_pages(pages);  // and charged as such
-    if (pages == 0) {
-      return fail_with(out_status, Status::InvalidSize);
-    }
+  // Then up to a size a capability can be bounded to exactly: that is what
+  // is allocated, and charged.
+  const size_t pages =
+      vm::round_up_pages((size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE);
+  if (pages == 0) {
+    return fail_with(out_status, Status::InvalidSize);
   }
   const uint64_t bytes = pages * vm::PAGE_SIZE;
+
+  // Memory for a device is one run of frames (FLAG_DMA), and never pageable.
+  // Anything else is pageable if the compartment is and paging is on, and
+  // otherwise takes whatever frames are free.
+  Compartment* c = reinterpret_cast<Compartment*>(comp_page);
+  vm::Backing backing = vm::Backing::Frames;
+  if ((flags & FLAG_DMA) != 0) {
+    backing = vm::Backing::OneRun;
+  } else if (vm::paging_on() &&
+             (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_PAGEABLE) !=
+                 0) {
+    backing = vm::Backing::Pageable;
+  }
 
   Locked hold(c->lock);
   if ((__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & FLAG_LIVE) == 0) {
@@ -609,9 +624,9 @@ Capability allocate(Capability comp, Capability mem_quota, size_t size,
     return fail_with(out_status, charged);
   }
 
-  // Reserve addresses, take frames, map them. Comes back zeroed.
-  Capability memory = pageable ? vm::alloc_pageable_pages(pages, revocable)
-                               : vm::alloc_pages(pages, revocable);
+  // Reserve addresses and, unless pageable, take frames and map them. Comes
+  // back zeroed.
+  Capability memory = vm::alloc_pages(pages, revocable, backing);
   if (!capability_is_valid(memory)) {
     quota::refund(mem_quota, billed);
     return fail_with(out_status, Status::NoMemory);

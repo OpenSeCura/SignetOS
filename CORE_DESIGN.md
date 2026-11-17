@@ -253,8 +253,8 @@ holds:
 * a linked list of virtual memory regions owned by the compartment
 * a linked list of entry points
 * its fault handler's code sentry, if one is installed (§9);
-* a unique ID, a live flag (cleared when it is destroyed), a pinned flag
-  (created before paging started, so its memory is never paged out) and a lock.
+* a unique ID, a live flag (cleared when it is destroyed), a pageable flag
+  (set by its creator: what it allocates may be paged out) and a lock.
 
 | Table slot | Contents |
 | --- | --- |
@@ -518,6 +518,11 @@ into the scheduler whenever a thread exits.
   of reuse until swapped capability pages are checked). During revocation the 
   page on the disk is checked for revoked capabilities and if present the corresponding 
   bit in the bitmap is cleared so that the capability is not reconstructed when paged in.
+  A compartment's memory is pageable only if its creator asks
+  (`COMPARTMENT_PAGEABLE`): `init` asks for none of what it starts, the shell
+  for the programs it runs. Paging is a build option (`make PAGING=0`):
+  without it the kernel has no paging code or system calls, there is no pager
+  and no swap, and all memory stays in RAM.
 * **Bounded DMA:** drivers never see physical addresses or writable descriptor
   rings; an isolated `dma` compartment confines DMA to a fixed window and
   configures static descriptor chains at boot.
@@ -583,7 +588,7 @@ do. As granted by `init` today:
 | `trap_wait` | `sched` | The interrupt handler's wait. Refused to anyone but the hart's installed handler while it handles an interrupt. |
 | `compartment_create`, `compartment_destroy`, `thread_create`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. A compartment it makes from an image loads itself (§3.2), so the shell holds only a handle that can destroy it. |
 | `vm_allocate`, `sentry`, `fault_install` (in slots 1 to 6) | each compartment made from an image, while its loader runs | Load the image (§3.2). The loader takes them out of the table as it starts, so the image never sees them. |
-| `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Still evolving WIP.|
+| `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Only in a build with paging. Still evolving WIP.|
 | `revoke_query` | `shell` | Ask for a rate-limited sweep. |
 | `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: installing the interrupt handler thread, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
 | `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |

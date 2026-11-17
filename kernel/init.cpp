@@ -153,7 +153,7 @@ Status launch(Capability system_quota, Capability thread_quota,
   // 2. Create the `init` compartment funded by `system_quota`.
   compartment::Status comp_status = compartment::Status::Ok;
   Capability init_comp =
-      compartment::create(system_quota, seed_cap, &comp_status);
+      compartment::create(system_quota, seed_cap, 0, &comp_status);
   for (size_t i = 0; i < INIT_SEED_COUNT; ++i) {
     init_seeds[i] = nullptr;
   }

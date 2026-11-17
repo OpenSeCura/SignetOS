@@ -253,7 +253,7 @@ void run(Capability root) {
   //     The marks go with the sweep, so the range can be handed out again.
   {
     Capability q = derive(root, 64 * PAGE, RW);
-    Capability comp = compartment::create(q, nullptr);
+    Capability comp = compartment::create(q, nullptr, 0);
     check(capability_is_valid(comp), "create a scratch compartment");
     Capability other = compartment::allocate(comp, q, PAGE, 0);
     const uint64_t before_arena = available_of(q);
@@ -363,7 +363,7 @@ void run(Capability root) {
     Capability q = derive(root, 64 * PAGE, RW);
     Capability loader = nullptr;
     Capability comp =
-        compartment::create_from_image(q, nullptr, image, &loader);
+        compartment::create_from_image(q, nullptr, image, 0, &loader);
     check(capability_is_valid(comp) && capability_is_valid(loader),
           "create a compartment from an image");
     const Capability* table =

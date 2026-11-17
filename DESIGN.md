@@ -73,7 +73,8 @@ make clean
 ```
 
 Options: `TRACE_SWITCH=1` prints every thread switch; `SMP=n` sets the hart
-count.
+count; `PAGING=0` builds without paging (no pager, no swap, all memory stays
+in RAM).
 
 ---
 
@@ -273,11 +274,12 @@ chains only grow while the compartment lives.
 
 #### Lifecycle
 
-* `sys_compartment_create(quota, seeds, image, &loader)` fills slot 0 and
-  the seeds, assigns the UID and bills the pages to `quota`. With an `image`
-  it also fills the loader's slots, writes the loader's entry point to
+* `sys_compartment_create(quota, seeds, image, &loader, flags)` fills slot 0
+  and the seeds, assigns the UID and bills the pages to `quota`. With an
+  `image` it also fills the loader's slots, writes the loader's entry point to
   `loader` and returns the destroy-only handle (§2.8); without one it returns
-  the full handle.
+  the full handle. With `COMPARTMENT_PAGEABLE` in `flags`, what the
+  compartment allocates may be paged out.
 * `sys_compartment_destroy(comp)` marks the compartment as no longer live
   (its handle stops working at once), then:
   * **Succeeds whatever threads are inside.** Their code and table are
@@ -838,7 +840,7 @@ Launcher (init / shell)          Loader (in the new compartment)        Kernel
   |-- build seeds[] by policy                                             |
   |   (sys_quota_vm_derive, fs.quota_derive, naming.lookup, ...)          |
   |-- user::create_compartment(...)                                       |
-  |     |-- sys_compartment_create(q, seeds, image, &loader) ------------>|
+  |     |-- sys_compartment_create(q, seeds, image, &loader, flags) ----->|
   |     |<-- destroy-only handle, loader entry ---------------------------|
   |     |-- invoke(loader) -->|                                           |
   |     |                     |   [take slots 1 to 6, leave them empty]   |
@@ -1296,7 +1298,7 @@ status.
 
 | Syscall (signature) | Behaviour |
 | --- | --- |
-| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Debits `mem_quota` and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. `FLAG_DMA` makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at. `FLAG_REVOCABLE` makes it one whose parts can be revoked; it starts on a 512KB boundary and is also charged its revocation marks, one page per 512KB (§4.2). Any other flag is refused. |
+| `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Rounds `size` up to whole pages, and on to the next size a capability can be bounded to exactly. Debits `mem_quota` for that and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. `FLAG_DMA` makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at. `FLAG_REVOCABLE` makes it one whose parts can be revoked; it starts on a 512KB boundary and is also charged its revocation marks, one page per 512KB (§4.2). Any other flag is refused. |
 | `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. **Quarantines** the memory; `mem_quota` is refunded when the sweep reclaims it (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
 | `uint64_t sys_revoke(comp, mem_cap)` | Marks `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s revocable allocations, not including its first byte, and start and end on a multiple of 16 bytes. Returns the current epoch: the range may be reused once `sys_revoke_query` reaches it. 0 if refused. |
@@ -1320,7 +1322,7 @@ status.
 
 | Syscall | Behaviour |
 | --- | --- |
-| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities, image, out_loader)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 7 (`RW_SLOT_SEED_BASE`), uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. With an `image`, the compartment loads it itself (§2.8): the loader's entry point is written to `*out_loader` and the handle returned can only destroy the compartment. Without one, the full handle is returned. |
+| `capability_compartment_t sys_compartment_create(mem_quota, initial_capabilities, image, out_loader, flags)` | §2.2. Slot 0 gets the new handle and the seeds follow from slot 7 (`RW_SLOT_SEED_BASE`), uninterpreted. The bounds of the seed array set the seed count. `mem_quota` pays for the table but is not put in it. With an `image`, the compartment loads it itself (§2.8): the loader's entry point is written to `*out_loader` and the handle returned can only destroy the compartment. Without one, the full handle is returned. `flags` is 0 or `COMPARTMENT_PAGEABLE`: what the compartment allocates may be paged out. |
 | `void sys_compartment_destroy(comp)` | §2.2. Any genuine handle will do. Succeeds whatever threads are inside and quarantines the memory; after the sweep, a thread's return into the compartment yields `ERR_COMPARTMENT_DESTROYED` to the live caller beneath. |
 | `uint64_t sys_compartment_invoke(entry_point, arg, ...)` | The switcher (§3.4). Passes up to five arguments (`ca1..ca5` → `ca0..ca4`) and returns the callee's `ca0` (or a `Status` if the call was refused before entry, or `Faulted` if the callee faulted and was unwound; §3.6). |
 | `Sentry sys_sentry(comp, code)` | §2.5. Returns the `EntryPoint` handle. `comp` needs `Permit_Store`. |

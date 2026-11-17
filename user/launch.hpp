@@ -893,7 +893,8 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
     }
   }
 
-  // 4. Its compartment. The seeds are all it will ever hold.
+  // 4. Its compartment. The seeds are all it will ever hold. Its memory may
+  //    go to swap (vm.hpp, PAGING, WHAT MUST NOT WAIT).
   Capability compartment = nullptr;
   Capability entry_point = nullptr;
   if (ok) {
@@ -905,7 +906,7 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
                   static_cast<size_t>(manifest.count) * sizeof(Capability));
     ok = create_compartment(starter.invoke, starter.compartment_create,
                             starter.compartment_destroy, quota, seeds, image,
-                            &compartment, &entry_point);
+                            COMPARTMENT_PAGEABLE, &compartment, &entry_point);
     if (!ok) {
       out(starter, "[run]      not a program (the image was refused)\n");
     }

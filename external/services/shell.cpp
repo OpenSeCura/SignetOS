@@ -65,6 +65,13 @@ uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
 // threads and runs programs is made of; the services it talks to; and the
 // disk quota, /home, /apps (programs' own) and /bin (read-only), all with
 // LINK, so that what is in them can be linked for a program (launch.hpp).
+#if defined(SIGNETOS_PAGING)
+#define SHELL_PAGING_MANIFEST(X)                                               \
+  M_SYSCALL(X, SYS_PAGE_TEST, page_test)                                       \
+  M_SERVICE_OPT(X, PAGING_STOP, "blk.paging_stop")
+#else
+#define SHELL_PAGING_MANIFEST(X)
+#endif
 #define SHELL_MANIFEST(X)                                                      \
   M_QUOTA_VM(X, VM_QUOTA)                                                      \
   M_QUOTA_THREAD(X, THREAD_QUOTA, 256ULL * 1024 * 1024)                        \
@@ -80,9 +87,8 @@ uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
   M_SYSCALL(X, SYS_THREAD_CREATE, thread_create)                               \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)                                   \
   M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
-  M_SYSCALL(X, SYS_PAGE_TEST, page_test)                                       \
+  SHELL_PAGING_MANIFEST(X)                                                     \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
-  M_SERVICE_OPT(X, PAGING_STOP, "blk.paging_stop")                             \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
   M_SERVICE(X, NAMING_LOOKUP, "naming.lookup")                                 \
   M_QUOTA_DISK(X, DISK, 0, ::signetos::init::FS_ALL, "disk")                   \
@@ -116,7 +122,7 @@ Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
 launch::Starter s_starter{};  // what `run` starts programs with (launch.hpp)
 
-inline uint64_t now_us() {
+[[maybe_unused]] inline uint64_t now_us() {  // only `pagetest` uses it
   uint64_t t;
   __asm__ volatile("csrr %0, time" : "=r"(t));
   return t / s_ticks_per_us;
@@ -562,7 +568,7 @@ constexpr size_t PICKS_MAX = 8;
 
 // Sleeps until `us` have passed, or until something wakes the shell first
 // (a keystroke); callers loop on whatever they are waiting for.
-void sleep_us(uint64_t us) {
+[[maybe_unused]] void sleep_us(uint64_t us) {  // only `pagetest` uses it
   invoke<int64_t>(s_gate_invoke, s_sched_block, us);
 }
 
@@ -791,12 +797,14 @@ void cmd_sealtest() {
 
   // Free the page. Until a sweep reclaims it the type still works (the page
   // is quarantined, not unmapped); after one, nothing based in it is tagged.
+  // Two epochs, for a sweep that starts after the free: one that was waiting
+  // for its checks of swap (revoke.hpp, SWAP) scanned before it.
   const uint64_t seen =
       syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, s_self_comp,
                            s_vm_quota, page);
   out("[sealtest] record freed; waiting for a sweep...\n");
-  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 1);
+  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 2);
 
   const Capability key_after =
       *reinterpret_cast<volatile Capability*>(&s_sealtest_key);
@@ -828,9 +836,9 @@ void cmd_sealtest() {
 }
 
 // --- PAGE TEST (vm.hpp, PAGING) ----------------------------------------------
-// The shell stays in RAM, as does what it allocates for itself: it was
-// started before paging was. What pages is what a compartment started since
-// allocates, so the test makes one, empty, and allocates for it.
+// The shell stays in RAM, as does what it allocates for itself: `init` did
+// not make it pageable. What pages is what a pageable compartment allocates,
+// so the test makes one, empty, and allocates for it.
 //   pagetest             16 pages of data and capabilities go to swap and
 //                        come back; then a capability on disk to memory that
 //                        is freed is not built again when its page comes
@@ -839,6 +847,7 @@ void cmd_sealtest() {
 //                        less free RAM than that it pages for real
 //                        (`make term MEM=128M PAGE_TEST=1`, then
 //                        `pagetest fill 112`). Needs PAGE_TEST=1 (Makefile).
+#if defined(SIGNETOS_PAGING)
 Capability s_gate_page_test = nullptr;
 
 struct PageArena {
@@ -857,10 +866,11 @@ bool arena_open(PageArena* a, size_t bytes) {
       },
       [](Capability q) { return sealing::is_sealed_as(OType::QuotaVm, q); });
   if (sealing::is_sealed_as(OType::QuotaVm, a->quota)) {
-    // No image: an empty compartment, with the full handle, for the shell to
-    // allocate into itself.
+    // No image: an empty, pageable compartment, with the full handle, for
+    // the shell to allocate into itself.
     a->comp = syscall::call<FnCompCreate>(s_gate_invoke, s_gate_comp_create,
-                                          a->quota, nullptr, nullptr, nullptr);
+                                          a->quota, nullptr, nullptr, nullptr,
+                                          COMPARTMENT_PAGEABLE);
   }
   if (!capability_is_valid(a->comp)) {
     out("[pagetest] no compartment to allocate for\n");
@@ -892,11 +902,35 @@ void arena_close(PageArena* a) {
   }
 }
 
-vm::PagingStats page_stats() {
+// One of the kernel's paging counts (vm.hpp, PAGE_TEST_*), or ~0 if refused.
+uint64_t page_count(uint64_t which) {
   using Fn = decltype(&sys_page_test);
-  vm::PagingStats st{};
-  syscall::call<Fn>(s_gate_invoke, s_gate_page_test, vm::PAGE_TEST_STATS,
-                    bounded(&st));
+  return syscall::call<Fn>(s_gate_invoke, s_gate_page_test, which, nullptr);
+}
+
+// The counts a test compares before and after. All zero if the kernel
+// refuses: paging is off, or it was built without PAGE_TEST.
+struct PagingStats {
+  uint64_t slots;
+  uint64_t free_frames;
+  uint64_t reserve;
+  uint64_t reads;
+  uint64_t writes;
+  uint64_t checks;
+  uint64_t digest_errors;
+};
+PagingStats page_stats() {
+  PagingStats st{};
+  if (page_count(vm::PAGE_TEST_SLOTS) == ~0ULL) {
+    return st;
+  }
+  st.slots = page_count(vm::PAGE_TEST_SLOTS);
+  st.free_frames = page_count(vm::PAGE_TEST_FREE_FRAMES);
+  st.reserve = page_count(vm::PAGE_TEST_RESERVE);
+  st.reads = page_count(vm::PAGE_TEST_READS);
+  st.writes = page_count(vm::PAGE_TEST_WRITES);
+  st.checks = page_count(vm::PAGE_TEST_CHECKS);
+  st.digest_errors = page_count(vm::PAGE_TEST_DIGEST_ERRORS);
   return st;
 }
 
@@ -907,14 +941,14 @@ bool evict(Capability mem) {
                         mem) == ~0ULL) {
     return false;
   }
-  for (int i = 0; i < 5000 && page_stats().evicting != 0; ++i) {
+  for (int i = 0; i < 5000 && page_count(vm::PAGE_TEST_EVICTING) != 0; ++i) {
     sleep_us(1000);
   }
-  return page_stats().evicting == 0;
+  return page_count(vm::PAGE_TEST_EVICTING) == 0;
 }
 
 // Touches each page of `mem`, for pages brought in after the ones a test
-// sends out: the last few brought in never go (vm.cpp, RECENT).
+// sends out: the last few brought in never go (paging.cpp, RECENT).
 void touch(Capability mem) {
   auto* w = reinterpret_cast<volatile uint64_t*>(mem);
   for (size_t off = 0; off < capability_get_length(mem); off += vm::PAGE_SIZE) {
@@ -946,6 +980,9 @@ void pagetest_basic() {
     return capability_set_address(
         mem, capability_get_base(mem) + (p * vm::PAGE_SIZE) + 2048);
   };
+  // Counted from before the pages are written: the pager may send one out
+  // on its own (vm.hpp, FRAMES) before the test asks it to.
+  const PagingStats before = page_stats();
   for (size_t p = 0; p < PAGES; ++p) {
     c[p * PT_WORDS / 2] = middle(p);
     for (size_t i = 2; i < PT_WORDS; ++i) {
@@ -953,13 +990,12 @@ void pagetest_basic() {
     }
   }
   touch(spacer);
-  const vm::PagingStats before = page_stats();
   if (!evict(mem)) {
     out("[pagetest] the pages did not go out\n");
     arena_close(&a);
     return;
   }
-  const vm::PagingStats out_st = page_stats();
+  const PagingStats out_st = page_stats();
   size_t wrong = 0;
   for (size_t p = 0; p < PAGES; ++p) {
     const Capability got = c[p * PT_WORDS / 2];
@@ -971,7 +1007,7 @@ void pagetest_basic() {
       wrong += (w[(p * PT_WORDS) + i] == ((p << 32) | i)) ? 0 : 1;
     }
   }
-  const vm::PagingStats after = page_stats();
+  const PagingStats after = page_stats();
   const uint64_t went = out_st.writes - before.writes;
   const uint64_t came = after.reads - out_st.reads;
   out_dec("[pagetest] out and back: ", went, " pages out, ");
@@ -1001,7 +1037,7 @@ void pagetest_revoke() {
   h[0] = target;  // freed while the holder is on disk
   h[1] = spacer;  // live throughout
   touch(spacer);
-  const vm::PagingStats before = page_stats();
+  const PagingStats before = page_stats();
   if (!evict(holder)) {
     out("[pagetest] the holder did not go out\n");
     arena_close(&a);
@@ -1016,7 +1052,7 @@ void pagetest_revoke() {
   const uint64_t seen =
       syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
   revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 2);
-  const vm::PagingStats after = page_stats();
+  const PagingStats after = page_stats();
   const bool gone = !capability_is_valid(h[0]);  // the holder comes back here
   const bool kept = capability_is_valid(h[1]);
   out_dec("[pagetest] revocation: ", after.checks - before.checks,
@@ -1051,7 +1087,8 @@ void pagetest_fill(const char* arg) {
   for (size_t k = 0; k < chunks; ++k) {
     mem[k] = arena_alloc(a, CHUNK);
     if (!capability_is_valid(mem[k])) {
-      out("[pagetest] could not allocate\n");
+      out("[pagetest] could not allocate: no more pageable memory than swap "
+          "holds (vm.hpp, SWAP)\n");
       arena_close(&a);
       return;
     }
@@ -1061,9 +1098,11 @@ void pagetest_fill(const char* arg) {
     return ((k << 32) | p) ^ 0x5A5A5A5A00000000ULL;
   };
   // One phase, writing or reading back: its time, and what paged meanwhile.
-  vm::PagingStats st = page_stats();
+  PagingStats st = page_stats();
+  const uint64_t spare =
+      st.free_frames > st.reserve ? st.free_frames - st.reserve : 0;
   out_dec("[pagetest] fill: ", chunks * PAGES, " pages, with ");
-  out_dec("", (st.free_frames - st.reserve) * vm::PAGE_SIZE / (1024 * 1024),
+  out_dec("", spare * vm::PAGE_SIZE / (1024 * 1024),
           " MiB of RAM free for them\n");
   size_t wrong = 0;
   for (int phase = 0; phase < 2; ++phase) {
@@ -1078,7 +1117,7 @@ void pagetest_fill(const char* arg) {
         }
       }
     }
-    const vm::PagingStats now = page_stats();
+    const PagingStats now = page_stats();
     out(phase == 0 ? "[pagetest]   written" : "[pagetest]   read back");
     out_dec(" in ", (now_us() - t0) / 1000, " ms: ");
     out_dec("", now.writes - st.writes, " pages out, ");
@@ -1091,6 +1130,7 @@ void pagetest_fill(const char* arg) {
 }
 
 void cmd_pagetest(char* args) {
+  s_gate_page_test = rw_table()[SLOT_SYS_PAGE_TEST];
   if (!capability_is_valid(s_gate_page_test) || page_stats().slots == 0) {
     out("[pagetest] paging is off, or the kernel was built without "
         "PAGE_TEST=1\n");
@@ -1105,6 +1145,11 @@ void cmd_pagetest(char* args) {
     pagetest_revoke();
   }
 }
+#else   // !SIGNETOS_PAGING
+void cmd_pagetest(char*) {
+  out("[pagetest] this system was built without paging (PAGING=0)\n");
+}
+#endif  // SIGNETOS_PAGING
 
 // Runs one command line (edited in place to split off arguments). False means
 // the console should end.
@@ -1360,7 +1405,6 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_comp_destroy = gate_comp_destroy;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
-  s_gate_page_test = rw[SLOT_SYS_PAGE_TEST];
   s_run_ready = sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&
                 capability_is_valid(s_sched_derive) &&
@@ -1430,10 +1474,12 @@ extern "C" int64_t compartment_main(Capability arg) {
   console_loop();  // returns on `shutdown`
 
   out("[shell]    shutting down; shell exiting\n");
+#if defined(SIGNETOS_PAGING)
   // The pager's thread too, or the machine would never stop (blk.cpp, PAGING).
   if (capability_is_valid(rw[SLOT_PAGING_STOP])) {
     invoke<int64_t>(gate_invoke, rw[SLOT_PAGING_STOP]);
   }
+#endif
   // Returning exits the shell thread. With nothing left registered, the
   // scheduler's dispatcher exits too and the kernel's host loop returns.
   return 0;

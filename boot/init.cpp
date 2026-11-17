@@ -64,8 +64,8 @@
  *      `quota_sched` node, the disk), `/home`, `/bin` and `/apps`, which it
  *      holds from then on; its thread is made from those quotas and
  *      registered with the scheduler. Then, if `blk` found swap, the pager's
- *      thread, and paging on. Last, so that every compartment `init` started
- *      stays in RAM (vm.hpp, PAGING): what pages is what the shell runs.
+ *      thread, and paging on. No compartment `init` starts is pageable
+ *      (vm.hpp, PAGING): what pages is what the shell runs.
  *  10. Records every handle in its own table for the kernel's tests, then
  *  11. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
@@ -461,8 +461,9 @@ struct Launcher {
                      : capability_set_bounds(
                            reinterpret_cast<Capability>(&s_seeds[0]),
                            static_cast<size_t>(m.count) * sizeof(Capability));
+    // Flags 0: not pageable (vm.hpp, PAGING, WHAT MUST NOT WAIT).
     if (!create_compartment(invoke, gate_comp_create, gate_comp_destroy,
-                            r.quota, seeds, image, &r.comp, &r.sentry)) {
+                            r.quota, seeds, image, 0, &r.comp, &r.sentry)) {
       warn(who, "could not be loaded");
       close_fs_seeds(m);
     }
@@ -555,12 +556,13 @@ extern "C" int64_t compartment_main(Capability arg) {
   // Only `init` holds this gate.
   const Capability gate_trap_install =
       rw[init::syscall_slot(syscall::Id::trap_install)];
+#if defined(SIGNETOS_PAGING)
   // Turns paging on, once the shell is up. Out of the table at once, so that
-  // no image can ask for it and turn paging on before what must stay in RAM
-  // is up.
+  // no image can ask for it.
   const Capability gate_page_setup =
       rw[init::syscall_slot(syscall::Id::page_setup)];
   rw[init::syscall_slot(syscall::Id::page_setup)] = nullptr;
+#endif
   auto install_irq = [&](Capability thread) -> bool {
     using Fn = decltype(&sys_trap_install);
     return sealing::is_sealed_as(OType::Thread, thread) &&
@@ -675,10 +677,12 @@ extern "C" int64_t compartment_main(Capability arg) {
   // disk): it polls until step 8 hands it the scheduler's entries and the
   // wait for its device's interrupt.
   const Started blk = L.start("blk", manifest->blk_img, 0);
+#if defined(SIGNETOS_PAGING)
   // Nobody after `blk` gets the pager's calls: with them, whoever holds them
   // reads every page that goes to swap, and says what comes back.
   rw[init::syscall_slot(syscall::Id::page_next)] = nullptr;
   rw[init::syscall_slot(syscall::Id::page_done)] = nullptr;
+#endif
   // One-shot handshake (abi.hpp, `BlkInterface`): the driver gets what `dma`
   // set up for it and hands back `read` and `write`, the pager's entries,
   // and how much of the disk is swap.
@@ -701,8 +705,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   // reachable through `fs` handles and through nothing else.
   L.offer("blk.read", blk_if.read);
   L.offer("blk.write", blk_if.write);
+#if defined(SIGNETOS_PAGING)
   // For the shell's `shutdown`: the machine stops once no thread is left.
   L.offer("blk.paging_stop", blk_if.paging_stop);
+#endif
 
   // =========================================================================
   // 4. `fs`: the file system
@@ -972,8 +978,9 @@ extern "C" int64_t compartment_main(Capability arg) {
   // Paging
   // -------------------------------------------------------------------------
   // If `blk` found swap: the pager's thread, on a node of its own (blk.cpp,
-  // PAGING), then paging on. Last, so that everything started above stays
-  // in RAM (vm.hpp, PAGING, WHAT MUST NOT WAIT).
+  // PAGING), then paging on. Nothing started above is pageable (`start`), as
+  // none of it may be (vm.hpp, PAGING, WHAT MUST NOT WAIT).
+#if defined(SIGNETOS_PAGING)
   if (blk_if.swap_pages != 0) {
     init::ManifestEntry node;
     zero_bytes(&node, sizeof(node));
@@ -1009,6 +1016,7 @@ extern "C" int64_t compartment_main(Capability arg) {
       say("[init]     WARNING: paging is off; all memory stays in RAM\n");
     }
   }
+#endif
 
   // =========================================================================
   // 10. Record all provisioned handles in `init`'s capability table

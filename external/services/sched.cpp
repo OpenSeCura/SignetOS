@@ -1315,8 +1315,12 @@ Capability on_interrupt(uint64_t cause, uint64_t tid, uint64_t pager) {
   busy_begin();
   const uint64_t now = now_us();
   charge_running(now);
+#if defined(SIGNETOS_PAGING)
   const bool page_wait = cause == irq::PAGE_WAIT &&
                          !__atomic_load_n(&cur->killed, __ATOMIC_SEQ_CST);
+#else
+  const bool page_wait = false;  // no thread ever waits for a page
+#endif
   if (page_wait) {
     if (pager != 0) {
       sched_wake_entry(pager);

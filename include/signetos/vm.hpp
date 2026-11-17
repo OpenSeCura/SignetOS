@@ -35,11 +35,10 @@
 //
 // Everything from DYNAMIC_BASE (the gigabyte after the kernel image) up to the
 // revocation bitmap is one pool of virtual addresses handed out by
-// `alloc_pages` as they are asked for. An address is in use exactly while it
-// is mapped; the page tables are the only record. There are no per-purpose
-// regions: kernel objects and
-// compartment memory come from the same pool and are distinguished by who
-// holds a capability to them, not by where they sit.
+// `alloc_pages` as they are asked for. An address is in use exactly while its
+// leaf entry is not zero (PAGES); the page tables are the only record. Kernel
+// objects and compartment memory come from the same pool and are
+// distinguished by who holds a capability to them, not by where they sit.
 //
 // THE DIRECT MAP
 //
@@ -148,6 +147,21 @@ constexpr uint64_t bitmap_of(uint64_t va) {
 }
 static_assert(bitmap_of(BITMAP_BASE) <= DYNAMIC_TOP);
 
+// PAGES
+//
+// A page of the pool is free (its leaf entry is zero) or in use. A page in
+// use either has a frame (it is resident) or it does not, and its entry says
+// which (pte, NON-RESIDENT ENTRIES). Two moves change that and nothing else
+// does: one gives a page its frame, one takes it away (vm_pages.hpp).
+// Allocation reserves addresses; memory that is not pageable is given its
+// frames there and then, and keeps them until it is reclaimed.
+//
+// Pageable memory (PAGING) can be anywhere in the pool. A 2MB region with a
+// page in use holds either pageable memory or memory that keeps its frames,
+// never both, so where a page is says whether its frame may be taken; an
+// empty region can become either. Without SIGNETOS_PAGING nothing is
+// pageable, no frame is ever taken away, and every page in use is resident.
+
 // The direct map: all of RAM, kernel-only, at the bottom of the upper half.
 constexpr uint64_t DIRECT_BASE = 0xFFFFFFC000000000ULL;
 
@@ -201,6 +215,10 @@ namespace pte {
     constexpr uint64_t KindFresh   = 1ULL << 1;  // never touched
     constexpr uint64_t KindSwapped = 2ULL << 1;  // its contents are on disk
     constexpr uint64_t KindHeld    = 3ULL << 1;  // reclaimed, not reusable yet
+
+    // A Swapped entry names the slot of swap its page is in (PAGING, SWAP),
+    // in the bits above the flags, where a resident entry names its frame.
+    constexpr unsigned SlotShift = 10;
 }
 
 // An address is in use while its leaf entry is non-zero; resident while it is
@@ -210,6 +228,7 @@ constexpr bool pte_resident(uint64_t e) { return (e & pte::Valid) != 0; }
 constexpr uint64_t pte_kind(uint64_t e) {
   return pte_resident(e) ? 0 : (e & pte::KindMask);
 }
+constexpr uint64_t pte_slot(uint64_t e) { return e >> pte::SlotShift; }
 
 // Builds the boot mappings (devices, direct map), derives the two standing
 // authorities, and turns the MMU on for this hart (satp, then
@@ -269,14 +288,36 @@ constexpr size_t bitmap_pages(size_t pages) {
   return (pages * PAGE_SIZE + BITMAP_SPAN - 1) / BITMAP_SPAN;
 }
 
+// `pages` rounded up to a count a capability can be bounded to exactly: what
+// an allocation of `pages` takes, and is charged for. 0 if `pages` is 0 or
+// more than the pool holds.
+size_t round_up_pages(size_t pages);
+
 // Allocates `pages` contiguous pages at the lowest free addresses that fit
-// (up to 2MB within one 2MB region, larger as whole empty 2MB regions).
-// Page tables are taken from the frame allocator as needed. Returns a capability bounded to exactly
-// that range with DataRw, or null. Contents are zeroed. If `revocable`, the
-// range starts on a BITMAP_SPAN boundary and comes with `bitmap_pages(pages)`
-// more frames of revocation bitmap (REVOCATION BITMAP), which the caller pays
-// for too.
-Capability alloc_pages(size_t pages, bool revocable = false);
+// (up to 2MB within one 2MB region, larger as whole empty 2MB regions), and
+// returns a capability bounded to exactly that range with DataRw, or null.
+// `pages` must be its own `round_up_pages`. Contents are zeroed. Page tables
+// are taken from the frame allocator as needed. If `revocable`, the range
+// starts on a BITMAP_SPAN boundary and comes with `bitmap_pages(pages)` more
+// frames of revocation bitmap (REVOCATION BITMAP), which the caller pays for
+// too.
+//
+// `backing` says how the pages get their frames. Null if RAM has not the
+// frames (Frames) or no run of them (OneRun), or if swap has not a slot for
+// each page (Pageable; PAGING, SWAP): always, unless paging is on.
+enum class Backing {
+  // A frame each, there and then, kept until the memory is reclaimed. Any
+  // free frames: they need not be adjacent in RAM.
+  Frames,
+  // The same, on adjacent frames in address order: one run of RAM. Only
+  // memory a device is pointed at needs it (FLAG_DMA).
+  OneRun,
+  // None yet: a page gets its frame when it is touched, and may go to swap
+  // (PAGING).
+  Pageable,
+};
+Capability alloc_pages(size_t pages, bool revocable = false,
+                       Backing backing = Backing::Frames);
 
 // Frees an allocation from alloc_pages by quarantining it. Nothing is unmapped
 // and no frame is released: the range stays mapped, with its data, until a
@@ -300,10 +341,10 @@ Capability next_live_page(uint64_t* cursor);
 // Unmaps every quarantined page in the dynamic address space, and its bitmap
 // page, and frees their frames; the addresses are then free for reuse.
 // Called by `revoke::sweep()` after all capability tags pointing into
-// quarantined ranges have been cleared. If `hold`, the sweep is waiting for
-// checks of swap (PAGING, REVOCATION), and the addresses are left Held until
-// `release_held`.
-void reclaim_quarantined(bool hold);
+// quarantined ranges have been cleared. With paging the addresses are left
+// Held instead, until the sweep is complete and calls `release_held`
+// (PAGING, REVOCATION).
+void reclaim_quarantined();
 
 // Kernel-only read/write view of the whole revocation bitmap (REVOCATION
 // BITMAP), for `revoke`, which owns what is in it. Only the pages of
@@ -313,43 +354,61 @@ Capability bitmap_view();
 
 // PAGING
 //
+// Built only with SIGNETOS_PAGING (the Makefile's PAGING), in paging.cpp.
+//
 // What compartments allocate can move to disk and back. The kernel decides
 // everything -- which pages go out, when, and where they come back -- and
 // `blk` moves the bytes, because only a thread can wait for the disk. A
 // page's state is in its leaf entry: Fresh, resident, Swapped, or Held
 // (NON-RESIDENT ENTRIES).
 //
-// THE PAGEABLE REGION. Pageable memory comes from a region at the top of the
-// pool, one page per slot of swap, so a page's slot is fixed by its address;
-// where the slots are on the disk is `blk`'s business. Memory is pageable
-// unless it is the kernel's own, DMA memory, or a compartment's that was
-// created before paging started -- and `init` starts paging after everything
-// it starts (WHAT MUST NOT WAIT), so what pages is the programs the shell
-// runs.
+// WHAT IS PAGEABLE. A compartment's memory is pageable if its creator made
+// it so (compartment.hpp, FLAG_PAGEABLE), DMA memory excepted; the kernel's
+// own never is. `init` makes nothing pageable (WHAT MUST NOT WAIT), so what
+// pages is the programs the shell runs.
 //
-// FAULTS. On a fault on a pageable page that is not resident, a Fresh page is
-// zero-filled at once if a frame is free. Otherwise the thread is noted as
-// waiting for the page, and the scheduler is told to block it and wake the
-// pager (trap.hpp, PAGE_WAIT); once the page is in, the pager wakes it, and
-// the access runs again. A thread that faulted with interrupts off cannot
-// wait like that, and its fault is an ordinary one.
+// SWAP. No more pageable pages are in use than swap has slots: an
+// allocation that would make more is refused. So a page that has to leave
+// RAM always has a slot to go to, and what one compartment allocates cannot
+// leave another's pages with nowhere to be. A page is given its slot as it
+// goes out, and its entry names the slot while it is there. The slot is free
+// again once the page is back in, or has been reclaimed. Where the slots are
+// on the disk is `blk`'s business.
+//
+// FAULTS. A page fault is paging's if the page it names is in use and has no
+// frame (Fresh or Swapped): only pageable memory is ever seen so. An access
+// that runs across two pages names the one that is missing, so one page is
+// all a fault is ever about. A Fresh page is zero-filled at once if there is
+// a frame to spare (FRAMES). Otherwise the thread is noted as waiting for
+// the page, and the scheduler is told to block it and wake the pager
+// (trap.hpp, PAGE_WAIT); once the page is in, the pager wakes it, and the
+// access runs again. It waits for as long as that takes: a fault on a page
+// in use is never turned into an ordinary one for want of a frame. The one
+// that is ordinary is that of a thread that faulted with interrupts off,
+// which cannot wait.
 //
 // THE PAGER. One thread of `blk`'s asks for a job (`page_next`), does its
 // 4 KiB transfer to or from its slot, and says so (`page_done`), one job at a
 // time, and sleeps when there is none. The jobs, most urgent first: wake a
 // thread whose page is in (or gone); bring in a page a thread waits for,
-// writing one out first if there is no frame for it; write pages out until
-// the reserve is back (FRAMES); write out the pages a test asked for; read a
-// page back for a check (REVOCATION). A page goes out by a clock over the resident pages that
-// passes over the last few brought in: its entry becomes Swapped, its bytes
-// are copied into `blk`'s buffer, and its frame is freed at once.
+// writing one out first if there is no frame to spare; write pages out to
+// keep frames free (FRAMES); write out the pages a test asked for; read a
+// page back for a check (REVOCATION). A page goes out by a
+// clock over the resident pages of pageable memory that passes over the last
+// few brought in: its entry becomes Swapped, its bytes are copied into
+// `blk`'s buffer, and its frame is freed at once.
 //
 // ONE HART. Like the sweep, paging relies on every thread running on the
 // boot hart (DESIGN.md §4.4): the kernel's own `sfence.vma` is all a page
 // needs as it leaves, and nothing pages while a sweep runs.
 //
-// FRAMES. A pageable page never takes one of the last free frames, a share of
-// RAM kept for what cannot wait: page tables, kernel objects, pinned memory.
+// FRAMES. Three marks, each a number of free frames and a share of RAM. A
+// pageable page never takes one of the last `reserve` free frames: those are
+// kept for what cannot wait -- page tables, kernel objects, memory that is
+// not pageable. Once fewer than `low` are free the pager writes pages out,
+// and goes on until `high` are, so that a fault mostly finds a frame to
+// spare and need not wait. The pager sees that frames are short when a fault
+// has to wait, or on its next round (blk.cpp, PAGING), whichever is first.
 //
 // CAPABILITIES. A page that goes out leaves, beside its slot, a bitmap of the
 // 16-byte granules that held capabilities. When it comes back, each is built
@@ -362,9 +421,10 @@ Capability bitmap_view();
 // REVOCATION. A sweep cannot see capabilities on disk. If there are any, it
 // asks for them to be checked (`start_checks`): the pager reads each such page
 // back, and every capability the sweep revokes is cleared from its bitmap, so
-// it is never built again. Until that is done the sweep is not complete: what
-// it reclaimed is Held (frame freed, address not reused) and its marks stay.
-// A page that comes in meanwhile is checked the same way as it comes in.
+// it is never built again. What a sweep reclaims is Held (frame freed,
+// address not reused) and its marks stay until it is complete: at once if
+// nothing had to be checked, else when the checks are done. A page that comes
+// in meanwhile is checked the same way as it comes in.
 //
 // KERNEL ACCESS. The kernel never takes a fault on pageable memory. To read
 // or write a compartment's memory it takes a ResidentHold, which fails if a
@@ -378,28 +438,22 @@ Capability bitmap_view();
 // only through `fs` and the console, which touch a program's memory only
 // while holding nothing the pager needs.
 
+// What paging makes of a page fault (FAULTS). No: an ordinary fault. Retry:
+// the page is in now. Wait: the thread waits for it, and is to block until
+// the pager wakes it.
+enum class Fault { No, Retry, Wait };
+
+#if defined(SIGNETOS_PAGING)
+
 // Sets paging up, once, for `slots` pages of swap. NotInitialized without a
 // root to build capabilities from (set_retag_root); Busy if it is set up
-// already or the region's addresses are in use; InvalidSize if it does not
-// fit; NoMemory without the memory for the slots' bitmaps.
+// already; InvalidSize if `slots` is 0, or more than an entry can name;
+// NoMemory without the memory for what is kept beside each slot.
 Status setup_paging(size_t slots);
 bool paging_on();
 
-// `pages` rounded up to a length a pageable allocation can be bounded to
-// exactly, or 0 if there can be no such allocation.
-size_t round_up_pageable_pages(size_t pages);
-
-// Reserves `pages` of the pageable region, all Fresh, and returns a capability
-// bounded to exactly them, like alloc_pages. Takes no frames, but for a
-// revocable allocation its bitmap pages. Null unless `pages` is its own
-// round_up_pageable_pages.
-Capability alloc_pageable_pages(size_t pages, bool revocable = false);
-
-// FAULTS: a page fault at `addr` by thread `tid`. No: not paging's, an
-// ordinary fault. Retry: every page the access touches is in now. Wait: the
-// thread, which can wait (`can_wait`), waits for one, and is to block until
-// the pager wakes it; `pager_tid` is the pager's thread, or 0.
-enum class Fault { No, Retry, Wait };
+// FAULTS: a page fault at `addr` by thread `tid`, which can wait for a page
+// only if `can_wait`. `pager_tid` is the pager's thread, or 0.
 Fault fault(uint64_t addr, bool can_wait, uint64_t tid);
 uint64_t pager_tid();
 
@@ -421,7 +475,8 @@ void page_done(Capability buf);
 
 // REVOCATION, for `revoke`. `start_checks` begins the checks a sweep needs
 // and says whether there are any; `checks_pending` whether they are still
-// going on; `release_held` frees what the sweep left Held, once they are done.
+// going on. `release_held` frees the addresses the sweep reclaimed, once it
+// is complete.
 bool start_checks();
 bool checks_pending();
 void release_held();
@@ -454,21 +509,41 @@ class ResidentHold {
 bool set_retag_root(Capability root);
 
 // sys_page_test, for the shell's `pagetest`, built in only with PAGE_TEST=1
-// (Makefile): STATS writes a PagingStats at `cap`; EVICT sends the resident
-// pages of `cap`'s range out. ~0 if refused, and always without PAGE_TEST.
-struct alignas(16) PagingStats {
-  uint64_t slots;          // pages of swap
-  uint64_t free_frames;    // free frames now
-  uint64_t reserve;        // of them, the reserve (FRAMES)
-  uint64_t reads;          // pages read back for faults
-  uint64_t writes;         // pages written out
-  uint64_t checks;         // pages read back for checks
-  uint64_t digest_errors;  // copies refused (SWAP_HASH)
-  uint64_t evicting;       // pages EVICT still has to send out
-};
-constexpr uint64_t PAGE_TEST_STATS = 0;
-constexpr uint64_t PAGE_TEST_EVICT = 1;
+// (Makefile). EVICT sends the resident pages of the range `cap` covers out,
+// and returns how many pages that is. Every other `op` returns one count,
+// and takes no `cap`: the kernel writes nothing to its caller's memory.
+// ~0 if refused, and always without PAGE_TEST.
+constexpr uint64_t PAGE_TEST_EVICT = 0;
+constexpr uint64_t PAGE_TEST_SLOTS = 1;          // pages of swap
+constexpr uint64_t PAGE_TEST_FREE_FRAMES = 2;    // free frames now
+constexpr uint64_t PAGE_TEST_RESERVE = 3;        // of them, the reserve (FRAMES)
+constexpr uint64_t PAGE_TEST_READS = 4;          // pages read back for faults
+constexpr uint64_t PAGE_TEST_WRITES = 5;         // pages written out
+constexpr uint64_t PAGE_TEST_CHECKS = 6;         // pages read back for checks
+constexpr uint64_t PAGE_TEST_DIGEST_ERRORS = 7;  // copies refused (SWAP_HASH)
+constexpr uint64_t PAGE_TEST_EVICTING = 8;       // pages EVICT has yet to send
 uint64_t page_test(uint64_t op, Capability cap);
+
+#else  // !SIGNETOS_PAGING
+
+// Every page in use is resident, so each place the kernel meets paging does
+// nothing: no fault is paging's, a sweep has nothing on disk to check,
+// memory the kernel is about to touch is always there, and the boot root is
+// not kept.
+constexpr bool paging_on() { return false; }
+inline bool set_retag_root(Capability) { return true; }
+inline Fault fault(uint64_t, bool, uint64_t) { return Fault::No; }
+inline uint64_t pager_tid() { return 0; }
+inline bool start_checks() { return false; }
+inline bool checks_pending() { return false; }
+inline void release_held() {}
+class ResidentHold {
+ public:
+  ResidentHold(uint64_t, size_t) {}
+  bool ok() const { return true; }
+};
+
+#endif  // SIGNETOS_PAGING
 
 // Diagnostics.
 size_t table_pages();         // frames held as page tables (never freed)

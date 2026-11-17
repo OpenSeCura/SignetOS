@@ -360,16 +360,17 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   // pageable memory, which is paging's: the access runs again, once the page
   // is in (vm.hpp, PAGING, FAULTS).
   if (!async) {
-    // MPIE is the MIE the faulting code had: only code that can be
-    // interrupted can wait for a page.
-    uint64_t mstatus = 0;
-    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
-    const vm::Fault paging =
+    vm::Fault paging = vm::Fault::No;
+    if (vm::paging_on() &&
         (mcause == EXC_INST_PAGE_FAULT || mcause == EXC_LOAD_PAGE_FAULT ||
-         mcause == EXC_STORE_PAGE_FAULT)
-            ? vm::fault(mtval, (mstatus & MSTATUS_MPIE) != 0,
-                        thread::current_tid())
-            : vm::Fault::No;
+         mcause == EXC_STORE_PAGE_FAULT)) {
+      // MPIE is the MIE the faulting code had: only code that can be
+      // interrupted can wait for a page.
+      uint64_t mstatus = 0;
+      __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
+      paging = vm::fault(mtval, (mstatus & MSTATUS_MPIE) != 0,
+                         thread::current_tid());
+    }
     if (paging == vm::Fault::No) {
       return dispatch_fault(mcause, mtval, mtval2, frame);
     }

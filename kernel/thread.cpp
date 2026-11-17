@@ -271,7 +271,13 @@ Capability create(Capability thread_mem_quota, size_t stack_size,
     return fail_with(out_status, Status::InvalidCapability);
   }
 
-  const size_t stack_pages = (stack_size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE;
+  // Whole pages, and as many as a capability can be bounded to exactly: that
+  // is what is allocated, and charged.
+  const size_t stack_pages =
+      vm::round_up_pages((stack_size + vm::PAGE_SIZE - 1) / vm::PAGE_SIZE);
+  if (stack_pages == 0) {
+    return fail_with(out_status, Status::BadStackSize);
+  }
   const uint64_t stack_bytes = stack_pages * vm::PAGE_SIZE;
   const uint64_t total_cost = THREAD_STATE_COST + stack_bytes;
   if (total_cost < stack_bytes) {

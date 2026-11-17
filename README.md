@@ -70,6 +70,7 @@ You can also use `make` directly:
 | `make` | build `signetos.elf` and `disk.img` |
 | `make term` | build if needed, then boot in QEMU on this terminal |
 | `make TRACE_SWITCH=1 term` | the same, but log every thread switch |
+| `make PAGING=0 term` | the same, built without paging: no pager and no swap, and all memory stays in RAM |
 | `make disk` | rewrite `disk.img` only |
 | `make clean` | remove build outputs (keeps `disk.img`) |
 

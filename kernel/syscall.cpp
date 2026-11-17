@@ -253,12 +253,13 @@ extern "C" int sys_quota_thread_mem_destroy(
 // discarded and the caller sees NULL.
 extern "C" capability_compartment_t sys_compartment_create(
     capability_quota_vm_t mem_quota, capability_data_t initial_capabilities,
-    capability_data_t image, capability_data_t out_loader) {
+    capability_data_t image, capability_data_t out_loader, uint32_t flags) {
   // Null, not merely untagged: an image whose tag was cleared (a revoked
   // buffer, say) still makes a compartment that loads itself (and finds
   // nothing to load), never one with the full handle.
   if (image == nullptr) {
-    return ::signetos::compartment::create(mem_quota, initial_capabilities);
+    return ::signetos::compartment::create(mem_quota, initial_capabilities,
+                                           flags);
   }
   if (!::signetos::syscall::can_store_at(out_loader)) {
     return nullptr;
@@ -266,7 +267,7 @@ extern "C" capability_compartment_t sys_compartment_create(
   capability_t loader = nullptr;
   const capability_compartment_t comp =
       ::signetos::compartment::create_from_image(
-          mem_quota, initial_capabilities, image, &loader);
+          mem_quota, initial_capabilities, image, flags, &loader);
   if (!::signetos::capability_is_valid(comp)) {
     return nullptr;
   }
@@ -327,6 +328,7 @@ extern "C" uint64_t sys_trap_install(capability_thread_t thread) {
 }
 
 // --- Paging ------------------------------------------------------------------
+#if defined(SIGNETOS_PAGING)
 
 extern "C" uint64_t sys_page_setup(size_t slots) {
   return static_cast<uint64_t>(::signetos::vm::setup_paging(slots));
@@ -344,3 +346,5 @@ extern "C" void sys_page_done(capability_data_t buf) {
 extern "C" uint64_t sys_page_test(uint64_t op, capability_t cap) {
   return ::signetos::vm::page_test(op, cap);
 }
+
+#endif  // SIGNETOS_PAGING

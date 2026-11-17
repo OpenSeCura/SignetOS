@@ -47,6 +47,10 @@ bool s_initialized = false;
 
 size_t s_allocated_count = 0;
 
+// No bitmap word below this index has a free frame. `find_run` starts its
+// search here and moves it up past full words; `free` moves it back down.
+size_t s_first_open = 0;
+
 bool test_bit(const uint64_t* bm, size_t i) {
     return (bm[i / FRAMES_PER_WORD] >> (i % FRAMES_PER_WORD)) & 1ULL;
 }
@@ -64,10 +68,17 @@ size_t find_run(size_t pages) {
     size_t run_start = 0;
     size_t run_len   = 0;
 
-    for (size_t w = 0; w < s_bitmap_words; ++w) {
-        // Frames under quarantined memory stay allocated until a sweep (see
-        // vm.hpp), so the low words fill up and stay full. Skipping them whole
-        // keeps allocation from rescanning the entire pool bit by bit.
+    // Frames under quarantined memory stay allocated until a sweep (see
+    // vm.hpp), so the low words fill up and stay full. The search starts
+    // above them, or taking frames one at a time would pass over all of them
+    // every time.
+    while (s_first_open < s_bitmap_words &&
+           s_allocated[s_first_open] == ~0ULL) {
+        ++s_first_open;
+    }
+
+    for (size_t w = s_first_open; w < s_bitmap_words; ++w) {
+        // A full word further up is skipped whole, rather than bit by bit.
         const uint64_t taken = s_allocated[w];
         if (taken == ~0ULL) {
             run_len = 0;
@@ -124,6 +135,7 @@ void init() {
     s_pool_pages      = 0;
     s_bitmap_words    = 0;
     s_allocated_count = 0;
+    s_first_open      = 0;
     s_initialized     = false;
 
     const uint64_t region_base = vm::boot_reserved_end();
@@ -218,6 +230,10 @@ bool free(uint64_t pa, size_t pages) {
 
     for (size_t i = start; i < start + pages; ++i) {
         clear_bit(s_allocated, i);
+    }
+    // The search for a free frame must not start above these.
+    if (start / FRAMES_PER_WORD < s_first_open) {
+        s_first_open = start / FRAMES_PER_WORD;
     }
     __atomic_store_n(&s_allocated_count, s_allocated_count - pages,
                      __ATOMIC_RELAXED);

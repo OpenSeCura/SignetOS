@@ -144,15 +144,9 @@ Status revoke(Capability comp, Capability mem_cap, uint64_t* out_epoch) {
   return Status::Ok;
 }
 
-namespace {
-
-// THE BASE RULE: true if `cap` is a valid capability whose base lies in a
-// marked range or a quarantined page. Standing kernel authorities (sealing
-// and ASR capabilities, the roots of whole address ranges) are never revoked.
-bool should_revoke(Capability cap) {
-  if (!capability_is_valid(cap)) {
-    return false;
-  }
+// THE BASE RULE. Standing kernel authorities (sealing and ASR capabilities,
+// the roots of whole address ranges) are never revoked.
+bool is_revoked(Capability cap) {
   const uint64_t p = capability_get_perms(cap);
   // Never revoke kernel system capabilities (return addresses, trap/switcher
   // sentries) or sealing authorities.
@@ -161,24 +155,28 @@ bool should_revoke(Capability cap) {
   }
   const uint64_t base = capability_get_base(cap);
   const uint64_t len = capability_get_length(cap);
-  // Only the dynamic space is ever freed or revoked. Never revoke the
+  // Only the pool (vm.hpp, LAYOUT) is ever freed or revoked. Never revoke the
   // standing kernel derivation roots (e.g. `vm::s_dynamic`,
   // `sentry::s_root_code_cap`), whose base is the base of the whole space.
-  if (base < vm::DYNAMIC_BASE || base >= vm::DYNAMIC_TOP ||
+  if (base < vm::DYNAMIC_BASE || base >= vm::BITMAP_BASE ||
       len >= vm::DYNAMIC_TOP - vm::DYNAMIC_BASE) {
     return false;
   }
 
-  // THE BASE RULE: a quarantined page, or a marked granule of a revocable one
-  // (called by the sweep with `s_lock` held).
+  // A quarantined page, one a waiting sweep has reclaimed (Held: SWAP), or a
+  // marked granule of a revocable one.
   const uint64_t flags = vm::leaf_flags(base);
-  if ((flags & vm::pte::Quarantined) != 0) {
+  if ((flags & vm::pte::Quarantined) != 0 ||
+      vm::pte_kind(flags) == vm::pte::KindHeld) {
     return true;
   }
   return (flags & vm::pte::Revocable) != 0 && is_marked(base);
 }
 
-// Clears the tag on every capability in `view` that should_revoke picks.
+namespace {
+
+// Clears the tag on every capability in `view` that THE BASE RULE picks
+// (called by the sweep with `s_lock` held).
 void scan(Capability view) {
   if (!capability_is_valid(view)) {
     return;
@@ -186,7 +184,7 @@ void scan(Capability view) {
   Capability* slots = reinterpret_cast<Capability*>(view);
   const size_t count = capability_get_length(view) / sizeof(Capability);
   for (size_t c = 0; c < count; ++c) {
-    if (capability_is_valid(slots[c]) && should_revoke(slots[c])) {
+    if (capability_is_valid(slots[c]) && is_revoked(slots[c])) {
       slots[c] = capability_clear_tag(slots[c]);
     }
   }
@@ -209,8 +207,10 @@ bool anything_pending() {
   return any_marked() || vm::quarantined_pages() > 0;
 }
 
-// Ends the sweep, its marks having done their job. Caller holds `s_lock`.
+// Ends the sweep, its marks having done their job: the addresses it
+// reclaimed are free for reuse (SWAP). Caller holds `s_lock`.
 void complete_locked() {
+  vm::release_held();
   clear_marks();
   const uint64_t swept = g_pending_epoch;
   __atomic_store_n(&g_completed_epoch, swept, __ATOMIC_RELEASE);
@@ -246,8 +246,8 @@ void sweep_locked() {
     // 4. All capabilities pointing into quarantined pages now have their
     //    hardware tags cleared. Unmap every quarantined page, free its
     //    physical frame, and return its virtual address range to the
-    //    reusable pool -- or, while the sweep waits, leave it Held.
-    vm::reclaim_quarantined(s_waiting);
+    //    reusable pool -- with paging, once the sweep is complete (SWAP).
+    vm::reclaim_quarantined();
     s_swept = true;
     s_last_sweep_end = clint::now();
   }
@@ -273,7 +273,6 @@ __attribute__((noinline)) void try_sweep(bool limited) {
     // A sweep waiting for its checks completes once they are done (SWAP).
     if (s_waiting) {
       if (!vm::checks_pending()) {
-        vm::release_held();
         s_waiting = false;
         complete_locked();
       }

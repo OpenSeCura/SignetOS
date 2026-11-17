@@ -85,8 +85,9 @@
  *   `s_lock` from asking to done, since its page is in the bounce buffer.
  *   A caller's buffer, which `handle` copies holding `s_lock`, must
  *   therefore never be pageable, or the copy would wait for the pager, which
- *   waits for `s_lock`: `fs`'s are not, since `fs` starts before paging
- *   does.
+ *   waits for `s_lock`: `fs`'s are not, since `init` makes no compartment
+ *   pageable. Built only with SIGNETOS_PAGING: without it there is no pager,
+ *   and a swap region is kept out of `read` and `write` and left alone.
  *
  * BEFORE THERE IS A SCHEDULER
  *   `blk` is in the boot set: `sched` is a file on the disk it serves, so at
@@ -107,18 +108,22 @@ namespace {
 // the driver still comes up and reports BLK_NO_DEVICE, and the file system
 // reports itself unmounted. `page_next` and `page_done` are the pager's
 // (PAGING); `init` grants them to nobody else.
+#if defined(SIGNETOS_PAGING)
+#define BLK_PAGING_MANIFEST(X)                           \
+  M_SYSCALL(X, SYS_PAGE_NEXT, page_next)                 \
+  M_SYSCALL(X, SYS_PAGE_DONE, page_done)
+#else
+#define BLK_PAGING_MANIFEST(X)
+#endif
 #define BLK_MANIFEST(X)                                  \
   M_SYSCALL(X, SYS_SENTRY, sentry)                       \
   M_SYSCALL(X, SYS_COMP_INVOKE, compartment_invoke)      \
-  M_SYSCALL(X, SYS_PAGE_NEXT, page_next)                 \
-  M_SYSCALL(X, SYS_PAGE_DONE, page_done)                 \
+  BLK_PAGING_MANIFEST(X)                                 \
   M_SERVICE(X, UART_SENTRY, "uart")
 SIGNETOS_MANIFEST(BLK_MANIFEST, 64 * 1024)
 // Runtime slots: the entry points minted in the handshake.
 constexpr size_t SLOT_READ_ENTRY  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 0;
 constexpr size_t SLOT_WRITE_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 1;
-constexpr size_t SLOT_PAGING_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
-constexpr size_t SLOT_PAGING_STOP  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 3;
 
 // --- The device, as `dma` left it (dma.cpp) ------------------------------------
 // The registers `blk` may write, as offsets into `s_notify`.
@@ -187,12 +192,18 @@ uint16_t s_last_used = 0;             // used-ring entries consumed so far
 // interrupt does not come.
 constexpr uint64_t WAIT_TIMEOUT_US = 10'000;
 
-// PAGING: how long the pager sleeps at most when the kernel has no job for
-// it, and whether it is to end (blk_paging_stop_entry).
-constexpr uint64_t PAGER_IDLE_US = 10'000;
 constexpr uint64_t SECTORS_PER_PAGE = init::BLK_XFER_BYTES / init::BLK_SECTOR_BYTES;
 static_assert(vm::PAGE_SIZE == init::BLK_XFER_BYTES);
+
+#if defined(SIGNETOS_PAGING)
+// PAGING: the pager's entry points' slots, how long the pager sleeps at most
+// when the kernel has no job for it, and whether it is to end
+// (blk_paging_stop_entry).
+constexpr size_t SLOT_PAGING_ENTRY = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 2;
+constexpr size_t SLOT_PAGING_STOP  = compartment::RW_SLOT_SEED_BASE + MANIFEST_COUNT + 3;
+constexpr uint64_t PAGER_IDLE_US = 10'000;
 bool s_paging_stop = false;
+#endif
 
 inline void fence() { __asm__ volatile("fence rw, rw" ::: "memory"); }
 
@@ -358,6 +369,8 @@ extern "C" int64_t blk_write_entry(Capability buf, uint64_t sector,
   return handle(buf, sector, count, BLK_T_OUT);
 }
 
+#if defined(SIGNETOS_PAGING)
+
 // PAGING: the pager's thread, until blk_paging_stop_entry.
 extern "C" uint64_t blk_paging_entry(Capability) {
   using FnNext = decltype(&sys_page_next);
@@ -402,6 +415,8 @@ extern "C" int64_t blk_paging_stop_entry() {
   __atomic_store_n(&s_paging_stop, true, __ATOMIC_RELEASE);
   return init::BLK_OK;
 }
+
+#endif  // SIGNETOS_PAGING
 
 namespace {
 
@@ -510,20 +525,22 @@ extern "C" int64_t compartment_main(Capability arg0, Capability arg1,
                                  reinterpret_cast<const void*>(&blk_read_entry));
   Capability e_write = mint_entry(s_gate_invoke, gate_sentry, self,
                                   reinterpret_cast<const void*>(&blk_write_entry));
+  rw[SLOT_READ_ENTRY] = e_read;
+  rw[SLOT_WRITE_ENTRY] = e_write;
+  iface->read = e_read;
+  iface->write = e_write;
+#if defined(SIGNETOS_PAGING)
   Capability e_paging = mint_entry(
       s_gate_invoke, gate_sentry, self,
       reinterpret_cast<const void*>(&blk_paging_entry));
   Capability e_paging_stop = mint_entry(
       s_gate_invoke, gate_sentry, self,
       reinterpret_cast<const void*>(&blk_paging_stop_entry));
-  rw[SLOT_READ_ENTRY] = e_read;
-  rw[SLOT_WRITE_ENTRY] = e_write;
   rw[SLOT_PAGING_ENTRY] = e_paging;
   rw[SLOT_PAGING_STOP] = e_paging_stop;
-  iface->read = e_read;
-  iface->write = e_write;
   iface->paging = e_paging;
   iface->paging_stop = e_paging_stop;
+#endif
   iface->capacity_sectors = s_capacity;
   iface->swap_pages = s_swap_pages;
   iface->status = init::BLK_OK;

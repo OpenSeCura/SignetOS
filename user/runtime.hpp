@@ -335,11 +335,13 @@ inline void revoke_wait(Capability invoke_gate, Capability query_gate,
 // ITSELF), and runs its loader once, on this thread. `*out_entry` is the
 // image's entry point, and `*out_comp` the handle the caller keeps, which can
 // only destroy the compartment. Destroys it via `destroy_gate` if loading
-// fails. `img_cap` can be released as soon as this returns.
+// fails. `img_cap` can be released as soon as this returns. `flags` are
+// `sys_compartment_create`'s.
 inline bool create_compartment(Capability invoke_gate, Capability create_gate,
                                Capability destroy_gate, Capability vm_quota,
                                Capability seeds, Capability img_cap,
-                               Capability* out_comp, Capability* out_entry) {
+                               uint32_t flags, Capability* out_comp,
+                               Capability* out_entry) {
   *out_comp = nullptr;
   *out_entry = nullptr;
   const init::CompartmentImageHeader* hdr = init::image_header(img_cap);
@@ -359,7 +361,7 @@ inline bool create_compartment(Capability invoke_gate, Capability create_gate,
       reinterpret_cast<Capability>(&loader), sizeof(Capability));
   using FnCompCreate = decltype(&sys_compartment_create);
   const Capability comp = syscall::call<FnCompCreate>(
-      invoke_gate, create_gate, vm_quota, seeds, img_cap, loader_out);
+      invoke_gate, create_gate, vm_quota, seeds, img_cap, loader_out, flags);
   if (!capability_is_valid(comp)) {
     return false;
   }
