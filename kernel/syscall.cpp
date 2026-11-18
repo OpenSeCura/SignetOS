@@ -205,6 +205,14 @@ extern "C" uint64_t sys_revoke_query(void) {
   return ::signetos::revoke::query();
 }
 
+extern "C" uint64_t sys_revoke_start(void) {
+  return ::signetos::revoke::start();
+}
+
+extern "C" uint64_t sys_revoke_step(size_t pages) {
+  return ::signetos::revoke::step(pages);
+}
+
 // --- Virtual memory quotas -------------------------------------------------
 // Not implemented: the roots are minted at boot by main.cpp, not by a call.
 extern "C" capability_quota_vm_t sys_quota_vm_create_root(

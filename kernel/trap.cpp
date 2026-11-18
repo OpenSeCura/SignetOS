@@ -43,6 +43,7 @@
 #include <signetos/debug/report.hpp>
 #include <signetos/fault.hpp>
 #include <signetos/irq.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/debug/inspect.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
@@ -301,8 +302,10 @@ bool install_context(TrapFrame* frame) {
   if (!capability_is_valid(frame->handler_ca0)) {
     return false;
   }
-  const auto* state =
-      reinterpret_cast<const fault::ErrorState*>(frame->handler_ca0);
+  // On the handler's stack: the registers come from there (revoke.hpp,
+  // KERNEL LOADS).
+  const auto* state = revoke::checked(
+      reinterpret_cast<const fault::ErrorState*>(frame->handler_ca0));
   // The faulting PCC with only its address changed: the handler moves the
   // program counter within its own code and nowhere else.
   const Capability pcc = capability_set_address(frame->mepcc, state->pc);
@@ -352,6 +355,14 @@ extern "C" Capability __signetos_trap_dispatch(uint64_t mcause, uint64_t mtval,
   // INTERRUPT IS THE KERNEL'S): cleared, and the interrupted context resumes.
   if (mcause == IRQ_M_SOFT) {
     irq::on_poke();
+    return nullptr;
+  }
+
+  // A capability loaded from a stale page (vm.hpp, CHECKED PAGES), which is
+  // what 1 in mtval2 says: the page is checked, and the load runs again. The
+  // sweep's, not the compartment's.
+  if (mcause == EXC_LOAD_PAGE_FAULT && mtval2 == revoke::STALE_LOAD &&
+      revoke::on_fault(mtval)) {
     return nullptr;
   }
 

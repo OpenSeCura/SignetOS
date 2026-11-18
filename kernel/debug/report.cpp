@@ -51,6 +51,8 @@ const char* const kStandardCause[16] = {
 // against target/riscv/cpu_bits.h in the QEMU tree:
 //     RISCV_EXCP_CHERI = 0x1c
 constexpr uint64_t kCheriFault = 28;
+//     RISCV_EXCP_LOAD_PAGE_FAULT = 0xd
+constexpr uint64_t kLoadPageFault = 13;
 
 // mtval2 layout for mcause 28, from cpu_helper.c:
 //     cheri_exc_info = cheri093_cap_cause(cause) | (type << 16)
@@ -174,6 +176,13 @@ void trap_report(const char* why, uint64_t mcause, uint64_t mepc,
     uart::print(", on ");
     uart::print(cheri_access(mtval2));
     uart::print("\n");
+  }
+  // A load page fault with 1 in mtval2 is a capability loaded from a page of
+  // another generation than the hart's (vm.hpp, CHECKED PAGES). Kernel code
+  // checks a page before it loads from it, so here it means a check is
+  // missing (revoke.hpp, KERNEL LOADS): mtval says for which page.
+  if (mcause == kLoadPageFault && mtval2 == 1) {
+    uart::print("  detail : a capability loaded from a stale page\n");
   }
 
   // mepc is the instruction that faulted, not the one after it, so the

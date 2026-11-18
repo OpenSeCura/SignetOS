@@ -75,9 +75,12 @@
 // a sweep has reclaimed, it walks every tree and refunds every node what it
 // is owed (`settle_owed`). No list of owed nodes is needed: a node that is
 // owed is not empty, so it is still linked into its tree, closed or not.
-// Nothing runs between the reclaim and the walk (the sweep runs with
-// interrupts masked on the one hart that runs threads; DESIGN.md, Multi-hart
-// status), so everything refunded has been reclaimed.
+//
+// A sweep reclaims what was freed before it started, and nothing freed while
+// it ran (revoke.hpp, EPOCHS). So a node keeps two counts, by the parity of
+// the sweep that will reclaim the memory: what is freed now goes in the next
+// sweep's, and a sweep that completes refunds its own and leaves the other.
+// Everything refunded has then been reclaimed.
 //
 // AUTHENTICATION VS ACCESS
 //
@@ -165,8 +168,9 @@ struct QuotaNode {
                               // closed node refunds what it is not using
     uint64_t allocated_bytes; // handed out: allocations, threads, and each
                               // child as its limit + QUOTA_NODE_COST
-    uint64_t owed_bytes;      // part of allocated_bytes freed but not yet
-                              // reclaimed by a sweep (OWED above)
+    uint64_t owed_bytes[2];   // part of allocated_bytes freed but not yet
+                              // reclaimed, by the parity of the sweep that
+                              // will reclaim it (OWED above)
     uint32_t flags;
     SpinLock lock;
 
@@ -236,10 +240,11 @@ bool query(Tree& t, Capability handle, QuotaNode* out_copy);
 // of any tree, or null for memory nobody paid for.
 void owe(Capability handle, uint64_t bytes);
 
-// Called by the sweep once it has reclaimed, holding no lock: walks every
-// tree and refunds every node what it is owed (OWED above).
+// Called by sweep `epoch` once it is complete, holding no lock: walks every
+// tree and refunds every node what it is owed for the memory that sweep
+// reclaimed (OWED above).
 constexpr size_t MAX_TREES = 2;  // VM and thread memory
-void settle_owed();
+void settle_owed(uint64_t epoch);
 
 // --- The VM quota tree (OType::QuotaVm) --------------------------------------
 

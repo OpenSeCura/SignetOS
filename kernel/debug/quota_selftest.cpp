@@ -56,6 +56,13 @@ void check(bool ok, const char* what) {
   }
 }
 
+// How a compartment holds a handle: in a page of the pool, where a sweep
+// finds it. This test is kernel code, and the kernel's own stack and
+// registers are no part of a sweep (vm.hpp, CHECKED PAGES), so a handle it
+// keeps across one, to show that it is refused afterwards, is kept here and
+// read back.
+volatile Capability* s_kept = nullptr;
+
 // Sweeps until nothing is left in quarantine. A sweep's refunds can empty a
 // closed node, whose page then waits for the next sweep, so it may take a
 // few.
@@ -70,6 +77,9 @@ void settle() {
 }
 
 void run(Capability root) {
+  const Capability kept = vm::alloc_pages(1);
+  check(capability_is_valid(kept), "a page to keep handles in");
+  s_kept = reinterpret_cast<volatile Capability*>(kept);
   const size_t nodes = live_nodes();
   const uint64_t root_before = available_of(root);
   Capability p = derive(root, 64 * PAGE, RW);
@@ -82,7 +92,9 @@ void run(Capability root) {
     check(available_of(p) == base - 5 * PAGE, "derive debits limit + node");
     check(destroy(q) == Status::Ok, "destroy empty");
     check(available_of(p) == base - PAGE, "the freed node page stays charged");
+    s_kept[0] = q;
     settle();
+    q = s_kept[0];
     check(available_of(p) == base, "the sweep refunds it");
     check(live_nodes() == nodes + 1, "empty destroy reclaims the node");
     check(charge(q, PAGE) != Status::Ok, "stale handle cannot charge");
@@ -113,7 +125,9 @@ void run(Capability root) {
     check(charge(q, PAGE) == Status::Ok, "charge parent");
     check(destroy(q) == Status::Ok, "destroy parent with a child");
     // q keeps its one page and its node; q2 held nothing and is gone.
+    s_kept[0] = q2;
     settle();
+    q2 = s_kept[0];
     check(available_of(p) == base - 2 * PAGE, "subtree returns all unused");
     check(charge(q2, PAGE) != Status::Ok, "child of a destroyed node is closed");
     check(destroy(q2) != Status::Ok, "closed child cannot be destroyed again");
@@ -149,7 +163,9 @@ void run(Capability root) {
     check(charge(b, PAGE) == Status::Ok, "charge middle");
     check(destroy(a) == Status::Ok, "destroy top");
     // c held nothing and is gone. Out: b's page, b's node, a's node.
+    s_kept[0] = c;
     settle();
+    c = s_kept[0];
     check(available_of(p) == base - 3 * PAGE, "every level's unused is back");
     check(charge(c, PAGE) != Status::Ok, "grandchild gone");
     check(charge(b, PAGE) != Status::Ok, "child closed");
@@ -209,7 +225,13 @@ void run(Capability root) {
     check(charge(b, PAGE) == Status::Ok, "charge middle child");
     check(destroy(q) == Status::Ok, "destroy wide subtree");
     // a, a1 and c held nothing and are gone. Out: b's page, b's node, q's node.
+    s_kept[0] = a;
+    s_kept[1] = a1;
+    s_kept[2] = c;
     settle();
+    a = s_kept[0];
+    a1 = s_kept[1];
+    c = s_kept[2];
     check(available_of(p) == base - 3 * PAGE, "every unused byte is back");
     check(charge(a, PAGE) != Status::Ok, "empty child gone");
     check(charge(a1, PAGE) != Status::Ok, "empty grandchild gone");
@@ -262,8 +284,8 @@ void run(Capability root) {
           "allocate an arena and another page");
     const uint64_t a = capability_get_base(arena);
     check(a % vm::BITMAP_SPAN == 0, "a revocable allocation starts on a span");
-    check(available_of(q) == before_arena - 5 * PAGE,
-          "and is charged one bitmap page");
+    check(available_of(q) == before_arena - 6 * PAGE,
+          "and is charged a page of each bitmap");
     auto carve = [](Capability from, uint64_t at, uint64_t len) {
       return capability_set_bounds(capability_set_address(from, at), len);
     };
@@ -293,6 +315,14 @@ void run(Capability root) {
     check(revoke::revoke(comp, carve(other, capability_get_base(other) + 64,
                                      16)) == Status::NotInRange,
           "nothing in an allocation that is not revocable can be revoked");
+    // The owner may, and nobody else: another compartment holding a
+    // capability to the same memory, and a handle of its own, may not.
+    Capability stranger = compartment::create(q, nullptr, 0);
+    check(capability_is_valid(stranger), "create a second compartment");
+    check(revoke::revoke(stranger, object) == Status::NotInRange,
+          "a compartment that does not own the memory cannot revoke it");
+    check(compartment::destroy(stranger) == Status::Ok,
+          "destroy the second compartment");
     check(revoke::revoke(comp, carve(arena, a + 264, 16)) ==
                   Status::BadAlignment &&
               revoke::revoke(comp, carve(arena, a + 256, 24)) ==
@@ -333,23 +363,137 @@ void run(Capability root) {
     check(live_nodes() == nodes, "no nodes leaked after revoking");
   }
 
-  // 11. Sweeps come at most once per SWEEP_INTERVAL_US (revoke.hpp, WHEN A
-  //     SWEEP RUNS). One has just ended, so looking completes the next
-  //     epoch at once while there is nothing to scan, and does not while
-  //     there is something.
+  // 11. A sweep is started, not run (revoke.hpp, A SWEEP). With nothing to
+  //     revoke it is complete at once. With something, starting it makes
+  //     every page stale: a page the kernel checks (KERNEL LOADS) has lost
+  //     what was freed before the start and nothing else, the epoch
+  //     completes once the sweeper has been through the rest, and what was
+  //     freed meanwhile waits for the next sweep. Every load from the pool
+  //     here follows a check: this is kernel code, which may not fault.
   {
     uint64_t before = revoke::completed_epoch();
-    check(revoke::query() > before,
-          "nothing to scan: the epoch completes at once");
-    check(destroy(derive(root, PAGE, RW)) == Status::Ok,
-          "free a node page, to have something to scan");
+    check(revoke::start() == before + 1 &&
+              revoke::completed_epoch() == before + 1,
+          "nothing to revoke: the sweep is complete at once");
+
+    Capability q = derive(root, 16 * PAGE, RW);
+    Capability comp = compartment::create(q, nullptr, 0);
+    Capability holder = compartment::allocate(comp, q, PAGE, 0);
+    Capability target = compartment::allocate(comp, q, PAGE, 0);
+    Capability later = compartment::allocate(comp, q, PAGE, 0);
+    check(capability_is_valid(holder) && capability_is_valid(target) &&
+              capability_is_valid(later),
+          "allocate a holder and two pages for it to hold");
+    auto* held = reinterpret_cast<volatile Capability*>(holder);
+    const uint64_t holder_at = capability_get_base(holder);
+    held[0] = target;
+    held[1] = later;
+    check(compartment::deallocate(comp, q, target) == Status::Ok,
+          "free the first before the sweep");
+
     before = revoke::completed_epoch();
-    check(revoke::query() == before,
-          "something to scan, too soon after the last sweep: not yet");
+    const uint64_t epoch = revoke::start();
+    check(epoch == before + 1 && revoke::completed_epoch() == before,
+          "something to revoke: the sweep is started, not complete");
+    check(revoke::start() == epoch + 1 && revoke::query() == before,
+          "starting again while it runs does nothing");
+    revoke::check(holder_at, PAGE);
+    check(!capability_is_valid(held[0]),
+          "a checked page has lost what was freed before the sweep");
+    check(capability_is_valid(held[1]), "and nothing else");
+    check(compartment::deallocate(comp, q, later) == Status::Ok,
+          "free the second while the sweep runs");
+    while (revoke::step(revoke::STEP_MAX) == revoke::STEP_MORE) {
+    }
+    check(revoke::completed_epoch() == epoch, "the sweeper completes it");
+    check(vm::quarantined_pages() == 1,
+          "what was freed while it ran waits for the next sweep");
+    revoke::check(holder_at, PAGE);
+    check(capability_is_valid(held[1]),
+          "and a page checked before that still holds it");
+    revoke::sweep();
+    check(vm::quarantined_pages() == 0, "which reclaims it");
+    check(!capability_is_valid(held[1]), "and revokes it");
+
+    check(compartment::destroy(comp) == Status::Ok, "destroy the compartment");
+    check(destroy(q) == Status::Ok, "destroy its quota");
     settle();
+    check(available_of(root) == root_before, "root restored after the sweeps");
+    check(live_nodes() == nodes, "no nodes leaked after the sweeps");
   }
 
-  // 12. A compartment made from an image (compartment.hpp, LOADING ITSELF):
+  // 12. Revoking while a sweep runs (revoke.hpp, TWO BITMAPS). It is not
+  //     refused, and the range belongs to the next sweep. A page checked
+  //     before the mark keeps its capability to the range until that sweep;
+  //     a page checked after it has lost it already. The sweep that was
+  //     running takes its own marks with it and leaves the new one.
+  {
+    Capability q = derive(root, 64 * PAGE, RW);
+    Capability comp = compartment::create(q, nullptr, 0);
+    Capability early = compartment::allocate(comp, q, PAGE, 0);
+    Capability late = compartment::allocate(comp, q, PAGE, 0);
+    Capability arena = compartment::allocate(comp, q, 4 * PAGE, FLAG_REVOCABLE);
+    check(capability_is_valid(early) && capability_is_valid(late) &&
+              capability_is_valid(arena),
+          "allocate an arena and two pages to hold capabilities to it");
+    const uint64_t a = capability_get_base(arena);
+    auto carve = [](Capability from, uint64_t at, uint64_t len) {
+      return capability_set_bounds(capability_set_address(from, at), len);
+    };
+    // Two pages, checked by hand: one before the second mark, one after it.
+    auto* in_early = reinterpret_cast<volatile Capability*>(early);
+    auto* in_late = reinterpret_cast<volatile Capability*>(late);
+    const uint64_t early_at = capability_get_base(early);
+    const uint64_t late_at = capability_get_base(late);
+    const Capability first = carve(arena, a + 256, 64);
+    const Capability second = carve(arena, a + 512, 64);
+    in_early[0] = first;
+    in_early[1] = second;
+    in_early[2] = arena;
+    in_late[0] = second;
+
+    uint64_t first_epoch = 0;
+    uint64_t second_epoch = 0;
+    check(revoke::revoke(comp, first, &first_epoch) == Status::Ok,
+          "revoke one object before the sweep");
+    const uint64_t epoch = revoke::start();
+    check(epoch == first_epoch && revoke::completed_epoch() < epoch,
+          "the sweep that starts is the one the object waits for");
+    revoke::check(early_at, PAGE);
+    check(!capability_is_valid(in_early[0]) && capability_is_valid(in_early[1]),
+          "a checked page has lost the first object and not the second");
+    check(revoke::revoke(comp, second, &second_epoch) == Status::Ok &&
+              second_epoch == epoch + 1,
+          "revoking while the sweep runs is not refused, and waits for the "
+          "next");
+    revoke::check(late_at, PAGE);
+    check(!capability_is_valid(in_late[0]),
+          "a page checked after that has lost the second object already");
+    while (revoke::step(revoke::STEP_MAX) == revoke::STEP_MORE) {
+    }
+    check(revoke::completed_epoch() == epoch, "the sweeper completes the sweep");
+    check(capability_is_valid(in_early[1]),
+          "the page checked before the mark still holds the second object");
+
+    // The first object handed out again, from the copy of the arena in
+    // memory (as in 10), and the next sweep.
+    in_early[0] = carve(in_early[2], a + 256, 64);
+    revoke::sweep();
+    check(revoke::completed_epoch() >= second_epoch,
+          "the next sweep completes the second object's epoch");
+    check(!capability_is_valid(in_early[1]), "and revokes it there too");
+    check(capability_is_valid(in_early[0]),
+          "the first sweep took its own marks with it");
+
+    check(compartment::destroy(comp) == Status::Ok, "destroy the compartment");
+    check(destroy(q) == Status::Ok, "destroy its quota");
+    settle();
+    check(available_of(root) == root_before,
+          "root restored after revoking during a sweep");
+    check(live_nodes() == nodes, "no nodes leaked after revoking during one");
+  }
+
+  // 13. A compartment made from an image (compartment.hpp, LOADING ITSELF):
   //     the image waits in the loader's slot, and the handle its creator
   //     keeps can destroy it and change nothing in it, while the
   //     compartment's own handle (slot 0) can.
@@ -400,6 +544,9 @@ void run(Capability root) {
     check(available_of(root) == root_before, "root restored after the image");
     check(live_nodes() == nodes, "no nodes leaked after the image");
   }
+  s_kept = nullptr;
+  vm::free_pages(kept);
+  settle();
   uart::print("[quota]    self-test passed\n");
 }
 

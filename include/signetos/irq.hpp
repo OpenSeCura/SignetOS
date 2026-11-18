@@ -77,8 +77,10 @@
 // hart can interrupt another, and it carries no message, so it cannot be
 // shared: if a compartment could handle it, the kernel could not tell its
 // own pokes from the compartment's. It never goes to the handler, its `mie`
-// bit is always set, and the trap dispatcher hands it to `on_poke`. Today
-// only boot sends one, to start a secondary hart.
+// bit is always set, and the trap dispatcher hands it to `on_poke`. Boot
+// sends one to start a secondary hart, and a hart sends one to every other
+// to stop it and to let it go (smp.hpp, THE STOP): the poke says "look",
+// and what to look at is in the kernel's memory.
 //
 
 #include <stdint.h>
@@ -116,7 +118,7 @@ void init_hart();
 Status install(Capability thread);
 
 // This hart took the kernel's poke (THE SOFTWARE INTERRUPT IS THE KERNEL'S):
-// clears it.
+// clears it, and does what it was poked for (`smp::on_poke`).
 void on_poke();
 
 // Sets this hart's next tick, `TICK_US` from now. Clears a pending timer

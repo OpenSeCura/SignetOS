@@ -1,0 +1,51 @@
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -1342,6 +1342,11 @@
+             error_setg(errp, "sentries requires Zylevels1");
+             return;
+         }
++        /* mmodecrg widens Svucrg's check, so it is nothing without it. */
++        if (cpu->cfg.ext_mmodecrg && !cpu->cfg.cheri_pte) {
++            error_setg(errp, "mmodecrg requires Svucrg");
++            return;
++        }
+ #endif
+     }
+     riscv_set_feature(env, RISCV_FEATURE_STID);
+@@ -1487,6 +1492,8 @@
+     DEFINE_PROP_UINT8("cheri_levels", RISCVCPU, cfg._compat_cheri_levels, 0),
+     DEFINE_PROP_BOOL("cheri_pte", RISCVCPU, cfg.cheri_pte, false),
+     DEFINE_PROP_BOOL("Svucrg", RISCVCPU, cfg.cheri_pte, false),
++    /* SignetOS: Svucrg's check on pages without U too (local, not ratified) */
++    DEFINE_PROP_BOOL("mmodecrg", RISCVCPU, cfg.ext_mmodecrg, false),
+ #endif
+ 
+     DEFINE_PROP_STRING("priv_spec", RISCVCPU, cfg.priv_spec),
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -612,6 +612,7 @@
+     uint8_t _compat_cheri_levels; /* To keep existing scripts working */
+     uint8_t lvbits; /* Only 0 and 1 (Zylevels1) are currently supported. */
+     bool cheri_pte;
++    bool ext_mmodecrg; /* SignetOS: CRG check on pages without U too */
+ #endif
+ #endif
+ 
+--- a/target/riscv/cpu_helper.c
++++ b/target/riscv/cpu_helper.c
+@@ -1374,7 +1374,14 @@
+                 if (!(pte & PTE_CW)) {
+                     /* CW inhibited */
+                     *prot |= PAGE_LC_CLEAR;
+-                } else if ((pte & PTE_U) && (status_ucrg != pte_crg)) {
++                } else if (((pte & PTE_U) || cpu->cfg.ext_mmodecrg) &&
++                           (status_ucrg != pte_crg)) {
++                    /*
++                     * A capability load from a page of another generation
++                     * traps. Svucrg checks U pages only; mmodecrg (SignetOS,
++                     * toolchain/mmodecrg) checks every page, for a system
++                     * that runs in M-mode and has no U pages.
++                     */
+                     *prot |= PAGE_LC_TRAP;
+                 }
+ 

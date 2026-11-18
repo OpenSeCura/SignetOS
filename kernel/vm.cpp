@@ -25,9 +25,18 @@
 #include <signetos/frame.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/hw/platform.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/vm.hpp>
 #include <signetos/vm_pages.hpp>
+
+// sweep.S: flips `bit` in every valid page table entry of `count` runs
+// (pairs of words at `runs`: the address of a run's first entry in the
+// direct map, which `direct` spans, and its length), then the hart's
+// generation, then flushes the TLB.
+extern "C" void __signetos_new_generation(signetos::Capability direct,
+                                          const uint64_t* runs, size_t count,
+                                          uint64_t bit);
 
 namespace signetos::vm {
 
@@ -64,6 +73,11 @@ Capability s_direct = nullptr;
 // from there to s_direct_top belongs to the frame allocator.
 uint64_t s_direct_top = 0;
 uint64_t s_boot_reserved_end = 0;
+
+// The direct map's own L1 tables: where they start (physical) and how many
+// entries they hold. `new_generation` rewrites them.
+uint64_t s_direct_tables = 0;
+size_t s_direct_entries = 0;
 
 // Authority covering the whole dynamic address space, narrowed to one object at
 // a time by alloc_pages and view. Never handed out.
@@ -145,23 +159,32 @@ constexpr void count_pageable(size_t, int) {}
 constexpr bool swap_has_room(size_t) { return false; }
 #endif
 
-// Bits 9:0 of a PTE are flags; everything above is the physical page number.
+// Bits 9:0 of a PTE are flags and bits 53:10 the physical page number. The
+// bits above that are the hardware's; the ones used here are pte::CapWrite
+// and pte::CapGen.
 constexpr uint64_t PTE_FLAG_MASK = 0x3FFULL;
+constexpr uint64_t PTE_PPN_MASK = ((1ULL << 54) - 1) & ~PTE_FLAG_MASK;
+
+// The hart's generation (vm.hpp, CHECKED PAGES): pte::CapGen or 0, always
+// what `mstatus.UCRG` says. Changed by `new_generation` alone, under
+// `s_lock`.
+uint64_t s_generation = 0;
 
 // Builds a page table entry pointing at the frame containing `pa`.
 uint64_t pte_make(uint64_t pa, uint64_t flags) {
   // pa >> PAGE_SHIFT turns a byte address into a frame number, and << 10
   // puts that frame number where the hardware reads it, above the flag bits.
-  // The mask drops anything a caller passed in outside bits 9:0.
-  return ((pa >> PAGE_SHIFT) << 10) | (flags & PTE_FLAG_MASK);
+  // The mask drops anything a caller passed in that is not a flag.
+  return ((pa >> PAGE_SHIFT) << 10) |
+         (flags & (PTE_FLAG_MASK | pte::CapWrite | pte::CapGen));
 }
 
 // The physical address of whatever an entry points at: a frame of memory if the
 // entry is a leaf, the next table down if it is not.
 uint64_t pte_addr(uint64_t entry) {
-  // Undoes pte_make: >> 10 drops the flags and recovers the frame number,
-  // << PAGE_SHIFT turns that frame number back into a byte address.
-  return (entry >> 10) << PAGE_SHIFT;
+  // Undoes pte_make: the mask keeps the frame number alone, >> 10 moves it
+  // down to bit 0, << PAGE_SHIFT turns it back into a byte address.
+  return ((entry & PTE_PPN_MASK) >> 10) << PAGE_SHIFT;
 }
 
 // Whether an entry ends the walk or continues it.
@@ -393,6 +416,11 @@ void init(Capability root_data_cap) {
   s_quarantined_pages = 0;
   reset_paging_state();
 
+  // Generation 0 (CHECKED PAGES): every entry written below has CapGen
+  // clear, so the hart starts with UCRG (mstatus bit 61) clear too.
+  s_generation = 0;
+  __asm__ volatile("csrc mstatus, %0" ::"r"(MSTATUS_UCRG) : "memory");
+
   // .bss is not guaranteed zeroed this early, and a stray set Valid bit would
   // send the hardware walking into nonsense.
   for (size_t i = 0; i < ENTRIES; ++i) {
@@ -429,7 +457,7 @@ void init(Capability root_data_cap) {
   }
   s_l2_root[l2_index(kbase)] = pte_make(phys_of(&s_l1_kernel[0]), pte::Valid);
   for (uint64_t pa = kbase; pa < kbase + KERNEL_SIZE; pa += MEGAPAGE_SIZE) {
-    s_l1_kernel[l1_index(pa)] = pte_make(pa, pte::Permissive);
+    s_l1_kernel[l1_index(pa)] = pte_make(pa, pte::Permissive | pte::CapWrite);
   }
 
   // The direct map: every megapage of RAM, as data, at DIRECT_BASE + offset.
@@ -462,9 +490,12 @@ void init(Capability root_data_cap) {
   for (uint64_t off = 0; off < direct_len; off += MEGAPAGE_SIZE) {
     const uint64_t va = DIRECT_BASE + off;
     const size_t g = l2_index(va) - l2_index(DIRECT_BASE);
-    tables[(g * ENTRIES) + l1_index(va)] = pte_make(kbase + off, pte::KernelData);
+    tables[(g * ENTRIES) + l1_index(va)] =
+        pte_make(kbase + off, pte::KernelData | pte::CapWrite);
   }
   s_direct_top = direct_top;
+  s_direct_tables = tables_pa;
+  s_direct_entries = gbs * ENTRIES;
   s_boot_reserved_end = tables_pa + (gbs * PAGE_SIZE);
 
   // The two standing authorities, both narrowed from the root and never
@@ -677,11 +708,17 @@ void zero_page(uint64_t va) {
   }
 }
 
+// The `k`th bitmap page of the revocable range at `va`: its spans in order, a
+// page of each bitmap for each (vm.hpp, REVOCATION BITMAP).
+uint64_t bitmap_page(uint64_t va, size_t k) {
+  return bitmap_of(va, k % 2) + ((k / 2) * PAGE_SIZE);
+}
+
 // Frees the first `count` bitmap pages of the revocable range at `va`, which
 // nothing has seen. Caller holds `s_lock`.
 void unmap_bitmap_locked(uint64_t va, size_t count) {
   for (size_t i = 0; i < count; ++i) {
-    uint64_t* slot = leaf_slot(bitmap_of(va) + (i * PAGE_SIZE), false);
+    uint64_t* slot = leaf_slot(bitmap_page(va, i), false);
     frame::free(pte_addr(*slot), 1);
     *slot = 0;
   }
@@ -694,7 +731,7 @@ void unmap_bitmap_locked(uint64_t va, size_t count) {
 bool map_bitmap_locked(uint64_t va, size_t pages) {
   const size_t count = bitmap_pages(pages);
   for (size_t i = 0; i < count; ++i) {
-    const uint64_t s = bitmap_of(va) + (i * PAGE_SIZE);
+    const uint64_t s = bitmap_page(va, i);
     // A bitmap page has one owner (vm.hpp, REVOCATION BITMAP), so its entry
     // is free; anything else is refused.
     uint64_t* slot = leaf_slot(s, true);
@@ -807,8 +844,14 @@ void give_frame_locked(uint64_t va, uint64_t pa) {
   if (pa % PAGE_SIZE != 0 || !range_is_ram(pa, 1)) {
     debug::panic("vm: a page given something that is not a frame of RAM");
   }
-  *slot = pte_make(pa, pte::Permissive |
-                           (*slot & (pte::Quarantined | pte::Revocable)));
+  // CHECKED PAGES: what the caller puts on the frame is zeroes or checked,
+  // so the page is of the hart's generation. A quarantined page keeps the
+  // one it was freed in.
+  const uint64_t old = *slot;
+  const uint64_t gen =
+      (old & pte::Quarantined) != 0 ? (old & pte::CapGen) : s_generation;
+  *slot = pte_make(pa, pte::Permissive | pte::CapWrite | gen |
+                           (old & (pte::Quarantined | pte::Revocable)));
   flush(va);
 }
 
@@ -831,7 +874,7 @@ uint64_t take_frame_locked(uint64_t va, uint64_t slot) {
   }
   const uint64_t e = *entry;
   *entry = (slot << pte::SlotShift) | pte::KindSwapped |
-           (e & (pte::Quarantined | pte::Revocable));
+           (e & (pte::Quarantined | pte::Revocable | pte::CapGen));
   flush(va);
   return pte_addr(e);
 }
@@ -921,7 +964,7 @@ Capability alloc_pages(size_t pages, bool revocable, Backing backing) {
   // Addresses, and unless the memory is pageable the frames to back them,
   // each undone if a later step fails. All under one hold of `s_lock`: the
   // room found must be reserved before anyone else looks. Running out is not
-  // a reason to sweep (revoke.hpp, WHEN A SWEEP RUNS).
+  // a reason to sweep (revoke.hpp, A SWEEP).
   Capability c = nullptr;
   {
     Locked hold(s_lock);
@@ -998,6 +1041,15 @@ uint64_t free_pages(Capability object) {
     return 0;
   }
 
+  // A stale page is checked before it is quarantined (below). Done here,
+  // the way the kernel checks any page (revoke.hpp, KERNEL LOADS), the scan
+  // runs on the hart's own stack and not on the caller's: a thread can be
+  // torn down on another thread's kernel stack (thread.cpp, `exit`, when an
+  // interrupt handler ends), which has no room for it. Nothing can make a
+  // page stale between here and the lock: that takes the start of a sweep,
+  // and a sweep does not start while a hart is in the kernel.
+  revoke::check(va, pages * PAGE_SIZE);
+
   Locked hold(s_lock);
 
   // Every page must be in use (a pageable one may have no frame), not Held,
@@ -1015,14 +1067,24 @@ uint64_t free_pages(Capability object) {
   // Quarantine, do NOT unmap or release the virtual address range yet.
   // Capabilities to this range may still be tagged, and until the revocation
   // sweep clears them they must keep reaching the same data (the accessibility
-  // invariant). Once `revoke::sweep()` clears all
+  // invariant). Once a sweep has cleared all
   // tags pointing into quarantined memory, `reclaim_quarantined()` unmaps the
   // pages and frees their physical frames, and the addresses are free for
   // reuse once unmapped. A revocable range's bitmap pages go with it.
+  //
+  // Each page is left carrying the generation it is freed in, which says
+  // which sweep reclaims it; one that is stale is checked first, because
+  // capabilities may go on being loaded from it until then (CHECKED PAGES).
   bool revocable = false;
   for (size_t i = 0; i < pages; ++i) {
-    uint64_t* slot = leaf_slot(va + (i * PAGE_SIZE), false);
-    *slot |= pte::Quarantined;
+    const uint64_t page = va + (i * PAGE_SIZE);
+    uint64_t* slot = leaf_slot(page, false);
+    if (pte_resident(*slot)) {
+      check_page_locked(page);
+      *slot |= pte::Quarantined;
+    } else {
+      *slot = (*slot & ~pte::CapGen) | s_generation | pte::Quarantined;
+    }
     revocable = (*slot & pte::Revocable) != 0;
   }
 
@@ -1031,27 +1093,157 @@ uint64_t free_pages(Capability object) {
   return (pages + (revocable ? bitmap_pages(pages) : 0)) * PAGE_SIZE;
 }
 
-// Both passes below walk the pool one page at a time, skipping every 2MB
-// region with nothing mapped in it (next_used). The page tables answer one
-// question only: is this page mapped, and if not, how far to the next place
-// that might be. Pages are read at their own addresses through `s_dynamic`.
+// CHECKED PAGES (vm.hpp).
 
-Capability next_live_page(uint64_t* cursor) {
-  if (!is_initialized()) {
-    return nullptr;
+uint64_t generation() {
+  return __atomic_load_n(&s_generation, __ATOMIC_ACQUIRE);
+}
+
+// Checks pool page `va` if it is stale: clears what is revoked in it, reading
+// it through the direct map, where no load traps, and gives it the hart's
+// generation. True if it did. Declared in vm_pages.hpp.
+bool check_page_locked(uint64_t va) {
+  if (va < DYNAMIC_BASE || va >= BITMAP_BASE) {
+    return false;
+  }
+  va &= ~(PAGE_SIZE - 1);
+  uint64_t* slot = leaf_slot(va, false);
+  if (slot == nullptr) {
+    return false;
+  }
+  const uint64_t e = *slot;
+  if (!pte_resident(e) || (e & pte::Quarantined) != 0 ||
+      (e & pte::CapGen) == s_generation) {
+    return false;
+  }
+  revoke::scan(phys_view(pte_addr(e), PAGE_SIZE));
+  *slot = e ^ pte::CapGen;
+  flush(va);
+  return true;
+}
+
+size_t check_pages(uint64_t va, size_t len) {
+  if (!is_initialized() || len == 0) {
+    return 0;
+  }
+  // Clipped to the pool: nothing outside it is ever stale.
+  uint64_t end = va + len < va ? BITMAP_BASE : va + len;
+  end = end > BITMAP_BASE ? BITMAP_BASE : end;
+  uint64_t cur = (va < DYNAMIC_BASE ? DYNAMIC_BASE : va) & ~(PAGE_SIZE - 1);
+  size_t checked = 0;
+  Locked hold(s_lock);
+  for (; cur < end; cur += PAGE_SIZE) {
+    checked += check_page_locked(cur) ? 1 : 0;
+  }
+  return checked;
+}
+
+bool check_fault(uint64_t va) {
+  if (!is_initialized() || va < DYNAMIC_BASE || va >= BITMAP_BASE) {
+    return false;
+  }
+  va &= ~(PAGE_SIZE - 1);
+  Locked hold(s_lock);
+  if (check_page_locked(va)) {
+    return true;
+  }
+  const uint64_t* slot = leaf_slot(va, false);
+  if (slot == nullptr || !pte_resident(*slot) ||
+      (*slot & pte::Quarantined) != 0 ||
+      (*slot & pte::CapGen) != s_generation) {
+    return false;
+  }
+  flush(va);
+  return true;
+}
+
+bool is_stale(uint64_t va) {
+  if (!is_initialized() || va < DYNAMIC_BASE || va >= BITMAP_BASE) {
+    return false;
   }
   Locked hold(s_lock);
-  for (uint64_t va = next_used(*cursor < DYNAMIC_BASE ? DYNAMIC_BASE : *cursor);
-       va < BITMAP_BASE;) {
-    const Leaf leaf = find_leaf(va);
-    if ((leaf.entry & (pte::Valid | pte::Quarantined)) == pte::Valid) {
-      *cursor = va + PAGE_SIZE;
-      return dynamic_view(va, PAGE_SIZE);
+  const uint64_t* slot = leaf_slot(va & ~(PAGE_SIZE - 1), false);
+  return slot != nullptr && pte_resident(*slot) &&
+         (*slot & pte::Quarantined) == 0 &&
+         (*slot & pte::CapGen) != s_generation;
+}
+
+// Walks the pool one page at a time, skipping every 2MB region with nothing
+// mapped in it (next_used). It stops after `pages` checks, or after looking
+// at LOOKS_PER_CHECK times as many entries: the caller's interrupts are
+// masked, and both bound for how long.
+bool check_some(uint64_t* cursor, size_t pages) {
+  constexpr size_t LOOKS_PER_CHECK = 64;
+  if (!is_initialized()) {
+    return true;
+  }
+  Locked hold(s_lock);
+  size_t looks = pages * LOOKS_PER_CHECK;
+  uint64_t va = next_used(*cursor < DYNAMIC_BASE ? DYNAMIC_BASE : *cursor);
+  while (va < BITMAP_BASE) {
+    if (pages == 0 || looks == 0) {
+      *cursor = va;
+      return false;
     }
+    const Leaf leaf = find_leaf(va);
+    if (check_page_locked(va)) {
+      pages -= 1;
+    }
+    looks -= 1;
     va = next_used(next_after(va, leaf));
   }
   *cursor = BITMAP_BASE;
-  return nullptr;
+  return true;
+}
+
+
+void new_generation(const uint64_t* keep, size_t count) {
+  if (!is_initialized() || count > MAX_KEPT) {
+    debug::panic("vm: a new generation that cannot be started");
+  }
+  Locked hold(s_lock);
+
+  // Every entry that moves to the new generation with the hart, as runs of
+  // entries addressed through the direct map (which maps all of RAM, the
+  // kernel image's own table included): the kernel image, the direct map,
+  // and the pages the caller keeps.
+  struct Run {
+    uint64_t at;     // the first entry, in the direct map
+    uint64_t count;  // how many
+  };
+  // Not on the caller's stack, which is a slice of a thread's: under
+  // `s_lock`.
+  static Run runs[2 + MAX_KEPT];
+  static uint64_t frames[MAX_KEPT];
+  size_t n = 0;
+  const uint64_t ram = kernel_base();
+  runs[n++] = {DIRECT_BASE + (phys_of(&s_l1_kernel[l1_index(ram)]) - ram),
+               KERNEL_SIZE / MEGAPAGE_SIZE};
+  runs[n++] = {DIRECT_BASE + (s_direct_tables - ram), s_direct_entries};
+  for (size_t i = 0; i < count; ++i) {
+    const bool pool = keep[i] >= DYNAMIC_BASE && keep[i] < BITMAP_BASE &&
+                      keep[i] % PAGE_SIZE == 0;
+    uint64_t* slot = pool ? leaf_slot(keep[i], false) : nullptr;
+    if (slot == nullptr || !pte_resident(*slot) ||
+        (*slot & pte::Quarantined) != 0 ||
+        (*slot & pte::CapGen) != s_generation) {
+      debug::panic("vm: a page kept across generations is not a checked page");
+    }
+    runs[n++] = {capability_get_address(reinterpret_cast<Capability>(slot)), 1};
+    frames[i] = pte_addr(*slot);
+  }
+
+  // One step as far as any capability load can tell (sweep.S): between the
+  // first entry rewritten and the hart's own bit, nothing loads one.
+  __signetos_new_generation(s_direct, reinterpret_cast<const uint64_t*>(runs),
+                            n, pte::CapGen);
+  __atomic_store_n(&s_generation, s_generation ^ pte::CapGen, __ATOMIC_RELEASE);
+
+  // The kept pages were given the new generation unchecked: check them now,
+  // before the caller loads anything it may hand on.
+  for (size_t i = 0; i < count; ++i) {
+    revoke::scan(phys_view(frames[i], PAGE_SIZE));
+  }
 }
 
 void reclaim_quarantined() {
@@ -1064,8 +1256,11 @@ void reclaim_quarantined() {
   }
   for (uint64_t va = next_used(DYNAMIC_BASE); va < BITMAP_BASE;) {
     const Leaf leaf = find_leaf(va);
-    uint64_t* slot =
-        (leaf.entry & pte::Quarantined) ? leaf_slot(va, false) : nullptr;
+    // Freed before this generation began (CHECKED PAGES): one freed since
+    // carries the hart's generation, and is the next sweep's.
+    const bool old = (leaf.entry & pte::Quarantined) != 0 &&
+                     (leaf.entry & pte::CapGen) != s_generation;
+    uint64_t* slot = old ? leaf_slot(va, false) : nullptr;
     if (slot != nullptr) {
       // Its frame, if it has one (a pageable page may not), goes back to the
       // frame allocator; if it is in swap instead, its slot is free.
@@ -1082,11 +1277,13 @@ void reclaim_quarantined() {
       count_page(va, -1);  // and so free for reuse
 #endif
       __atomic_fetch_sub(&s_quarantined_pages, 1, __ATOMIC_RELAXED);
-      // The bitmap page for this span goes with the page that starts it.
+      // The bitmap pages for this span go with the page that starts it.
       if ((leaf.entry & pte::Revocable) != 0 && va % BITMAP_SPAN == 0) {
-        uint64_t* bit_page = leaf_slot(bitmap_of(va), false);
-        frame::free(pte_addr(*bit_page), 1);
-        *bit_page = 0;
+        for (unsigned which = 0; which < 2; ++which) {
+          uint64_t* bit_page = leaf_slot(bitmap_of(va, which), false);
+          frame::free(pte_addr(*bit_page), 1);
+          *bit_page = 0;
+        }
       }
     }
     va = next_used(next_after(va, leaf));

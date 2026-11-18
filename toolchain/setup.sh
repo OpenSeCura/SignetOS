@@ -106,6 +106,7 @@ fi
 "$HERE/zyseal/setup.sh"
 "$HERE/mmodemmu/setup.sh"
 "$HERE/sentries/setup.sh"
+"$HERE/mmodecrg/setup.sh"
 
 # --------------------------------------------------------------------- build
 echo "### building patched LLVM"

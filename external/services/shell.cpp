@@ -87,6 +87,8 @@ uint64_t s_ticks_per_us = 10;  // `time` ticks per us (/cpus timebase-frequency)
   M_SYSCALL(X, SYS_THREAD_CREATE, thread_create)                               \
   M_SYSCALL(X, SYS_THREAD_KILL, thread_kill)                                   \
   M_SYSCALL(X, SYS_REVOKE_QUERY, revoke_query)                                 \
+  M_SYSCALL(X, SYS_REVOKE_START, revoke_start)                                 \
+  M_SERVICE_OPT(X, SWEEPER_STOP, "sweeper.stop")                               \
   SHELL_PAGING_MANIFEST(X)                                                     \
   M_SERVICE(X, UART_SENTRY, "uart")                                            \
   M_SERVICE_OPT(X, UART_READ, "uart.read")                                     \
@@ -109,6 +111,7 @@ SIGNETOS_MANIFEST(SHELL_MANIFEST, 1024ULL * 1024 * 1024)
 Capability s_gate_invoke = nullptr;
 Capability s_gate_thread_create = nullptr;
 Capability s_gate_revoke_query = nullptr;
+Capability s_gate_revoke_start = nullptr;
 Capability s_uart = nullptr;
 Capability s_uart_read = nullptr;
 Capability s_vm_quota = nullptr;
@@ -760,13 +763,13 @@ void cmd_sealtest() {
     out("[sealtest] the sealer's entry points were not found by name\n");
     return;
   }
-  if (!capability_is_valid(s_gate_revoke_query) || !s_run_ready) {
-    out("[sealtest] needs revoke_query and `run`\n");
+  if (!capability_is_valid(s_gate_revoke_query) ||
+      !capability_is_valid(s_gate_revoke_start) || !s_run_ready) {
+    out("[sealtest] needs revoke_query, revoke_start and `run`\n");
     return;
   }
   using FnAlloc = decltype(&sys_vm_allocate);
   using FnDealloc = decltype(&sys_vm_deallocate);
-  using FnQuery = decltype(&sys_revoke_query);
   const Capability page = with_reclaim(
       [&] {
         return syscall::call<FnAlloc>(s_gate_invoke, s_gate_vm_alloc,
@@ -796,15 +799,13 @@ void cmd_sealtest() {
          : "[sealtest] FAILED: could not mint, seal and unseal on the page\n");
 
   // Free the page. Until a sweep reclaims it the type still works (the page
-  // is quarantined, not unmapped); after one, nothing based in it is tagged.
-  // Two epochs, for a sweep that starts after the free: one that was waiting
-  // for its checks of swap (revoke.hpp, SWAP) scanned before it.
-  const uint64_t seen =
-      syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
+  // is quarantined, not unmapped); after one that started after the free,
+  // nothing based in it is tagged.
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, s_self_comp,
                            s_vm_quota, page);
   out("[sealtest] record freed; waiting for a sweep...\n");
-  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 2);
+  revoke_sweep(s_gate_invoke, s_gate_revoke_start, s_gate_revoke_query,
+               s_sched_block);
 
   const Capability key_after =
       *reinterpret_cast<volatile Capability*>(&s_sealtest_key);
@@ -1043,15 +1044,13 @@ void pagetest_revoke() {
     arena_close(&a);
     return;
   }
-  // Freed, then two sweeps: the first that starts after the free reclaims
-  // it, once the holder has been read back and checked.
+  // Freed, then a sweep: one that starts after the free reclaims it, once
+  // the holder has been read back and checked.
   using FnDealloc = decltype(&sys_vm_deallocate);
-  using FnQuery = decltype(&sys_revoke_query);
   syscall::call<FnDealloc>(s_gate_invoke, s_gate_vm_dealloc, a.comp, a.quota,
                            target);
-  const uint64_t seen =
-      syscall::call<FnQuery>(s_gate_invoke, s_gate_revoke_query);
-  revoke_wait(s_gate_invoke, s_gate_revoke_query, s_sched_block, seen + 2);
+  revoke_sweep(s_gate_invoke, s_gate_revoke_start, s_gate_revoke_query,
+               s_sched_block);
   const PagingStats after = page_stats();
   const bool gone = !capability_is_valid(h[0]);  // the holder comes back here
   const bool kept = capability_is_valid(h[1]);
@@ -1405,6 +1404,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_gate_comp_destroy = gate_comp_destroy;
   s_gate_thread_kill = rw[SLOT_SYS_THREAD_KILL];
   s_gate_revoke_query = rw[SLOT_SYS_REVOKE_QUERY];
+  s_gate_revoke_start = rw[SLOT_SYS_REVOKE_START];
   s_run_ready = sealing::is_sealed_as(OType::EntryPoint, s_gate_thread_kill) &&
                 sealing::is_sealed_as(OType::QuotaThreadMem, s_thread_quota) &&
                 capability_is_valid(s_sched_derive) &&
@@ -1446,6 +1446,7 @@ extern "C" int64_t compartment_main(Capability arg) {
   starter.thread_create = gate_thread_create;
   starter.thread_kill = s_gate_thread_kill;
   starter.revoke_query = s_gate_revoke_query;
+  starter.revoke_start = s_gate_revoke_start;
   starter.sched_block = s_sched_block;
   starter.sched_derive = s_sched_derive;
   starter.sched_query = s_sched_query;
@@ -1474,6 +1475,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   console_loop();  // returns on `shutdown`
 
   out("[shell]    shutting down; shell exiting\n");
+  // The sweeper's thread, or the machine would never stop (sweeper.cpp).
+  if (capability_is_valid(rw[SLOT_SWEEPER_STOP])) {
+    invoke<int64_t>(gate_invoke, rw[SLOT_SWEEPER_STOP]);
+  }
 #if defined(SIGNETOS_PAGING)
   // The pager's thread too, or the machine would never stop (blk.cpp, PAGING).
   if (capability_is_valid(rw[SLOT_PAGING_STOP])) {

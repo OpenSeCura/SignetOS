@@ -187,17 +187,24 @@
  *
  *   1. `sys_compartment_invoke` pushes a `ReturnFrame` only if at least
  *      RET_FRAME_MIN_FREE bytes are free. That covers the frame (416) plus
- *      the most its callee puts on the kernel stack: `_prepare` (128, plus
- *      `sentry::resolve` 128); for `sys_thread_switch` the `TrapFrame` it
- *      parks its caller in (640) and `__signetos_thread_dispatch` with the
- *      resume path under it (432; `sys_trap_wait`'s is the same frame and
- *      400); or a trap in the callee -- an interrupt anywhere in compartment
- *      code, or a fault (compartment code, or a kernel bug) -- one
- *      `TrapFrame` (640) plus the trap dispatcher's deepest path
- *      (`__signetos_trap_dispatch` 272 + `debug::fault_report` 112 +
- *      `uart::print_dec` 48 = 432; waking the handler is 272 + 16), so the
- *      trap is dispatched instead of overflowing. 416 + 640 + 432 = 1488,
- *      with room to spare.
+ *      the most its callee puts on the kernel stack: `_prepare` (240, plus
+ *      `sentry::resolve` 128 and `compartment::open` 32); for
+ *      `sys_thread_switch` the `TrapFrame` it parks its caller in (640) and
+ *      `__signetos_thread_dispatch` with the resume path under it (96 +
+ *      `resume` 48 + `unwind::resume` 176 + `install_context` 144 = 464;
+ *      `sys_trap_wait`'s is the same frame and 432); or a trap in the callee
+ *      -- an interrupt anywhere in compartment code, or a fault (compartment
+ *      code, or a kernel bug) -- one `TrapFrame` (640) plus the trap
+ *      dispatcher's deepest path (`__signetos_trap_dispatch` 272 +
+ *      `debug::fault_report` 112 + `uart::print_dec` 48 = 432; waking the
+ *      handler is 272 + 96, and a poke that stops the hart, smp.hpp, is
+ *      272 + `irq::on_poke` 16 + `smp::on_poke` 48), so the trap is
+ *      dispatched instead of overflowing. Any of these may end in a check
+ *      of a page (revoke.hpp, KERNEL LOADS), which costs this stack 80
+ *      bytes however deep the check goes (`revoke::check_slow` 48 +
+ *      `__signetos_check_on` 32): the check itself runs on the hart's own
+ *      stack. The deepest is the thread switch: 416 + 640 + 464 + 80 =
+ *      1600, which leaves 128.
  *   2. `__signetos_trap_dispatch` enters a fault handler (fault.hpp) only if
  *      at least RET_FRAME_MIN_FREE bytes are free below the fault's
  *      `TrapFrame`: enough for the handler's kernel calls (check 1), and for
@@ -235,3 +242,18 @@
 #define MSTATUS_MIE             0x8
 #define MSTATUS_MPIE            0x80
 #define MSTATUS_MPP             0x1800
+/* UCRG (bit 61; Svucrg): the hart's generation (vm.hpp, CHECKED PAGES). */
+#define MSTATUS_UCRG            0x2000000000000000
+
+/* The `mie` bit of the machine software interrupt, the kernel's poke
+ * (irq.hpp). */
+#define MIE_MSIE                0x8
+
+/* `smp::Stop` (smp.cpp), as a stopped hart reads it (sweep.S,
+ * `__signetos_stop_here`): where its words are, and the phase in which the
+ * hart waits. */
+#define STOP_PHASE              0
+#define STOP_STOPPED            8
+#define STOP_RESUMED            16
+#define STOP_UCRG               24
+#define STOP_PHASE_STOP         1

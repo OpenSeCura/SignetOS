@@ -115,23 +115,41 @@ capability_t sys_cow(
     size_t                   len
 );
 
-// Marks `mem_cap`'s range for the next revocation sweep, which revokes every
-// capability whose BASE lies in it (revoke.hpp, THE BASE RULE): the way an
-// owner takes back part of an allocation it keeps, such as an object its
-// heap is freeing. The range must lie inside one of `comp`'s own
-// FLAG_REVOCABLE allocations, must not include that allocation's first byte,
-// which is where the owner's own capability to the allocation is based, and
-// must start and end on a multiple of 16 bytes. Returns the current epoch, N:
-// the range may be reused once `sys_revoke_query()` reaches N. Returns 0 if
-// the range was refused.
+// Marks `mem_cap`'s range, so that every capability whose BASE lies in it is
+// revoked (revoke.hpp, THE BASE RULE): the way an owner takes back part of
+// an allocation it keeps, such as an object its heap is freeing. The range
+// must lie inside one of `comp`'s own FLAG_REVOCABLE allocations, must not
+// include that allocation's first byte, which is where the owner's own
+// capability to the allocation is based, and must start and end on a
+// multiple of 16 bytes. Returns the range's epoch, N: the number of the next
+// sweep to start, which is the first to cover it (revoke.hpp, EPOCHS). The
+// range may be reused once `sys_revoke_query()` reaches N. Returns 0 if the
+// range was refused. It never starts a sweep, and is never refused because
+// one is running.
 uint64_t sys_revoke(
     capability_compartment_t comp,
     capability_t             mem_cap
 );
 
-// How many sweeps have completed (the completed epoch), having swept first if
-// the interval allows (revoke.hpp, WHEN A SWEEP RUNS).
+// How many sweeps have completed (the completed epoch). It starts nothing.
 uint64_t sys_revoke_query(void);
+
+// Starts a revocation sweep, unless one is running (revoke.hpp, A SWEEP), and
+// returns N, the epoch that covers everything freed or marked before the
+// call: that memory may be reused once `sys_revoke_query()` reaches N. If a
+// sweep was already running, N is the one after it, and has yet to be
+// started: call again once the running one is complete. The call itself is
+// short; the sweep is finished in the background, by the pages threads touch
+// and by the sweeper.
+uint64_t sys_revoke_start(void);
+
+// The sweeper's (revoke.hpp, A SWEEP): checks up to `pages` of the pages the
+// running sweep has not reached yet (`revoke::STEP_MAX` at most a call), and
+// completes the sweep if those were the last. Returns 1 if there are more
+// pages to check; 2 if there are none but the sweep is not complete yet,
+// because it waits for the pager to check the pages on disk; 0 if no sweep
+// is running. On 0 and 2 the caller has nothing to do for a while.
+uint64_t sys_revoke_step(size_t pages);
 
 // --- Virtual memory quotas -------------------------------------------------
 
@@ -374,6 +392,8 @@ namespace signetos::syscall {
   X(cow)                          \
   X(revoke)                       \
   X(revoke_query)                 \
+  X(revoke_start)                 \
+  X(revoke_step)                  \
   X(quota_vm_create_root)         \
   X(quota_vm_derive)              \
   X(quota_vm_destroy)             \
@@ -414,10 +434,14 @@ constexpr size_t kSyscallCount = static_cast<size_t>(Id::Count);
 // `__signetos_switcher_return`; the default build booted, then `run hello`,
 // `run fault.bin unwind`, `sealtest` and `run logo`; -O2): the deepest entry
 // is `compartment_create` at 1056 bytes, then `thread_create` 912,
-// `vm_allocate` 816, `page_setup` 800, the two quota derives 784,
-// `revoke_query` 768 and `page_next` 704; everything else is under 400. 4096
-// is nearly four times the worst case. Re-measure before adding a syscall
-// with large locals.
+// `vm_allocate` 816, `page_setup` 800, the two quota derives 784 and
+// `page_next` 704; everything else is under 400. 4096 is nearly four times
+// the worst case. Re-measure before adding a syscall with large locals.
+// Added since, and not measured that way, by their frames in `llvm-objdump`:
+// `revoke_start` is 1024 (`revoke::start` 272, `vm::new_generation` 480,
+// `revoke::scan` 224 and what that calls), and a call that frees memory
+// while a sweep runs checks the pages it frees, about 370 bytes under
+// `vm::free_pages`.
 constexpr uint64_t SYSCALL_STACK_BYTES = 4096;
 
 // Builds the kernel's entry records from the running kernel PCC. Called once

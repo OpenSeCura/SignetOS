@@ -216,7 +216,10 @@ Status resolve(Sentry entry_point, Entry* out) {
     return Status::InsufficientPermission;
   }
 
-  const EntryRecord* rec = reinterpret_cast<const EntryRecord*>(open);
+  // The record is in its compartment's entry page, or the kernel's own table
+  // (revoke.hpp, KERNEL LOADS).
+  const EntryRecord* rec =
+      revoke::checked(reinterpret_cast<const EntryRecord*>(open));
 
   // Cleared record (owner destroyed): refuse. A compartment entry must also
   // still have its table and its owner; a kernel entry has neither.

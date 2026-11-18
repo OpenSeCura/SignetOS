@@ -316,16 +316,22 @@ inline void unlock(Capability invoke_gate, Capability lock_wake,
   }
 }
 
-// How often `revoke_wait` looks.
+// How often `revoke_sweep` looks.
 constexpr uint64_t REVOKE_POLL_US = 100'000;
 
-// Waits until the completed epoch reaches `epoch`, looking
-// (`sys_revoke_query`, which sweeps when it may) every REVOKE_POLL_US and
-// sleeping in the scheduler (`sched_block`) in between.
-inline void revoke_wait(Capability invoke_gate, Capability query_gate,
-                        Capability sched_block, uint64_t epoch) {
-  while (syscall::call<decltype(&sys_revoke_query)>(invoke_gate, query_gate) <
-         epoch) {
+// Starts a revocation sweep (`sys_revoke_start`) and waits for it: when this
+// returns, everything freed or marked before the call has been revoked and
+// may be reused. It looks (`sys_revoke_query`) every REVOKE_POLL_US, sleeping
+// in the scheduler (`sched_block`) in between. If another sweep was already
+// running, ours is the one after it, and is asked for again once that one is
+// out of the way; asking while a sweep runs does nothing.
+inline void revoke_sweep(Capability invoke_gate, Capability start_gate,
+                         Capability query_gate, Capability sched_block) {
+  using FnStart = decltype(&sys_revoke_start);
+  using FnQuery = decltype(&sys_revoke_query);
+  const uint64_t epoch = syscall::call<FnStart>(invoke_gate, start_gate);
+  while (syscall::call<FnQuery>(invoke_gate, query_gate) < epoch) {
+    syscall::call<FnStart>(invoke_gate, start_gate);
     invoke<int64_t>(invoke_gate, sched_block, REVOKE_POLL_US);
   }
 }

@@ -504,13 +504,20 @@ into the scheduler whenever a thread exits.
   byte can never be marked, so the owner's own capability to the whole arena
   survives. Ordinary allocations are only ever revoked whole, when freed.
 * **Pre-funded marks:** a revocable arena pays up front, from the same quota,
-  for its revocation bitmap (one bit per 16 bytes, one page per 512 KiB), so
-  marking freed sub-ranges costs no memory and sweep checks are `O(1)`.
+  for its revocation bitmaps (one bit per 16 bytes, and two bitmaps, so two
+  pages per 512 KiB: a mark made while a sweep runs goes in the one that
+  sweep does not clear), so marking freed sub-ranges costs no memory, is
+  never refused, and sweep checks are `O(1)`.
 * **Charged until swept:** quarantined memory stays charged as *owed* on its
   funding quota until a sweep reclaims it and refunds owed bytes, so rapid
   alloc/free loops exhaust only the freer's own quota.
-* **Rate-limited sweeps:** sweeps run at most once per minimum interval rather
-  than on demand, bounding total CPU time spent sweeping.
+* **Sweeps in the background:** a compartment starts a sweep when it wants
+  memory back (`sys_revoke_start`); nothing stops the machine to scan. From
+  the start of a sweep a page is checked before the first capability is
+  loaded from it, at the expense of whoever loads it, and the pages nobody
+  touches are checked by the `sweeper` thread, whose CPU quota bounds the
+  time spent sweeping in the background. Memory freed while a sweep runs is
+  reclaimed by the next one.
 * **Capability-safe paging:** on eviction to disk, the kernel
   records a per-slot capability tag bitmap and page digest (hash). 
   On page-in, it verifies the digest and rebuilds capabilities from its
@@ -589,7 +596,8 @@ do. As granted by `init` today:
 | `compartment_create`, `compartment_destroy`, `thread_create`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. A compartment it makes from an image loads itself (§3.2), so the shell holds only a handle that can destroy it. |
 | `vm_allocate`, `sentry`, `fault_install` (in slots 1 to 6) | each compartment made from an image, while its loader runs | Load the image (§3.2). The loader takes them out of the table as it starts, so the image never sees them. |
 | `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Only in a build with paging. Still evolving WIP.|
-| `revoke_query` | `shell` | Ask for a rate-limited sweep. |
+| `revoke_start`, `revoke_query` | `shell` | Start a sweep, and see when it is complete. |
+| `revoke_step` | `sweeper` only | Check the pages a running sweep has not reached, a few at a time. |
 | `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: installing the interrupt handler thread, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
 | `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |
 

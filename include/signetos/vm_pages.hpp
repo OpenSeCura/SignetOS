@@ -39,6 +39,10 @@ extern SpinLock s_lock;
 // anything can reach the page.
 void give_frame_locked(uint64_t va, uint64_t pa);
 
+// Checks pool page `va` if it is stale (vm.hpp, CHECKED PAGES); true if it
+// was. Anything else is left alone.
+bool check_page_locked(uint64_t va);
+
 #if defined(SIGNETOS_PAGING)
 
 // The leaf entry of pool page `va`: 0 if it is free.

@@ -101,6 +101,17 @@ struct alignas(16) UartInterface {
 // Published by the sealer itself; `init` hands nothing back from it.
 
 // ----------------------------------------------------------------------------
+// Sweeper service (`external/services/sweeper.cpp`)
+// ----------------------------------------------------------------------------
+//   int64_t sweeper.stop() -> 0   the sweeper's thread ends
+//
+// The thread that finishes revocation sweeps (revoke.hpp, A SWEEP). It serves
+// nobody: whoever wants memory back starts a sweep with `sys_revoke_start`
+// and waits for the epoch (runtime.hpp, `revoke_sweep`). `stop` is for the
+// shell's `shutdown`, since the machine stops once no thread is left.
+// Published by the sweeper itself.
+
+// ----------------------------------------------------------------------------
 // Scheduler service (`external/services/sched.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t  sched.quota_derive(SchedDeriveRequest* req) -> SCHED_*

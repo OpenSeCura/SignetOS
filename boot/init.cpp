@@ -65,7 +65,9 @@
  *      holds from then on; its thread is made from those quotas and
  *      registered with the scheduler. Then, if `blk` found swap, the pager's
  *      thread, and paging on. No compartment `init` starts is pageable
- *      (vm.hpp, PAGING): what pages is what the shell runs.
+ *      (vm.hpp, PAGING): what pages is what the shell runs. Before the
+ *      shell, `sweeper` and its thread, which finishes revocation sweeps
+ *      (the shell asks for `sweeper.stop`, for its `shutdown`).
  *  10. Records every handle in its own table for the kernel's tests, then
  *  11. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
@@ -924,6 +926,40 @@ extern "C" int64_t compartment_main(Capability arg) {
         !sealing::is_sealed_as(OType::EntryPoint, blk_wait)) {
       say("[init]     WARNING: blk has no scheduler entries or no interrupt; "
           "the block device will poll\n");
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The sweeper
+  // -------------------------------------------------------------------------
+  // The thread that finishes revocation sweeps (sweeper.cpp; revoke.hpp, A
+  // SWEEP), on a node of its own: a tenth of the machine, and that is all
+  // the time sweeping in the background can take. Without it a sweep that
+  // is started is never complete, and freed memory does not come back.
+  {
+    const Started sweeper = L.start_file("sweeper.bin");
+    const bool up = capability_is_valid(sweeper.sentry) &&
+                    comp_invoke(sweeper.sentry, nullptr) == 0;
+    init::ManifestEntry node;
+    zero_bytes(&node, sizeof(node));
+    node.kind = init::MANIFEST_QUOTA_SCHED;
+    node.amount = 10'000;  // budget, us
+    node.count = 100'000;  // period, us
+    node.param = init::PRIORITY_NORMAL;
+    const Capability sweeper_quota = up ? L.tmem_quota(64 * 1024) : nullptr;
+    const Capability sweeper_node = up ? L.sched_node(node) : nullptr;
+    const Capability sweeper_thread =
+        capability_is_valid(sweeper_quota)
+            ? thread_create(sweeper_quota, 32 * 1024, sweeper.sentry, nullptr)
+            : nullptr;
+    const bool running =
+        capability_is_valid(sweeper_thread) &&
+        capability_is_valid(sweeper_node) &&
+        capability_is_valid(sched_thread_register) &&
+        ::signetos::user::invoke<int64_t>(invoke, sched_thread_register,
+                                          sweeper_thread, sweeper_node) > 0;
+    if (!running) {
+      say("[init]     WARNING: no sweeper; freed memory will not come back\n");
     }
   }
 

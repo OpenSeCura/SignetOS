@@ -58,6 +58,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <signetos/revoke.hpp>
 #include <signetos/types.hpp>
 
 namespace signetos::sealing {
@@ -208,6 +209,9 @@ inline T* open_live(OType type, Capability handle, uint32_t live_flag,
     return nullptr;
   }
   const T* ro = reinterpret_cast<const T*>(open);
+  // `self_page` is loaded from the object's page, and the caller goes on to
+  // load the rest of it from there (revoke.hpp, KERNEL LOADS).
+  revoke::check(capability_get_address(open), sizeof(T));
   if ((ro->flags & live_flag) == 0 || !capability_is_valid(ro->self_page)) {
     return nullptr;
   }

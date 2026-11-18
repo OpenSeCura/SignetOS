@@ -225,6 +225,23 @@ uint64_t tid_of(Capability thread_handle);
 // The id of the thread running on this hart, or 0 in host context.
 uint64_t current_tid();
 
+// Where the state pages of the thread running on this hart start
+// (THREAD_STATE_PAGES of them: its ThreadState and its kernel stack), or 0
+// in host context. For the start of a sweep (revoke.hpp, A SWEEP).
+uint64_t current_state();
+
+// The same for the thread running on `hart`, which the caller has stopped
+// (smp.hpp, THE STOP): the registers that thread had are saved there.
+uint64_t state_on(uint64_t hart);
+
+// This hart's own kernel stack, from the frame the host is parked in
+// downwards, while a thread runs: free then, and never a page of the pool.
+// Null in host context, which is on it; and the host is still on it for a
+// moment after it has parked itself to switch to a thread, so a caller
+// looks where it is standing first. What checks pages runs here (revoke.hpp,
+// KERNEL LOADS).
+Capability spare_stack();
+
 // The thread running on this hart's entry point (`OType::EntryPoint`), its
 // whole stack, and the slice its entry was given. Null in host context.
 Capability current_entry_sentry();

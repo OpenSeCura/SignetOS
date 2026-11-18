@@ -86,8 +86,9 @@ void send_ipi(uint64_t hart_mask);
 void clear_ipi();
 
 // A capability to `hart`'s `msip` alone (4 bytes, Load|Store), for code that
-// clears its hart's pokes without calling in here: a parked secondary hart
-// (`HartBootSlot`, thread.cpp). Null if `hart` is not present.
+// pokes a hart, or clears its own pokes, where it cannot call in here: a
+// stopped hart (sweep.S, `__signetos_stop_here`). Null if `hart` is not
+// present.
 Capability msip_register(uint64_t hart);
 
 }  // namespace signetos::clint

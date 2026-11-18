@@ -59,11 +59,14 @@
 // frames and maps them at fresh addresses in the dynamic space; the direct map
 // aliases those frames but no compartment ever holds an address into it.
 //
-// The direct map is used only for things that have no virtual address of
-// their own: page tables, the frame bitmap, and the device tree at boot.
-// Anything mapped in the dynamic space is reached at its own address through
-// `s_dynamic`, the authority every allocation is derived from; the revocation
-// sweep reads pages that way.
+// The direct map is used for things that have no virtual address of their
+// own -- page tables, the frame bitmap, and the device tree at boot -- and
+// for two that must reach a page without going through its own entry:
+// paging, which copies a page out and in, and the check of a page for a
+// revocation sweep (CHECKED PAGES), which has to load from a page that traps
+// loads. Anything else mapped in the dynamic space is reached at its own
+// address through `s_dynamic`, the authority every allocation is derived
+// from.
 //
 // FREEING AND QUARANTINE
 //
@@ -130,22 +133,27 @@ constexpr uint64_t DYNAMIC_TOP  = 0x4000000000ULL;  // top of the lower half
 
 // REVOCATION BITMAP
 //
-// The top 2GB of the dynamic space is never handed out. It holds the marks
-// `revoke` sets (revoke.hpp, MARKING RANGES): one bit per 16 bytes of
-// everything below it, so the mark for `va` is a bit in the byte at
-// `bitmap_of(va)`, and 4KB of bitmap covers BITMAP_SPAN of addresses. This
-// file only lays the region out and maps and unmaps its pages; what the bits
-// mean is revoke's. Only revocable allocations (FLAG_REVOCABLE) have bitmap
-// pages: their pages carry pte::Revocable, they start on a BITMAP_SPAN
-// boundary so that no other revocable allocation shares their bitmap pages,
-// and those are mapped, paid for and freed with them. Everywhere else the
-// region is unmapped and costs nothing.
-constexpr uint64_t BITMAP_BASE = DYNAMIC_TOP - 2 * GIGAPAGE_SIZE;
+// The top 4GB of the dynamic space is never handed out. It holds the marks
+// `revoke` sets (revoke.hpp, MARKING RANGES), in two bitmaps of 2GB, one
+// after the other: a mark made while a sweep runs must outlive that sweep,
+// so it goes in the bitmap the sweep does not clear (revoke.hpp, TWO
+// BITMAPS). Each is one bit per 16 bytes of everything below the region, so
+// the mark for `va` in bitmap `which` is a bit in the byte at
+// `bitmap_of(va, which)`, and 4KB of bitmap covers BITMAP_SPAN of addresses.
+// This file only lays the region out and maps and unmaps its pages; what the
+// bits mean is revoke's. Only revocable allocations (FLAG_REVOCABLE) have
+// bitmap pages: their pages carry pte::Revocable, they start on a
+// BITMAP_SPAN boundary so that no other revocable allocation shares their
+// bitmap pages, and those -- a page of each bitmap per span -- are mapped,
+// paid for and freed with them. Everywhere else the region is unmapped and
+// costs nothing.
+constexpr uint64_t BITMAP_BYTES = 2 * GIGAPAGE_SIZE;  // one bitmap
+constexpr uint64_t BITMAP_BASE = DYNAMIC_TOP - 2 * BITMAP_BYTES;
 constexpr uint64_t BITMAP_SPAN = PAGE_SIZE * 128;
-constexpr uint64_t bitmap_of(uint64_t va) {
-  return BITMAP_BASE + (va - DYNAMIC_BASE) / 128;
+constexpr uint64_t bitmap_of(uint64_t va, unsigned which) {
+  return BITMAP_BASE + which * BITMAP_BYTES + (va - DYNAMIC_BASE) / 128;
 }
-static_assert(bitmap_of(BITMAP_BASE) <= DYNAMIC_TOP);
+static_assert(bitmap_of(BITMAP_BASE, 0) <= BITMAP_BASE + BITMAP_BYTES);
 
 // PAGES
 //
@@ -206,19 +214,36 @@ namespace pte {
     // so it has revocation bitmap pages (REVOCATION BITMAP).
     constexpr uint64_t Revocable = (1ULL << 9);
 
+    // Hardware bit (CW, bit 60; Svucrg): the page may hold capabilities.
+    // Without it a store of a tagged capability faults, and a capability
+    // loaded from the page comes back untagged. Every mapping that
+    // capabilities are stored through carries it: the kernel image, the
+    // direct map (paging copies pages, tags and all, through it) and the
+    // pool. Devices and the revocation bitmap hold none and do not. Leaf
+    // entries only: the hardware refuses a table pointer that has it.
+    constexpr uint64_t CapWrite = (1ULL << 60);
+
+    // Hardware bit (CRG, bit 59; Svucrg with mmodecrg): the generation of
+    // the page (CHECKED PAGES). Loading a tagged capability through an entry
+    // whose generation is not the hart's (`mstatus.UCRG`) traps. Only
+    // entries with CapWrite have one; it stays clear on the rest.
+    constexpr uint64_t CapGen = (1ULL << 59);
+
     // NON-RESIDENT ENTRIES. The hardware ignores a leaf entry whose Valid bit
     // is clear, so its other bits are software's. Zero is a free address; any
     // other entry with Valid clear is an address in use with no frame: one of
-    // the kinds below (PAGING). `Quarantined` and `Revocable` keep their
-    // meaning.
+    // the kinds below (PAGING). `Quarantined`, `Revocable` and `CapGen` keep
+    // their meaning.
     constexpr uint64_t KindMask    = 3ULL << 1;
     constexpr uint64_t KindFresh   = 1ULL << 1;  // never touched
     constexpr uint64_t KindSwapped = 2ULL << 1;  // its contents are on disk
     constexpr uint64_t KindHeld    = 3ULL << 1;  // reclaimed, not reusable yet
 
     // A Swapped entry names the slot of swap its page is in (PAGING, SWAP),
-    // in the bits above the flags, where a resident entry names its frame.
+    // in the bits above the flags and below CapGen, where a resident entry
+    // names its frame.
     constexpr unsigned SlotShift = 10;
+    constexpr unsigned SlotBits = 59 - SlotShift;
 }
 
 // An address is in use while its leaf entry is non-zero; resident while it is
@@ -228,7 +253,9 @@ constexpr bool pte_resident(uint64_t e) { return (e & pte::Valid) != 0; }
 constexpr uint64_t pte_kind(uint64_t e) {
   return pte_resident(e) ? 0 : (e & pte::KindMask);
 }
-constexpr uint64_t pte_slot(uint64_t e) { return e >> pte::SlotShift; }
+constexpr uint64_t pte_slot(uint64_t e) {
+  return (e >> pte::SlotShift) & ((1ULL << pte::SlotBits) - 1);
+}
 
 // Builds the boot mappings (devices, direct map), derives the two standing
 // authorities, and turns the MMU on for this hart (satp, then
@@ -283,10 +310,12 @@ uint64_t leaf_flags(uint64_t va);
 // default. It is page granular: there is no heap and no sub-page allocator.
 //
 
-// Pages of revocation bitmap a revocable allocation of `pages` pages comes with.
-constexpr size_t bitmap_pages(size_t pages) {
+// Pages of revocation bitmap a revocable allocation of `pages` pages comes
+// with: one of each bitmap for every BITMAP_SPAN it covers.
+constexpr size_t bitmap_spans(size_t pages) {
   return (pages * PAGE_SIZE + BITMAP_SPAN - 1) / BITMAP_SPAN;
 }
+constexpr size_t bitmap_pages(size_t pages) { return 2 * bitmap_spans(pages); }
 
 // `pages` rounded up to a count a capability can be bounded to exactly: what
 // an allocation of `pages` takes, and is charged for. 0 if `pages` is 0 or
@@ -331,23 +360,93 @@ Capability alloc_pages(size_t pages, bool revocable = false,
 // be freed twice.
 uint64_t free_pages(Capability object);
 
-// Walks the live (mapped, not quarantined) pages of the dynamic address space:
-// returns a kernel-only view of the first one at or above `*cursor` and moves
-// `*cursor` past it, or null when there are no more. Start with `*cursor = 0`.
-// What to do with each page is the caller's: the revocation sweep clears tags
-// in it.
-Capability next_live_page(uint64_t* cursor);
+// CHECKED PAGES
+//
+// A revocation sweep (revoke.hpp) does not stop the machine to scan memory.
+// It starts a new GENERATION, and each page of the pool is then checked
+// before the first capability is loaded from it, or by the sweeper, whichever
+// comes first. The hardware does the first half: the hart's generation is
+// `mstatus.UCRG`, a page's is pte::CapGen in its entry, and loading a tagged
+// capability through an entry of the other generation traps.
+//
+// A resident page that is not quarantined is CHECKED if its generation is the
+// hart's and STALE if not. Checking a page clears every capability in it that
+// is revoked (revoke.hpp, THE BASE RULE) and gives it the hart's generation.
+// Between sweeps every page is checked. A page that gets a frame is checked:
+// it holds zeroes, or what came back from swap, which is checked on its way
+// in (PAGING, REVOCATION). So a page is stale only if it was resident when
+// the generation began and nothing has loaded a capability from it since.
+//
+// The kernel is no part of this. Its image and the direct map move to the
+// new generation with the hart (`new_generation`), so nothing loaded through
+// them ever traps; a page is checked by reading it through the direct map.
+// The kernel's static data is not scanned either: no capability a
+// compartment gave the kernel is kept there, and the pointers it keeps to
+// pool pages (the thread a hart runs, a quota root's children) it clears
+// itself. Everything else -- thread stacks, saved registers, descriptors,
+// tables, heaps -- is a page of the pool like any other.
+//
+// A quarantined page carries the generation it was freed in, with a frame or
+// without. A sweep reclaims the ones of the generation before its own: those
+// were freed before it began, so every page it checks is checked against
+// them. A page freed while it runs is checked first if it is stale, takes the
+// new generation, and waits for the next sweep, because pages checked before
+// it was freed may hold capabilities to it.
+//
+// SEVERAL HARTS. The generation is a hart's own, and every hart has the
+// same one: they are stopped, and take the step together (`new_generation`;
+// revoke.hpp, SEVERAL HARTS). A check gives a page the new generation in the
+// page table, which the harts share, and drops the translation of the hart
+// that did it; another hart that still has the old one cached traps once
+// more on that page and finds it checked (`check_fault`).
 
-// Unmaps every quarantined page in the dynamic address space, and its bitmap
-// page, and frees their frames; the addresses are then free for reuse.
-// Called by `revoke::sweep()` after all capability tags pointing into
-// quarantined ranges have been cleared. With paging the addresses are left
-// Held instead, until the sweep is complete and calls `release_held`
-// (PAGING, REVOCATION).
+// The hart's generation, as the bit its pages carry: pte::CapGen or 0.
+uint64_t generation();
+
+// Starts a new generation. Every resident page of the pool is stale from
+// then on, except the `count` pages at `keep`: the ones the harts are running
+// on (the caller's stack, and what was saved of the thread each hart runs),
+// which are checked here and now. Each must be a resident page of the pool
+// that is not quarantined, and there are MAX_KEPT at most: two for each of
+// sixteen harts, and a system call's stack. Called between sweeps only, when
+// no page is stale, with every other hart stopped (SEVERAL HARTS): they
+// follow when the caller lets them go.
+constexpr size_t MAX_KEPT = 40;
+void new_generation(const uint64_t* keep, size_t count);
+
+// Checks every stale page of `[va, va + len)`, and returns how many there
+// were. Anything else in the range (not in the pool, no frame, quarantined,
+// checked already) is left alone.
+size_t check_pages(uint64_t va, size_t len);
+
+// The trap's: a capability load from the page at `va` trapped as a load from
+// a stale page. Checks the page if it is stale. If it is checked already,
+// another hart did it after this hart last looked the page up (SEVERAL
+// HARTS), and this hart's cached translation of it is dropped. True if the
+// load is to run again; false if the page is not one a check applies to.
+bool check_fault(uint64_t va);
+
+// Whether the page at `va` is stale. For the self-tests.
+bool is_stale(uint64_t va);
+
+// Checks stale pages from `*cursor` up, at most `pages` of them, and moves
+// `*cursor` past everything it has looked at. True once it has reached the
+// top of the pool: nothing below is stale then, and nothing becomes stale
+// until the next generation. Start with `*cursor = 0`.
+bool check_some(uint64_t* cursor, size_t pages);
+
+// Unmaps every page quarantined before this generation began (CHECKED
+// PAGES), and its bitmap pages, and frees their frames; the addresses are
+// then free for reuse. Called by the sweep once no page is stale, so that no
+// capability to them is left. With paging the addresses are left Held
+// instead, until the sweep is complete and calls `release_held` (PAGING,
+// REVOCATION). ONE HART: only the calling hart's cached translations of
+// them are dropped. With threads on several harts the others have to drop
+// theirs too before the addresses are handed out again (DESIGN.md §4.4).
 void reclaim_quarantined();
 
-// Kernel-only read/write view of the whole revocation bitmap (REVOCATION
-// BITMAP), for `revoke`, which owns what is in it. Only the pages of
+// Kernel-only read/write view of both revocation bitmaps (REVOCATION
+// BITMAP), for `revoke`, which owns what is in them. Only the pages of
 // revocable allocations are mapped: test `leaf_flags` before touching
 // anything else.
 Capability bitmap_view();
@@ -398,9 +497,10 @@ Capability bitmap_view();
 // few brought in: its entry becomes Swapped, its bytes are copied into
 // `blk`'s buffer, and its frame is freed at once.
 //
-// ONE HART. Like the sweep, paging relies on every thread running on the
-// boot hart (DESIGN.md §4.4): the kernel's own `sfence.vma` is all a page
-// needs as it leaves, and nothing pages while a sweep runs.
+// ONE HART. Like the end of a sweep (`reclaim_quarantined`), paging relies
+// on every thread running on the boot hart (DESIGN.md §4.4): the kernel's
+// own `sfence.vma` is all a page needs as it leaves. Pages come and go while
+// a sweep runs (REVOCATION).
 //
 // FRAMES. Three marks, each a number of free frames and a share of RAM. A
 // pageable page never takes one of the last `reserve` free frames: those are
@@ -418,17 +518,21 @@ Capability bitmap_view();
 // again -- so `blk` cannot change a page, or have a capability built that was
 // not there. Without it, `blk` is trusted with those.
 //
-// REVOCATION. A sweep cannot see capabilities on disk. If there are any, it
-// asks for them to be checked (`start_checks`): the pager reads each such page
-// back, and every capability the sweep revokes is cleared from its bitmap, so
-// it is never built again. What a sweep reclaims is Held (frame freed,
-// address not reused) and its marks stay until it is complete: at once if
-// nothing had to be checked, else when the checks are done. A page that comes
-// in meanwhile is checked the same way as it comes in.
+// REVOCATION. A sweep cannot see capabilities on disk. Once no page in RAM is
+// stale (CHECKED PAGES) it asks for the pages on disk to be checked
+// (`start_checks`): the pager reads each one that holds capabilities back,
+// and every capability the sweep revokes is cleared from its bitmap, so it is
+// never built again. What a sweep reclaims is Held (frame freed, address not
+// reused) and its marks stay until it is complete: at once if nothing had to
+// be checked, else when the checks are done. A page that comes in, at any
+// time, is checked the same way as it comes in, and a stale page is checked
+// before it goes out, so nothing that moves meanwhile is missed.
 //
-// KERNEL ACCESS. The kernel never takes a fault on pageable memory. To read
-// or write a compartment's memory it takes a ResidentHold, which fails if a
-// page is not in RAM; the caller touches the memory and calls again.
+// KERNEL ACCESS. The kernel never takes a fault on a compartment's memory:
+// not for a page that is out, and not for a stale one (CHECKED PAGES). To
+// read or write it, it takes a ResidentHold, which fails if a page is not in
+// RAM and checks any that is stale; if it fails, the caller touches the
+// memory and calls again.
 //
 // WHAT MUST NOT WAIT. Nor may anything the pager needs wait for a page: `blk`
 // holding its lock, the scheduler holding its own, or code running with
@@ -473,18 +577,18 @@ constexpr unsigned PAGE_SLOT_SHIFT = 8;
 uint64_t page_next(Capability buf, uint64_t tid);
 void page_done(Capability buf);
 
-// REVOCATION, for `revoke`. `start_checks` begins the checks a sweep needs
-// and says whether there are any; `checks_pending` whether they are still
-// going on. `release_held` frees the addresses the sweep reclaimed, once it
-// is complete.
+// REVOCATION, for `revoke`. `start_checks` begins the checks of swap a sweep
+// needs and says whether there are any; `checks_pending` whether they are
+// still going on. `release_held` frees the addresses the sweep reclaimed,
+// once it is complete.
 bool start_checks();
 bool checks_pending();
 void release_held();
 
 // KERNEL ACCESS. Holds the VM lock, and so keeps every page of
-// `[va, va + len)` in RAM, while it lives; `ok()` false, holding nothing, if
-// any of them is not in RAM. Nothing that takes a lock listed before the VM
-// lock (lock.hpp) may be taken while it is held.
+// `[va, va + len)` in RAM and checked, while it lives; `ok()` false, holding
+// nothing, if any of them is not in RAM. Nothing that takes a lock listed
+// before the VM lock (lock.hpp) may be taken while it is held.
 bool hold_resident(uint64_t va, size_t len);
 void release_resident();
 class ResidentHold {
@@ -528,8 +632,8 @@ uint64_t page_test(uint64_t op, Capability cap);
 
 // Every page in use is resident, so each place the kernel meets paging does
 // nothing: no fault is paging's, a sweep has nothing on disk to check,
-// memory the kernel is about to touch is always there, and the boot root is
-// not kept.
+// memory the kernel is about to touch is always there (it is only checked,
+// KERNEL ACCESS), and the boot root is not kept.
 constexpr bool paging_on() { return false; }
 inline bool set_retag_root(Capability) { return true; }
 inline Fault fault(uint64_t, bool, uint64_t) { return Fault::No; }
@@ -539,7 +643,7 @@ inline bool checks_pending() { return false; }
 inline void release_held() {}
 class ResidentHold {
  public:
-  ResidentHold(uint64_t, size_t) {}
+  ResidentHold(uint64_t va, size_t len) { check_pages(va, len); }
   bool ok() const { return true; }
 };
 

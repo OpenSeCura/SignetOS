@@ -8,6 +8,7 @@ setup.sh     fetches, copies, patches and builds the whole toolchain
 zyseal/      Zyseal sealing extension: LLVM and QEMU patches, tests
 mmodemmu/    lets M-mode use the MMU: one QEMU patch
 sentries/    call sentries and local return sentries: one QEMU patch
+mmodecrg/    capability load generations for M-mode's pages: one QEMU patch
 ```
 
 From the repository root:
@@ -28,8 +29,8 @@ About an hour and ~30 GB of disk the first time, nearly all of it LLVM.
 2. copies the LLVM and QEMU trees to `$CHERI_ROOT/zyseal/`, so cheribuild's
    originals stay untouched;
 3. runs each extension's `setup.sh` to patch the copies, in order:
-   `zyseal/`, then `mmodemmu/`, then `sentries/` (each QEMU patch goes on
-   top of the ones before it);
+   `zyseal/`, then `mmodemmu/`, then `sentries/`, then `mmodecrg/` (each
+   QEMU patch goes on top of the ones before it);
 4. builds the patched LLVM and QEMU.
 
 **Re-running** is safe. Finished steps are skipped, a patch that is already

@@ -105,6 +105,9 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
 #ifdef SIGNETOS_QUOTA_SELFTEST
   debug::quota_self_test(system_quota);
 #endif
+#ifdef SIGNETOS_SMP_SELFTEST
+  debug::smp_self_test(system_quota, thread_quota);
+#endif
 
   (void)hartid;
 
@@ -113,5 +116,8 @@ extern "C" void kernel_main(Capability root_data_cap, uint64_t hartid,
 
   const init::Status status = init::launch(system_quota, thread_quota);
 
+#ifdef SIGNETOS_SMP_SELFTEST
+  debug::smp_self_test_report();
+#endif
   uart::qemu_poweroff(status == init::Status::Ok ? 0 : 1);
 }

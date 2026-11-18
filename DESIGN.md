@@ -42,6 +42,12 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
     (`toolchain/sentries`).
   * `mmodemmu`: lets M-mode use the MMU (`toolchain/mmodemmu`). Everything
     runs in M-mode, and this is what keeps paging.
+  * `Svucrg` with `mmodecrg`: two capability bits in each page's entry that
+    the hardware reads (`toolchain/mmodecrg`). Every mapping that holds
+    capabilities carries the first, `pte::CapWrite`. The second,
+    `pte::CapGen`, is the page's generation: loading a capability from a
+    page whose generation is not the hart's traps, which is how a revocation
+    sweep gets a page checked before anything is loaded from it (§4.2).
 * **Machine:** multi-hart QEMU `virt` with one virtio-blk disk (`disk.img`).
   There is no firmware (`-bios none`). The kernel starts in M-mode and stays
   there, takes every trap itself (nothing is delegated), and drives the CLINT
@@ -74,7 +80,8 @@ make clean
 
 Options: `TRACE_SWITCH=1` prints every thread switch; `SMP=n` sets the hart
 count; `PAGING=0` builds without paging (no pager, no swap, all memory stays
-in RAM).
+in RAM). Test builds, described in the `Makefile`: `QUOTA_SELFTEST=1`,
+`SWEEP_STRESS=1`, `SMP_SELFTEST=1`.
 
 ---
 
@@ -112,7 +119,9 @@ The present build makes these simplifications, each expanded below:
   park (§4.4).
 * **The scheduler is currently round-robin** with per-node budgets,
   lazy replenishment and budgets enforced at the kernel's 10 ms tick (§2.6).
-* **A revocation sweep runs when someone asks, and at most once per interval.**
+* **A revocation sweep runs when a compartment starts one, and in the
+  background.** Nothing stops the machine to scan memory: a page is checked
+  before the first capability is loaded from it, or by the sweeper thread.
   Freed memory is quarantined, stays mapped and stays charged to whoever paid
   for it until a sweep reclaims it (§4.2).
 * **A fault is handled by the faulting compartment**, through the fault
@@ -660,8 +669,8 @@ kernel's only part in it is minting the two authorities at boot.
    fewer permissions.
 9. **Lifetime.** A type lives as long as its record. When the record is freed,
    the revocation sweep untags every key and every header copy, so all objects
-   of the type become unopenable at once. A sweep runs only when someone asks
-   for one (§4.2), so until then a freed type stays openable.
+   of the type become unopenable at once. A sweep runs only when someone
+   starts one (§4.2), so until then a freed type stays openable.
 10. **Provisioning at load time.** A creator can mint types for a compartment
     it is building and put the keys in its seeds. It follows that a creator
     can always open its child's sealed objects. **Sealing protects a
@@ -1216,35 +1225,68 @@ usual leak is physical memory held in quarantine until a sweep.
   freed object. The authority is the compartment handle: the range must lie
   inside one of `comp`'s revocable allocations (`FLAG_REVOCABLE`), and must
   not include its first byte, where the owner's own capability to it is
-  based. `sys_revoke` returns the current epoch; the owner reuses the memory
-  once `sys_revoke_query`, the count of completed sweeps, reaches it. Nobody
-  else can revoke; whoever needs memory revoked asks its owner.
+  based. `sys_revoke` returns the range's epoch, the number of the next sweep
+  to start; the owner reuses the memory once `sys_revoke_query`, the number
+  of the last sweep completed, reaches it. Nobody else can revoke; whoever
+  needs memory revoked asks its owner. `sys_revoke` is never refused because
+  a sweep is running.
 * **Marks.** `sys_revoke` sets one bit per 16 bytes of its range, so both ends
-  must be multiples of 16 bytes; the sweep tests the bit under each
-  capability's base, and clears them all when it ends. The bits are a
-  bitmap of the virtual address space, at a fixed place in its top 2GB
+  must be multiples of 16 bytes; a sweep tests the bits under each
+  capability's base, and clears its own when it ends. The bits are bitmaps of
+  the virtual address space, two of them, at a fixed place in its top 4GB
   (`vm.hpp`, REVOCATION BITMAP), because capabilities name virtual addresses.
-  Only revocable allocations have bitmap pages: one page per 512KB of
-  allocation, rounded up, mapped with it, charged to its quota and freed with
-  it. To keep each bitmap page to one owner, a revocable allocation starts on
-  a 512KB boundary. Revoking itself costs no memory, and the sweep's test
-  costs the same however much is marked.
+  Two, because a mark made while a sweep runs must outlive that sweep: it
+  goes in the bitmap the running sweep does not clear, and is the next
+  sweep's (`revoke.hpp`, TWO BITMAPS). Only revocable allocations have bitmap
+  pages: a page of each bitmap per 512KB of allocation, rounded up, mapped
+  with it, charged to its quota and freed with it. To keep each bitmap page
+  to one owner, a revocable allocation starts on a 512KB boundary. Revoking
+  itself costs no memory, and a sweep's test costs the same however much is
+  marked.
 * **Freed memory stays charged until it is reclaimed.** A quarantined range
-  is still the freer's address space: nobody else can be given it until the
-  sweep. So whoever frees memory owes it to the quota that paid for it: the
-  bytes stay charged, counted as owed on the node. After each sweep has
-  reclaimed, it walks the quota trees and refunds every node what it is owed
-  (`quota.hpp`, OWED). Freeing in a loop therefore exhausts only the freer's
-  own quota.
-* **When a sweep runs:** nobody can ask for one. `sys_revoke_query()` sweeps
-  before it answers, at most once per `revoke::SWEEP_INTERVAL_US` however
-  many look. A sweep stops the machine while it scans all live memory, so the
-  interval is what bounds the time sweeps take; who looks, and how often,
-  cannot change it. Nothing
-  else starts a sweep: `vm::alloc_pages` just fails when memory runs out. A
-  compartment whose allocation fails because what it freed is still in
-  quarantine waits for the next epoch and tries again (`runtime.hpp`,
-  `revoke_wait`).
+  is still the freer's address space: nobody else can be given it until a
+  sweep has reclaimed it. So whoever frees memory owes it to the quota that
+  paid for it: the bytes stay charged, counted as owed on the node. A sweep
+  that completes walks the quota trees and refunds every node what it is owed
+  for the memory that sweep reclaimed (`quota.hpp`, OWED). Freeing in a loop
+  therefore exhausts only the freer's own quota.
+* **A sweep does not stop the machine to scan memory.** A compartment starts
+  one with `sys_revoke_start`, and nothing else does: no timer, and no
+  shortage of memory (`vm::alloc_pages` just fails when memory runs out).
+  Starting is one short step. Every hart moves to a new *generation*, which
+  leaves every page of the pool in the old one (`vm.hpp`, CHECKED PAGES), and
+  the pages the caller is running on are checked on the spot. The other harts
+  are stopped for that step and nothing more: each is interrupted where it
+  is, the registers of the thread it was running are checked where the trap
+  saved them, and it goes on in the new generation (§4.4). From then on,
+  loading a capability from a page of the old generation traps: the kernel
+  checks the page (clears every revoked capability in it), gives it the new
+  generation, and the load runs again. So a compartment pays for the pages
+  it uses, once per sweep, as it uses them; and from the moment a sweep
+  starts, no running code holds a revoked capability or can load one. A
+  thread that was not running has its saved registers checked before it runs
+  again: they are in a page too, its kernel stack.
+* **The sweeper** (`external/services/sweeper.cpp`) is the thread that
+  finishes a sweep. It has the kernel check the pages nobody has touched, a
+  few at a time (`sys_revoke_step`), until none is left. It is a thread like
+  any other, under a scheduler node of its own (a tenth of the machine), and
+  that budget is all the processor time sweeping in the background takes,
+  whoever starts sweeps and however often. Once no page is of the old
+  generation the sweep is complete: what was freed before it started is
+  reclaimed, and its marks are cleared. Memory freed while a sweep runs waits
+  for the next one, because pages checked before it was freed may still hold
+  capabilities to it. A compartment whose allocation fails because what it
+  freed is still in quarantine starts a sweep, waits for it, and tries again
+  (`runtime.hpp`, `revoke_sweep`).
+* **The kernel is not swept, and never takes the trap.** Its image, its
+  static data and the direct map move to the new generation with the hart.
+  No capability a compartment gave the kernel is kept in its static data, and
+  the pointers it keeps there to pool pages it clears itself. Everything else
+  it uses (thread state, saved registers, descriptors, quota nodes) is in
+  pages of the pool like any other, and before the kernel loads a capability
+  from one it has not just checked, it checks the page itself, reading it
+  through the direct map (`revoke.hpp`, KERNEL LOADS). A fault raised by
+  kernel code is still a bug, and halts.
 
 ### 4.3 Architectural invariants
 
@@ -1270,20 +1312,44 @@ The kernel is written with SMP in mind:
 **Today, though, every thread runs on the boot hart; the secondary harts are
 brought up and park.**
 
-The revocation sweep (§4.2) relies on that. It runs with interrupts off and
-assumes nothing else runs meanwhile. Once threads run on several harts,
-another hart could, during a sweep:
+The revocation sweep (§4.2) does not rely on that for what it does when it
+starts and while it runs (`revoke.hpp`, SEVERAL HARTS):
 
-* hold a revoked capability in a register, where the sweep never looks;
-* copy a capability from a page the sweep has not reached yet into one it
-  has already scanned;
-* free memory after the sweep has scanned the pages that point into it, which
-  the sweep would then reclaim along with the rest.
+* **The start.** A generation is a hart's own (`mstatus.UCRG`), so the harts
+  take the step together. The hart that starts a sweep pokes every other one
+  and waits until each has stopped (`smp.hpp`, THE STOP). A hart stops in the
+  poke: interrupted in a compartment's code, with the registers of its
+  thread saved on that thread's kernel stack, or parked. A hart inside a
+  system call finishes the call first; the kernel is never stopped in the
+  middle of anything. With every other hart stopped, the starting hart moves
+  the kernel's mappings and itself to the new generation and checks the
+  pages each hart is running on, the saved registers among them. Then it
+  lets the others go, and each follows before it runs anything else.
+* **The checks.** A page is checked by one hart, under the VM lock. A
+  capability another hart stores into the page meanwhile is not lost: a tag
+  is cleared only if the capability that was looked at is still the one
+  there. A hart whose cached translation of the page is older than the check
+  traps once more on it, finds it checked, and carries on.
 
-Sweeping with several harts running is still to be designed. One option is
-to pause every hart briefly at the end of the sweep, to check registers and
-the pages written during it. Another is hardware that checks capabilities as
-they are loaded (CHERIoT's load filter).
+The parked harts take part in every start as any hart would. What a hart
+that is *running a thread* does there is exercised only by the
+`SMP_SELFTEST=1` build, which runs a thread on a second hart, frees what a
+capability in one of its registers points to, starts a sweep, and has the
+thread report that the register lost its tag; the thread then stays there,
+stopped by every sweep, until power-off.
+
+Still to do before threads run on several harts:
+
+* **Unmapping.** When a sweep ends it unmaps what it reclaims, and when the
+  pager sends a page out it unmaps that page; in both cases only the hart
+  that does it drops its cached translation. Every other hart has to drop
+  its own before the address (or the frame) is used again. Nothing makes
+  them, yet.
+* **Switching threads.** A thread is released for other harts to take a
+  moment before the hart that ran it is off its kernel stack
+  (`thread.cpp`, `__signetos_thread_dispatch`).
+* **Somewhere for them to run.** The scheduler dispatches on the boot hart
+  only, and owns the PLIC for the boot hart only.
 
 ## 5. System Call and Service Interface Reference
 
@@ -1301,8 +1367,10 @@ status.
 | `capability_t sys_vm_allocate(comp, mem_quota, size, flags)` | Rounds `size` up to whole pages, and on to the next size a capability can be bounded to exactly. Debits `mem_quota` for that and records the range as owned by `comp`. Returns a read/write capability bounded to the allocation, with `StoreLocal` stripped. Memory is always zeroed and at fresh addresses. `FLAG_DMA` makes it one physically contiguous run with its physical base in its first 8 bytes, for a device to be pointed at. `FLAG_REVOCABLE` makes it one whose parts can be revoked; it starts on a 512KB boundary and is also charged its revocation marks, one page per 512KB (§4.2). Any other flag is refused. |
 | `void sys_vm_deallocate(comp, mem_quota, mem_capability)` | `mem_quota` must be the quota that funded the range. **Quarantines** the memory; `mem_quota` is refunded when the sweep reclaims it (§4.2). |
 | `capability_t sys_cow(comp, mem_quota, src_memory, len)` | Debits `len` up front. Currently an **eager copy** that keeps tags (§3.7). |
-| `uint64_t sys_revoke(comp, mem_cap)` | Marks `mem_cap`'s range for the next sweep, which revokes every capability based in it (§4.2). The range must lie inside one of `comp`'s revocable allocations, not including its first byte, and start and end on a multiple of 16 bytes. Returns the current epoch: the range may be reused once `sys_revoke_query` reaches it. 0 if refused. |
-| `uint64_t sys_revoke_query(void)` | How many sweeps have completed, having swept first if `revoke::SWEEP_INTERVAL_US` allows (§4.2). |
+| `uint64_t sys_revoke(comp, mem_cap)` | Marks `mem_cap`'s range, so that every capability based in it is revoked (§4.2). The range must lie inside one of `comp`'s revocable allocations, not including its first byte, and start and end on a multiple of 16 bytes. Returns the range's epoch, the number of the next sweep to start: the range may be reused once `sys_revoke_query` reaches it. 0 if refused. It starts no sweep, and is not refused because one is running. |
+| `uint64_t sys_revoke_query(void)` | The number of the last sweep completed (§4.2). It starts nothing. |
+| `uint64_t sys_revoke_start(void)` | Starts a sweep unless one is running, and returns the epoch that covers everything freed or marked before the call: that memory may be reused once `sys_revoke_query` reaches it (§4.2). If a sweep was already running, that epoch is the one after it, which the caller asks for again once the running one is complete (`runtime.hpp`, `revoke_sweep`). The call is short; the sweep is finished in the background. |
+| `uint64_t sys_revoke_step(pages)` | The sweeper's (§4.2): checks up to `pages` of the pages the running sweep has not reached, 64 at most a call, and completes the sweep if they were the last. 1 if more pages are left; 2 if none is but the sweep waits for the pager to check pages on disk; 0 if no sweep is running. |
 
 ### 5.2 Virtual memory quotas
 

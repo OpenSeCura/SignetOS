@@ -24,6 +24,7 @@
 #include <signetos/debug/inspect.hpp>
 #include <signetos/loader.hpp>
 #include <signetos/quota.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/syscall.hpp>  // FLAG_DMA, FLAG_REVOCABLE, COMPARTMENT_PAGEABLE
@@ -39,14 +40,23 @@ size_t s_live_count = 0;
 // and only ever increases, so a UID is never reused.
 uint64_t s_next_uid = 1;
 
+// Range and entry pages are reached from the descriptor and from each other,
+// and through these three alone, so this is where each is checked before
+// anything is loaded from it (revoke.hpp, KERNEL LOADS).
+void check_page(Capability page) {
+  revoke::check(capability_get_base(page), vm::PAGE_SIZE);
+}
+
 // The header of a range or entry page, which starts the page, so the page
 // capability itself addresses it.
 PageHeader* header_of(Capability page) {
+  check_page(page);
   return reinterpret_cast<PageHeader*>(page);
 }
 
 // The record array, bounded so it cannot reach back over the header.
 Range* records_of(Capability range_page) {
+  check_page(range_page);
   Capability r = capability_set_address(
       range_page, capability_get_base(range_page) + sizeof(PageHeader));
   r = capability_set_bounds(r, RANGES_PER_PAGE * sizeof(Range));
@@ -142,6 +152,7 @@ bool owns(Capability comp_page, uint64_t base, uint64_t len,
 
 // The entry record array of an entry page, bounded like records_of.
 EntryRecord* entries_of(Capability entry_page) {
+  check_page(entry_page);
   Capability r = capability_set_address(
       entry_page, capability_get_base(entry_page) + sizeof(PageHeader));
   r = capability_set_bounds(r, ENTRIES_PER_PAGE * sizeof(EntryRecord));
@@ -409,6 +420,10 @@ Capability table_writable(Capability handle) {
     return nullptr;
   }
   const Compartment* c = reinterpret_cast<const Compartment*>(page);
+  // The kernel reads slots through what this returns (init.cpp, loader.cpp):
+  // every page of the table, not only the descriptor's (revoke.hpp, KERNEL
+  // LOADS).
+  revoke::check(capability_get_base(page), capability_get_length(page));
   return user_view(table_slice(page, 0, c->table_slots));
 }
 
@@ -755,6 +770,9 @@ Capability cow(Capability comp, Capability mem_quota, Capability src_memory,
 
   if ((src_addr & (CAP_BYTES - 1)) == 0 &&
       capability_has_perms(src_memory, perms::LoadCapability)) {
+    // The copy loads every capability in the source (revoke.hpp, KERNEL
+    // LOADS).
+    revoke::check(src_addr, len);
     const auto* src_caps = reinterpret_cast<const Capability*>(src_memory);
     auto* dst_caps = reinterpret_cast<Capability*>(dst);
     const size_t n_caps = len / CAP_BYTES;

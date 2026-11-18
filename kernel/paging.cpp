@@ -294,8 +294,10 @@ uint64_t victim_locked() {
 // Sends `va`, a resident page of pageable memory, out: its frame is taken
 // away, copied into `buf`, and freed at once, and its tag bitmap and digest
 // are kept beside the slot it is given. The write of `buf` to the slot is
-// then the job in hand.
+// then the job in hand. A stale page is checked first (REVOCATION): what
+// goes out while a sweep runs is checked already.
 void send_out_locked(uint64_t va, Capability buf) {
+  check_page_locked(va);
   const uint64_t slot = take_slot_locked();
   const uint64_t pa = take_frame_locked(va, slot);
   const volatile uint64_t* w = frame_words(pa);
@@ -515,8 +517,8 @@ Status setup_paging(size_t slots) {
   if (!is_initialized() || !capability_is_valid(s_retag_root)) {
     return Status::NotInitialized;
   }
-  // A Swapped entry names its slot in the bits above SlotShift.
-  if (slots == 0 || slots > (1ULL << (64 - pte::SlotShift))) {
+  // A Swapped entry names its slot in SlotBits bits above SlotShift.
+  if (slots == 0 || slots > (1ULL << pte::SlotBits)) {
     return Status::InvalidSize;
   }
   // The kernel's memory for paging, zeroed: a scratch page, a bit per slot,
@@ -620,6 +622,10 @@ bool hold_resident(uint64_t va, size_t len) {
   if (!resident_locked(va, len)) {
     s_lock.release();
     return false;
+  }
+  // And checked (CHECKED PAGES): the kernel is about to load from them.
+  for (uint64_t cur = va & ~(PAGE_SIZE - 1); cur < va + len; cur += PAGE_SIZE) {
+    check_page_locked(cur);
   }
   return true;
 }

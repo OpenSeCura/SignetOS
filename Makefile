@@ -43,6 +43,13 @@
 # every compartment run in M-mode, so this is what keeps paging; without it
 # the kernel's first access to the mmodemmu CSR is an illegal instruction.
 #
+# Svucrg=on gives each page two capability bits the hardware reads: whether it
+# may hold capabilities, and its capability load generation. mmodecrg=on
+# (toolchain/mmodecrg) makes the generation check apply to M-mode's pages,
+# which Svucrg leaves out. Every mapping that holds capabilities carries
+# pte::CapWrite (vm.hpp); a kernel without it cannot store a capability under
+# Svucrg and stops at boot.
+#
 # CHERI_ROOT is the install root toolchain/setup.sh used (its default is
 # ~/cheri); the patched tools are under $(CHERI_ROOT)/zyseal. Override it (or
 # CHERI_SDK_BIN / QEMU individually) on the command line or in the environment
@@ -52,7 +59,7 @@ CHERI_ROOT    ?= $(HOME)/cheri
 CHERI_SDK_BIN ?= $(CHERI_ROOT)/zyseal/llvm-build/bin
 QEMU          ?= $(CHERI_ROOT)/zyseal/qemu-build/qemu-system-riscv64cheristd
 MARCH         = rv64gc_zcheripurecap_zyseal
-QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on,sentries=on,mmodemmu=on
+QEMU_CPU      = rv64,Zyseal=on,Zylevels1=on,sentries=on,mmodemmu=on,Svucrg=on,mmodecrg=on
 EXTRA_LDFLAGS =
 
 CXX     = $(CHERI_SDK_BIN)/clang++
@@ -90,6 +97,30 @@ ifeq ($(QUOTA_SELFTEST),1)
 TEST_DEFS = -DSIGNETOS_QUOTA_SELFTEST
 else
 TEST_DEFS =
+endif
+
+# SWEEP_STRESS=1 keeps a revocation sweep running all the time and makes each
+# one slow, so that most pages are stale most of the time (vm.hpp, CHECKED
+# PAGES): the sweeper starts the next sweep as soon as one completes and
+# checks one page every few milliseconds, and a sweep is started whether or
+# not there is anything to revoke. Every path that loads capabilities then
+# meets stale pages, including the ones the kernel has to check for itself
+# (revoke.hpp, KERNEL LOADS), where one that was missed halts the machine
+# with a load page fault raised by kernel code. A test build: off by default.
+SWEEP_STRESS ?= 0
+ifeq ($(SWEEP_STRESS),1)
+TEST_DEFS += -DSIGNETOS_SWEEP_STRESS
+endif
+
+# SMP_SELFTEST=1 runs `debug::smp_self_test` (`kernel/debug/smp_selftest.cpp`)
+# at boot: one of the parked harts is given a thread to run, a sweep is
+# started under it, and the thread stays there, stopped by every sweep the
+# system starts, until power-off (revoke.hpp, SEVERAL HARTS). The only build
+# in which a hart other than the boot hart runs a thread. Needs SMP >= 2. A
+# test build: off by default.
+SMP_SELFTEST ?= 0
+ifeq ($(SMP_SELFTEST),1)
+TEST_DEFS += -DSIGNETOS_SMP_SELFTEST
 endif
 
 # PAGING=1 (the default): what compartments allocate can go to swap and back
@@ -149,7 +180,7 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 # `external/` (`EXT_SERVICES` and `EXT_APPS`): written into `disk.img` at build
 # time by `tools/signetfs.py` (never linked into the kernel image).
 #   - `external/services/`: root-owned system services (`naming`, `sealer`,
-#     `sched`, `shell`) that `init` reads from `fs` out of `/` and
+#     `sched`, `sweeper`, `shell`) that `init` reads from `fs` out of `/` and
 #     loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell can
 #     `run` (user/launch.hpp); each one's manifest says what it asks for.
@@ -159,7 +190,7 @@ BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))
 BOOT_BINS  = $(patsubst %,boot/%.bin,$(BOOT_COMPS))
 
-EXT_SERVICES     = naming sealer sched shell
+EXT_SERVICES     = naming sealer sched sweeper shell
 EXT_SERVICE_SRCS = $(patsubst %,external/services/%.cpp,$(EXT_SERVICES))
 EXT_SERVICE_OBJS = $(patsubst %.cpp,%.o,$(EXT_SERVICE_SRCS))
 EXT_SERVICE_ELFS = $(patsubst %,external/services/%.elf,$(EXT_SERVICES))
@@ -201,6 +232,8 @@ QEMU_DISK  = -global virtio-mmio.force-legacy=false \
 ASM_SRCS = kernel/boot.S \
            kernel/early_trap.S \
            kernel/switch.S \
+           kernel/sweep.S \
+           kernel/debug/smp_stub.S \
            kernel/boot_images.S
 
 # The core kernel is kernel/*.cpp. Around it: hardware drivers (kernel/hw/),
@@ -228,6 +261,7 @@ CXX_SRCS = kernel/vm.cpp \
            kernel/debug/report.cpp \
            kernel/debug/inspect.cpp \
            kernel/debug/quota_selftest.cpp \
+           kernel/debug/smp_selftest.cpp \
            kernel/lib/kstring.cpp \
            $(PAGING_SRCS)
 
@@ -318,12 +352,13 @@ clean:
 disk: $(DISK_IMG)
 
 # Everything is rebuilt, and the disk image remade, whenever one of
-# TRACE_SWITCH, QUOTA_SELFTEST, PAGING, SWAP_HASH, PAGE_TEST or SWAP_BYTES
+# TRACE_SWITCH, QUOTA_SELFTEST, SWEEP_STRESS, SMP_SELFTEST, PAGING, SWAP_HASH,
+# PAGE_TEST or SWAP_BYTES
 # flips, via a stamp file that only changes when a value does. Everything,
 # because PAGING changes the system call list every object is built against.
 FLAGS_STAMP = .build_flags
 FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST) $(PAGING) $(SWAP_HASH) \
-              $(PAGE_TEST) $(SWAP_BYTES)
+              $(PAGE_TEST) $(SWAP_BYTES) $(SWEEP_STRESS) $(SMP_SELFTEST)
 $(FLAGS_STAMP): FORCE
 	@echo $(FLAG_VALUES) | cmp -s - $@ 2>/dev/null || echo $(FLAG_VALUES) > $@
 $(OBJS) $(COMP_OBJS): $(FLAGS_STAMP)

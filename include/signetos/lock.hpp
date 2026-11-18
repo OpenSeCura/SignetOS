@@ -42,9 +42,22 @@
  * innermost). Pure capability-derivation and read-only syscalls
  * (`sys_thread_tid`) take no lock at all.
  *
- * A revocation sweep refunds what quota nodes are owed after it has let go
- * of `revoke::s_lock`. It runs only inside `sys_revoke_query` (or the boot
- * self-test), never inside another kernel call.
+ * A revocation sweep that completes refunds what quota nodes are owed after
+ * it has let go of `revoke::s_lock`. That happens only inside one of
+ * revoke's own calls (`sys_revoke_start`, `sys_revoke_step`,
+ * `sys_revoke_query`, or the boot self-test), never inside another kernel
+ * call.
+ *
+ * A page is checked (vm.hpp, CHECKED PAGES) under `vm::s_lock` alone, from
+ * the trap dispatcher or from wherever the kernel is about to load from it
+ * (revoke.hpp, KERNEL LOADS), which may be under any lock listed before it.
+ *
+ * A hart that stops the others (smp.hpp, THE STOP) holds no lock while it
+ * waits for them. A hart stops only once the kernel on it has finished what
+ * it was doing, and that may need any of these locks; so a lock held by the
+ * waiting hart could keep the others from ever stopping. `sys_revoke_start`,
+ * the one caller, lets go of `revoke::s_lock` first. A stopped hart holds no
+ * lock either, so with the others stopped every lock is free.
  *
  * HOW IT IS SAFE TO HOLD
  * ----------------------

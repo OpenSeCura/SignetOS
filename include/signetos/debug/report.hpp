@@ -77,4 +77,14 @@ inline void trace_switch(uint64_t, uint64_t) {}
 // QUOTA_SELFTEST=1 build.
 void quota_self_test(Capability root);
 
+// Runs a thread on a second hart and starts a sweep under it
+// (kernel/debug/smp_selftest.cpp), with memory from the two root quotas;
+// panics on the first failed check. Run at boot in an SMP_SELFTEST=1 build,
+// where a parked hart calls `smp_self_test_poke` at each poke to take the
+// thread, and `smp_self_test_report` says at power-off how the thread fared
+// since.
+void smp_self_test(Capability vm_root, Capability thread_root);
+void smp_self_test_poke();
+void smp_self_test_report();
+
 }  // namespace signetos::debug

@@ -21,6 +21,7 @@
  */
 
 #include <signetos/quota.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 
 namespace signetos::quota {
@@ -41,7 +42,8 @@ void init_node(QuotaNode* node, uint64_t limit_bytes, uint32_t flags) {
   node->prev_sibling = nullptr;
   node->limit_bytes = limit_bytes;
   node->allocated_bytes = 0;
-  node->owed_bytes = 0;
+  node->owed_bytes[0] = 0;
+  node->owed_bytes[1] = 0;
   node->flags = flags | FLAG_LIVE | FLAG_EXISTS;
   node->lock = SpinLock{};
 }
@@ -49,6 +51,12 @@ void init_node(QuotaNode* node, uint64_t limit_bytes, uint32_t flags) {
 // Seals a node as a handle of `t` carrying `perms_mask`. When `Permit_Load`
 // is present, `LoadCapability | LoadMutable` are preserved on the sealed
 // handle so the kernel can read `self_page` directly on unseal.
+// OWED: where `node` counts memory freed now, which the next sweep to start
+// reclaims.
+uint64_t& owed_now(QuotaNode* node) {
+  return node->owed_bytes[revoke::next_epoch() & 1];
+}
+
 Capability seal_node(Tree& t, QuotaNode* node, uint64_t perms_mask) {
   Capability c = reinterpret_cast<Capability>(node);
   c = capability_set_bounds(c, sizeof(QuotaNode));
@@ -116,7 +124,7 @@ void free_node_page(Tree& t, Capability page, QuotaNode* parent) {
   if (!capability_is_valid(page)) {
     return;
   }
-  parent->owed_bytes += vm::free_pages(page);
+  owed_now(parent) += vm::free_pages(page);
   __atomic_fetch_sub(&t.live_nodes, 1, __ATOMIC_RELAXED);
 }
 
@@ -131,7 +139,9 @@ void free_node_page(Tree& t, Capability page, QuotaNode* parent) {
 // counts what `node` gave back as handed out.
 void refund_unused(Tree& t, QuotaNode* node) {
   while ((node->flags & FLAG_LIVE) == 0) {
-    QuotaNode* parent = node->parent;  // never null: the root is never closed
+    // Never null: the root is never closed. Another node's page (revoke.hpp,
+    // KERNEL LOADS).
+    QuotaNode* parent = revoke::checked(node->parent);
     const uint64_t unused = give_back(node);
     const bool empty = (node->flags & FLAG_EXISTS) == 0;
     node->lock.release();
@@ -145,10 +155,11 @@ void refund_unused(Tree& t, QuotaNode* node) {
   node->lock.release();
 }
 
-// Refunds what `node` is owed (OWED in quota.hpp). Caller holds its lock.
-void settle(QuotaNode* node) {
-  node->allocated_bytes -= node->owed_bytes;
-  node->owed_bytes = 0;
+// Refunds what `node` is owed for memory sweep `epoch` reclaimed (OWED in
+// quota.hpp). Caller holds its lock.
+void settle(QuotaNode* node, uint64_t epoch) {
+  node->allocated_bytes -= node->owed_bytes[epoch & 1];
+  node->owed_bytes[epoch & 1] = 0;
 }
 
 // Call with `top->lock` held; returns with it still held. Visits every node
@@ -157,9 +168,9 @@ void settle(QuotaNode* node) {
 //   closing (destroy): closes it. A node closed already is skipped, along
 //            with everything beneath it, which is closed too and holds no
 //            unused allowance.
-//   otherwise (the sweep): refunds what it is owed. Before its children, so
-//            that a child page freed further down is owed to a node already
-//            settled, and waits for the next sweep, which reclaims it.
+//   otherwise (sweep `epoch`): refunds what it is owed for that sweep. A
+//            child page freed further down is owed for the next one, which
+//            reclaims it.
 //
 // Coming back up, each closed node gives its unused allowance to its parent
 // once everything beneath it has done the same, so that all of it ends up
@@ -171,12 +182,13 @@ void settle(QuotaNode* node) {
 // lock of every node from `top` down to where it is, taking each parent's
 // before its child's, so nothing on that path can be unlinked or freed
 // meanwhile: `parent` and `next_sibling` are always safe to follow.
-void walk(Tree& t, QuotaNode* top, bool closing) {
+void walk(Tree& t, QuotaNode* top, bool closing, uint64_t epoch = 0) {
   QuotaNode* node = top;
   QuotaNode* next = top->first_child;
   for (;;) {
     if (next != nullptr) {
-      QuotaNode* child = next;
+      // Another node's page (revoke.hpp, KERNEL LOADS).
+      QuotaNode* child = revoke::checked(next);
       child->lock.acquire();
       if (closing && (child->flags & FLAG_LIVE) == 0) {
         next = child->next_sibling;
@@ -186,7 +198,7 @@ void walk(Tree& t, QuotaNode* top, bool closing) {
       if (closing) {
         child->flags &= ~FLAG_LIVE;
       } else {
-        settle(child);
+        settle(child, epoch);
       }
       node = child;
       next = child->first_child;
@@ -428,19 +440,20 @@ void owe(Capability handle, uint64_t bytes) {
     Locked hold(node->lock);
     // What it paid for is still charged, so it cannot have been freed.
     if ((node->flags & FLAG_EXISTS) != 0 &&
-        bytes <= node->allocated_bytes - node->owed_bytes) {
-      node->owed_bytes += bytes;
+        bytes <= node->allocated_bytes - node->owed_bytes[0] -
+                     node->owed_bytes[1]) {
+      owed_now(node) += bytes;
     }
     return;
   }
 }
 
-void settle_owed() {
+void settle_owed(uint64_t epoch) {
   for (size_t i = 0; i < s_tree_count; ++i) {
     Tree& t = *s_trees[i];
     Locked hold(t.root.lock);
-    settle(&t.root);
-    walk(t, &t.root, /*closing=*/false);
+    settle(&t.root, epoch);
+    walk(t, &t.root, /*closing=*/false, epoch);
   }
 }
 

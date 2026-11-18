@@ -395,8 +395,11 @@ _start:
     csrw    mtvecc, ct0
 
     /* Call secondary_hart_init(hartid in ca0) with bounded PCC (cs10),
-     * scrubbing all temporary capability registers except callee-saved cs1. */
+     * scrubbing all temporary capability registers except callee-saved cs1.
+     * cs3 keeps what the parked loop below calls, with the same PCC. */
     cmv     ca0, cs0
+    llc     ct1, __signetos_parked_poke
+    scaddr  cs3, cs10, t1
     llc     ct0, secondary_hart_init
     scaddr  ct0, cs10, t0
     cmv     cs0, cnull
@@ -406,11 +409,8 @@ _start:
     cmv     ct1, cnull
     cjalr   cra, ct0
 
-    /* Keep this hart's CLINT `msip` in cs2 for the idle loop and scrub its
-     * slot, signal boot hart that this hart is online (state = 2), scrub
+    /* Signal boot hart that this hart is online (state = 2), scrub
      * cs1/cra/ct0, and park. */
-    clc     cs2, 48(cs1)
-    csc     cnull, 48(cs1)
     fence   rw, w
     li      t0, 2
     sd      t0, 40(cs1)
@@ -418,10 +418,12 @@ _start:
     cmv     cra, cnull
     cmv     ct0, cnull
 .Lsecondary_idle:
-    /* Parked with interrupts masked (DESIGN.md §4.4). A poke ends the `wfi`;
-     * clearing it is all this hart does with it, so the next `wfi` sleeps. */
+    /* Parked with interrupts masked (DESIGN.md §4.4), on this hart's host
+     * stack. A poke ends the `wfi`; `__signetos_parked_poke` (smp.cpp) clears
+     * it, so the next `wfi` sleeps, and stops this hart for as long as
+     * another hart asks (smp.hpp, THE STOP). */
     wfi
-    sw      zero, 0(cs2)        /* msip[this hart] = 0 */
+    cjalr   cra, cs3
     j       .Lsecondary_idle
 
     .align 2                    /* `mtvecc` until step 8: 4-byte aligned */

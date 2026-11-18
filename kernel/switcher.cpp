@@ -23,6 +23,7 @@
 
 #include <signetos/asm_macros.h>
 #include <signetos/debug/inspect.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/switcher.hpp>
@@ -206,6 +207,12 @@ extern "C" Capability __signetos_switcher_prepare(Sentry entry_point,
     }
   } else if (!trusted) {
     return refuse(Status::InvalidSentry);  // a compartment entry always has one
+  }
+  // A system call's body runs on its slice, and loads back from it what it
+  // spills there (revoke.hpp, KERNEL LOADS). A compartment's takes the fault.
+  if (trusted && capability_is_valid(narrowed)) {
+    revoke::check(capability_get_base(narrowed),
+                  capability_get_length(narrowed));
   }
 
   // Domain switcher entry: verify that every capability about to be loaded into a compartment

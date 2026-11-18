@@ -22,6 +22,7 @@
 #include <signetos/irq.hpp>
 #include <signetos/lock.hpp>
 #include <signetos/quota.hpp>
+#include <signetos/revoke.hpp>
 #include <signetos/sealing.hpp>
 #include <signetos/sentry.hpp>
 #include <signetos/switcher.hpp>
@@ -95,8 +96,22 @@ void set_utidc(uint64_t hart, uint64_t tid) {
   __asm__ volatile("csrw 0x480, %0" : : "C"(id));  // 0x480 = utidc
 }
 
+// `t`, with its state pages checked (revoke.hpp, KERNEL LOADS): its
+// ThreadState, and its kernel stack with the frames it is parked in. Every
+// way to a thread other than the one running goes through this before a
+// capability is loaded from either; the running thread's own are checked
+// already.
+ThreadState* fresh(ThreadState* t) {
+  if (t != nullptr) {
+    revoke::check(capability_get_address(reinterpret_cast<Capability>(t)),
+                  THREAD_STATE_COST);
+  }
+  return t;
+}
+
 ThreadState* unseal_thread(Capability handle) {
-  return sealing::open_live<ThreadState>(OType::Thread, handle, FLAG_LIVE);
+  return fresh(
+      sealing::open_live<ThreadState>(OType::Thread, handle, FLAG_LIVE));
 }
 
 void teardown_thread(ThreadState* t) {
@@ -162,6 +177,7 @@ bool take(ThreadState* t) {
 // compartments are skipped), with the MIE that frame records. Never returns.
 [[noreturn]] void resume(ThreadState* t) {
   Cpu* c = cpu();
+  fresh(t);
   c->current = t;
   set_utidc(c->hart_id, t->tid);
   set_kernel_sp(t->kernel_sp);
@@ -519,7 +535,7 @@ Status install_handler(Capability thread_handle) {
 
 bool wake_handler(trap::TrapFrame* frame, uint64_t cause, uint64_t aux) {
   Cpu* c = cpu();
-  ThreadState* h = c->handler;
+  ThreadState* h = fresh(c->handler);
   ThreadState* t = c->current;
   // The handler waits whenever it is not handling one (it runs masked).
   if (h == nullptr || t == nullptr || c->interrupted != nullptr) {
@@ -592,7 +608,7 @@ void exit(int exit_status) {
   // killed): this hart has none from now on, and carries on with the thread
   // it was woken for. `t` is torn down once off its stacks.
   if (t == c->handler) {
-    ThreadState* parked = c->interrupted;
+    ThreadState* parked = fresh(c->interrupted);
     c->handler = nullptr;
     c->interrupted = nullptr;
     c->event_addr = 0;
@@ -656,6 +672,19 @@ uint64_t current_tid() {
   ThreadState* t = cpu()->current;
   return t == nullptr ? 0 : t->tid;
 }
+
+uint64_t current_state() {
+  return capability_get_address(reinterpret_cast<Capability>(cpu()->current));
+}
+
+uint64_t state_on(uint64_t hart) {
+  return hart < MAX_HARTS
+             ? capability_get_address(
+                   reinterpret_cast<Capability>(s_cpus[hart].current))
+             : 0;
+}
+
+Capability spare_stack() { return cpu()->host_kernel_sp; }
 
 Capability current_entry_sentry() {
   ThreadState* t = cpu()->current;

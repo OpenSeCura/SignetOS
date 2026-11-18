@@ -21,13 +21,13 @@
 
 #include <signetos/hw/clint.hpp>
 #include <signetos/irq.hpp>
+#include <signetos/smp.hpp>
 #include <signetos/thread.hpp>
 
 namespace signetos::irq {
 namespace {
 
-// `mie` bits. `MSTATUS_MPIE` comes from asm_macros.h.
-constexpr uint64_t MIE_MSIE = 1ULL << 3;
+// `mie` bits. `MIE_MSIE` and `MSTATUS_MPIE` come from asm_macros.h.
 constexpr uint64_t MIE_MTIE = 1ULL << 7;
 constexpr uint64_t MIE_MEIE = 1ULL << 11;
 
@@ -40,7 +40,7 @@ void init_hart() {
   // (the one that started a secondary hart is still set, thread.cpp).
   clint::set_timer(clint::TIMER_OFF);
   clint::clear_ipi();
-  __asm__ volatile("csrw mie, %0" : : "r"(MIE_MSIE));
+  __asm__ volatile("csrw mie, %0" : : "r"(static_cast<uint64_t>(MIE_MSIE)));
 }
 
 Status install(Capability thread) {
@@ -53,7 +53,7 @@ Status install(Capability thread) {
   return Status::Ok;
 }
 
-void on_poke() { clint::clear_ipi(); }
+void on_poke() { smp::on_poke(); }
 
 void rearm_tick() { clint::set_timer(clint::now() + tick_ticks()); }
 

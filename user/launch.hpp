@@ -59,6 +59,7 @@ struct Starter {
   Capability thread_create;
   Capability thread_kill;
   Capability revoke_query;
+  Capability revoke_start;
   Capability sched_block;  // scheduler entries
   Capability sched_derive;
   Capability sched_query;
@@ -208,18 +209,12 @@ struct ScopedHandle {
 template <typename Attempt, typename Ok>
 auto with_reclaim(const Starter& starter, Attempt attempt, Ok ok) {
   auto result = attempt();
-  if (ok(result) || !capability_is_valid(starter.revoke_query)) {
+  if (ok(result) || !capability_is_valid(starter.revoke_query) ||
+      !capability_is_valid(starter.revoke_start)) {
     return result;
   }
-  using FnQuery = decltype(&sys_revoke_query);
-  const uint64_t seen =
-      syscall::call<FnQuery>(starter.invoke, starter.revoke_query);
-  result = attempt();
-  if (ok(result)) {
-    return result;
-  }
-  revoke_wait(starter.invoke, starter.revoke_query, starter.sched_block,
-              seen + 1);
+  revoke_sweep(starter.invoke, starter.revoke_start, starter.revoke_query,
+               starter.sched_block);
   return attempt();
 }
 
