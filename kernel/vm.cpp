@@ -951,7 +951,9 @@ Capability alloc_pages(size_t pages, bool revocable, Backing backing) {
   if (!is_initialized() || pages == 0 || round_up_pages(pages) != pages) {
     return nullptr;
   }
-  const bool pageable = backing == Backing::Pageable;
+  // Pageable says the memory may be paged, not that it must be: with paging
+  // off it gets its frames now, like any other (Backing::Frames).
+  const bool pageable = backing == Backing::Pageable && paging_on();
 
   // The capability covers exactly the allocation, never a neighbour: the
   // length is representable (above), and the base is aligned as CHERI needs

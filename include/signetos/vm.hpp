@@ -332,8 +332,8 @@ size_t round_up_pages(size_t pages);
 // too.
 //
 // `backing` says how the pages get their frames. Null if RAM has not the
-// frames (Frames) or no run of them (OneRun), or if swap has not a slot for
-// each page (Pageable; PAGING, SWAP): always, unless paging is on.
+// frames (Frames) or no run of them (OneRun), or if paging is on and swap
+// has not a slot for each page (Pageable; PAGING, SWAP).
 enum class Backing {
   // A frame each, there and then, kept until the memory is reclaimed. Any
   // free frames: they need not be adjacent in RAM.
@@ -342,7 +342,8 @@ enum class Backing {
   // memory a device is pointed at needs it (FLAG_DMA).
   OneRun,
   // None yet: a page gets its frame when it is touched, and may go to swap
-  // (PAGING).
+  // (PAGING). The memory may be paged, it need not be: with paging off this
+  // is Frames, and the memory stays in RAM even if paging is set up later.
   Pageable,
 };
 Capability alloc_pages(size_t pages, bool revocable = false,
