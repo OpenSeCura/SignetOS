@@ -78,7 +78,7 @@ inline uint64_t load64(const uint8_t* p) {
 // and the alignment allow, else a byte at a time.
 inline void load_block(const uint8_t* p, uint64_t m[WORDS]) {
   if (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ &&
-      reinterpret_cast<uintptr_t>(p) % sizeof(uint64_t) == 0) {
+      __builtin_is_aligned(p, sizeof(uint64_t))) {
     const auto* w = reinterpret_cast<const uint64_t*>(p);
     for (size_t i = 0; i < WORDS; ++i) {
       m[i] = w[i];

@@ -26,8 +26,10 @@ typedef unsigned int uint32_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
 
-typedef long long intptr_t;
-typedef unsigned long long uintptr_t;
+// The compiler's own types: capabilities on this target, as CHERI C has it.
+// An integer made from a pointer keeps the pointer's tag and bounds.
+typedef __INTPTR_TYPE__ intptr_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
 
 #define INT32_MAX  2147483647
 #define INT32_MIN  (-2147483647 - 1)

@@ -35,7 +35,7 @@ namespace {
 constexpr size_t CAP_SIZE = sizeof(void* __capability);
 
 inline bool cap_aligned(const void* p) {
-    return (reinterpret_cast<uintptr_t>(p) % CAP_SIZE) == 0;
+    return __builtin_is_aligned(p, CAP_SIZE);
 }
 
 } // namespace
