@@ -40,6 +40,8 @@
  *                paging self-test (PAGE TEST below)
  *     sealtest   compartment-minted sealing self-test: the sealer service,
  *                from the shell and from a program (`run sealtest.bin`)
+ *     heapstress [N] [shared] [SCALE] [ITER]
+ *                N instances of mstress.bin at once, own heaps or one shared
  *     shutdown   stop the pager and exit. Nothing is registered after that,
  *                so the dispatcher exits too and the kernel powers the
  *                machine off.
@@ -125,7 +127,7 @@ Capability s_sched_yield = nullptr;
 Capability s_sched_block = nullptr;
 launch::Starter s_starter{};  // what `run` starts programs with (launch.hpp)
 
-[[maybe_unused]] inline uint64_t now_us() {  // only `pagetest` uses it
+[[maybe_unused]] inline uint64_t now_us() {  // `pagetest`, `heapstress`
   uint64_t t;
   __asm__ volatile("csrr %0, time" : "=r"(t));
   return t / s_ticks_per_us;
@@ -185,6 +187,11 @@ Capability s_seal_mint = nullptr;
 Capability s_seal_derive = nullptr;
 Capability s_seal_seal = nullptr;
 Capability s_seal_unseal = nullptr;
+
+// The heap service's entries (abi.hpp, "Heap service"), resolved by name:
+// for programs that ask for `heap.*`, and for `heapstress shared`. Null if
+// the service did not come up; programs that require them are not started.
+Capability s_heap_calls[init::HEAP_CALLS];
 
 // Buffers that cross into `fs` live here rather than on the (narrowed) stack:
 // a chunk of a file for `cat`, a page of a directory for `ls`.
@@ -554,7 +561,8 @@ void cmd_df() {
 // file or directory for this run; `link <prog> <request>=<path>` gives it for
 // good, and `unlink` takes it back; `quota <prog> <bytes>` resizes its own
 // quota. A program can be given only what the shell holds: its roots, its
-// quotas, and the services in `s_services` -- the console, fs.* and seal.*.
+// quotas, and the services in `s_services` -- the console, fs.*, seal.* and
+// heap.*.
 // Not `naming.lookup`, `sched`, `uart.read`: nothing it could reach further
 // with.
 bool s_run_ready = false;
@@ -566,7 +574,7 @@ Capability s_gate_q_destroy = nullptr;
 Capability s_gate_comp_create = nullptr;
 Capability s_gate_comp_destroy = nullptr;
 Capability s_gate_thread_kill = nullptr;
-launch::Service s_services[1 + init::FS_CALLS + 4];
+launch::Service s_services[1 + init::FS_CALLS + 4 + init::HEAP_CALLS];
 constexpr size_t PICKS_MAX = 8;
 
 // Sleeps until `us` have passed, or until something wakes the shell first
@@ -742,7 +750,258 @@ void print_help() {
       "  quota <prog> <bytes>          resize its own quota (64K, 4M)\n"
       "  pagetest [fill <MiB>]  paging self-test\n"
       "  sealtest   compartment-minted sealing self-test (the sealer service)\n"
+      "  heapstress [N] [shared] [SCALE] [ITER]\n"
+      "             N instances of mstress.bin at once, each with its own heap\n"
+      "             or all sharing one heap and transfer array (N: 1..8)\n"
       "  shutdown   power the machine off\n");
+}
+
+// heapstress [N] [shared] [SCALE] [ITER]: N instances of `mstress.bin`
+// (mimalloc's stress test) at once on one hart, pre-empted at any point.
+// Instance k is the test's worker k: its own random sequence, (k % 8 + 1)
+// times the work of worker 0. Without `shared`, each makes its own heap.
+// With `shared`, all allocate from one Permit_Load-only child quota of a
+// heap the shell makes, and swap blocks through a `transfer` array in it,
+// so blocks allocated in one compartment are freed in another.
+constexpr size_t STRESS_MAX = 8;
+constexpr size_t STRESS_TRANSFERS = 1000;
+constexpr uint32_t STRESS_BUDGET_US = 40'000;
+constexpr uint64_t STRESS_WAIT_CALLS = 1200;
+constinit launch::Slot s_stress_slots[STRESS_MAX] = {};
+int64_t s_stress_status[STRESS_MAX];
+bool s_stress_started[STRESS_MAX];
+
+void cmd_heapstress(char* line) {
+  if (!run_available()) {
+    return;
+  }
+  uint64_t numbers[3] = {0, 0, 0};  // N, SCALE, ITER; 0: the default
+  size_t given = 0;
+  bool shared = false;
+  bool usage = false;
+  for (char* rest = line;;) {
+    const char* word = first_word(rest, &rest);
+    if (*word == '\0') {
+      break;
+    }
+    if (str_eq(word, "shared") && !shared && given <= 1) {
+      shared = true;
+      continue;
+    }
+    if (*word < '0' || *word > '9' || given == 3) {
+      usage = true;
+      break;
+    }
+    numbers[given++] = launch::parse_number(word);
+  }
+  const size_t n = numbers[0] == 0 ? 4 : static_cast<size_t>(numbers[0]);
+  if (usage || n == 0 || n > STRESS_MAX) {
+    out("[heapstress] usage: heapstress [N] [shared] [SCALE] [ITER], N 1..8\n");
+    return;
+  }
+  const uint64_t scale = numbers[1] == 0 ? 1 : numbers[1];
+  const uint64_t iter =
+      numbers[2] == 0 ? (80 / n == 0 ? 1 : 80 / n) : numbers[2];
+
+  Capability shared_root = nullptr;
+  Capability worker_quota = nullptr;
+  Capability transfer_handle = nullptr;
+  alignas(sizeof(Capability)) Capability transfer_block = nullptr;
+  size_t shared_bytes = 0;
+  if (shared) {
+    for (uint32_t i = 0; i < init::HEAP_CALLS; ++i) {
+      if (!capability_is_valid(s_heap_calls[i])) {
+        out("[heapstress] heap.* is not available\n");
+        return;
+      }
+    }
+    shared_bytes = n * static_cast<size_t>(scale) * 1024 * 1024;
+    if (shared_bytes < 4 * 1024 * 1024) {
+      shared_bytes = 4 * 1024 * 1024;
+    } else if (shared_bytes > 32 * 1024 * 1024) {
+      shared_bytes = 32 * 1024 * 1024;
+    }
+    shared_root = launch::with_reclaim(
+        s_starter,
+        [&] {
+          return invoke<Capability>(s_gate_invoke,
+                                    s_heap_calls[init::HEAP_CALL_CREATE],
+                                    s_vm_quota, shared_bytes);
+        },
+        [](Capability cap) {
+          return sealing::is_sealed_as(OType::QuotaHeap, cap);
+        });
+    if (!sealing::is_sealed_as(OType::QuotaHeap, shared_root)) {
+      out("[heapstress] FAILED: heap.create refused the shared heap\n");
+      return;
+    }
+    transfer_handle = invoke<Capability>(
+        s_gate_invoke, s_heap_calls[init::HEAP_CALL_ALLOC], shared_root,
+        STRESS_TRANSFERS * sizeof(Capability), bounded(&transfer_block));
+    init::HeapInfo root_info{};
+    const int64_t info_st = invoke<int64_t>(
+        s_gate_invoke, s_heap_calls[init::HEAP_CALL_INFO], shared_root,
+        bounded(&root_info));
+    const size_t worker_limit =
+        (info_st == init::HEAP_OK &&
+         root_info.limit > root_info.used + init::HEAP_NODE_COST_MAX)
+            ? static_cast<size_t>(root_info.limit - root_info.used -
+                                  init::HEAP_NODE_COST_MAX)
+            : 0;
+    if (sealing::is_sealed_as(OType::HeapAllocation, transfer_handle) &&
+        capability_is_valid(transfer_block) && worker_limit > 0) {
+      worker_quota = invoke<Capability>(
+          s_gate_invoke, s_heap_calls[init::HEAP_CALL_DERIVE], shared_root,
+          worker_limit, perms::Load);
+    }
+    if (!sealing::is_sealed_as(OType::QuotaHeap, worker_quota)) {
+      invoke<int64_t>(s_gate_invoke, s_heap_calls[init::HEAP_CALL_DESTROY],
+                      shared_root);
+      out("[heapstress] FAILED: could not set up shared transfer or quota\n");
+      return;
+    }
+  }
+
+  for (size_t k = 0; k < STRESS_MAX; ++k) {
+    s_stress_status[k] = launch::NOT_RUN;
+    s_stress_started[k] = false;
+  }
+  LineBuffer banner;
+  banner.str("[heapstress] ");
+  banner.dec(n);
+  if (shared) {
+    banner.str(" instances of mstress.bin on one ");
+    banner.dec(shared_bytes / (1024 * 1024));
+    banner.str(" MiB shared heap; SCALE ");
+  } else {
+    banner.str(" instances of mstress.bin, each with a heap of its own; SCALE ");
+  }
+  banner.dec(scale);
+  banner.str(", ITER ");
+  banner.dec(iter);
+  banner.str("\n");
+  out(banner.buf);
+
+  const Capability shared_caps[2] = {worker_quota, transfer_block};
+  const uint64_t began = now_us();
+  s_starter.budget_us = STRESS_BUDGET_US / static_cast<uint32_t>(n);
+  for (size_t k = 0; k < n; ++k) {
+    LineBuffer args;  // "-w <worker> <THREADS> <SCALE> <ITER>"
+    args.str("-w ");
+    args.dec(k);
+    args.put(' ');
+    args.dec(n);
+    args.put(' ');
+    args.dec(scale);
+    args.put(' ');
+    args.dec(iter);
+    s_stress_started[k] = launch::start(
+        s_starter, s_stress_slots[k], "mstress.bin", nullptr, 0, args.buf,
+        shared ? shared_caps : nullptr, shared ? 2 : 0);
+  }
+  s_starter.budget_us = 0;
+  for (size_t k = 0; k < n; ++k) {
+    if (s_stress_started[k]) {
+      launch::finish(s_starter, s_stress_slots[k], &s_stress_status[k]);
+    }
+  }
+  const uint64_t took_ms = (now_us() - began) / 1000;
+
+  size_t passed = 0;
+  for (size_t k = 0; k < n; ++k) {
+    LineBuffer result;
+    result.str("[heapstress] worker ");
+    result.dec(k);
+    if (!s_stress_started[k]) {
+      result.str(": FAILED, not started\n");
+    } else if (s_stress_status[k] == 0) {
+      result.str(": passed\n");
+      passed += 1;
+    } else if (s_stress_status[k] == launch::NOT_RUN) {
+      result.str(": FAILED, ended without a status\n");
+    } else {
+      result.str(": FAILED, status ");
+      result.dec(static_cast<uint64_t>(s_stress_status[k]));
+      result.str("\n");
+    }
+    out(result.buf);
+  }
+
+  bool shared_ok = true;
+  uint64_t contended = 0;
+  if (shared) {
+    size_t leftover = 0;
+    const auto* slots = reinterpret_cast<const Capability*>(transfer_block);
+    for (size_t i = 0; i < STRESS_TRANSFERS; ++i) {
+      if (slots[i] != nullptr || capability_is_valid(slots[i])) {
+        leftover += 1;
+      }
+    }
+    const bool transfer_freed =
+        invoke<int64_t>(s_gate_invoke, s_heap_calls[init::HEAP_CALL_FREE],
+                        transfer_handle) == init::HEAP_OK;
+    int64_t unswept = 0;
+    for (uint64_t waits = 0; waits < STRESS_WAIT_CALLS; ++waits) {
+      unswept = invoke<int64_t>(s_gate_invoke,
+                                s_heap_calls[init::HEAP_CALL_WAIT],
+                                shared_root, init::HEAP_WAIT_MAX_US);
+      if (unswept <= 0) {
+        break;
+      }
+    }
+    init::HeapInfo worker_info{};
+    worker_info.used = ~0ULL;
+    const int64_t info_st = invoke<int64_t>(
+        s_gate_invoke, s_heap_calls[init::HEAP_CALL_INFO], worker_quota,
+        bounded(&worker_info));
+    const uint64_t charged =
+        info_st == init::HEAP_OK ? worker_info.used : ~0ULL;
+    contended = info_st == init::HEAP_OK ? worker_info.contended : 0;
+    const int64_t destroy_st = invoke<int64_t>(
+        s_gate_invoke, s_heap_calls[init::HEAP_CALL_DESTROY], shared_root);
+
+    shared_ok = leftover == 0 && transfer_freed && unswept == 0 &&
+                info_st == init::HEAP_OK && charged == 0 &&
+                destroy_st == init::HEAP_OK;
+    LineBuffer report;
+    report.str("[heapstress] shared heap: bytes still charged ");
+    if (info_st == init::HEAP_OK) {
+      report.dec(charged);
+    } else {
+      report.str("unknown");
+    }
+    report.str(", transfer slots left ");
+    report.dec(leftover);
+    report.str(", lock waits ");
+    report.dec(contended);
+    if (!transfer_freed) {
+      report.str(", transfer free refused");
+    }
+    if (unswept != 0) {
+      report.str(", sweeps not over");
+    }
+    if (destroy_st != init::HEAP_OK) {
+      report.str(", heap.destroy failed");
+    }
+    report.str("\n");
+    out(report.buf);
+  }
+
+  const bool all_ok = passed == n && shared_ok;
+  LineBuffer summary;
+  summary.str(all_ok ? "[heapstress] OK: " : "[heapstress] FAILED: ");
+  summary.dec(passed);
+  summary.str(" of ");
+  summary.dec(n);
+  summary.str(" passed, ");
+  summary.dec(took_ms);
+  summary.str(" ms");
+  if (shared) {
+    summary.str(", lock waits ");
+    summary.dec(contended);
+  }
+  summary.str("\n");
+  out(summary.buf);
 }
 
 // sealtest: compartment-minted sealing types (abi.hpp, "Sealing service";
@@ -1187,6 +1446,8 @@ bool execute(char* line) {
     cmd_quota(rest);
   } else if (str_eq(cmd, "sealtest")) {
     cmd_sealtest();
+  } else if (str_eq(cmd, "heapstress")) {
+    cmd_heapstress(rest);
   } else if (str_eq(cmd, "pagetest")) {
     cmd_pagetest(rest);
   } else if (str_eq(cmd, "shutdown")) {
@@ -1392,6 +1653,19 @@ extern "C" int64_t compartment_main(Capability arg) {
         "granted sealing\n");
   }
 
+  // The heap service: granted to programs that ask, and used by
+  // `heapstress shared`. Not having it costs nothing else.
+  bool heap_found = true;
+  for (uint32_t i = 0; i < init::HEAP_CALLS; ++i) {
+    s_heap_calls[i] =
+        lookup_name(gate_invoke, naming_lookup, init::HEAP_CALL_NAMES[i]);
+    heap_found = heap_found && capability_is_valid(s_heap_calls[i]);
+  }
+  if (!heap_found) {
+    out("[shell]    WARNING: heap.* not found by name; programs cannot be "
+        "granted the heap service\n");
+  }
+
   // Programs: `run` needs the file system above, the view of `/bin`, and all
   // of these. The manifest asks `init` for every one; a system that will not
   // give them just loses the command.
@@ -1431,6 +1705,10 @@ extern "C" int64_t compartment_main(Capability arg) {
   s_services[service_count++] = launch::Service{"seal.derive", s_seal_derive};
   s_services[service_count++] = launch::Service{"seal.seal", s_seal_seal};
   s_services[service_count++] = launch::Service{"seal.unseal", s_seal_unseal};
+  for (uint32_t i = 0; i < init::HEAP_CALLS; ++i) {
+    s_services[service_count++] =
+        launch::Service{init::HEAP_CALL_NAMES[i], s_heap_calls[i]};
+  }
   launch::Starter& starter = s_starter;
   starter.invoke = gate_invoke;
   starter.self = self_comp;

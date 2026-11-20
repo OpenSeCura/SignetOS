@@ -67,7 +67,9 @@
  *      thread, and paging on. No compartment `init` starts is pageable
  *      (vm.hpp, PAGING): what pages is what the shell runs. Before the
  *      shell, `sweeper` and its thread, which finishes revocation sweeps
- *      (the shell asks for `sweeper.stop`, for its `shutdown`).
+ *      (the shell asks for `sweeper.stop`, for its `shutdown`), and then
+ *      `heap`, the one holder of the `QuotaHeap` and `HeapAllocation`
+ *      authorities, which publishes `heap.*`.
  *  10. Records every handle in its own table for the kernel's tests, then
  *  11. scrubs every authority out of that table and exits: `init` is
  *      transient, and what it held must not outlive it in a table nothing
@@ -397,6 +399,10 @@ struct Launcher {
             return rw[init::RW_SLOT_SEAL_TYPE_KEY];
           case OType::SealedObject:
             return rw[init::RW_SLOT_SEAL_OBJECT];
+          case OType::QuotaHeap:
+            return rw[init::RW_SLOT_SEAL_QUOTA_HEAP];
+          case OType::HeapAllocation:
+            return rw[init::RW_SLOT_SEAL_HEAP_ALLOC];
           default:
             return nullptr;
         }
@@ -962,6 +968,26 @@ extern "C" int64_t compartment_main(Capability arg) {
       say("[init]     WARNING: no sweeper; freed memory will not come back\n");
     }
   }
+
+  // -------------------------------------------------------------------------
+  // The heap
+  // -------------------------------------------------------------------------
+  // `heap` (external/services/heap.cpp) sets up its arena, publishes
+  // `heap.*` and returns. It needs the scheduler and the sweeper (for
+  // revocation sweeps and `sched.block`), so it starts after them. Only its
+  // manifest asks for the `QuotaHeap` and `HeapAllocation` authorities. The
+  // shell, started next, grants `heap.*` to programs that ask for it.
+  {
+    const Started heap = L.start_file("heap.bin");
+    if (capability_is_valid(heap.sentry)) {
+      if (comp_invoke(heap.sentry, nullptr) != 0) {
+        say("[init]     WARNING: the heap service did not come up\n");
+      }
+    }
+  }
+  // The authorities go to nobody else, as with the sealer's.
+  rw[init::RW_SLOT_SEAL_QUOTA_HEAP] = nullptr;
+  rw[init::RW_SLOT_SEAL_HEAP_ALLOC] = nullptr;
 
   // =========================================================================
   // 9. `shell`

@@ -46,7 +46,7 @@ using Sentry = Capability;
 //                 but CT 1, so neither makes a return sentry or opens any
 //                 sentry.
 //
-// 24 object types are available; 15 and 22..31 are spare.
+// 24 object types are available; 15 and 23..31 are spare.
 enum class OType : uint64_t {
     Unsealed         = 0,
     Sentry           = 1,
@@ -75,6 +75,12 @@ enum class OType : uint64_t {
 
     FsQuota          = 20,  // fs: disk quota handles
     FsDir            = 21,  // fs: directory handles
+
+    // heap: allocation handles, each the authority to free one block
+    // (external/services/heap.cpp). User-managed like QuotaHeap: the kernel
+    // mints both authorities for `init` at boot and never seals with them;
+    // `init` delegates them to the `heap` service.
+    HeapAllocation   = 22,
 };
 
 // The range yseal and yunseal will act on. Outside it they clear the tag.

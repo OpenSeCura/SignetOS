@@ -129,6 +129,7 @@ const char* otype_name(uint64_t ct) {
         case OType::Trap:           return "Trap";
         case OType::FsQuota:        return "FsQuota";
         case OType::FsDir:          return "FsDir";
+        case OType::HeapAllocation: return "HeapAllocation";
     }
     return "unknown";
 }

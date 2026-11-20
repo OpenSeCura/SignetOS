@@ -71,6 +71,7 @@ You can also use `make` directly:
 | `make term` | build if needed, then boot in QEMU on this terminal |
 | `make TRACE_SWITCH=1 term` | the same, but log every thread switch |
 | `make PAGING=0 term` | the same, built without paging: no pager and no swap, and all memory stays in RAM |
+| `make HEAP_DEBUG=1 term` | the same, with the allocator's own consistency checks in the `heap` service. In any build, `run mstress.bin` runs mimalloc's stress test, and `heapstress` runs up to 8 copies of it at once |
 | `make disk` | rewrite `disk.img` only |
 | `make clean` | remove build outputs (keeps `disk.img`) |
 
@@ -108,12 +109,16 @@ kernel/      the microkernel (boot, VM, traps, threads, sealing, syscalls), with
              hw/ (uart, clint, DTB), debug/ (reports, checks, self-tests)
              and lib/ (kstring) around it
 include/     kernel headers and a minimal freestanding libc
-user/        runtime and linker script shared by all user compartments
+user/        runtime and linker script shared by all user compartments, the
+             heap library (heap.hpp, heap/) and C malloc shim (malloc.hpp)
 boot/        compartments embedded in the kernel: init, fs, uart, dma, blk,
              and the loader every compartment made from an image runs first
 external/    compartments loaded from disk.img: services/ (naming, sealer,
-             sched, shell) and apps/ (programs the shell can `run`)
+             heap, sched, shell) and apps/ (programs the shell can `run`)
 tools/       signetfs.py, which writes disk.img
 toolchain/   patches and scripts that build the CHERI LLVM and QEMU (Zyseal,
              mmodemmu, sentries)
+third_party/ code from other projects, under their own licences:
+             cheriot_allocator/ is the CHERIoT RTOS allocator core (MIT);
+             mimalloc_stress/ is mimalloc's stress test (MIT), built as mstress
 ```

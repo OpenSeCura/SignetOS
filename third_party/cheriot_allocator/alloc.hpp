@@ -1,0 +1,3117 @@
+// Copyright Microsoft and CHERIoT Contributors.
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+// Not to be included on its own: allocator.hpp includes this file after
+// the configuration and the revoker, which it uses.
+#include <cheri.hpp>
+#include <ds/bits.hpp>
+#include <ds/linked_list.hpp>
+#include <ds/pointer.hpp>
+#include <ds/ring_buffer.hpp>
+#include <heap_compat.hpp>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+
+extern Revocation::Revoker revoker;
+using namespace CHERI;
+
+/// Do we have temporal safety support in hardware?
+constexpr bool HasTemporalSafety =
+  !std::is_same_v<Revocation::Revoker, Revocation::NoTemporalSafety>;
+
+// the byte and bit size of a size_t
+constexpr size_t BitsInSizeT = utils::bytes_to_bits(sizeof(size_t));
+
+constexpr size_t NSmallBinsShift = 3U;
+// number of small bins
+constexpr size_t NSmallBins = 1U << NSmallBinsShift;
+// number of large (tree) bins
+constexpr size_t NTreeBins = 12U;
+// shift needed to get the index of small bin
+constexpr size_t SmallBinShift = MallocAlignShift;
+// shift needed to get the index of tree bin
+constexpr size_t TreeBinShift = MallocAlignShift + NSmallBinsShift;
+// the max size (including header) that still falls in small bins
+constexpr size_t MaxSmallSize = 1U << TreeBinShift;
+
+// the compressed size. The actual size is SmallSize * MallocAlignment.
+using SmallSize = uint32_t;
+constexpr size_t MaxChunkSize =
+  ((size_t{1} << utils::bytes_to_bits(sizeof(SmallSize))) - 1)
+  << MallocAlignShift;
+// the index to one of the bins
+using BIndex = uint32_t;
+// the bit map of all the bins. 1 for in-use and 0 for empty.
+using Binmap = uint32_t;
+static_assert(NSmallBins < utils::bytes_to_bits(sizeof(Binmap)));
+static_assert(NTreeBins < utils::bytes_to_bits(sizeof(Binmap)));
+
+/// Quota identifier 0 is reserved for allocator-owned objects.
+constexpr uint32_t QuotaIdentifierAllocatorOwned = 0;
+
+// Convert small size header into the actual size in bytes.
+static inline constexpr size_t head2size(SmallSize h)
+{
+	return static_cast<size_t>(h) << MallocAlignShift;
+}
+// Convert byte size into small size header.
+static inline constexpr SmallSize size2head(size_t s)
+{
+	return s >> MallocAlignShift;
+}
+
+// Generate a bit mask for a single index.
+static inline Binmap idx2bit(BIndex i)
+{
+	return static_cast<Binmap>(1) << i;
+}
+
+// index of the bit mask
+static inline BIndex bit2idx(Binmap x)
+{
+	return ctz(x);
+}
+
+// Return treebin index for size s.
+static inline BIndex compute_tree_index(size_t s)
+{
+	/*
+	 * The upper bits of the size after TreeBinShift, if larger than this, must
+	 * be thrown into the largest bin. Every two tree bins handle one
+	 * power-of-two.
+	 */
+	constexpr size_t MaxTreeComputeMask = (1U << (NTreeBins >> 1)) - 1;
+
+	size_t x = s >> TreeBinShift, k;
+	if (x == 0)
+	{
+		return 0;
+	}
+	if (x > MaxTreeComputeMask)
+	{
+		return NTreeBins - 1;
+	}
+	k          = utils::bytes_to_bits(sizeof(x)) - 1 - clz(x);
+	BIndex ret = (k << 1) + ((s >> (k + (TreeBinShift - 1)) & 1));
+	Debug::Assert(
+	  ret < NTreeBins, "Return value {} is out of range 0-{}", ret, NTreeBins);
+	return ret;
+}
+
+// shift placing maximum resolved bit in a treebin at i as sign bit
+static inline size_t leftshift_for_tree_index(BIndex i)
+{
+	return i == NTreeBins - 1 ? 0
+	                          : (BitsInSizeT - ((i >> 1) + TreeBinShift - 1U));
+}
+
+/**
+ * After size << leftshift_for_tree_index, the bit to be resolved must be at the
+ * sign bit. Checking if the bit is 1 only needs to check val < 0. This assumes
+ * 2's complement.
+ *
+ * @param val the value already shifted by leftshift_for_tree_index()
+ */
+static inline size_t leftshifted_val_msb(size_t val)
+{
+	static_assert(sizeof(ssize_t) == sizeof(size_t));
+	return static_cast<ssize_t>(val) < 0 ? 1 : 0;
+}
+
+// the size of the smallest chunk held in bin with index i
+static inline size_t minsize_for_tree_index(BIndex i)
+{
+	return (1U << ((i >> 1) + TreeBinShift)) |
+	       ((1U & i) << ((i >> 1) + TreeBinShift - 1));
+}
+
+/**
+ * The index of the small bin this size should live in.
+ * Size 1 to MallocAlignment live in bin 0, MallocAlignment + 1 to
+ * 2 * MallocAlignment live in bin 1, etc.
+ */
+static inline BIndex small_index(size_t s)
+{
+	return (s - 1) >> SmallBinShift;
+}
+// Is this a smallbin size?
+static inline bool is_small(size_t s)
+{
+	return small_index(s) < NSmallBins;
+}
+// Convert smallbin index to the size it contains.
+static inline size_t small_index2size(BIndex i)
+{
+	return (static_cast<size_t>(i) + 1) << SmallBinShift;
+}
+
+namespace displacement_proxy
+{
+
+	template<auto F, typename D>
+	concept Decoder = requires(D d) {
+		{ F(d) } -> std::same_as<size_t>;
+	};
+
+	template<auto F, typename D>
+	concept Encoder = requires(size_t s) {
+		{ F(s) } -> std::same_as<D>;
+	};
+
+	/**
+	 * Equipped with a context for bounds and a base address, a reference to a
+	 * (coded) displacement relative to that base can be a proxy for a pointer.
+	 */
+	template<typename T, typename D, bool Positive, auto Decode, auto Encode>
+	    requires Decoder<Decode, D> && Encoder<Encode, D>
+	class Proxy
+	{
+		CHERI::Capability<void> ctx;
+		D                      &d;
+
+		__always_inline void set(T *p)
+		{
+			size_t diff =
+			  Positive ? ds::pointer::diff(ctx, p) : ds::pointer::diff(p, ctx);
+			d = Encode(diff);
+		}
+
+		public:
+		using Type = T;
+
+		__always_inline Proxy(void *c, D &r) : ctx(c), d(r) {}
+
+		__always_inline operator T *() const
+		{
+			size_t disp = Decode(d);
+
+			auto p = CHERI::Capability{ctx};
+			auto a = p.address();
+
+			if constexpr (Positive)
+			{
+				a += disp;
+			}
+			else
+			{
+				a -= disp;
+			}
+
+			return reinterpret_cast<T *>(a.ptr());
+		}
+
+		__always_inline T *operator->()
+		{
+			return *this;
+		}
+
+		__always_inline operator ptraddr_t()
+		{
+			return CHERI::Capability{static_cast<T *>(*this)}.address();
+		}
+
+		__always_inline Proxy &operator=(T *p)
+		{
+			set(p);
+			return *this;
+		}
+
+		__always_inline Proxy &operator=(Proxy const &p)
+		{
+			set(p);
+			return *this;
+		}
+
+		__always_inline bool operator==(Proxy const &p) const
+		{
+			return static_cast<T *>(*this) == static_cast<T *>(p);
+		}
+
+		__always_inline auto operator<=>(Proxy const &p) const
+		{
+			return static_cast<T *>(*this) <=> static_cast<T *>(p);
+		}
+	};
+
+	static_assert(ds::pointer::proxy::Proxies<
+	              Proxy<void, SmallSize, false, head2size, size2head>,
+	              void>);
+
+} // namespace displacement_proxy
+
+/**
+ * Every chunk, in use or not, includes a minimal header.  That is, this is a
+ * classic malloc, not something like a slab or sizeclass allocator or a
+ * "BIBOP"-inspired design.
+ *
+ * This header uses relative displacements to refer to the address-order
+ * predecessor and successor adjacent headers.  The details of encoding are
+ * encapsulated using the displacement_proxy::Proxy above and the
+ * cell_{next,prev} methods herein.
+ *
+ * Chunks are in one of four states:
+ *
+ *   - Allocated / "In Use" by the application
+ *
+ *       - body() is untyped memory.
+ *       - Not indexed by any other structures in the MState
+ *
+ *   - Quarantined (until revocation scrubs inward pointers from the system)
+ *
+ *       - body() is left alone: on SignetOS capabilities to it still work,
+ *         for loads and stores, until the sweep completes
+ *       - The header is still marked in use, and has isQuarantined set
+ *       - Collected in a quarantine list using the headers' quarantineNext
+ *
+ *   - Free for allocation and small
+ *
+ *       - body() is a MChunk (and not a TChunk)
+ *       - Collected in a smallbin ring using body()'s MChunk::ring
+ *
+ *   - Free for allocation and large
+ *
+ *       - body() is a TChunk
+ *       - Collected in a treebin ring, using either/both the TChunk linkages
+ *         or/and the MChunk::ring links present in body().
+ */
+struct __packed __aligned(MallocAlignment)
+__cheri_no_subobject_bounds MChunkHeader
+{
+	/**
+	 * Each chunk has a 32-bit metadata field that is used to store a small
+	 * bitfield and the owner ID in the remaining bits.  This is the space not
+	 * consumed by the metadata.  It must be reduced if additional bits are
+	 * stolen for other fields.
+	 */
+	static constexpr size_t OwnerIDWidth = 29;
+	/**
+	 * Compressed size of the predecessor chunk.  See cell_prev().
+	 */
+	SmallSize prevSize;
+	/**
+	 * Compressed size of this chunk.  See cell_next().
+	 */
+	SmallSize currSize;
+
+	/**
+	 * The unique identifier of the allocator.  The ID 0 is reserved for
+	 * objects that are owned by the allocator.
+	 */
+	uint32_t ownerID : OwnerIDWidth;
+	/**
+	 * In quarantine: freed, still marked in use, waiting for a sweep.  The
+	 * allocator cannot read SignetOS's revocation bits, so this is what tells
+	 * a freed chunk from a live one.
+	 */
+	bool isQuarantined : 1;
+	bool isPrevInUse : 1;
+	bool isCurrInUse : 1;
+	/**
+	 * The next chunk on its quarantine list (MState::quarantine_link()); 0
+	 * at the end of a list and when not quarantined.  The lists run through
+	 * headers because a quarantined body can still be written by whoever
+	 * holds a capability to it.
+	 */
+	uint32_t quarantineNext;
+
+	__always_inline auto cell_prev()
+	{
+		return displacement_proxy::
+		  Proxy<MChunkHeader, SmallSize, false, head2size, size2head>(this,
+		                                                              prevSize);
+	}
+
+	__always_inline auto cell_next()
+	{
+		return displacement_proxy::
+		  Proxy<MChunkHeader, SmallSize, true, head2size, size2head>(this,
+		                                                             currSize);
+	}
+
+	/**
+	 * Returns the owner for an in-use chunk. This should not be called with a
+	 * not-in-use chunk.  A value of 0 indicates that the object is owned by
+	 * the allocator and cannot be freed by any external caller.
+	 */
+	uint32_t owner()
+	{
+		Debug::Assert(is_in_use(),
+		              "owner does not make sense on unallocated chunk");
+		return ownerID;
+	}
+
+	/**
+	 * Sets the owner for an in-use chunk. This should not be called with a
+	 * not-in-use chunk.  A value of 0 indicates that the object is owned by
+	 * the allocator.
+	 */
+	void set_owner(uint32_t newOwner)
+	{
+		Debug::Assert(is_in_use(),
+		              "owner does not make sense on unallocated chunk");
+		ownerID = newOwner;
+	}
+
+	bool is_in_use()
+	{
+		return isCurrInUse;
+	}
+
+	bool is_prev_in_use()
+	{
+		return isPrevInUse;
+	}
+
+	// size of the previous chunk
+	size_t prevsize_get()
+	{
+		return head2size(prevSize);
+	}
+
+	// size of this chunk
+	size_t size_get()
+	{
+		return head2size(currSize);
+	}
+
+	void mark_in_use()
+	{
+		isCurrInUse              = true;
+		cell_next()->isPrevInUse = true;
+	}
+
+	void mark_free()
+	{
+		isCurrInUse              = false;
+		cell_next()->isPrevInUse = false;
+	}
+
+	/**
+	 * Obtain a pointer to the body of this chunk.
+	 *
+	 * This relies on the CHERI bounds of `this` being (at least) to the
+	 * entire object.  In practice, they will be to the entire heap.
+	 */
+	template<typename T = void>
+	__always_inline CHERI::Capability<T> body()
+	{
+		return ds::pointer::offset<T>(this, sizeof(MChunkHeader));
+	}
+
+	static MChunkHeader *from_body(void *body)
+	{
+		return ds::pointer::offset<MChunkHeader>(body, -sizeof(MChunkHeader));
+	}
+
+	/**
+	 * Land a new header somewhere within an existing chunk.
+	 *
+	 * The resulting header inherits its in-use status from this one, which
+	 * leaves consistent the "previous in use" bits of both this new header and
+	 * the successor header, but this can violate other invariants of the
+	 * system.  In particular, if this is a free chunk, then the result will be
+	 * two free chunks in a row; the caller is expected to fix this by marking
+	 * at least one of the two split chunks as in-use.
+	 */
+	MChunkHeader *split(size_t offset)
+	{
+		auto newloc = ds::pointer::offset<void>(this, offset);
+
+		auto newnext = new (newloc) MChunkHeader(this->isCurrInUse);
+
+		newnext->isPrevInUse = isCurrInUse;
+
+		/*
+		 * Insertion into the list of headers updates two linkages in the chain:
+		 * 1. between `this` and `newnext`
+		 * 2. between `newnext` and `this`'s original successor (which is now
+		 *    `newnext`-s successor), which is unnamed in the source but we will
+		 *    call `next`.
+		 *
+		 * Concretely, that means it...
+		 * 1.1. sets `this->currSize`,
+		 * 1.2. sets `newnext->prevSize`,
+		 * 2.1. sets `newnext->currSize`,
+		 * 2.2. sets `next->prevSize`
+		 */
+		ds::linked_list::emplace_after(this, newnext);
+
+		return newnext;
+	}
+
+	/**
+	 * Build an initial pair of chunk headers.  The returned header is at the
+	 * indicated base and is suitable for installation into a free list (or
+	 * tree).  The other header is a sentinel of sorts, at the end of the
+	 * indicated span of memory.  To prevent the system from attempting to walk
+	 * beyond these bounds, ficitious "in use" bits are set true: the first
+	 * chunk claims that its predecessor is in use and the second claims that
+	 * it itself is.
+	 *
+	 * This function is marked always-inlined as it is called exactly once.
+	 */
+	__always_inline static MChunkHeader *make(void *base, size_t size)
+	{
+		size -= sizeof(MChunkHeader);
+
+		auto first         = new (base) MChunkHeader(false);
+		first->prevSize    = 0;
+		first->isPrevInUse = true;
+
+		auto footer =
+		  new (ds::pointer::offset<void>(base, size)) MChunkHeader(true);
+		footer->currSize    = size2head(sizeof(MChunkHeader));
+		footer->isPrevInUse = false;
+
+		first->cell_next()  = footer; // sets first->currSize
+		footer->cell_prev() = first;  // sets footer->prevSize
+
+		return first;
+	}
+
+	/**
+	 * Given a pointer to the previous chunk, merge this one back into it.
+	 *
+	 * The caller is responsible for managing indexing of chunks, which means it
+	 * must already have a handle to our predecessor.
+	 */
+	void unsplit(MChunkHeader * previous)
+	{
+		Debug::Assert(previous->cell_next() == this,
+		              "Unsplitting MChunkHeader into bad predecessor");
+
+		/*
+		 * Drop us out of the list of all chunk headers.
+		 * This updates previous->currSize and our successor's ->prevSize.
+		 */
+		ds::linked_list::unsafe_remove_link(previous, this);
+
+		// Erase our metadata fields
+		this->clear();
+
+		// Clear the shadow bit marking our presence (set in our constructor)
+		revoker.mark_clear_one(CHERI::Capability{this}.address());
+	}
+
+	/// Remove the default constructor
+	MChunkHeader() = delete;
+
+	private:
+	/**
+	 * Erase the header fields
+	 */
+	__always_inline void clear()
+	{
+		/*
+		 * This is spelled slightly oddly as using memset results in a call
+		 * rather than a single store instruction.
+		 */
+		static_assert(sizeof(*this) == sizeof(uintptr_t));
+		*reinterpret_cast<uintptr_t *>(this) = 0;
+	}
+
+	/**
+	 * Common aspects of building a `MChunkHeader`.
+	 *
+	 * These exist only in the heap arena; they are never carried as values in
+	 * registers or on the stack and are always built with placement `new`.
+	 * Their lifecycle and field updates are, as can be seen from above,
+	 * moderately nuanced, but some things are always common to their
+	 * construction and never otherwise implicitly done; those are the bits
+	 * factored out here.
+	 */
+	MChunkHeader(bool inUse)
+	{
+		this->clear();
+		this->isCurrInUse = inUse;
+		revoker.mark_set_one(this);
+	}
+};
+static_assert(sizeof(MChunkHeader) == 16);
+static_assert(std::is_standard_layout_v<MChunkHeader>);
+static_assert(
+  offsetof(MChunkHeader, quarantineNext) ==
+    2 * sizeof(SmallSize) + sizeof(uint32_t),
+  "Metadata is no longer 32 bits.  Update the OwnerIDWidth constant to correct "
+  "the space used for the owner ID to match the remaining space.");
+
+// the maximum requested size that is still categorised as a small bin
+constexpr size_t MaxSmallRequest = MaxSmallSize - sizeof(MChunkHeader);
+
+// Pad request bytes into a usable size.
+static inline size_t pad_request(size_t req)
+{
+	return ((req) + sizeof(MChunkHeader) + MallocAlignMask) & ~MallocAlignMask;
+}
+
+/*
+ * Chunk headers are also, sort of, a linked list encoding.  They're not a ring
+ * and not exactly a typical list, in that the first and last nodes rely on "out
+ * of band" bits (the InUse flags) to prevent any traversals past those nodes.
+ * But, since we never try to insert before the first or after the last, it all
+ * basically works out.
+ */
+static_assert(ds::linked_list::cell::HasCellOperations<MChunkHeader>);
+
+/**
+ * When chunks are not allocated, they are treated as nodes of either
+ * lists or trees.
+ *
+ * Quarantined chunks of any size are not nodes of anything kept in their
+ * bodies: they are on a list threaded through their headers (see
+ * MChunkHeader::quarantineNext).
+ *
+ * Free small chunks are stored as MChunk-s on a ring threaded through
+ * one of the smallbin[] sentinels.
+ *
+ * Larger free chunks are indexed in a form of bitwise digital trees
+ * (aka tries) keyed on chunksizes.  Because TChunk are only for
+ * free chunks greater than 64 bytes, their size doesn't impose any
+ * constraints on user chunk sizes.
+ *
+ * Each tree holding treenodes is a tree of unique chunk sizes.  Chunks
+ * of the same size are arranged in a circularly-linked list (a "tree
+ * ring"), with only one chunk per size actually in the tree, whose
+ * ring link field serves as the tree ring's sentinel.  (Large nodes
+ * are distinguished by their parent pointer, with tree roots and
+ * tree ring nodes having designated values.)  If a chunk with the same
+ * size an an existing node is inserted, it is linked off the existing
+ * node using the MChunk::ring field.
+ *
+ * Each tree contains a power of 2 sized range of chunk sizes (the
+ * smallest is 0x100 <= x < 0x180), which is is divided in half at each
+ * tree level, with the chunks in the smaller half of the range (0x100
+ * <= x < 0x140 for the top nose) in the left subtree and the larger
+ * half (0x140 <= x < 0x180) in the right subtree.  This is, of course,
+ * done by inspecting individual bits.
+ *
+ * Using these rules, each node's left subtree contains all smaller
+ * sizes than its right subtree.  However, the node at the root of each
+ * subtree has no particular ordering relationship to either.  (The
+ * dividing line between the subtree sizes is based on trie relation.)
+ * If we remove the last chunk of a given size from the interior of the
+ * tree, we need to replace it with a leaf node.  The tree ordering
+ * rules permit a node to be replaced by any leaf below it.
+ *
+ * The smallest chunk in a tree (a common operation in a best-fit
+ * allocator) can be found by walking a path to the leftmost leaf in
+ * the tree.  Unlike a usual binary tree, where we follow left child
+ * pointers until we reach a null, here we follow the right child
+ * pointer any time the left one is null, until we reach a leaf with
+ * both child pointers null. The smallest chunk in the tree will be
+ * somewhere along that path.
+ *
+ * The worst case number of steps to add, find, or remove a node is
+ * bounded by the number of bits differentiating chunks within
+ * bins. Under current bin calculations, this ranges from 6 up to 21
+ * (for 32 bit sizes) or up to 53 (for 64 bit sizes). The typical case
+ * is of course much better.
+ */
+
+using ChunkFreeLink = ds::linked_list::cell::PtrAddr;
+
+/**
+ * Class of a free allocator chunk's metadata.
+ *
+ * This class can reference either a smallbin chunk or a TChunk (and is the base
+ * class of TChunk). Header fields should never be accessed directly since the
+ * format is subject to change (hence private). The public wrappers also take
+ * care of converting chunks and sizes into internal compressed formats.
+ *
+ * Several methods in this file are said to "initialize the linkages" of a
+ * MChunk.  This means that these functions assume the adjacent MChunkHeader is
+ * set up appropriately (that is, present and linked to adjacent headers), but
+ * the MChunk::ring link node and any tree state (in a TChunk) is undefined on
+ * the way in and paved over by initialization.  Use of these functions can
+ * relax the usual invariants of data structures; it is, for example, OK to
+ * feed an unsafe_remove'd MChunk to such a function or to simply build a new
+ * MChunk header in the heap.
+ */
+class __packed __aligned(MallocAlignment) MChunk
+{
+	friend class MChunkAssertions;
+	friend class TChunk;
+
+	/**
+	 * Given a MChunkHeader, interpret its body as a MChunk.  This may be
+	 * the MChunk at the start of a TChunk, too; see TChunk::from_mchunk().
+	 */
+	__always_inline static MChunk *from_header(MChunkHeader * p)
+	{
+		return p->body<MChunk>();
+	}
+
+	/**
+	 * Each MChunk participates in a circular doubly-linked list.  The
+	 * exact form of that participation varies by the state and role of the
+	 * node:
+	 *
+	 *   - Small chunks are on the ring whose sentinel node is a smallbin[]
+	 *
+	 *   - Large chunks directly included in the tree (TChunk-s) use this
+	 *     link *as* the sentinel element of a ring of equally sized nodes
+	 *
+	 *   - Large chunks not directly included in the tree again use this
+	 *     link as the link for the above ring.
+	 *
+	 * This is no_subobject_bounds so that from_ring() below will work even if
+	 * subobject bounds are turned on.
+	 */
+	ChunkFreeLink ring __attribute__((__cheri_no_subobject_bounds__)) = {};
+
+	/**
+	 * Container-of for the above field.
+	 */
+	__always_inline static MChunk *from_ring(ChunkFreeLink * c)
+	{
+		return reinterpret_cast<MChunk *>(reinterpret_cast<uintptr_t>(c) -
+		                                  offsetof(MChunk, ring));
+	}
+
+	/**
+	 * The friend needs to access bk, fd and ptr() to rederive chunks.
+	 * XXX: How do we grant access to only these?
+	 */
+	friend class MState;
+
+	public:
+	// Is the bk field pointing to p?
+	bool bk_equals(MChunk * p)
+	{
+		return ring.cell_prev() == &p->ring;
+	}
+
+	// Is the fd field pointing to p?
+	bool fd_equals(MChunk * p)
+	{
+		return ring.cell_next() == &p->ring;
+	}
+
+	/**
+	 * Erase the MChunk-specific metadata of this chunk (specifically, ring).
+	 */
+	__always_inline void metadata_clear()
+	{
+		static_assert(sizeof(*this) == sizeof(ring));
+		/*
+		 * This is spelled slightly oddly as using memset results in a call
+		 * rather than a single store instruction.
+		 */
+		static_assert(sizeof(ring) == sizeof(uintptr_t));
+		*reinterpret_cast<uintptr_t *>(&this->ring) = 0;
+	}
+};
+
+class MChunkAssertions
+{
+	static_assert(sizeof(MChunk) == 16);
+	static_assert(std::is_standard_layout_v<MChunk>);
+};
+
+// the minimum size of a chunk (including the header)
+constexpr size_t MinChunkSize =
+  (sizeof(MChunkHeader) + sizeof(MChunk) + MallocAlignMask) & ~MallocAlignMask;
+// the minimum size of a chunk (excluding the header)
+constexpr size_t MinRequest = MinChunkSize - sizeof(MChunkHeader);
+
+// true if cap address a has acceptable alignment
+static inline bool is_aligned(CHERI::Capability<void> a)
+{
+	return (a.address() & MallocAlignMask) == 0;
+}
+// true if the size has acceptable alignment
+static inline bool is_aligned(size_t s)
+{
+	return (s & MallocAlignMask) == 0;
+}
+// the number of bytes to offset an address to align it
+static inline size_t align_offset(CHERI::Capability<void> a)
+{
+	return is_aligned(a) ? 0
+	                     : MallocAlignment - (a.address() & MallocAlignMask);
+}
+
+/**
+ * Format of a large chunk living in large tree bins. The beginning of the
+ * header shares the same format with small chunk, and may be accessed with
+ * a MChunk pointer when not performing tree operations.
+ *
+ * Since we have enough room (large/tree chunks are at least 65 bytes), we just
+ * put full capabilities here, and the format probably won't change, ever.
+ */
+class __packed __aligned(MallocAlignment) TChunk
+{
+	friend class TChunkAssertions;
+	friend class MState;
+
+	/**
+	 * TChunk-s also have MChunk rings up front, making it safe to interpret
+	 * any free chunk as a MChunk.
+	 */
+	MChunk mchunk = {};
+
+	/**
+	 * Container-of for the above field.
+	 */
+	__always_inline static TChunk *from_mchunk(MChunk * p)
+	{
+		return ds::pointer::offset<TChunk>(p, offsetof(TChunk, mchunk));
+	}
+
+	// pointers to left and right children in the tree
+	TChunk *child[2] = {nullptr, nullptr};
+	// pointer to parent
+	TChunk *parent;
+	// the tree index this chunk is in
+	BIndex index;
+	/*
+	 * There's padding to alignment here, so if we needed more metadata, it
+	 * could be "free", in spatial terms.
+	 *
+	 * This padding doesn't break our targeted zeroing in metadata_clear()
+	 * because said padding will be zeroed before we view the chunk as a TChunk
+	 * and we won't store to it.
+	 */
+
+	TChunk *leftmost_child()
+	{
+		if (child[0] != nullptr)
+		{
+			return child[0];
+		}
+		return child[1];
+	}
+
+	/**
+	 * Fictitious root for ring-linked nodes
+	 */
+	static constexpr uintptr_t RingParent = 0;
+
+	/**
+	 * Fictitious root for roots of tree bins.
+	 */
+	static constexpr uintptr_t RootParent = 1;
+
+	/**
+	 * Is this the root of a tree bin?
+	 */
+	bool is_root()
+	{
+		return reinterpret_cast<uintptr_t>(parent) == RootParent;
+	}
+
+	/**
+	 * Is this TChunk linked by its mchunk.ring to the tree, rather than its
+	 * parent/child nodes?  That is, is there an equal-size node already in
+	 * the tree?
+	 */
+	bool is_tree_ring()
+	{
+		return parent == reinterpret_cast<TChunk *>(RingParent);
+	}
+
+	/**
+	 * TChunk's `mchunk.ring` fields are sentinels for their rings of
+	 * equal-sized nodes.
+	 */
+	template<typename F>
+	bool ring_search(F f)
+	{
+		return ds::linked_list::search(&mchunk.ring, [&](ChunkFreeLink *&p) {
+			return f(MChunk::from_ring(p));
+		});
+	}
+
+	/**
+	 * Convenience composition of two container-of operations to get us from
+	 * a TChunk's ring node back to the TChunk.
+	 */
+	__always_inline static TChunk *from_ring(ChunkFreeLink * c)
+	{
+		return TChunk::from_mchunk(MChunk::from_ring(c));
+	}
+
+	/**
+	 * Construct a TChunk in `tHeader`, place it on the same free ring as
+	 * `this`, and initialize its linkages.
+	 */
+	__always_inline void ring_emplace(BIndex ix, MChunkHeader * tHeader)
+	{
+		ds::linked_list::emplace_before(
+		  &mchunk.ring,
+		  &(new (tHeader->body())
+		      TChunk(ix, reinterpret_cast<TChunk *>(RingParent)))
+		     ->mchunk.ring);
+	}
+
+	/**
+	 * Wipe the TChunk metadata.
+	 */
+	__always_inline void metadata_clear()
+	{
+		/*
+		 * This is spelled slightly oddly as using memset results in a call
+		 * rather than a few store instructions.  Even a loop with constant
+		 * limits lowers to an actual loop.
+		 */
+		static_assert(sizeof(*this) == 5 * sizeof(uintptr_t));
+		uintptr_t *body = reinterpret_cast<uintptr_t *>(this);
+		body[0] = body[1] = body[2] = body[3] = body[4] = 0;
+	}
+
+	/**
+	 * Construct a root leaf node for the given trie index.
+	 */
+	TChunk(BIndex ix)
+	  : index(ix), parent(reinterpret_cast<TChunk *>(RootParent))
+	{
+	}
+
+	/**
+	 * Construct a non-root leaf node for the given trie index with indicated
+	 * parent.
+	 */
+	TChunk(BIndex ix, TChunk * p) : index(ix), parent(p) {}
+
+	public:
+	/**
+	 * Remove default constructor
+	 */
+	TChunk() = delete;
+};
+
+class TChunkAssertions
+{
+	static_assert(std::is_standard_layout_v<TChunk>);
+	static_assert(offsetof(TChunk, mchunk) == 0);
+};
+
+class MState
+{
+	public:
+	CHERI::Capability<void> heapStart;
+
+	using RingSentinel = ds::linked_list::Sentinel<ChunkFreeLink>;
+	/*
+	 * Rings for each small bin size.  Use smallbin_at() for access to
+	 * ensure proper CHERI bounds!
+	 */
+	RingSentinel smallbins[NSmallBins];
+	/* Tree root nodes for each large bin */
+	TChunk *treebins[NTreeBins];
+
+	/*
+	 * Chunks may be enqueued into quarantine in at most three different epochs.
+	 * The opening of a fourth epoch necessarily implies that the eldest of the
+	 * three being tracked is finished.  Moreover, at least two of those three
+	 * will exit quarantine at the same time, so we track up to two sets of
+	 * chunks still in quarantine.
+	 *
+	 * Each pending quarantine ring has a sentinel and an epoch.  The rings are
+	 * threaded through MChunk::ring-s.  We don't struct-ure these together to
+	 * avoid some padding.  We use a small ring buffer Cursors object to tell us
+	 * which one to use.  There's some redundancy in this aggregate encoding,
+	 * but it's small.
+	 *
+	 * On SignetOS a chunk's epoch is the number the kernel returned when
+	 * its body was marked: the first sweep that covers it, which is the
+	 * last sweep started plus one.  A sweep starts only once the one before
+	 * it is complete, so an epoch that has not finished is the completed
+	 * one plus one or plus two, and two sets still suffice.  Each set is a
+	 * QuarantineList through the chunk headers, not a ring through
+	 * MChunk::ring-s in the bodies.
+	 */
+	static constexpr size_t QuarantineRings = 2;
+
+	/**
+	 * Quarantined chunks, oldest first, linked through
+	 * MChunkHeader::quarantineNext.  `head` and `tail` are the first and last
+	 * as quarantine_link() encodes them; both 0 when empty.
+	 */
+	struct QuarantineList
+	{
+		uint32_t head;
+		uint32_t tail;
+
+		bool is_empty()
+		{
+			return head == 0;
+		}
+
+		void reset()
+		{
+			head = 0;
+			tail = 0;
+		}
+	};
+
+	QuarantineList          quarantinePendingChunks[QuarantineRings];
+	size_t                  quarantinePendingEpoch[QuarantineRings];
+	ds::ring_buffer::Cursors<Debug, QuarantineRings, uint8_t>
+	  quarantinePendingRing;
+
+	QuarantineList *quarantine_pending_get(size_t ix)
+	{
+		return &quarantinePendingChunks[ix];
+	}
+
+	/*
+	 * Chunks that have progressed through quarantine completely are moved onto
+	 * this ring to be dequeued into the free bins above.  Entire _pending rings
+	 * can move in O(1) onto this ring, but each chunk needs individual
+	 * attention to be pushed into bins.
+	 */
+	QuarantineList quarantineFinished;
+
+	auto quarantine_finished_get()
+	{
+		return &quarantineFinished;
+	}
+
+	/**
+	 * A chunk header as quarantine lists store it: its offset from
+	 * heapStart.base() in units of MallocAlignment.  Never 0, as the MState
+	 * comes first; fits 32 bits, as no heap is larger than MaxChunkSize.
+	 */
+	uint32_t quarantine_link(MChunkHeader *header)
+	{
+		return static_cast<uint32_t>(
+		  (CHERI::Capability{header}.address() - heapStart.base()) >>
+		  MallocAlignShift);
+	}
+
+	/// The chunk header that quarantine_link() encoded as `link`.
+	MChunkHeader *quarantine_chunk(uint32_t link)
+	{
+		return rederive<MChunkHeader>(
+		  heapStart.base() +
+		  (static_cast<ptraddr_t>(link) << MallocAlignShift));
+	}
+
+	uint32_t quarantine_next_get(MChunkHeader *header)
+	{
+		return header->quarantineNext;
+	}
+
+	void quarantine_next_set(MChunkHeader *header, uint32_t link)
+	{
+		header->quarantineNext = link;
+	}
+
+	void quarantine_list_append(QuarantineList *list, MChunkHeader *header)
+	{
+		uint32_t link = quarantine_link(header);
+		quarantine_next_set(header, 0);
+		if (list->is_empty())
+		{
+			list->head = link;
+		}
+		else
+		{
+			quarantine_next_set(quarantine_chunk(list->tail), link);
+		}
+		list->tail = link;
+	}
+
+	/// Move all of `from`, which is not empty, to the end of `to`.
+	void quarantine_list_append_all(QuarantineList *to, QuarantineList *from)
+	{
+		if (to->is_empty())
+		{
+			to->head = from->head;
+		}
+		else
+		{
+			quarantine_next_set(quarantine_chunk(to->tail), from->head);
+		}
+		to->tail = from->tail;
+		from->reset();
+	}
+
+	/// Take the first chunk off `list`, which is not empty.
+	MChunkHeader *quarantine_list_take_first(QuarantineList *list)
+	{
+		MChunkHeader *first = quarantine_chunk(list->head);
+		list->head          = quarantine_next_get(first);
+		if (list->head == 0)
+		{
+			list->tail = 0;
+		}
+		quarantine_next_set(first, 0);
+		return first;
+	}
+
+	// bitmap telling which bins are empty which are not
+	Binmap smallmap;
+	Binmap treemap;
+	size_t heapTotalSize;
+	size_t heapFreeSize;
+	size_t heapQuarantineSize;
+
+	bool is_free_cap_inbounds(CHERI::Capability<void> mem)
+	{
+		return mem.is_subset_of(heapStart);
+	}
+
+	/// Rederive a capability to a `T` from the heap range.  This does not
+	/// apply bounds to the result.
+	template<typename T>
+	T *rederive(ptraddr_t address)
+	{
+		CHERI::Capability<T> cap{heapStart.cast<T>()};
+		cap.address() = address;
+		return cap;
+	}
+
+	// Returns the smallbin head for index i.
+	auto smallbin_at(BIndex i)
+	{
+		return rederive<RingSentinel>(
+		  CHERI::Capability{&smallbins[i]}.address());
+	}
+	// Returns a pointer to the pointer to the root chunk of a tree.
+	TChunk **treebin_at(BIndex i)
+	{
+		return &treebins[i];
+	}
+
+	// Mark the bit at smallbin index i.
+	void smallmap_mark(BIndex i)
+	{
+		smallmap |= idx2bit(i);
+	}
+	// Clear the bit at smallbin index i.
+	void smallmap_clear(BIndex i)
+	{
+		smallmap &= ~idx2bit(i);
+	}
+	// Is the bit at smallbin index i set?
+	bool is_smallmap_marked(BIndex i)
+	{
+		return smallmap & idx2bit(i);
+	}
+
+	// Mark the bit at treebin index i.
+	void treemap_mark(BIndex i)
+	{
+		treemap |= idx2bit(i);
+	}
+	// Clear the bit at treebin index i.
+	void treemap_clear(BIndex i)
+	{
+		treemap &= ~idx2bit(i);
+	}
+	// Is the bit at treebin index i set?
+	bool is_treemap_marked(BIndex i)
+	{
+		return treemap & idx2bit(i);
+	}
+
+	// Initialize bins for a new MState.
+	void init_bins()
+	{
+		// Establish circular links for smallbins.
+		for (BIndex i = 0; i < NSmallBins; ++i)
+		{
+			smallbin_at(i)->reset();
+		}
+		// The treebins should be all nullptrs due to memset earlier.
+
+		// Initialise quarantine
+		for (auto &quarantinePendingChunk : quarantinePendingChunks)
+		{
+			quarantinePendingChunk.reset();
+		}
+		quarantinePendingRing.reset();
+		quarantineFinished.reset();
+		heapQuarantineSize = 0;
+	}
+
+	/**
+	 * Called when adding the first memory chunk to this MState. At the
+	 * moment we only support one contiguous MChunk for each MState.
+	 *
+	 * Takes the base address and size of the first chunk to be added.
+	 */
+	void mspace_firstchunk_add(void *base, size_t size)
+	{
+		// Should only be called once during mstate_init() for now.
+		Debug::Assert((heapTotalSize == 0) && (heapFreeSize == 0),
+		              "First chunk added more than once.  Heap size {} and "
+		              "free size {} should both be 0",
+		              heapTotalSize,
+		              heapFreeSize);
+
+		auto p = MChunkHeader::make(base, size);
+
+		heapTotalSize += size;
+		heapFreeSize += p->size_get();
+		insert_chunk(p, p->size_get());
+	}
+
+	/**
+	 * Tag type indicating that the requested allocation can never succeed.
+	 */
+	struct AllocationFailurePermanent
+	{
+	};
+
+	/**
+	 * Tag type indicating that the requested allocation may be able to succeed
+	 * once the revoker has finished, as long as nothing else uses the
+	 * available memory until then.
+	 */
+	struct AllocationFailureRevocationNeeded
+	{
+		size_t waitingEpoch;
+	};
+
+	/**
+	 * Tag type indicating that the requested allocation cannot succeed until
+	 * some objects have been freed in the passed quota.
+	 */
+	struct AllocationFailureQuotaExceeded
+	{
+	};
+
+	/**
+	 * Tag type indicating that the requested allocation cannot succeed until
+	 * some objects have been freed.
+	 */
+	struct AllocationFailureHeapFull
+	{
+	};
+
+	/**
+	 * Possible outcomes of an attempt to allocate memory: built from one of
+	 * the tag types above, or from the allocation.  (Upstream uses a
+	 * std::variant of the same five types.)
+	 */
+	struct AllocationResult
+	{
+		enum Kind
+		{
+			Permanent,
+			RevocationNeeded,
+			QuotaExceeded,
+			HeapFull,
+			Success,
+		} kind;
+		/// RevocationNeeded: the epoch to wait for.
+		size_t waitingEpoch = 0;
+		/// Success: the allocation.
+		CHERI::Capability<void> allocation = nullptr;
+
+		AllocationResult(AllocationFailurePermanent) : kind(Permanent) {}
+		AllocationResult(AllocationFailureRevocationNeeded failure)
+		  : kind(RevocationNeeded), waitingEpoch(failure.waitingEpoch)
+		{
+		}
+		AllocationResult(AllocationFailureQuotaExceeded) : kind(QuotaExceeded)
+		{
+		}
+		AllocationResult(AllocationFailureHeapFull) : kind(HeapFull) {}
+		AllocationResult(CHERI::Capability<void> allocation)
+		  : kind(Success), allocation(allocation)
+		{
+		}
+	};
+
+	/**
+	 * @brief Adjust size and alignment to ensure precise representability, and
+	 * paint the shadow bit for the header to detect valid free().
+	 *
+	 * The `quota` is the amount of memory that the caller is still permitted
+	 * to allocate.  This is decremented by the amount allocated on successful
+	 * allocation.  The `identifier` will be stored as the owner in the header
+	 * of a successful allocation.
+	 *
+	 * @return User pointer if request can be satisfied, or a tag type
+	 * representing the error otherwise.
+	 */
+	AllocationResult mspace_dispatch(size_t   bytes,
+	                                 size_t  &quota,
+	                                 uint32_t identifier)
+	{
+		size_t alignSize =
+		  (CHERI::representable_length(bytes) + MallocAlignMask) &
+		  ~MallocAlignMask;
+		// This 0 size check is for:
+		// 1. We choose to return nullptr for 0-byte requests.
+		// 2. crrl overflows to 0 if bytes is too big. Force failure.
+		if (alignSize == 0)
+		{
+			return AllocationFailurePermanent{};
+		}
+		// Check this first so that quota exhaustion doesn't return temporary
+		// failure.
+		if (heapTotalSize < alignSize)
+		{
+			return AllocationFailurePermanent{};
+		}
+		// Return failure if the quota is exhausted.
+		if (alignSize > quota)
+		{
+			Debug::log("Quota exhausted trying to allocate {} bytes (remaining "
+			           "quota is {})",
+			           alignSize,
+			           quota);
+			return AllocationFailureQuotaExceeded{};
+		}
+		CHERI::Capability<void> ret{mspace_memalign(
+		  alignSize, -CHERI::representable_alignment_mask(bytes))};
+		if (ret == nullptr)
+		{
+			auto neededSize = alignSize + sizeof(MChunkHeader);
+			if (heapQuarantineSize > 0 &&
+			    (heapQuarantineSize + heapFreeSize) >= neededSize)
+			{
+				/* Quarantine is nonempty; there must be an eldest epoch. */
+				return AllocationFailureRevocationNeeded{
+				  quarantinePendingEpoch[quarantinePendingRing
+				                           .head_get_unsafe()]};
+			}
+			if (heapTotalSize < neededSize)
+			{
+				return AllocationFailurePermanent{};
+			}
+			return AllocationFailureHeapFull{};
+		}
+		auto header = MChunkHeader::from_body(ret);
+
+		// The allocation might be just on the boundary where the requested
+		// size is less than the quota but the allocated size is greater. In
+		// this case, return the memory without quarantining and retry.
+		if (header->size_get() > quota)
+		{
+			Debug::log("Quota exhausted trying to allocate {} bytes (remaining "
+			           "quota is {})",
+			           header->size_get(),
+			           quota);
+			heapFreeSize += header->size_get();
+			mspace_free_internal(header);
+			return AllocationFailureQuotaExceeded{};
+		}
+
+		if constexpr (AllocatorDebugEnabled)
+		{
+			// Periodically sanity check the entire state for this mspace.
+			static size_t           sanityCounter        = 0;
+			static constexpr size_t MStateSanityInterval = 128;
+			if (sanityCounter % MStateSanityInterval == 0)
+			{
+				ok_malloc_state();
+			}
+			++sanityCounter;
+		}
+
+		size_t bodySize = header->size_get() - sizeof(MChunkHeader);
+		header->set_owner(identifier);
+		quota -= header->size_get();
+		if (CHERI::is_precise_range(ret.address(), bodySize))
+		{
+			// Can we use this whole chunk as is? Yes!
+			ret.bounds() = bodySize;
+		}
+		else
+		{
+			/*
+			 * Using the whole chunk cannot give a precise capability, so only
+			 * use the portion that gives us a precise capability.
+			 */
+			ret.bounds() = alignSize;
+			Debug::Assert(bodySize == alignSize + MallocAlignment,
+			              "bodySize {} should only be {} bytes larger than "
+			              "alignSize {} when bodySize is not representable",
+			              bodySize,
+			              MallocAlignment,
+			              alignSize);
+		}
+		return ret;
+	}
+
+	/**
+	 * Returns
+	 * the size of the allocation associated with `chunk`.
+	 */
+	size_t chunk_body_size(MChunkHeader &chunk) const
+	{
+		size_t    bodySize = chunk.size_get() - sizeof(MChunkHeader);
+		ptraddr_t base     = chunk.body().address();
+		if (!CHERI::is_precise_range(base, bodySize))
+		{
+			/*
+			 * If we can't give a precise capability covering the whole chunk,
+			 * then we must have given out the representable portion.
+			 * See also the logic in mspace_dispatch().
+			 */
+			bodySize -= MallocAlignment;
+			Debug::Assert(
+			  CHERI::is_precise_range(base, bodySize),
+			  "Neither bodySize nor bodySize - 8 can give a precise "
+			  "capability. "
+			  "Something is wrong during allocation.");
+		}
+		return bodySize;
+	}
+
+	/**
+	 * Free a chunk.  The `bodySize` parameter specifies the size of the
+	 * allocated space that must be zeroed.  This must be calculated by the
+	 * caller and so is provided here to avoid recalculating it.
+	 *
+	 * On success, `*freedEpoch`, if given, is set to the epoch of the sweep
+	 * that revokes the capabilities to the chunk.  (SignetOS: upstream has no
+	 * such parameter.  The revoker is shared by every heap in an image, so
+	 * it cannot be asked afterwards which epoch this free was given.)
+	 */
+	int mspace_free(MChunkHeader &chunk,
+	                size_t        bodySize,
+	                size_t       *freedEpoch = nullptr)
+	{
+		// Expand the bounds of the freed object to the whole heap and set the
+		// address that we're looking at to the base of the requested
+		// capability.
+		Capability mem{chunk.body()};
+
+		/*
+		 * The sweep that revokes capabilities to this chunk, as the revoker
+		 * returns it on marking the body (upstream reads an epoch counter).
+		 */
+		size_t epoch;
+
+		{
+			Capability bounded{mem};
+			bounded.bounds() = bodySize;
+
+			if (!bounded.is_valid())
+			{
+				return -EINVAL;
+			}
+
+			/*
+			 * Paint the shadow bitmap.
+			 *
+			 * It must happen before zeroing because the allocator is
+			 * running with interrupts enabled.  Were we to zero and then paint,
+			 * there would be a window in which preemption could allow a store
+			 * through a copy of the user capability (or its progeny) that undid
+			 * our work of zeroing!
+			 */
+			if (!revoker.mark_set_range(bounded, epoch))
+			{
+				/*
+				 * Capabilities to an unmarked body are never revoked, so it
+				 * must never be reused: the chunk stays in use for good,
+				 * owned by the allocator.
+				 */
+				Debug::Assert(false,
+				              "The revoker refused to mark the body of chunk {}",
+				              &chunk);
+				chunk.set_owner(0);
+				return -EINVAL;
+			}
+		}
+
+		/*
+		 * SignetOS has no load barrier, so what upstream says below about
+		 * one does not hold here: capabilities to this chunk keep working,
+		 * for loads and for stores, until the sweep for `epoch` completes.
+		 * Two things follow.  The body is not zeroed here but when the chunk
+		 * leaves quarantine (mspace_qtbin_deqn), and nothing of the
+		 * allocator's is kept in the body meanwhile.  Upstream's account is
+		 * kept for reference.
+		 *
+		 * Shadow bits have been painted. To first approximation, from now on
+		 * user caps to this chunk will not come to exist in registers due to
+		 * load barrier.  Any that are already there will be addressed (either
+		 * zeroed or reloaded and, so, tag-cleared) when we return from this
+		 * compartment.
+		 *
+		 * ### The First Disturbance
+		 *
+		 * In slightly more detail, none of our C++ code between here and return
+		 * from the allocator compartment is going to write any would-be-revoked
+		 * caps to this chunk to memory or use them to access memory.  But just
+		 * because these values are linguistically dead, we might still have
+		 * such a thing in the registers (it's tricky to make assurances of the
+		 * registers from C++ beyond those required by the ABI) and that thing
+		 * might get spilled to the stack.  Separately, if we get preempted,
+		 * that might get spilled to our thread's trusted stack's register spill
+		 * area.
+		 *
+		 * Excitingly, those spills might happen while the revoker is probing
+		 * the spilled-to address, so it might well be the case that we write
+		 * a tagged capability whose base indicates that it should be revoked
+		 * to a location being revoked, and possibly that the revoker would be
+		 * attempting to clear (in fact, we could be writing back an identical
+		 * copy).  That's fine, if initially (and locally) alarming.
+		 *
+		 * ### The Second Disturbance
+		 *
+		 * In this gap between painting and return we also find that the story
+		 * we tell to non-TCB software is in fact an oversimplification and it
+		 * is, in fact, possible for a capability to this freed object to
+		 * persist in memory and in registers even after the freed object has
+		 * lingered in quarantine for sufficiently long to be de-quarantined!
+		 * Fortunately, such lingering copies are visible only to the allocator
+		 * software and switcher, but for anyone attempting to do formal
+		 * verification of the system, this is a challenge.
+		 *
+		 * In principle, Events Beyond Our Control may have caused the revoker
+		 * to engage after this read of the `epoch` value and before we get to
+		 * `mspace_qtbin_deqn()` all without us ever getting preempted.[^really]
+		 * In such a scenario, all of these may be true simultaneously:
+		 *
+		 *  - We still have, in our CPU registers, a copy of a capability to the
+		 *    object that was once `chunk` that neither the load filter nor the
+		 *    revoker have been able to scrutinize,
+		 *
+		 *  - The revoker has made blindingly fast progress relative to the CPU
+		 *    core and this `mspace_qtbin_deqn()` call may remove `chunk`
+		 *    from quarantine, zeroing its revocation bits in the process.
+		 *
+		 *  - The compiler may have generated code for dequarantining that does
+		 *    not touch the register holding the aforementioned unexamined
+		 *    capability.
+		 *
+		 * If we are now preempted or spill that capability to the stack, we
+		 * will have written to memory a capability that we should not be
+		 * allowed to have: a revocation pass has started and ended since the
+		 * memory to which it points was quarantined, and yet.  Moreover, we
+		 * could read this capability back into the indefinite future, because
+		 * the revocation bitmap bits have been cleared.  This is, however
+		 * alarming it may seem, fine, if admittedly unexpected:
+		 *
+		 *  - The allocator is the thing defining object lifetimes, and it holds
+		 *    a capability to the whole heap.  It (and it alone, of the TCB)
+		 *    could have rederived this forbidden capability anyway.
+		 *
+		 *  - The allocator isn't going to return such an accidentally-surviving
+		 *    capability; in fact it is, from a C++ perspective, dead.
+		 *
+		 *  - Spills to the stack are private to this compartment invocation
+		 *    (the specific instance of this thread in this compartment) and are
+		 *    going to be erased before we return to the calling compartment.
+		 *
+		 *  - Spills to the trusted stack's register spill area are private to
+		 *    this thread and, moreover, are dead by the time we're back on core
+		 *    (that is, we will never read those values again; all subsequent
+		 *    loads from the spill area will be of values that will have already
+		 *    been overwritten by entry to the trap handler).
+		 *
+		 * However, all this remains a big mess for formal verification of the
+		 * RTOS at the ISA level.
+		 *
+		 * [^really]:  It is not immediately possible to see how the revoker
+		 * might engage like this, but a few plausible scenarios exist:
+		 *
+		 *   - Kicking the revoker might take a long time, so this activation
+		 *     was in fact requested by a previous object's having been freed.
+		 *
+		 *   - The revoker can activates itself without software intervention.
+		 *
+		 *   - The order of the calls to `mpsace_bg_revoker_kick()` and
+		 *     `mspace_qtbin_deqn()` below, which is a historical happenstance,
+		 *     might be swapped, so that the kick happens first.
+		 */
+
+		/*
+		 * Enqueue this chunk to quarantine.  Its header is still marked as
+		 * being allocated.
+		 */
+		chunk.isQuarantined = true;
+		quarantine_pending_push(epoch, &chunk);
+		heapQuarantineSize += chunk.size_get();
+
+		/*
+		 * Perhaps there has been some progress on revocation.  Dequeue 3 times.
+		 * 3 is chosen randomly. At least 2 is needed for easy argument that the
+		 * allocator stays ahead of its quarantine.
+		 */
+		mspace_qtbin_deqn(3);
+		mspace_bg_revoker_kick();
+
+		if (freedEpoch != nullptr)
+		{
+			*freedEpoch = epoch;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Given a pointer that is probably in an allocation, try to find the start
+	 * of that allocation.  Returns the header if this is a valid pointer into
+	 * an allocation, nullptr otherwise.
+	 */
+	MChunkHeader *allocation_start(ptraddr_t address)
+	{
+		address &= ~MallocAlignMask;
+		ptraddr_t base = heapStart.address();
+		if ((address < base) || (address > heapStart.top()))
+		{
+			return nullptr;
+		}
+		// If we don't have shadow bits, skip this check and just assume that
+		// this is the start of an allocation.  This mode is for benchmark
+		// baselines only.  (On SignetOS it is also the mode of the revoker in
+		// use, whose marks user space cannot read: the caller checks what the
+		// header says.)
+		if constexpr (!Revocation::Revoker::HasChunkMarks)
+		{
+			address -= MallocAlignment;
+		}
+		else
+		{
+			if (revoker.mark_get(address))
+			{
+				return nullptr;
+			}
+			while (!revoker.mark_get(address) && (address > base))
+			{
+				address -= MallocAlignment;
+			}
+		}
+		CHERI::Capability<MChunkHeader> header{heapStart.cast<MChunkHeader>()};
+		header.address() = address;
+		if (header->is_in_use())
+		{
+			return header;
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Try to dequeue some objects from quarantine.
+	 *
+	 * Returns true if any objects were dequeued, false otherwise.
+	 */
+	__always_inline bool quarantine_dequeue()
+	{
+		// 4 chosen by fair die roll.
+		return mspace_qtbin_deqn(4) > 0;
+	}
+
+	private:
+	/**
+	 * @brief helper to perform operation on a range of capability words
+	 * @param start beginning of the range
+	 * @param size the size of the range
+	 * @param fn what to be done for each word. Returns true to break loop
+	 * @return true if something breaks the loop. false otherwise
+	 */
+	static bool __always_inline capaligned_range_do(void  *start,
+	                                                size_t size,
+	                                                bool (*fn)(void **))
+	{
+		Debug::Assert((size & (sizeof(void *) - 1)) == 0,
+		              "Cap range is not aligned");
+		void **capstart = static_cast<void **>(start);
+		for (size_t i = 0; i < size / sizeof(void *); ++i)
+		{
+			if (fn(&capstart[i]))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	static void capaligned_zero(void *start, size_t size)
+	{
+		capaligned_range_do(start, size, [](void **word) {
+			*word = nullptr;
+			return false;
+		});
+	}
+
+	/**
+	 * Internal debug checks. Crashes the allocator when inconsistency detected.
+	 * No-ops in Release build.
+	 */
+	bool ok_address(ptraddr_t a)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return true;
+		}
+		return a >= heapStart.base();
+	}
+	bool ok_address(void *p)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return true;
+		}
+		return ok_address(CHERI::Capability{p}.address());
+	}
+	void ok_any_chunk(MChunkHeader *p)
+	{
+		if constexpr (HasTemporalSafety && AllocatorDebugEnabled)
+		{
+			bool thisShadowBit =
+			  !Revocation::Revoker::HasChunkMarks ||
+			  revoker.mark_get(CHERI::Capability{p}.address());
+			Debug::Assert(thisShadowBit,
+			              "Chunk header does not point to a set shadow bit: {}",
+			              p);
+			MChunkHeader *next = p->cell_next();
+			bool          nextShadowBit =
+			  !Revocation::Revoker::HasChunkMarks ||
+			  revoker.mark_get(CHERI::Capability{next}.address());
+			Debug::Assert(
+			  nextShadowBit,
+			  "Next chunk header does not point to a set shadow bit: {}",
+			  next);
+			Debug::Assert(
+			  is_aligned(p->body()), "Chunk is not correctly aligned: {}", p);
+			Debug::Assert(
+			  ok_address(p->body()), "Invalid address {} for chunk", p->body());
+		}
+	}
+	// Sanity check an in-use chunk.
+	void ok_in_use_chunk(MChunkHeader *p)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		ok_any_chunk(p);
+		Debug::Assert(p->is_in_use(), "In use chunk {} is not in use", p);
+		Debug::Assert(p->cell_next()->is_prev_in_use(),
+		              "In use chunk {} is in a list with chunk that expects it "
+		              "to not be in use",
+		              p);
+		Debug::Assert(p->is_prev_in_use() || p->cell_prev()->cell_next() == p,
+		              "Previous chunk is not in use or the chunk list is "
+		              "corrupt for chunk {}",
+		              p);
+	}
+	// Sanity check a free chunk.
+	void ok_free_chunk(MChunkHeader *pHeader)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		auto   p          = MChunk::from_header(pHeader);
+		size_t sz         = pHeader->size_get();
+		auto   nextHeader = pHeader->cell_next();
+		ok_any_chunk(pHeader);
+		Debug::Assert(
+		  !pHeader->is_in_use(), "Free chunk {} is marked as in use", p);
+		Debug::Assert(
+		  !nextHeader->is_prev_in_use(),
+		  "Free chunk {} is in list with chunk that expects it to be in use",
+		  p);
+		Debug::Assert(ds::linked_list::is_well_formed(&p->ring),
+		              "Chunk {} cons cell is not well formed",
+		              p);
+		if (sz >= MinChunkSize)
+		{
+			Debug::Assert((sz & MallocAlignMask) == 0,
+			              "Chunk size {} is incorrectly aligned",
+			              sz);
+			Debug::Assert(is_aligned(pHeader->body()),
+			              "Chunk {} is insufficiently aligned",
+			              pHeader);
+			Debug::Assert(
+			  nextHeader->prevsize_get() == sz,
+			  "Chunk {} has size {}, next node expects its size to be {}",
+			  pHeader,
+			  sz,
+			  nextHeader->prevsize_get());
+			Debug::Assert(pHeader->is_prev_in_use(),
+			              "Free chunk {} should follow an in-use chunk",
+			              pHeader);
+			Debug::Assert(nextHeader->is_in_use(),
+			              "Free chunk {} should be followed by an in-use chunk",
+			              pHeader);
+			Debug::Assert(
+			  ds::linked_list::is_well_formed(&p->ring),
+			  "Forward and backwards chunk pointers are inconsistent for {}",
+			  p);
+		}
+		else // Markers are just the MChunkHeader.
+		{
+			Debug::Assert(sz == sizeof(MChunkHeader),
+			              "Marker chunk size is {}, should always be {}",
+			              sz,
+			              sizeof(MChunkHeader));
+		}
+	}
+	// Sanity check a chunk that was just malloced.
+	void ok_malloced_chunk(MChunkHeader *p, size_t s)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		if (p != nullptr)
+		{
+			size_t sz = p->size_get();
+			ok_in_use_chunk(p);
+			Debug::Assert((sz & MallocAlignMask) == 0,
+			              "Chunk size {} is insufficiently aligned",
+			              sz);
+			Debug::Assert(sz >= MinChunkSize,
+			              "Chunk size {} is smaller than minimum size {}",
+			              sz,
+			              MinChunkSize);
+			Debug::Assert(sz >= s,
+			              "Chunk size {} is smaller that requested size {}",
+			              sz,
+			              s);
+			/*
+			 * Size is less than MinChunkSize more than request. If this does
+			 * not hold, then it should have been split into two mallocs.
+			 */
+			Debug::Assert(sz < (s + MinChunkSize),
+			              "Chunk of size {} returned for requested size {}, "
+			              "should have been split",
+			              sz,
+			              s);
+		}
+	}
+
+	/**
+	 * @brief Advance to the next tree chunk.
+	 */
+	void ok_tree_next(TChunk *from, TChunk *t)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		if (from == t->parent)
+		{
+			/* Came from parent; descend as leftwards as we can */
+			if (t->child[0])
+			{
+				[[clang::musttail]] return ok_tree(t, t->child[0]);
+			}
+			if (t->child[1])
+			{
+				[[clang::musttail]] return ok_tree(t, t->child[1]);
+			}
+
+			/* Leaf nodes fall through */
+		}
+		else if (from == t->child[0] && t->child[1])
+		{
+			/* Came from left child; descend right if there is one */
+			[[clang::musttail]] return ok_tree(t, t->child[1]);
+		}
+
+		if (!t->is_root())
+		{
+			/* Leaf node or came from rightmost child; ascend */
+			[[clang::musttail]] return ok_tree_next(t, t->parent);
+		}
+
+		/* Otherwise, we are the root node and we have nowhere to go, so stop */
+	}
+	/**
+	 * @brief Sanity check all the chunks in a tree.
+	 *
+	 * @param from the previously visited node or TChunk::RootParent
+	 * @param t the root of a whole tree or a subtree
+	 */
+	void ok_tree(TChunk *from, TChunk *t)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		auto   tHeader = MChunkHeader::from_body(t);
+		BIndex tindex  = t->index;
+		size_t tsize   = tHeader->size_get();
+		BIndex idx     = compute_tree_index(tsize);
+		Debug::Assert(
+		  tindex == idx, "Chunk index {}, expected {}", tindex, idx);
+		Debug::Assert(tsize > MaxSmallSize,
+		              "Size {} is smaller than the minimum size",
+		              tsize);
+		Debug::Assert(tsize >= minsize_for_tree_index(idx),
+		              "Size {} is smaller than the minimum size for tree {}",
+		              tsize,
+		              idx);
+		Debug::Assert((idx == NTreeBins - 1) ||
+		                (tsize < minsize_for_tree_index((idx + 1))),
+		              "Tree shape is invalid");
+
+		/* Properties of this tree node */
+		ok_any_chunk(tHeader);
+		ok_free_chunk(tHeader);
+		Debug::Assert(t->index == tindex,
+		              "Chunk has index {}, expected {}",
+		              t->index,
+		              tindex);
+		Debug::Assert(tHeader->size_get() == tsize,
+		              "Chunk has size {}, expected {}",
+		              tHeader->size_get(),
+		              tsize);
+		Debug::Assert(
+		  !t->is_tree_ring(), "Tree node {} marked as tree ring node", tHeader);
+		Debug::Assert(t->parent != t, "Chunk {} is its own parent", tHeader);
+		Debug::Assert(t->is_root() || t->parent->child[0] == t ||
+		                t->parent->child[1] == t,
+		              "Chunk {} is neither root nor a child of its parent",
+		              tHeader);
+
+		/* Equal-sized chunks */
+		t->ring_search([this, tsize](MChunk *uMchunk) {
+			auto u       = TChunk::from_mchunk(uMchunk);
+			auto uHeader = MChunkHeader::from_body(uMchunk);
+			ok_any_chunk(uHeader);
+			ok_free_chunk(uHeader);
+			Debug::Assert(
+			  uHeader->size_get() == tsize, "Large chunk {} has wrong size", u);
+			Debug::Assert(
+			  u->is_tree_ring(), "Chunk {} is not in tree but has parent", u);
+			Debug::Assert(u->child[0] == nullptr,
+			              "Chunk {} has no parent but has a child {}",
+			              uHeader,
+			              u->child[0]);
+			Debug::Assert(u->child[1] == nullptr,
+			              "Chunk {} has no parent but has a child {}",
+			              uHeader,
+			              u->child[1]);
+			return false;
+		});
+
+		auto checkChild = [&](int childIndex) {
+			auto child = t->child[childIndex];
+			if (child != nullptr)
+			{
+				Debug::Assert(child->parent == t,
+				              "Chunk {} has child {} ({}) that has parent {}",
+				              t,
+				              childIndex,
+				              child,
+				              child->parent);
+				Debug::Assert(child != t,
+				              "Chunk {} is its its own child ({})",
+				              t,
+				              childIndex);
+				Debug::Assert(MChunkHeader::from_body(child)->size_get() !=
+				                tsize,
+				              "Chunk {} has child {} with equal size {}",
+				              t,
+				              child,
+				              tsize);
+			}
+		};
+		checkChild(0);
+		checkChild(1);
+		if ((t->child[0] != nullptr) && (t->child[1] != nullptr))
+		{
+			auto childHeaderSize = [&](int ix) {
+				return MChunkHeader::from_body(t->child[ix])->size_get();
+			};
+			Debug::Assert(childHeaderSize(0) < childHeaderSize(1),
+			              "Chunk {}'s children are not sorted by size",
+			              tHeader);
+		}
+
+		[[clang::musttail]] return ok_tree_next(from, t);
+	}
+	// Sanity check the tree at treebin[i].
+	void ok_treebin(BIndex i)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		TChunk **tb    = treebin_at(i);
+		TChunk  *t     = *tb;
+		bool     empty = (treemap & (1U << i)) == 0;
+		if (t == nullptr)
+		{
+			Debug::Assert(empty, "Null tree is not empty");
+		}
+		if (!empty)
+		{
+			Debug::Assert(
+			  t->is_root(), "Non-empty bin has non-root tree node {}", t);
+			ok_tree(t->parent, t);
+		}
+	}
+	// Sanity check smallbin[i].
+	void ok_smallbin(BIndex i)
+	{
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		auto b     = smallbin_at(i);
+		bool empty = (smallmap & (1U << i)) == 0;
+
+		Debug::Assert(empty == b->is_empty(),
+		              "Small bin {} empty flag and list disagree",
+		              i);
+
+		b->search([this, i](auto pRing) {
+			auto pHeader = MChunkHeader::from_body(MChunk::from_ring(pRing));
+
+			// Each chunk claims to be free.
+			ok_free_chunk(pHeader);
+
+			// Chunk belongs in this bin.
+			size_t size = pHeader->size_get();
+			Debug::Assert(small_index(size) == i,
+			              "Chunk is in bin with index {} but should be in {}",
+			              i,
+			              small_index(size));
+
+			return false;
+		});
+	}
+	// Sanity check the entire malloc state in this MState.
+	void ok_malloc_state()
+	{
+		if constexpr (Revocation::Revoker::IsAsynchronous)
+		{
+			mspace_bg_revoker_kick();
+		}
+		if constexpr (!AllocatorDebugEnabled)
+		{
+			return;
+		}
+		BIndex i;
+		size_t total;
+		// Check all the bins.
+		for (i = 0; i < NSmallBins; ++i)
+		{
+			ok_smallbin(i);
+		}
+		for (i = 0; i < NTreeBins; ++i)
+		{
+			ok_treebin(i);
+		}
+	}
+
+	private:
+	/*
+	 * Link a free chunk into a smallbin.
+	 *
+	 * Initializes the linkages of p.
+	 */
+	void insert_small_chunk(MChunkHeader *p, size_t size)
+	{
+		BIndex i   = small_index(size);
+		auto   bin = smallbin_at(i);
+		Debug::Assert(
+		  size >= MinChunkSize, "Size {} is not a small chunk size", size);
+		if (!is_smallmap_marked(i))
+		{
+			smallmap_mark(i);
+		}
+		else if (!RTCHECK(ok_address(bin)))
+		{
+			corruption_error_action();
+		}
+		/*
+		 * The constructor and emplacement are expected to inline and not
+		 * generate redundant stores.
+		 */
+		bin->append_emplace(&(new (p->body()) MChunk())->ring);
+	}
+
+	/// Unlink a chunk from a smallbin.
+	void unlink_small_chunk(MChunk *p, size_t s)
+	{
+		auto   fr      = p->ring.cell_next();
+		auto  *f       = MChunk::from_ring(fr);
+		auto   br      = p->ring.cell_prev();
+		auto  *b       = MChunk::from_ring(br);
+		auto   pHeader = MChunkHeader::from_body(p);
+		BIndex i       = small_index(s);
+		auto   bin     = smallbin_at(i);
+
+		Debug::Assert(!ds::linked_list::is_singleton(&p->ring),
+		              "Chunk {} is circularly referenced",
+		              p);
+		Debug::Assert(pHeader->size_get() == small_index2size(i),
+		              "Chunk {} is has size {} but is in bin for size {}",
+		              pHeader,
+		              pHeader->size_get(),
+		              small_index2size(i));
+
+		if (RTCHECK(&p->ring == bin->last() ||
+		            (ok_address(f) && f->bk_equals(p))))
+		{
+			if (br == fr)
+			{
+				// This is the last chunk in this bin.
+				smallmap_clear(i);
+				bin->reset();
+			}
+			else if (RTCHECK(&p->ring == smallbin_at(i)->first() ||
+			                 (ok_address(b) && b->fd_equals(p))))
+			{
+				ds::linked_list::unsafe_remove(&p->ring);
+			}
+			else
+			{
+				corruption_error_action();
+			}
+		}
+		else
+		{
+			corruption_error_action();
+		}
+
+		p->metadata_clear();
+	}
+
+	// Unlink the first chunk from a smallbin.
+	MChunkHeader *unlink_first_small_chunk(BIndex i)
+	{
+		auto b = smallbin_at(i);
+
+		Debug::Assert(ds::linked_list::is_well_formed(&b->sentinel),
+		              "Smallbin {} sentinel (at {}) is not well formed",
+		              i,
+		              b);
+
+		MChunk *p = MChunk::from_ring(b->unsafe_take_first());
+
+		Debug::Assert(ok_address(p), "Removed chunk {} has bad address", p);
+
+		if (b->is_empty())
+		{
+			smallmap_clear(i);
+		}
+
+		p->metadata_clear();
+
+		MChunkHeader *pHeader = MChunkHeader::from_body(p);
+		Debug::Assert(pHeader->size_get() == small_index2size(i),
+		              "Chunk {} is has size {} but is in bin for size {}",
+		              pHeader,
+		              pHeader->size_get(),
+		              small_index2size(i));
+
+		return pHeader;
+	}
+
+	/**
+	 * Insert chunk into tree.
+	 *
+	 * Initializes the linkages of x.
+	 */
+	void insert_large_chunk(MChunkHeader *xHeader, size_t s)
+	{
+		TChunk **head;
+		BIndex   i = compute_tree_index(s);
+		head       = treebin_at(i);
+
+		if (!is_treemap_marked(i))
+		{
+			treemap_mark(i);
+			*head = new (xHeader->body()) TChunk(i);
+		}
+		else
+		{
+			TChunk *t = *head;
+			size_t  k = s << leftshift_for_tree_index(i);
+			for (;;)
+			{
+				if (MChunkHeader::from_body(t)->size_get() != s)
+				{
+					CHERI::Capability<TChunk *> c =
+					  &(t->child[leftshifted_val_msb(k)]);
+					k <<= 1;
+					if (*c != nullptr)
+					{
+						t = *c;
+					}
+					else if (RTCHECK(ok_address(c.address())))
+					{
+						*c = new (xHeader->body()) TChunk(i, t);
+						break;
+					}
+					else
+					{
+						corruption_error_action();
+						break;
+					}
+				}
+				else
+				{
+					TChunk *back =
+					  TChunk::from_ring(t->mchunk.ring.cell_prev());
+					if (RTCHECK(ok_address(&t->mchunk) &&
+					            ok_address(&back->mchunk)))
+					{
+						t->ring_emplace(i, xHeader);
+						break;
+					}
+
+					corruption_error_action();
+					break;
+				}
+			}
+		}
+	}
+
+	/**
+	 * Unlink steps:
+	 *
+	 * 1. If x is a chained node, unlink it from its same-sized fd/bk links
+	 *     and choose its bk node as its replacement.
+	 * 2. If x was the last node of its size, but not a leaf node, it must
+	 *     be replaced with a leaf node (not merely one with an open left or
+	 *     right), to make sure that lefts and rights of descendents
+	 *     correspond properly to bit masks.  We use the rightmost descendent
+	 *     of x.  We could use any other leaf, but this is easy to locate and
+	 *     tends to counteract removal of leftmosts elsewhere, and so keeps
+	 *     paths shorter than minimally guaranteed.  This doesn't loop much
+	 *     because on average a node in a tree is near the bottom.
+	 * 3. If x is the base of a chain (i.e., has parent links) relink
+	 *     x's parent and children to x's replacement (or null if none).
+	 *
+	 * Always zeros the chunk linkages.
+	 */
+	void unlink_large_chunk(TChunk *x)
+	{
+		TChunk *r;
+		if (!ds::linked_list::is_singleton(&x->mchunk.ring))
+		{
+			TChunk *f = TChunk::from_ring(x->mchunk.ring.cell_next());
+			r         = TChunk::from_ring(x->mchunk.ring.cell_prev());
+			if (RTCHECK(ok_address(&f->mchunk) &&
+			            f->mchunk.bk_equals(&x->mchunk) &&
+			            r->mchunk.fd_equals(&x->mchunk)))
+			{
+				ds::linked_list::unsafe_remove(&x->mchunk.ring);
+			}
+			else
+			{
+				corruption_error_action();
+			}
+		}
+		else
+		{
+			CHERI::Capability<TChunk *> rp;
+			if (((r = *(rp = &(x->child[1]))) != nullptr) ||
+			    ((r = *(rp = &(x->child[0]))) != nullptr))
+			{
+				TChunk **cp;
+				while ((*(cp = &(r->child[1])) != nullptr) ||
+				       (*(cp = &(r->child[0])) != nullptr))
+				{
+					r = *(rp = cp);
+				}
+				if (RTCHECK(ok_address(rp.address())))
+				{
+					*rp = nullptr;
+				}
+				else
+				{
+					corruption_error_action();
+				}
+			}
+		}
+		if (!x->is_tree_ring())
+		{
+			TChunk  *xp = x->parent;
+			TChunk **h  = treebin_at(x->index);
+			if (x == *h)
+			{
+				if ((*h = r) == nullptr)
+				{
+					treemap_clear(x->index);
+				}
+			}
+			else if (RTCHECK(ok_address(&xp->mchunk)))
+			{
+				if (xp->child[0] == x)
+				{
+					xp->child[0] = r;
+				}
+				else
+				{
+					xp->child[1] = r;
+				}
+			}
+			else
+			{
+				corruption_error_action();
+			}
+			if (r != nullptr)
+			{
+				if (RTCHECK(ok_address(&r->mchunk)))
+				{
+					TChunk *c0, *c1;
+					r->parent = xp;
+					if ((c0 = x->child[0]) != nullptr)
+					{
+						if (RTCHECK(ok_address(&c0->mchunk)))
+						{
+							r->child[0] = c0;
+							c0->parent  = r;
+						}
+						else
+						{
+							corruption_error_action();
+						}
+					}
+					if ((c1 = x->child[1]) != nullptr)
+					{
+						if (RTCHECK(ok_address(&c1->mchunk)))
+						{
+							r->child[1] = c1;
+							c1->parent  = r;
+						}
+						else
+						{
+							corruption_error_action();
+						}
+					}
+				}
+				else
+				{
+					corruption_error_action();
+				}
+			}
+		}
+
+		x->metadata_clear();
+	}
+
+	/**
+	 * Throw p into the correct bin based on s.  Initializes the linkages of p.
+	 */
+	void insert_chunk(MChunkHeader *p, size_t s)
+	{
+		if (is_small(s))
+		{
+			insert_small_chunk(p, s);
+		}
+		else
+		{
+			insert_large_chunk(p, s);
+		}
+	}
+
+	// Unlink p from the correct bin based on s.
+	void unlink_chunk(MChunk *p, size_t s)
+	{
+		if (is_small(s))
+		{
+			unlink_small_chunk(p, s);
+		}
+		else
+		{
+			unlink_large_chunk(TChunk::from_mchunk(p));
+		}
+	}
+
+	/**
+	 * @brief Find the smallest chunk in t and allocate nb bytes from it.
+	 *
+	 * @return Should always succeed because we made sure this tree has chunks
+	 * and all chunks in this tree are larger than nb.  The chunk holding the
+	 * returned memory has had its linkages cleared.
+	 */
+	MChunkHeader *tmalloc_smallest(TChunk *t, size_t nb)
+	{
+		auto    tHeader = MChunkHeader::from_body(t);
+		size_t  rsize   = tHeader->size_get() - nb;
+		TChunk *v       = t;
+
+		Debug::Assert(t != nullptr, "Chunk must not be null");
+		/*
+		 * Clang analyser isn't quite clever enough and so concludes that we
+		 * might get here with a null `t` through tmalloc_small() and a
+		 * non-zero treemap, but a non-zero treemap means that tmalloc_small()
+		 * will certainly find a TChunk for us.
+		 */
+		// NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
+		while ((t = t->leftmost_child()) != nullptr)
+		{
+			tHeader     = MChunkHeader::from_body(t);
+			size_t trem = tHeader->size_get() - nb;
+			if (trem < rsize)
+			{
+				rsize = trem;
+				v     = t;
+			}
+		}
+
+		/*
+		 * Prefer to unlink a ring node rather than a tree node, as this
+		 * simplifies the work in unlink_large_chunk() below, leaving the
+		 * tree structure unmodified.
+		 */
+		v = TChunk::from_ring(v->mchunk.ring.cell_next());
+
+		if (RTCHECK(ok_address(&v->mchunk)))
+		{
+			auto vHeader = MChunkHeader::from_body(v);
+
+			Debug::Assert(vHeader->size_get() == rsize + nb,
+			              "Chunk {} size is {}, should be {}",
+			              v,
+			              vHeader->size_get(),
+			              rsize + nb);
+			Debug::Assert(vHeader->is_prev_in_use(),
+			              "Free chunk {} follows another free chunk",
+			              v);
+
+			unlink_large_chunk(v);
+
+			if (rsize >= MinChunkSize)
+			{
+				/*
+				 * The remainder is big enough to to used by another
+				 * allocation, place it into the free list.
+				 */
+				auto r = vHeader->split(nb);
+				insert_chunk(r, rsize);
+			}
+
+			/*
+			 * Having split off any residual, mark this chunk in use.
+			 */
+			vHeader->mark_in_use();
+
+			return vHeader;
+		}
+
+		corruption_error_action();
+		return nullptr;
+	}
+
+	/**
+	 * Allocate a large request from the best fitting chunk in a treebin.
+	 *
+	 * The chunk holding the returned memory has had its linkages cleared.
+	 */
+	MChunkHeader *tmalloc_large(size_t nb)
+	{
+		TChunk *v     = nullptr;
+		size_t  rsize = -nb; // unsigned negation
+		TChunk *t;
+		BIndex  idx = compute_tree_index(nb);
+		if ((t = *treebin_at(idx)) != nullptr)
+		{
+			// Traverse tree for this bin looking for node with size >= nb.
+			size_t  sizebits = nb << leftshift_for_tree_index(idx);
+			TChunk *rst      = nullptr; // the deepest untaken right subtree
+			for (;;)
+			{
+				TChunk *rt;
+				auto    tHeader = MChunkHeader::from_body(t);
+				size_t  trem    = tHeader->size_get() - nb;
+				if (trem < rsize)
+				{
+					v = t;
+					if ((rsize = trem) == 0)
+					{
+						break;
+					}
+				}
+				rt = t->child[1];
+				t  = t->child[leftshifted_val_msb(sizebits)];
+				if (rt != nullptr && rt != t)
+				{
+					rst = rt;
+				}
+				if (t == nullptr)
+				{
+					t = rst; // Set t to least subtree holding sizes > nb.
+					break;
+				}
+				sizebits <<= 1;
+			}
+		}
+		if (t == nullptr && v == nullptr)
+		{
+			/*
+			 * We didn't find anything usable in the tree, so use the next tree
+			 * if there is one. Set t to root of next non-empty treebin.
+			 */
+			Binmap leftbits = ds::bits::above_least(idx2bit(idx)) & treemap;
+			if (leftbits != 0)
+			{
+				BIndex i;
+				Binmap leastbit = ds::bits::isolate_least(leftbits);
+				i               = bit2idx(leastbit);
+				t               = *treebin_at(i);
+			}
+			else
+			{
+				return nullptr;
+			}
+		}
+		else if (v)
+		{
+			t = v;
+		}
+
+		return tmalloc_smallest(t, nb);
+	}
+
+	/**
+	 * @brief Allocate a small request from a tree bin. It should return a valid
+	 * chunk successfully as long as one tree exists, because all tree chunks
+	 * are larger than a small request.
+	 *
+	 * The chunk holding the returned memory has had its linkages cleared.
+	 */
+	MChunkHeader *tmalloc_small(size_t nb)
+	{
+		TChunk *t;
+		size_t  rsize;
+		BIndex  i;
+		Binmap  leastbit = ds::bits::isolate_least(treemap);
+		i                = bit2idx(leastbit);
+		t                = *treebin_at(i);
+
+		return tmalloc_smallest(t, nb);
+	}
+
+	/**
+	 * Move a chunk back onto free lists.
+	 *
+	 * Note that this chunk does not have to come from quarantine, because it
+	 * can come from initialisation or splitting a free chunk.  Thus, it is
+	 * the caller's responsibility to appropriately account heapFreeSize.
+	 *
+	 * Assumes that the revocation shadow bits are clear in either case.
+	 *
+	 * Initializes the linkages of p.
+	 */
+	void mspace_free_internal(MChunkHeader *p)
+	{
+		ok_in_use_chunk(p);
+
+		if (!p->is_prev_in_use())
+		{
+			// Consolidate backward
+			MChunkHeader *prev = p->cell_prev();
+			unlink_chunk(MChunk::from_header(prev), prev->size_get());
+			p->unsplit(prev);
+			p = prev;
+		}
+
+		MChunkHeader *next = p->cell_next();
+		if (!next->is_in_use())
+		{
+			// Consolidate forward
+			unlink_chunk(MChunk::from_header(next), next->size_get());
+			next->unsplit(p);
+		}
+
+		p->mark_free();
+
+		insert_chunk(p, p->size_get());
+		ok_free_chunk(p);
+	}
+
+	/**
+	 * Move a pending quarantine ring whose epoch is now past onto the finished
+	 * quarantine ring.
+	 */
+	void quarantine_pending_to_finished()
+	{
+		if (quarantinePendingRing.is_empty())
+		{
+			for (size_t ix = 0; ix < QuarantineRings; ix++)
+			{
+				Debug::Assert(quarantine_pending_get(ix)->is_empty(),
+				              "Empty quarantine with non-empty ring!");
+			}
+		}
+
+		decltype(quarantinePendingRing)::Ix oldestPendingIx;
+		if (!quarantinePendingRing.head_get(oldestPendingIx))
+		{
+			return;
+		}
+
+		if (!revoker.has_revocation_finished_for_epoch(
+		      quarantinePendingEpoch[oldestPendingIx]))
+		{
+			return;
+		}
+
+		auto qring = quarantine_pending_get(oldestPendingIx);
+
+		/*
+		 * If and when we support consolidation in quarantine, it may happen
+		 * that this ring is empty, because everything that was here got
+		 * consolidated with younger chunks.  Until then, this is_empty()
+		 * check is somewhat redundant, but take_all() behaves poorly on
+		 * empty rings, so best to have it.
+		 */
+		if (!qring->is_empty())
+		{
+			quarantine_list_append_all(quarantine_finished_get(), qring);
+		}
+
+		quarantinePendingRing.head_advance();
+	}
+
+	/**
+	 * Push a chunk to a pending quarantine ring, possibly opening a new one
+	 */
+	void quarantine_pending_push(size_t epoch, MChunkHeader *header)
+	{
+		decltype(quarantinePendingRing)::Ix youngestPendingIx;
+
+		if (!quarantinePendingRing.tail_get(youngestPendingIx) ||
+		    quarantinePendingEpoch[youngestPendingIx] != epoch)
+		{
+			/*
+			 * We need to insert this object onto a new pending ring for the
+			 * new epoch.  Ensure that we have room by transferring a pending
+			 * ring whose epoch is past onto the finished ring, if any.  We can
+			 * be waiting for at most three epochs to age out, two of which are
+			 * merged onto one ring, and have room for two in our pending ring
+			 * buffer.  As long as the passed-in epoch is a later observation
+			 * than those that went into the pending ring, either there is
+			 * already room for that epoch or this will create it.
+			 */
+			quarantine_pending_to_finished();
+
+			auto opened = quarantinePendingRing.tail_next(youngestPendingIx);
+			quarantinePendingRing.tail_advance();
+			Debug::Assert(opened, "Failed to open epoch ring");
+
+			quarantinePendingEpoch[youngestPendingIx] = epoch;
+		}
+
+		quarantine_list_append(quarantine_pending_get(youngestPendingIx),
+		                       header);
+	}
+
+	/**
+	 * @brief Start revocation if this MState has accumulated enough things in
+	 * quarantine or the free space is too low.
+	 * @param Force force start a revocation regardless of heuristics
+	 *
+	 * @return true if there are things in the quarantine
+	 */
+	template<bool Force = false>
+	bool mspace_bg_revoker_kick()
+	{
+		if (heapQuarantineSize == 0)
+		{
+			return 0;
+		}
+		/*
+		 * Async revocation can run in the background, but sync revocation
+		 * blocks and we don't want it to sweep too early, so we have different
+		 * quarantine thresholds here.
+		 */
+		bool shouldKick;
+		if constexpr (Revocation::Revoker::IsAsynchronous)
+		{
+			shouldKick = heapQuarantineSize > heapFreeSize / 4 ||
+			             heapFreeSize < heapTotalSize / 8;
+		}
+		else
+		{
+			shouldKick = heapQuarantineSize > heapFreeSize / 4 * 3;
+		}
+		if (Force || shouldKick)
+		{
+			revoker.system_bg_revoker_kick();
+		}
+
+		return 1;
+	}
+
+	/**
+	 * @brief Try to dequeue the quarantine list multiple times.
+	 *
+	 * @param loops how many times do we try to dequeue
+	 */
+	int mspace_qtbin_deqn(size_t loops)
+	{
+		int  dequeued   = 0;
+		auto quarantine = quarantine_finished_get();
+
+		for (size_t i = 0; i < loops; i++)
+		{
+			/*
+			 * If we're out of nodes on the finished ring, try grabbing some
+			 * from the pending rings.
+			 */
+			if (quarantine->is_empty())
+			{
+				quarantine_pending_to_finished();
+				if (quarantine->is_empty())
+				{
+					break;
+				}
+			}
+
+			/*
+			 * Detach from quarantine, and only now zero the body, tags
+			 * included.  The sweep for this chunk's epoch has completed, so
+			 * no capability to the body is left and nothing can write to it
+			 * again; until now it held whatever the holders of such
+			 * capabilities chose to leave in it.  (Upstream zeroes in
+			 * mspace_free() and keeps the quarantine linkage in the body,
+			 * which is safe only behind a load barrier.)
+			 * mspace_free_internal() will build the free-list cell in the
+			 * zeroed body, if it cannot consolidate backwards.
+			 */
+			MChunkHeader *foreHeader = quarantine_list_take_first(quarantine);
+#ifdef ALLOCATOR_CHUNK_RELEASED
+			/*
+			 * SignetOS: a chunk keeps its owner through quarantine.  Report it
+			 * leaving, so its owner stops being charged for it.  The hook must
+			 * not call back into the allocator.
+			 */
+			ALLOCATOR_CHUNK_RELEASED(heapStart,
+			                         foreHeader->ownerID,
+			                         foreHeader->size_get());
+#endif
+			foreHeader->isQuarantined = false;
+			capaligned_zero(foreHeader->body(),
+			                foreHeader->size_get() - sizeof(MChunkHeader));
+
+			heapQuarantineSize -= foreHeader->size_get();
+			heapFreeSize += foreHeader->size_get();
+
+			/*
+			 * Clear the shadow bits that marked this region as quarantined.
+			 * Because chunks in quarantine are not coalesced and come directly
+			 * from chunks that we handed out, they must have exact CHERI
+			 * capability representability.
+			 */
+			revoker.mark_clear_range(foreHeader->body().address(),
+			                         foreHeader->cell_next());
+
+			mspace_free_internal(foreHeader);
+			dequeued++;
+		}
+		return dequeued;
+	}
+
+	/**
+	 * Successful end to mspace_malloc()
+	 */
+	void *mspace_malloc_success(MChunkHeader *p)
+	{
+		// If we reached here, then it means we took a real chunk off the free
+		// list without errors. Zero the user portion metadata.
+		size_t size = p->size_get();
+		/*
+		 * We sanity check that things off the free list are indeed zeroed out,
+		 * and none corresponds to a set shadow bit. We need to wrap *word
+		 * inside a Capability because that gives exact equal for nullptr.
+		 */
+		Debug::Assert(
+		  [&]() -> bool {
+			  return capaligned_range_do(
+			           p->body(), size - sizeof(MChunkHeader), [](void **word) {
+				           CHERI::Capability eachCap{*word};
+				           bool              shadowBit = true;
+				           if constexpr (Revocation::Revoker::HasChunkMarks)
+				           {
+					           shadowBit = revoker.mark_get(
+					             CHERI::Capability{word}.address());
+				           }
+				           return eachCap != nullptr && shadowBit;
+			           }) == false;
+		  },
+		  "Memory from free list is not entirely zeroed, size {}",
+		  size);
+		heapFreeSize -= size;
+		return p->body();
+	}
+
+	/**
+	 * This is the only function that takes memory from the free list. All other
+	 * wrappers that take memory must call this in the end.
+	 */
+	MChunkHeader *mspace_malloc_internal(size_t bytes)
+	{
+		size_t nb;
+
+		/* Move O(1) nodes from quarantine, if any are available */
+		quarantine_dequeue();
+
+		if (bytes <= MaxSmallRequest)
+		{
+			BIndex idx;
+			Binmap smallbits;
+			nb  = (bytes < MinRequest) ? MinChunkSize : pad_request(bytes);
+			idx = small_index(nb);
+			smallbits = smallmap >> idx;
+
+			if (smallbits & 0x1U)
+			{ // exact match
+				auto p = unlink_first_small_chunk(idx);
+				p->mark_in_use();
+				ok_malloced_chunk(p, nb);
+				return p;
+			}
+
+			if (smallbits != 0)
+			{ // Use chunk in next nonempty smallbin.
+				Binmap leftbits =
+				  (smallbits << idx) & ds::bits::above_least(idx2bit(idx));
+				Binmap leastbit = ds::bits::isolate_least(leftbits);
+				BIndex i        = bit2idx(leastbit);
+				auto   p        = unlink_first_small_chunk(i);
+				size_t rsize    = small_index2size(i) - nb;
+
+				if (rsize >= MinChunkSize)
+				{
+					auto r = p->split(nb);
+					insert_small_chunk(r, rsize);
+				}
+				p->mark_in_use();
+				ok_malloced_chunk(p, nb);
+				return p;
+			}
+
+			MChunkHeader *p;
+			if (treemap != 0 && (p = tmalloc_small(nb)) != nullptr)
+			{
+				ok_malloced_chunk(p, nb);
+				return p;
+			}
+		}
+		else
+		{
+			MChunkHeader *p;
+			nb = pad_request(bytes);
+			if (treemap != 0 && (p = tmalloc_large(nb)) != nullptr)
+			{
+				ok_malloced_chunk(p, nb);
+				return p;
+			}
+		}
+
+		/*
+		 * Exhausted all allocation options. Force start a revocation or
+		 * continue with synchronous revocation.
+		 */
+		mspace_bg_revoker_kick<true>();
+		return nullptr;
+	}
+
+	__always_inline void *mspace_malloc(size_t bytes)
+	{
+		auto p = mspace_malloc_internal(bytes);
+		if (p != nullptr)
+		{
+			return mspace_malloc_success(p);
+		}
+		return nullptr;
+	}
+
+	// Allocate memory with specific alignment.
+	void *mspace_memalign(size_t bytes, size_t alignment)
+	{
+		auto nb = pad_request(bytes);
+		// Make sure alignment is power of 2 (in case MINSIZE is not).
+		Debug::Assert((alignment & (alignment - 1)) == 0,
+		              "Alignment {} is not a power of two",
+		              alignment);
+
+		// fast path for not-too-big objects
+		if (alignment <= MallocAlignment)
+		{
+			return mspace_malloc(bytes);
+		}
+
+		/*
+		 * Strategy: find a spot within that chunk that meets the alignment
+		 * request, and then possibly free the leading and trailing space.
+		 * Call malloc with worst case padding to hit alignment.
+		 */
+		auto p = mspace_malloc_internal(nb + alignment + MinChunkSize);
+		if (p == nullptr)
+		{
+			return p;
+		}
+
+		ptraddr_t memAddress = p->body().address();
+		if ((memAddress % alignment) != 0)
+		{
+			/*
+			 * Find an aligned spot inside chunk. Since we need to give back
+			 * leading space in a chunk of at least MINSIZE, if the first
+			 * calculation places us at a spot with less than MINSIZE
+			 * leader, we can move to the next aligned spot -- we've
+			 * allocated enough total room so that this is always possible.
+			 */
+			size_t alignpad =
+			  alignment - (memAddress & static_cast<ssize_t>(alignment - 1));
+			if (alignpad < MinChunkSize)
+			{
+				alignpad += alignment;
+			}
+
+			/*
+			 * Break off the first chunk.  This is a little subtle, in that the
+			 * short expression here is the result of some cancellation: we
+			 * want to generate an aligned pointer, so we need to create a
+			 * chunk that is misaligned by -sizeof(MChunkHeader).  Having used
+			 * the ->body() address (memAddress) to compute alignpad, we have
+			 * computed the offset from the beginning of this chunk's body to
+			 * the aligned address.  When we ask this chunk's *header* to split
+			 * at that length, it will offset by -sizeof(MChunkHeader), since
+			 * headers always measure lengths inclusive of themselves!
+			 */
+			auto r = p->split(alignpad);
+			/*
+			 * XXX Were we to not use the general mspace_malloc above, but
+			 * have a raw, free MChunk* from the free pool here, we could
+			 * avoid a futile test and a presently useless test:
+			 *
+			 * - consolidation forward (with r) won't happen (ever), as that's
+			 *   the (start of the) chunk we're about to return.
+			 *
+			 * - consolidation backward won't happen either, at present, as
+			 *   mspace_malloc does not displace into the chunk it finds from
+			 *   the free pool, but, in principle, it could.
+			 */
+			// This chunk is already free; do not adjust heapFreeSpace
+			mspace_free_internal(p);
+			p = r;
+		}
+
+		// Also give back spare room at the end.
+		auto size = p->size_get();
+		if (size >= nb + MinChunkSize)
+		{
+			auto r = p->split(nb);
+			/*
+			 * XXX Were we to not use the general mspace_malloc above, but
+			 * have a raw, free MChunk* from the free pool here, we could
+			 * avoid a futile test and some duplicated work.
+			 *
+			 * - consolidation backward won't happen (ever), as that's the
+			 *   (tail of the) chunk we're about to return.
+			 *
+			 * - consolidation forward *can* happen right now, because the
+			 *   generic mspace_malloc doesn't know that we're also poised
+			 *   to trim our tail, so it may well have trimmed the chunk
+			 *   it used to satisfy our request.
+			 */
+			// This chunk is already free; do not adjust heapFreeSpace
+			mspace_free_internal(r);
+		}
+
+		ok_malloced_chunk(p, nb);
+		return mspace_malloc_success(p);
+	}
+
+	void corruption_error_action()
+	{
+		ABORT();
+	}
+
+#if HEAP_RENDER
+	public:
+	/**
+	 * "Render" the heap for debugging.
+	 */
+	template<bool Asserts = true, bool Chatty = true>
+	void render()
+	{
+		using RenderDebug = ConditionalDebug<Chatty, "Allocator heap">;
+
+		size_t measuredAllocated = 0, measuredFree = 0, measuredQuarantined = 0;
+		// Bytes of chunks marked quarantined, found by walking all chunks.
+		size_t measuredFlagged = 0;
+
+		auto toAddr = [](void *p) {
+			return static_cast<ptraddr_t>(CHERI::Capability{p}.address());
+		};
+
+		auto header =
+		  static_cast<MChunkHeader *>(static_cast<void *>(heapStart));
+
+		RenderDebug::log("Dumping MState={} start={} end={}",
+		                 toAddr(this),
+		                 toAddr(heapStart),
+		                 heapStart.top());
+
+		while (toAddr(header) != heapStart.top())
+		{
+			RenderDebug::log(
+			  "  header {}: size={} inuse={} pinuse={} owner={}",
+			  toAddr(header),
+			  header->size_get(),
+			  header->isCurrInUse,
+			  header->isPrevInUse,
+			  header->ownerID);
+
+			if (!header->is_in_use())
+			{
+				measuredFree += header->size_get();
+
+				auto chunk = MChunk::from_header(header);
+				if (!ds::linked_list::is_singleton(&chunk->ring))
+				{
+					RenderDebug::log(
+					  "   free ring <{},{}>",
+					  toAddr(MChunk::from_ring(chunk->ring.cell_prev())),
+					  toAddr(MChunk::from_ring(chunk->ring.cell_next())));
+				}
+				else
+				{
+					RenderDebug::log("   free ring empty");
+				}
+
+				if (!is_small(header->size_get()))
+				{
+					auto t = TChunk::from_mchunk(chunk);
+
+					if (t->is_tree_ring())
+					{
+						RenderDebug::log("   tree ring, index={}", t->index);
+					}
+					else
+					{
+						RenderDebug::log(
+						  "   tree, index={} parent={} children=[{},{}]",
+						  t->index,
+						  toAddr(t->parent),
+						  toAddr(t->child[0]),
+						  toAddr(t->child[1]));
+					}
+				}
+			}
+			else
+			{
+				measuredAllocated += header->size_get();
+				if (header->isQuarantined)
+				{
+					measuredFlagged += header->size_get();
+				}
+			}
+
+			header = header->cell_next();
+		}
+
+		auto showQuarantineList = [&](QuarantineList *list) {
+			uint32_t last = 0;
+			for (uint32_t link = list->head; link != 0;)
+			{
+				auto header = quarantine_chunk(link);
+				RenderDebug::log("   quarantined {} size={}",
+				                 toAddr(header),
+				                 header->size_get());
+				measuredQuarantined += header->size_get();
+				if constexpr (Asserts)
+				{
+					RenderDebug::invariant(header->isQuarantined &&
+					                         header->is_in_use(),
+					                       "Quarantine list node malformed");
+					// Also what ends the walk of a list that loops.
+					RenderDebug::invariant(
+					  measuredQuarantined <= heapQuarantineSize,
+					  "Quarantine lists hold more than the quarantine: {} {}",
+					  measuredQuarantined,
+					  heapQuarantineSize);
+				}
+				last = link;
+				link = quarantine_next_get(header);
+			}
+			if constexpr (Asserts)
+			{
+				RenderDebug::invariant(
+				  last == list->tail,
+				  "Quarantine list does not end at its tail");
+			}
+		};
+
+		{
+			decltype(quarantinePendingRing)::Ix head = 0, tail = 0;
+
+			quarantinePendingRing.head_get(head);
+			quarantinePendingRing.tail_get(tail);
+			RenderDebug::log(" Quarantine status: empty={} head={} tail={}",
+			                 quarantinePendingRing.is_empty(),
+			                 head,
+			                 tail);
+		}
+
+		if (quarantineFinished.is_empty())
+		{
+			RenderDebug::log("  finished ring empty");
+		}
+		else
+		{
+			RenderDebug::log("  finished ring <{},{}>:",
+			                 toAddr(quarantine_chunk(quarantineFinished.tail)),
+			                 toAddr(quarantine_chunk(quarantineFinished.head)));
+			showQuarantineList(quarantine_finished_get());
+		}
+
+		for (size_t ix = 0; ix < QuarantineRings; ix++)
+		{
+			if (quarantinePendingChunks[ix].is_empty())
+			{
+				RenderDebug::log(
+				  "  ring {} epoch={} empty", ix, quarantinePendingEpoch[ix]);
+			}
+			else
+			{
+				RenderDebug::log(
+				  "  ring {} epoch={}:", ix, quarantinePendingEpoch[ix]);
+				showQuarantineList(quarantine_pending_get(ix));
+			}
+		}
+
+		auto measuredTotal = measuredAllocated + measuredFree;
+
+		RenderDebug::log(
+		  "Sizes: alloc={} free={} (expect {}) quar={} (expect {}) "
+		  "total={} (expect {})",
+		  measuredAllocated,
+		  measuredFree,
+		  heapFreeSize,
+		  measuredQuarantined,
+		  heapQuarantineSize,
+		  measuredTotal,
+		  heapTotalSize);
+
+		if constexpr (Asserts)
+		{
+			RenderDebug::invariant(measuredFree == heapFreeSize,
+			                       "Bad accounting in free size: {} {}",
+			                       measuredFree,
+			                       heapFreeSize);
+
+			RenderDebug::invariant(
+			  measuredQuarantined == heapQuarantineSize,
+			  "Bad accounting in quarantine size: {} {}",
+			  measuredQuarantined,
+			  heapQuarantineSize);
+
+			RenderDebug::invariant(
+			  measuredFlagged == heapQuarantineSize,
+			  "Chunks marked quarantined are not the quarantine: {} {}",
+			  measuredFlagged,
+			  heapQuarantineSize);
+
+			RenderDebug::invariant(
+			  measuredTotal == heapTotalSize,
+			  "Bad accounting in total size: {} {}",
+			  measuredTotal,
+			  heapTotalSize);
+		}
+	}
+#endif
+};

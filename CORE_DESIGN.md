@@ -61,7 +61,7 @@ The resource managers divide between the kernel and user space (§2.1):
 | --- | --- | --- |
 | **File** | filesystem (`fs`) | disk quota and memory quota |
 | **Socket** | network service (`net`) | network quota and memory quota |
-| **Allocation** | heap allocator | heap quota (the heap was created with a VM quota) |
+| **Allocation** | heap service (`heap`) | heap quota (the heap was created with a VM quota) |
 | **Type key** | sealer (`sealer`) | lives in the owner's own memory |
 | **Sealed object** | sealer (`sealer`) | lives in the owner's own memory |
 
@@ -92,7 +92,7 @@ and no manager needs to spend its own memory on a client, avoiding potential res
 **Bootstrap.** At boot, the kernel creates one compartment (`init`) seeded with
 the root quotas, all syscall gates, device windows, and service sealing
 authorities. `init` starts the core services (console, block driver, filesystem,
-naming, sealing service, scheduler, shell), grants each only
+naming, sealing service, scheduler, heap service, shell), grants each only
 what its manifest requests, hands the scheduler's dispatch entry to the kernel,
 clears its own table, and exits.
 
@@ -130,7 +130,7 @@ can re-issue with fewer of them.
 | --- | --- | --- | --- |
 | **File** (filesystem) | Read it. | Write it, close it. | whoever opened it or was passed it |
 | **Socket** (network service) | Send and receive. | Close it. | whoever opened it or was passed it |
-| **Allocation** (heap allocator) | Free it; the memory is the plain payload handed out with it. | — | whoever allocated it |
+| **Allocation** (heap service) | Free it; the memory is the plain payload handed out with it. | — | whoever allocated it |
 | **Type key** (sealer) | Unseal objects of the type (§2.3). | Seal objects of the type. | its minter, and whoever it passes the key to |
 | **Sealed object** (sealer) | Pass it on; only a key opens it. | — | anyone it is passed to |
 | **Credentials** (credential manager) | Use one secret (sign, authenticate to one service) without seeing it. | Derive narrower credentials. | — |
@@ -154,7 +154,7 @@ User-space managers keep the rest:
 | **CPU** (scheduler) | CPU time per period, with a priority class and guarantee term | None: threads registered on it run | Register threads, query. | Derive, destroy. | the scheduler (root); the shell derives one per worker and program |
 | **Disk** (filesystem) | Bytes and inodes under one root directory | Files under that directory | Open, read and list under its root. | Create, write and delete files; derive, destroy. | `fs` (root); the shell: `/home` with both rights, `/bin` with the user right only; one per program |
 | **Network** (network service) | Bytes sent and received, and sockets, within a reach (address prefix, ports, protocols) | Sockets within that reach | Open sockets, send and receive within its reach. | Derive, destroy. | `net` (root); the shell; one per program that asks |
-| **Heap** (heap allocator) | Bytes of sub-page allocations | Allocations: a sealed handle each, with its plain payload | Allocate small objects. | Derive, destroy. | — |
+| **Heap** (heap service) | Bytes of blocks in one heap: each block's length plus a 16-byte header, charged until the freed block has been swept | Allocations: a sealed handle each, with its plain payload | Allocate blocks. | Derive, destroy; destroying a heap's root quota ends the heap. | whoever made the heap (its root quota), and whoever it derives quotas for; today the program `mstress`, and the shell's `heapstress`, which with `shared` makes one heap and derives one quota for the `mstress` copies it runs |
 
 A leaked quota lets its holder spend or close that budget, and a leaked disk or
 network quota exposes exactly its directory subtree or reach; none lets it read
@@ -405,7 +405,8 @@ Locks are currently mediated by the scheduler.
 
 Each resource manager owns a quota tree in its own dimension (VM and thread
 memory in the kernel, CPU bandwidth in the scheduler, storage in the
-filesystem, network traffic in the network service):
+filesystem, network traffic in the network service, heap bytes in the heap
+service):
 
 1. **Caller-funded nodes.** Every quota node is a thing that lives in memory and thus is paid for by a caller VM
    quota, never the manager (to prevent exhaustion as an attack vector). VM quota derivations debit the child's allowance
@@ -452,6 +453,17 @@ filesystem, network traffic in the network service):
 * **Network quotas:** bound bytes sent, bytes received and open sockets, within
   a reach (an IPv4 prefix, port ranges and protocols) that a child can only
   narrow.
+* **Heap quotas:** bound the bytes of blocks in one heap, a revocable arena
+  (§8) that the heap service allocates against its creator's VM quota. The
+  root quota covers the whole heap. A child costs its parent its whole limit
+  and its node (a block of the heap) at once. The tree closes like the
+  kernel's memory trees, the service frees a closed quota's blocks, and
+  destroying the root quota gives the arena back. A freed block stays charged
+  until its sweep completes. Prototype limits (DESIGN.md §5.7.1 has the full
+  list): `heapstress N shared` runs up to 8 compartments on one heap,
+  contending for its lock, but no heap has run on more than one hart; a
+  client that ends without destroying its heap leaves the arena allocated and
+  charged; and the service holds a fixed number of heaps.
 
 ## 7. Scheduling and Synchronisation
 
@@ -576,9 +588,9 @@ answer all three.
 
 After `init` exits, the only places a handle can be sealed are the kernel (its
 own types), the scheduler (CPU quotas), the filesystem (disk quotas and files),
-the network service (network quotas and sockets) and the sealer (type keys and
-sealed objects). Future managers, such as a heap allocator or a credential
-manager, add to these.
+the network service (network quotas and sockets), the sealer (type keys and
+sealed objects) and the heap service (heap quotas and allocations). Future
+managers, such as a credential manager, add to these.
 
 ### 10.1 Kernel gates by holder
 
@@ -588,18 +600,19 @@ do. As granted by `init` today:
 | Gate(s) | Held by | What it allows |
 | --- | --- | --- |
 | `compartment_invoke` | everyone | The switcher gate itself. |
-| `sentry` | `uart`, `blk`, `fs`, `naming`, `sealer`, `sched`; no program | Create entry points to export. |
-| `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `shell` etc.| Allocate against a VM quota it holds. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
+| `sentry` | `uart`, `blk`, `fs`, `naming`, `sealer`, `sched`, `heap`; no program | Create entry points to export. |
+| `vm_allocate`, `vm_deallocate` | `fs`, `sched`, `heap`, `shell` etc.| Allocate against a VM quota it holds. `heap` allocates each client's arena against the VM quota that client hands it. `uart`, `dma`, `blk`, `naming` and programs cannot allocate at all after load. |
 | `thread_switch`, `thread_tid` | `sched` | The only compartment that can run a thread. |
 | `thread_kill` | `sched` | End a thread it holds a handle to. |
 | `trap_wait` | `sched` | The interrupt handler's wait. Refused to anyone but the hart's installed handler while it handles an interrupt. |
 | `compartment_create`, `compartment_destroy`, `thread_create`, `quota_vm_derive`, `quota_vm_destroy` | `shell` only | Build and tear down compartments and threads, funded from its own quotas: the launcher role. A compartment it makes from an image loads itself (§3.2), so the shell holds only a handle that can destroy it. |
 | `vm_allocate`, `sentry`, `fault_install` (in slots 1 to 6) | each compartment made from an image, while its loader runs | Load the image (§3.2). The loader takes them out of the table as it starts, so the image never sees them. |
 | `page_next`, `page_done` | `blk` only | The pager: move pages between RAM and swap (contents and capability bitmaps are checked by the kernel, §8). Only in a build with paging. Still evolving WIP.|
-| `revoke_start`, `revoke_query` | `shell` | Start a sweep, and see when it is complete. |
+| `revoke_start`, `revoke_query` | `shell`, `heap` | Start a sweep, and see when it is complete. |
+| `revoke` | `heap` only | Mark part of a revocable arena it owns, so that the next sweep untags every capability based in it (§8): how a heap takes a freed block back before it reuses it. |
 | `revoke_step` | `sweeper` only | Check the pages a running sweep has not reached, a few at a time. |
 | `trap_install`, `page_setup`, `quota_*_create_root` | `init` only, scrubbed when it exits | Boot setup: installing the interrupt handler thread, enabling paging, and creating root physical quotas are fundamentally unreachable after boot. |
-| `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow`, `revoke` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW / user-triggered revocation are not yet wired up. |
+| `quota_thread_mem_derive`, `quota_thread_mem_destroy`, `cow` | `init` only (current WIP) | Implementation artifacts: `shell` currently allocates threads from a flat quota rather than deriving sub-trees, and lazy CoW is not yet wired up. |
 
 Beyond gates, three compartments hold raw hardware: `uart` its device window,
 `sched` the interrupt controller, and `dma` the virtio window and the DMA

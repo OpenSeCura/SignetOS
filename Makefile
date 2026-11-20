@@ -123,6 +123,14 @@ ifeq ($(SMP_SELFTEST),1)
 TEST_DEFS += -DSIGNETOS_SMP_SELFTEST
 endif
 
+# HEAP_DEBUG=1 builds the `heap` service with the CHERIoT allocator's own
+# consistency checks (user/heap.hpp, BUILDING). Slow; a failed check prints
+# a line and traps. Off by default.
+HEAP_DEBUG ?= 0
+ifeq ($(HEAP_DEBUG),1)
+TEST_DEFS += -DSIGNETOS_HEAP_DEBUG
+endif
+
 # PAGING=1 (the default): what compartments allocate can go to swap and back
 # (vm.hpp, PAGING). PAGING=0 builds everything without it: the kernel has no
 # paging code and no paging system calls, `blk` no pager, the disk image no
@@ -180,8 +188,8 @@ USER_LDFLAGS = -fuse-ld=lld -T user/compartment.ld -nostdlib -static -Wl,--local
 # `external/` (`EXT_SERVICES` and `EXT_APPS`): written into `disk.img` at build
 # time by `tools/signetfs.py` (never linked into the kernel image).
 #   - `external/services/`: root-owned system services (`naming`, `sealer`,
-#     `sched`, `sweeper`, `shell`) that `init` reads from `fs` out of `/` and
-#     loads.
+#     `heap`, `sched`, `sweeper`, `shell`) that `init` reads from `fs` out of
+#     `/` and loads.
 #   - `external/apps/`: programs, written to `/bin`, which the shell can
 #     `run` (user/launch.hpp); each one's manifest says what it asks for.
 BOOT_COMPS = init loader fs uart dma blk
@@ -190,17 +198,27 @@ BOOT_OBJS  = $(patsubst %.cpp,%.o,$(BOOT_SRCS))
 BOOT_ELFS  = $(patsubst %,boot/%.elf,$(BOOT_COMPS))
 BOOT_BINS  = $(patsubst %,boot/%.bin,$(BOOT_COMPS))
 
-EXT_SERVICES     = naming sealer sched sweeper shell
+EXT_SERVICES     = naming sealer heap sched sweeper shell
 EXT_SERVICE_SRCS = $(patsubst %,external/services/%.cpp,$(EXT_SERVICES))
 EXT_SERVICE_OBJS = $(patsubst %.cpp,%.o,$(EXT_SERVICE_SRCS))
 EXT_SERVICE_ELFS = $(patsubst %,external/services/%.elf,$(EXT_SERVICES))
 EXT_SERVICE_BINS = $(patsubst %,external/services/%.bin,$(EXT_SERVICES))
 
-EXT_APPS     = hello logo fault sealtest
+# The heap (user/heap.hpp) wraps the vendored CHERIoT allocator. Only images
+# that use it get its include paths: the allocator's own directory, and our
+# stand-ins for the parts of the C++ library and CHERIoT SDK it needs.
+HEAP_INCLUDES = -Ithird_party/cheriot_allocator -Iuser/heap
+external/services/heap.o: CXXFLAGS += $(HEAP_INCLUDES)
+
+EXT_APPS     = hello logo fault sealtest mstress
 EXT_APP_SRCS = $(patsubst %,external/apps/%.cpp,$(EXT_APPS))
 EXT_APP_OBJS = $(patsubst %.cpp,%.o,$(EXT_APP_SRCS))
 EXT_APP_ELFS = $(patsubst %,external/apps/%.elf,$(EXT_APPS))
 EXT_APP_BINS = $(patsubst %,external/apps/%.bin,$(EXT_APPS))
+
+# mstress.bin is mimalloc's stress test, vendored under
+# third_party/mimalloc_stress: external/apps/mstress.cpp includes it.
+external/apps/mstress.o: CXXFLAGS += -Ithird_party/mimalloc_stress
 
 COMP_OBJS = user/entry.o $(BOOT_OBJS) $(EXT_SERVICE_OBJS) $(EXT_APP_OBJS)
 COMP_ELFS = $(BOOT_ELFS) $(EXT_SERVICE_ELFS) $(EXT_APP_ELFS)
@@ -352,13 +370,14 @@ clean:
 disk: $(DISK_IMG)
 
 # Everything is rebuilt, and the disk image remade, whenever one of
-# TRACE_SWITCH, QUOTA_SELFTEST, SWEEP_STRESS, SMP_SELFTEST, PAGING, SWAP_HASH,
-# PAGE_TEST or SWAP_BYTES
+# TRACE_SWITCH, QUOTA_SELFTEST, SWEEP_STRESS, SMP_SELFTEST, HEAP_DEBUG,
+# PAGING, SWAP_HASH, PAGE_TEST or SWAP_BYTES
 # flips, via a stamp file that only changes when a value does. Everything,
 # because PAGING changes the system call list every object is built against.
 FLAGS_STAMP = .build_flags
 FLAG_VALUES = $(TRACE_SWITCH) $(QUOTA_SELFTEST) $(PAGING) $(SWAP_HASH) \
-              $(PAGE_TEST) $(SWAP_BYTES) $(SWEEP_STRESS) $(SMP_SELFTEST)
+              $(PAGE_TEST) $(SWAP_BYTES) $(SWEEP_STRESS) $(SMP_SELFTEST) \
+              $(HEAP_DEBUG)
 $(FLAGS_STAMP): FORCE
 	@echo $(FLAG_VALUES) | cmp -s - $@ 2>/dev/null || echo $(FLAG_VALUES) > $@
 $(OBJS) $(COMP_OBJS): $(FLAGS_STAMP)

@@ -73,6 +73,7 @@ struct Starter {
   const Service* services;
   size_t service_count;
   uint64_t ticks_per_us;
+  uint32_t budget_us;  // the most CPU a program gets per PERIOD_US; 0: BUDGET_US
 };
 
 // What was picked for request `name`, for one run.
@@ -84,7 +85,7 @@ struct Pick {
 constexpr int64_t NOT_RUN = -1;  // a program's status if it never ran
 
 constexpr size_t VM_DEFAULT = 64 * 1024;    // for a manifest asking for 0
-constexpr size_t VM_MAX = 128 * 1024;       // the most a program may ask
+constexpr size_t VM_MAX = 8 * 1024 * 1024;  // the most a program may ask
 constexpr uint64_t DISK_MAX = 1024 * 1024;  // the most a program may ask
 constexpr size_t STACK_BYTES = 64 * 1024;
 constexpr uint32_t BUDGET_US = 20'000;  // CPU: at most this per PERIOD_US
@@ -93,13 +94,30 @@ constexpr uint32_t PERIOD_MIN_US = 1'000;  // the periods a manifest may ask
 constexpr uint32_t PERIOD_MAX_US = 1'000'000;
 constexpr uint64_t POLL_US = 5'000;          // how often to look if it ended
 constexpr size_t ID_MAX = 21;                // a decimal ID and its NUL
+constexpr size_t PROGRAM_NAME_MAX = 64;
 inline constexpr const char* LIST = "list";  // /apps/list
 inline constexpr const char* OWN = "own";    // /apps/<id>/own
 
-// In .bss, not on a stack: the kernel refuses seeds that overlap the stack,
-// and takes the request as a global capability.
-inline Capability s_seeds[init::MANIFEST_MAX];
-inline init::AppRequest s_app_request;
+// What a run keeps while its program runs. In .bss, not on a stack: the
+// kernel refuses seeds that overlap the stack, and takes the request as a
+// global capability.
+struct Slot {
+  Capability seeds[init::MANIFEST_MAX];
+  uint64_t fs_seeds;  // bit i: seeds[i] is an fs handle `finish` closes
+  uint32_t seed_count;
+  uint32_t pad_;
+  init::AppRequest request;
+  Capability quota;
+  Capability node;
+  Capability app_dir;
+  Capability compartment;
+  char program[PROGRAM_NAME_MAX];
+};
+static_assert(init::MANIFEST_MAX <= 64, "fs_seeds is one bit per entry");
+
+// `run`'s: one program at a time. Whoever runs several at once gives each a
+// `Slot` of its own (`start` and `finish`).
+inline constinit Slot s_slot = {};
 
 // --- Small helpers
 // -------------------------------------------------------------
@@ -575,13 +593,13 @@ inline Capability open_fs_handle(const Starter& starter,
   return handle;
 }
 
-// Step 3: fills `s_seeds` from the manifest, and `*app_dir` with /apps/<id> if
+// Step 3: fills `seeds` from the manifest, and `*app_dir` with /apps/<id> if
 // the program has one; it must stay open while the program runs. False if a
 // REQUIRED entry was not met. Prints the grants on one line.
 inline bool fill_seeds(const Starter& starter, const char* program,
                        const init::Manifest& manifest, Capability quota,
                        Capability node, const Pick* picks, size_t pick_count,
-                       Capability* app_dir) {
+                       Capability* app_dir, Capability* seeds) {
   bool any_own = false;
   bool any_request = false;
   for (uint32_t i = 0; i < manifest.count; ++i) {
@@ -643,7 +661,7 @@ inline bool fill_seeds(const Starter& starter, const char* program,
       default:
         break;
     }
-    s_seeds[i] = capability_is_valid(seed) ? seed : nullptr;
+    seeds[i] = capability_is_valid(seed) ? seed : nullptr;
     out(starter, " ");
     print_manifest_entry(starter.invoke, starter.uart, entry);
     if (capability_is_valid(seed) && entry.kind == init::MANIFEST_QUOTA_DISK) {
@@ -678,10 +696,12 @@ inline bool fill_seeds(const Starter& starter, const char* program,
 // A CPU node for the program: what the first QUOTA_SCHED entry of its manifest
 // asks for, held to at most BUDGET_US per PERIOD_US and never above the
 // interactive class; exactly that, interactive, if it asks for none (or 0).
+// A starter that sets `budget_us` holds its programs to that instead.
 inline Capability cpu_node(const Starter& starter,
                            const init::Manifest& manifest) {
+  const uint64_t most = starter.budget_us != 0 ? starter.budget_us : BUDGET_US;
   uint32_t period = PERIOD_US;
-  uint64_t budget = BUDGET_US;
+  uint64_t budget = most;
   uint8_t priority = init::PRIORITY_INTERACTIVE;
   for (uint32_t i = 0; i < manifest.count; ++i) {
     const init::ManifestEntry& entry = manifest.entries[i];
@@ -693,8 +713,7 @@ inline Capability cpu_node(const Starter& starter,
                : entry.count > PERIOD_MAX_US ? PERIOD_MAX_US
                                              : entry.count;
     }
-    const uint64_t max_budget =
-        static_cast<uint64_t>(BUDGET_US) * period / PERIOD_US;
+    const uint64_t max_budget = most * period / PERIOD_US;
     budget = (entry.amount == 0 || entry.amount > max_budget) ? max_budget
                                                               : entry.amount;
     if (entry.param >
@@ -724,10 +743,10 @@ inline Capability cpu_node(const Starter& starter,
   return request.status == init::SCHED_OK ? request.out_quota : nullptr;
 }
 
-// Starts the program's thread at `entry_point` with `s_app_request`, on
+// Starts the program's thread at `entry_point` with `*request`, on
 // `node`. False if it could not, in which case nothing of it is left running.
 inline bool start_thread(const Starter& starter, Capability entry_point,
-                         Capability node) {
+                         Capability node, init::AppRequest* request) {
   using FnThreadCreate = decltype(&sys_thread_create);
   using FnThreadKill = decltype(&sys_thread_kill);
   const Capability thread = with_reclaim(
@@ -735,7 +754,7 @@ inline bool start_thread(const Starter& starter, Capability entry_point,
       [&] {
         return syscall::call<FnThreadCreate>(
             starter.invoke, starter.thread_create, starter.thread_quota,
-            STACK_BYTES, entry_point, bounded(&s_app_request));
+            STACK_BYTES, entry_point, bounded(request));
       },
       [](Capability result) {
         return sealing::is_sealed_as(OType::Thread, result);
@@ -782,18 +801,30 @@ inline bool wait_thread(const Starter& starter, Capability node) {
   return true;
 }
 
-// --- Starting one
-// ----------------------------------------------------------------
+// --- Starting and finishing
+// ------------------------------------------------------
 
-// Runs program `name` (<name>.bin in `bin`) with `picks` for this run, and
-// waits for it to end. False if it could not be started; `*status` is what it
-// returned.
-inline bool run(const Starter& starter, const char* name, const Pick* picks,
-                size_t pick_count, const char* args, int64_t* status) {
+// Starts program `name` (<name>.bin in `bin`) in `slot` and leaves it
+// running; `finish` waits for it and takes it down. False if it could not be
+// started, and then nothing of it is left open or running. `caps` (at most
+// APP_CAPS_MAX) go into `slot.request.caps`.
+inline bool start(const Starter& starter, Slot& slot, const char* name,
+                  const Pick* picks, size_t pick_count, const char* args,
+                  const Capability* caps = nullptr, size_t cap_count = 0) {
   using FnQuotaDerive = decltype(&sys_quota_vm_derive);
   using FnQuotaDestroy = decltype(&sys_quota_vm_destroy);
   using FnCompDestroy = decltype(&sys_compartment_destroy);
-  *status = NOT_RUN;
+  slot.fs_seeds = 0;
+  slot.seed_count = 0;
+  slot.quota = nullptr;
+  slot.node = nullptr;
+  slot.app_dir = nullptr;
+  slot.compartment = nullptr;
+  slot.program[0] = '\0';
+  for (size_t i = 0; i < init::APP_CAPS_MAX; ++i) {
+    slot.request.caps[i] =
+        (caps != nullptr && i < cap_count) ? caps[i] : nullptr;
+  }
 
   // 1. The program and its manifest.
   Scratch file_text(starter, text_length(name) + 5);
@@ -806,9 +837,16 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
   char* const program = program_text.text;
   image_name(name, file);
   program_name(name, program);
+  size_t name_len = 0;
+  for (; name_len + 1 < PROGRAM_NAME_MAX && program[name_len] != '\0';
+       ++name_len) {
+    slot.program[name_len] = program[name_len];
+  }
+  slot.program[name_len] = '\0';
+
   uint64_t size = 0;
   int64_t error = init::FS_OK;
-  const Capability image = read_all(starter, starter.bin, file, &size, &error);
+  Capability image = read_all(starter, starter.bin, file, &size, &error);
   bool ok = capability_is_valid(image);
   if (!ok) {
     out(starter, "[run]      /bin/");
@@ -879,8 +917,14 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
   // 3. What it gets.
   ScopedHandle app_dir(starter);
   if (ok) {
+    slot.seed_count = manifest.count;
+    for (uint32_t i = 0; i < manifest.count; ++i) {
+      if (init::manifest_is_fs(manifest.entries[i].kind)) {
+        slot.fs_seeds |= uint64_t{1} << i;
+      }
+    }
     ok = fill_seeds(starter, program, manifest, quota, node, picks, pick_count,
-                    &app_dir.handle);
+                    &app_dir.handle, slot.seeds);
     if (!ok) {
       out(starter, "[run]      ");
       out(starter, program);
@@ -889,7 +933,8 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
   }
 
   // 4. Its compartment. The seeds are all it will ever hold. Its memory may
-  //    go to swap (vm.hpp, PAGING, WHAT MUST NOT WAIT).
+  //    go to swap (vm.hpp, PAGING, WHAT MUST NOT WAIT). The image buffer can
+  //    be released as soon as the compartment has loaded itself from it.
   Capability compartment = nullptr;
   Capability entry_point = nullptr;
   if (ok) {
@@ -897,7 +942,7 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
         manifest.count == 0
             ? nullptr
             : capability_set_bounds(
-                  reinterpret_cast<Capability>(&s_seeds[0]),
+                  reinterpret_cast<Capability>(&slot.seeds[0]),
                   static_cast<size_t>(manifest.count) * sizeof(Capability));
     ok = create_compartment(starter.invoke, starter.compartment_create,
                             starter.compartment_destroy, quota, seeds, image,
@@ -906,55 +951,108 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
       out(starter, "[run]      not a program (the image was refused)\n");
     }
   }
+  release(starter, image);
 
-  // 5. Run it on a thread of its own, and sleep until that thread has ended.
+  // 5. Start its thread.
   if (ok) {
     size_t i = 0;
     for (; i + 1 < init::APP_ARGS_MAX && args[i] != '\0'; ++i) {
-      s_app_request.args[i] = args[i];
+      slot.request.args[i] = args[i];
     }
     for (; i < init::APP_ARGS_MAX; ++i) {
-      s_app_request.args[i] = '\0';
+      slot.request.args[i] = '\0';
     }
-    s_app_request.status = NOT_RUN;
-    s_app_request.ticks_per_us = starter.ticks_per_us;
-    ok = start_thread(starter, entry_point, node);
+    slot.request.status = NOT_RUN;
+    slot.request.ticks_per_us = starter.ticks_per_us;
+    ok = start_thread(starter, entry_point, node, &slot.request);
   }
   if (ok) {
-    ok = wait_thread(starter, node);
-    node = nullptr;  // destroyed by the wait, or left as it would not go
-    *status = s_app_request.status;
+    slot.quota = quota;
+    slot.node = node;
+    slot.app_dir = app_dir.handle;
+    app_dir.handle = nullptr;
+    slot.compartment = compartment;
+    return true;
+  }
+
+  // Anything built before a refusal goes back here.
+  for (size_t i = 0; i < init::APP_CAPS_MAX; ++i) {
+    slot.request.caps[i] = nullptr;
   }
   if (capability_is_valid(node)) {
     invoke<int64_t>(starter.invoke, starter.sched_destroy, starter.sched_quota,
-                    node);  // never ran
+                    node);
   }
-
-  // 6. Take it all down, in the reverse order it was built. Its fs handles go
-  //    before the VM quota that paid for them.
   if (capability_is_valid(compartment)) {
     syscall::call<FnCompDestroy>(starter.invoke, starter.compartment_destroy,
                                  compartment);
   }
-  for (uint32_t i = 0; i < manifest.count; ++i) {
-    if (init::manifest_is_fs(manifest.entries[i].kind) &&
-        capability_is_valid(s_seeds[i])) {
-      fs(starter, init::FS_CALL_CLOSE,
-         s_seeds[i]);  // and all opened through it
-    }
-    s_seeds[i] = nullptr;
+  if (capability_is_valid(app_dir.handle)) {
+    fs(starter, init::FS_CALL_CLOSE, app_dir.handle);
+    app_dir.handle = nullptr;
   }
+  for (uint32_t i = 0; i < slot.seed_count; ++i) {
+    if (((slot.fs_seeds >> i) & 1) != 0 &&
+        capability_is_valid(slot.seeds[i])) {
+      fs(starter, init::FS_CALL_CLOSE, slot.seeds[i]);
+    }
+    slot.seeds[i] = nullptr;
+  }
+  slot.seed_count = 0;
+  slot.fs_seeds = 0;
   if (capability_is_valid(quota) &&
       syscall::call<FnQuotaDestroy>(starter.invoke, starter.quota_vm_destroy,
                                     quota) != 0) {
     out(starter,
         "[run]      WARNING: the program's VM quota would not destroy\n");
   }
-  release(starter, image);
+  return false;
+}
+
+// Waits for the program `start` began in `slot` to end, then takes down its
+// compartment, handles and VM quota. `*status` is what the program returned.
+inline bool finish(const Starter& starter, Slot& slot, int64_t* status) {
+  using FnQuotaDestroy = decltype(&sys_quota_vm_destroy);
+  using FnCompDestroy = decltype(&sys_compartment_destroy);
+  const bool ok = wait_thread(starter, slot.node);
+  slot.node = nullptr;  // destroyed by the wait, or left as it would not go
+  *status = slot.request.status;
+  for (size_t i = 0; i < init::APP_CAPS_MAX; ++i) {
+    slot.request.caps[i] = nullptr;
+  }
+
+  // Its fs handles go before the VM quota that paid for them.
+  if (capability_is_valid(slot.compartment)) {
+    syscall::call<FnCompDestroy>(starter.invoke, starter.compartment_destroy,
+                                 slot.compartment);
+    slot.compartment = nullptr;
+  }
+  if (capability_is_valid(slot.app_dir)) {
+    fs(starter, init::FS_CALL_CLOSE, slot.app_dir);
+    slot.app_dir = nullptr;
+  }
+  for (uint32_t i = 0; i < slot.seed_count; ++i) {
+    if (((slot.fs_seeds >> i) & 1) != 0 &&
+        capability_is_valid(slot.seeds[i])) {
+      fs(starter, init::FS_CALL_CLOSE,
+         slot.seeds[i]);  // and all opened through it
+    }
+    slot.seeds[i] = nullptr;
+  }
+  slot.seed_count = 0;
+  slot.fs_seeds = 0;
+  if (capability_is_valid(slot.quota)) {
+    if (syscall::call<FnQuotaDestroy>(starter.invoke, starter.quota_vm_destroy,
+                                      slot.quota) != 0) {
+      out(starter,
+          "[run]      WARNING: the program's VM quota would not destroy\n");
+    }
+    slot.quota = nullptr;
+  }
 
   if (ok) {
     out(starter, "[run]      ");
-    out(starter, program);
+    out(starter, slot.program);
     if (*status == NOT_RUN) {
       out(starter, " returned without a status\n");
     } else if (*status < 0) {
@@ -966,6 +1064,18 @@ inline bool run(const Starter& starter, const char* name, const Pick* picks,
     }
   }
   return ok;
+}
+
+// Runs program `name` (<name>.bin in `bin`) with `picks` for this run, and
+// waits for it to end. False if it could not be started; `*status` is what it
+// returned.
+inline bool run(const Starter& starter, const char* name, const Pick* picks,
+                size_t pick_count, const char* args, int64_t* status) {
+  *status = NOT_RUN;
+  if (!start(starter, s_slot, name, picks, pick_count, args)) {
+    return false;
+  }
+  return finish(starter, s_slot, status);
 }
 
 // --- Linking and resizing

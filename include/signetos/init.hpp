@@ -243,9 +243,13 @@ constexpr size_t RW_SLOT_SEAL_TYPE_KEY =
     RW_SLOT_SEAL_FS_QUOTA + 1;                       // OType::TypeKey authority
 constexpr size_t RW_SLOT_SEAL_OBJECT =
     RW_SLOT_SEAL_TYPE_KEY + 1;                       // OType::SealedObject authority
+constexpr size_t RW_SLOT_SEAL_QUOTA_HEAP =
+    RW_SLOT_SEAL_OBJECT + 1;                         // OType::QuotaHeap authority
+constexpr size_t RW_SLOT_SEAL_HEAP_ALLOC =
+    RW_SLOT_SEAL_QUOTA_HEAP + 1;                     // OType::HeapAllocation authority
 
 constexpr size_t INIT_SEED_COUNT =
-    (RW_SLOT_SEAL_OBJECT + 1) - compartment::RW_SLOT_SEED_BASE;
+    (RW_SLOT_SEAL_HEAP_ALLOC + 1) - compartment::RW_SLOT_SEED_BASE;
 
 // Written by `init` (not seeded): the scheduler's dispatcher entry point.
 // After the `init` thread exits, `launch()` reads this slot back; if it holds
@@ -253,7 +257,7 @@ constexpr size_t INIT_SEED_COUNT =
 // `thread_quota` and re-dispatches that thread every time the running thread
 // exits. That thread is the user-level scheduler's run loop; the kernel never
 // picks threads itself.
-constexpr size_t RW_SLOT_SCHED_RUN = RW_SLOT_SEAL_OBJECT + 1;
+constexpr size_t RW_SLOT_SCHED_RUN = RW_SLOT_SEAL_HEAP_ALLOC + 1;
 constexpr size_t SCHED_RUN_STACK_SIZE = 16 * 1024;
 
 using Status = signetos::Status;

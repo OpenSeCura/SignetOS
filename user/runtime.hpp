@@ -237,12 +237,13 @@ inline Capability lock_word_cap(uint64_t* word) {
 }
 
 // Takes the lock at `word`, sleeping in the scheduler while another thread
-// holds it. SCHED_OK once it is held. SCHED_OWNER_DEAD once it is held, but
-// the previous owner ended without releasing it, so what it protects may be
-// half-updated. Anything else means it was not taken: SCHED_DEADLOCK if the
-// caller holds it already, or the owner is waiting for the caller.
+// holds it (`*waits`, if given, counts each sleep). SCHED_OK once it is held.
+// SCHED_OWNER_DEAD once it is held, but the previous owner ended without
+// releasing it, so what it protects may be half-updated. Anything else means
+// it was not taken: SCHED_DEADLOCK if the caller holds it already, or the
+// owner is waiting for the caller.
 inline int64_t lock(Capability invoke_gate, Capability lock_wait,
-                    uint64_t* word) {
+                    uint64_t* word, uint64_t* waits = nullptr) {
   const uint64_t me = self_tid();
   for (;;) {
     uint64_t seen = 0;
@@ -264,6 +265,9 @@ inline int64_t lock(Capability invoke_gate, Capability lock_wait,
         continue;  // it changed meanwhile: look again
       }
       seen = flagged;
+    }
+    if (waits != nullptr) {
+      __atomic_fetch_add(waits, uint64_t{1}, __ATOMIC_RELAXED);
     }
     const int64_t st =
         invoke<int64_t>(invoke_gate, lock_wait, lock_word_cap(word), seen);

@@ -63,11 +63,13 @@ scaffolding, placeholders or deliberate shortcuts. Read it as the current direct
 | `kernel/lib/` | Freestanding C library routines (`kstring.cpp`) |
 | `include/signetos/` | Kernel headers (`types.hpp` holds `OType`, `Status`, perms), with `hw/` and `debug/` mirroring the sources |
 | `include/libc/` | The few freestanding helpers used in place of a libc |
-| `user/` | Shared user-space runtime: `abi.hpp` (every cross-compartment request struct and slot layout), `manifest.hpp`, `runtime.hpp`, `entry.S` (image trampoline), `compartment.ld` |
+| `user/` | Shared user-space runtime: `abi.hpp` (every cross-compartment request struct and slot layout), `manifest.hpp`, `runtime.hpp`, `launch.hpp`, `entry.S` (image trampoline), `compartment.ld`; the heap library `heap.hpp`, with `heap/` (the stand-ins for a C++ standard library and the CHERIoT SDK that the vendored allocator needs); `malloc.hpp` (`malloc`, `calloc`, `realloc` and `free` for programs, on the `heap` service) (§5.7.1) |
 | `boot/` | Compartments **embedded in the kernel image** |
 | `external/services/` | Services loaded **from disk** |
 | `external/apps/` | Programs loaded from disk |
 | `tools/signetfs.py` | Builds and inspects the on-disk filesystem |
+| `third_party/cheriot_allocator/` | The CHERIoT RTOS heap allocator core, vendored and adapted (MIT licence). `user/heap.hpp` is built on it. Its `README.md` lists every change (§5.7.1) |
+| `third_party/mimalloc_stress/` | mimalloc's `test/test-stress.c`, vendored and adapted (MIT licence), built into `external/apps/mstress.cpp` (§5.7.1) |
 
 ### 0.3 Building and running
 
@@ -81,7 +83,7 @@ make clean
 Options: `TRACE_SWITCH=1` prints every thread switch; `SMP=n` sets the hart
 count; `PAGING=0` builds without paging (no pager, no swap, all memory stays
 in RAM). Test builds, described in the `Makefile`: `QUOTA_SELFTEST=1`,
-`SWEEP_STRESS=1`, `SMP_SELFTEST=1`.
+`SWEEP_STRESS=1`, `SMP_SELFTEST=1`, `HEAP_DEBUG=1` (§5.7.1).
 
 ---
 
@@ -104,7 +106,7 @@ in RAM). Test builds, described in the `Makefile`: `QUOTA_SELFTEST=1`,
  hardware  ──►  kernel (M-mode, ASR)  ──►  init (embedded)
                                              │  creates the core services
                                              │  (drivers, fs, naming,
-                                             │   sched, shell)
+                                             │   sched, heap, shell)
                                              │  publishes sched.run, exits
                                              ▼
                       kernel host loop re-dispatches sched.run
@@ -159,7 +161,7 @@ What the kernel genuinely owns is small and fixed:
 The rest of the design follows the same rule:
 
 * Scheduling state lives entirely in the scheduler (§2.6).
-* Disk and CPU quota trees live in their managers (§2.4).
+* Disk, CPU and heap quota trees live in their managers (§2.4).
 * Compartment-minted sealing types cost the kernel no memory at all (§2.7).
 
 The present descriptors are a first cut. Shrinking them further, or moving
@@ -172,8 +174,9 @@ Zyseal, but this is an area of active investigation!) to distinguish the
 handles of its resource managers. Each hardware type belongs to the manager of
 that resource, which holds the authority to seal and unseal it. The kernel
 delegates `QuotaSched` and `QuotaDisk` to the user-space scheduler and
-filesystem, and `TypeKey` and `SealedObject` to the sealer, via `init` (§2.8,
-§5.8), and holds the remaining hardware types itself.
+filesystem, `TypeKey` and `SealedObject` to the sealer, and `QuotaHeap` and
+`HeapAllocation` to the heap service, via `init` (§2.8, §5.8), and holds the
+remaining hardware types itself.
 
 Sealed types managed by the kernel:
 
@@ -196,7 +199,8 @@ seal and unseal them:
 | `QuotaDisk` | filesystem | Disk quotas and open-file handles (§2.4, §5.7.3). |
 | `TypeKey` | sealer | Compartment-minted type key (§2.7). |
 | `SealedObject` | sealer | Compartment-sealed object (§2.7). |
-| `QuotaHeap` | heap allocator | Reserved for the heap allocator (§5.7.1), which does not exist yet. |
+| `QuotaHeap` | heap service | Heap quotas (§2.4, §5.7.1). |
+| `HeapAllocation` | heap service | The handle to one heap allocation: the authority to free it (§5.7.1). |
 
 **Permission convention on handles:** `Permit_Load` is the *operational*
 right (use it) and `Permit_Store` the *administrative* right (derive from it,
@@ -432,7 +436,7 @@ and one for children.
 | --- | --- | --- | --- |
 | `quota_vm` | kernel VM | `OType::QuotaVm` | As above. The root covers all pool memory left after boot. |
 | `quota_thread_mem` | kernel threads | `OType::QuotaThreadMem` | As above. The root is carved out of the VM root at boot. |
-| `quota_heap` | heap allocator | `OType::QuotaHeap` | Sub-page allocation budgets. **Does not exist yet**: there is no malloc and no sub-page allocator. |
+| `quota_heap` | heap service (user space) | `OType::QuotaHeap` | Bytes of blocks in one heap. Each heap has its own tree, rooted at the quota `heap.create` returns; a node is a block of the heap itself. A prototype (§5.7.1). |
 | `quota_sched` | scheduler (user space) | `OType::QuotaSched` | CPU bandwidth. |
 | `quota_disk` | filesystem (user space) | `OType::QuotaDisk` | Disk space and inodes. |
 
@@ -686,10 +690,10 @@ kernel's only part in it is minting the two authorities at boot.
     caller's interrupt state, and an object on a page out in swap is faulted
     in rather than refused.
 
-Users today: none in the default image (`sched` and `fs` use their dedicated
-hardware `OType`s; see §2.1, §2.4). The shell grants `seal.*` to a program
-whose manifest asks for them; `external/apps/sealtest.cpp`, and the shell's
-`sealtest` command, exercise every point above.
+Users today: none in the default image (`sched`, `fs` and `heap` use their
+dedicated hardware `OType`s; see §2.1, §2.4). The shell grants `seal.*` to a
+program whose manifest asks for them; `external/apps/sealtest.cpp`, and the
+shell's `sealtest` command, exercise every point above.
 
 ### 2.8 Images, manifests and the loader
 
@@ -740,7 +744,8 @@ header points to.
   * `QUOTA_SCHED`: a `quota_sched` node (budget, period, class).
   * `ROOT`: one of the system's root quotas.
   * `OTYPE`: a hardware sealing authority (`OType::QuotaSched`,
-    `OType::QuotaDisk`, `OType::TypeKey`, `OType::SealedObject`).
+    `OType::QuotaDisk`, `OType::TypeKey`, `OType::SealedObject`,
+    `OType::QuotaHeap`, `OType::HeapAllocation`).
 
   Only `init` can meet the hardware and root kinds. The `QUOTA_*` kinds are
   how a compartment comes to hold its own quotas: its launcher derives each
@@ -835,6 +840,7 @@ filesystem; which is which is a build detail.
 | 5 | `naming` | Once it is up, init publishes `uart` and the `fs.*` entries. |
 | 6 | `sched` | `OType::QuotaSched`, the PLIC window and the `trap_wait` gate. Init creates the interrupt handler's thread on the scheduler's interrupt entry and installs it (§3.6). |
 | 7 | — | Device interrupts: init routes the UART's and `blk`'s PLIC sources through the scheduler (`irq_route`, init-only) and hands each driver its `irq_wait`; `blk` also gets the scheduler's entries, so it sleeps instead of polling. |
+| 7b | `heap` | Started only once the scheduler and the sweeper (§4.2) run, because it takes freed memory back by revocation. `OType::QuotaHeap` and `OType::HeapAllocation`, the memory and revocation syscalls, and the scheduler's lock and `block` entries. It publishes `heap.*` itself and hands nothing back (§5.7.1). |
 | 8 | `shell` | Per its manifest: its VM quota, a thread-memory quota, a permanent `quota_sched` node (`INTERACTIVE`, 50 ms per 100 ms), `/home` as an ADMIN `quota_disk` (adopting what is already there), and `/bin` as a read-only OP view. Init then creates **the only thread it ever creates**: the shell's, paid from the shell's thread-memory quota and registered under the shell's node. |
 | 9 | — | Hand `sched.run` to the kernel, scrub its own syscall entries, and exit. |
 
@@ -987,13 +993,13 @@ error path.
 ### 3.5 Quota enforcement and fixed allocation limits
 
 Quotas are strict, static partitions, both in the kernel's two trees and in
-the scheduler's and filesystem's trees:
+the scheduler's, the filesystem's and the heap service's trees:
 
 1. **Static derivation.** A budget is fixed for the quota's lifetime; neither
    parent nor child can resize it.
 2. **Deterministic bounds.** An allocation that does not fit is rejected at
-   once: `sys_vm_allocate` returns NULL, `fs` returns `FS_QUOTA`, and `sched`
-   refuses admission.
+   once: `sys_vm_allocate` returns NULL, `fs` returns `FS_QUOTA`, `heap.alloc`
+   returns `HEAP_OVER_QUOTA`, and `sched` refuses admission.
 3. **No runtime renegotiation.** A workload that needs a different footprint
    is torn down and re-provisioned by its supervisor.
 4. **Reclamation.** Destroying a quota refunds the unused allowance of its
@@ -1164,7 +1170,8 @@ store, is future work. Nothing in user space depends on CoW yet.
 ### 3.8 Termination and resource teardown
 
 Tearing down a child reclaims everything and returns every allowance to its
-parent. The shell does this after a program's thread has exited:
+parent, except a heap the child left in the heap service (last row below).
+The shell does this after a program's thread has exited:
 
 ```c
 // shell `run`, after the program thread is gone
@@ -1183,6 +1190,7 @@ sys_quota_vm_destroy(prog_vm_quota);     // closes; freed once nothing it funded
 | `sched.quota_destroy` | Called through the parent's handle. Frees the node and everything derived under it, returns their bandwidth to the parent and their pages to their funding grants. Threads still on them stop (§2.6). Refused only while a fixed term runs. |
 | `fs.quota_destroy` | Cascade-unlinks everything the node owns; refused while child nodes exist. |
 | Funding order | None required. A VM quota that funds another manager's nodes may be destroyed before them: it closes, and is freed once the manager releases the node pages. Destroying a compartment never takes manager-held nodes with it. |
+| Heaps in the heap service | Not torn down. A heap the program made and did not destroy stays: its arena is the heap service's memory, so destroying the program's compartment does not free it, and it stays charged to the program's VM quota, which closes but is not freed. Nothing cleans it up (§5.7.1). |
 
 The shell prints a warning when a step fails and carries on. In practice the
 usual leak is physical memory held in quarantine until a sweep.
@@ -1207,7 +1215,7 @@ usual leak is physical memory held in quarantine until a sweep.
 | Model | Description |
 | --- | --- |
 | 1. Ephemeral borrowing (local capabilities) | A caller lends a buffer by passing a local capability in a register argument. The callee cannot store it outside a stack, and access ends with the call, so no sweep is needed. |
-| 2. Persistent sharing via sealed handles | The owner seals handles under its hardware `OType` (§2.1) or a compartment-minted type (§2.7) and hands out handles that only it can open. Used for `fs` file handles and for both services' quota handles. |
+| 2. Persistent sharing via sealed handles | The owner seals handles under its hardware `OType` (§2.1) or a compartment-minted type (§2.7) and hands out handles that only it can open. Used for `fs` file handles, for the heap service's allocation handles, and for the quota handles of `sched`, `fs` and `heap`. |
 | 3. Direct global sharing with quarantine + revocation | Raw global capabilities shared across compartments require the memory to be revoked before it is reused. |
 
 **Revocation (`kernel/revoke.cpp`, `kernel/vm.cpp`):**
@@ -1294,9 +1302,9 @@ usual leak is physical memory held in quarantine until a sweep.
 | --- | --- |
 | Capabilities are the sole source of authority; the MMU is never used for access control, only for backing, demand paging and CoW write detection | Page permissions are permissive everywhere. Demand paging and CoW write detection do not exist yet, so the MMU currently does *only* backing. |
 | Accessibility invariant: never unmap under a valid capability | Quarantine keeps freed pages mapped until the sweep has cleared every tag. |
-| Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities and service quotas (`QuotaSched`, `QuotaDisk`) use hardware types. Compartment-minted objects use software types (§2.7), whose identity is a hardware tag and cannot be made by writing memory. |
+| Sealing type invariant: a compartment cannot open or forge an authority without holding the authority for its type | Kernel authorities, service quotas (`QuotaSched`, `QuotaDisk`, `QuotaHeap`) and heap allocation handles (`HeapAllocation`) use hardware types. Compartment-minted objects use software types (§2.7), whose identity is a hardware tag and cannot be made by writing memory. |
 | Immutable quota partitions | Quotas cannot be increased after derivation (§3.5). |
-| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, revocation backlog pages, scheduler nodes and fs nodes are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
+| Self-funding metadata | Compartments, threads, kernel quota nodes, entry pages, range pages, revocation backlog pages, scheduler nodes, fs nodes and heap arenas (with the allocator's state and the heap quota nodes in them) are all billed to the requester. The exceptions are page tables, which come from the frame pool, are never freed and are not charged, and each service's own static tables, which the service pays for from its own quota. |
 | Deterministic quotas and write guarantees | All memory is backed at allocation time; nothing is lazy, so nothing can fail later. |
 
 ### 4.4 Multi-hart status
@@ -1434,19 +1442,134 @@ service may allocate against anything it is handed.
 
 #### 5.7.1 Compartment heap allocator
 
-The possible future design of the compartment heap allocator, subject to all of the changes and redesigns you could imagine:
+Sub-page allocation is a **prototype**, with one allocator core in two forms:
 
-```c
-capability_quota_heap_t heap_quota_create(size_t initial_bytes);
-capability_quota_heap_t heap_quota_derive(capability_quota_heap_t parent, size_t sub_limit_bytes, uint32_t perms);
-int                     heap_quota_destroy(capability_quota_heap_t quota);
+* the library `user/heap.hpp`, for a compartment that runs heaps on arenas it
+  holds itself;
+* the user-space **`heap`** service (`external/services/heap.cpp`), built on
+  the library, for compartments with no allocator of their own.
 
-capability_t heap_allocate(capability_quota_heap_t quota, size_t size);
-void         heap_free(capability_quota_heap_t quota, capability_t ptr);
-```
+The core is the CHERIoT RTOS allocator, vendored under
+`third_party/cheriot_allocator/` (MIT) and adapted: 16-byte alignment and
+chunk headers, 64-bit addresses, SignetOS's revocation, no claims or hazard
+pointers. Its `README.md` lists every change.
 
-**Not built yet.** There is no `malloc` anywhere; every compartment works
-from page-granular `sys_vm_allocate` and static arrays.
+**The library.** A compartment first calls `heap::setup` once, with the
+kernel's `revoke`, `revoke_query` and `revoke_start` gates and, optionally,
+the scheduler's lock entries. Each `Heap` object then makes one arena a heap
+(`init`) and serves `allocate`, `free` and `reclaim`. A compartment can have
+several, each on its own arena.
+
+1. **Arena.** A zeroed `FLAG_REVOCABLE` allocation of the compartment's own
+   (§5.1), with the allocator's state at its start and a 16-byte header
+   before each block; only the `Heap` object, which holds the lock, is
+   outside it. A heap does not grow.
+2. **Blocks.** Zeroed, at least the size asked for, a multiple of 16 bytes,
+   and bounded exactly, so even the header is out of reach.
+3. **Free.** `free` marks the block (`sys_revoke`) and quarantines it. With
+   no load barrier, every capability to it can read and write it until its
+   sweep completes (§4.2). So the heap keeps nothing in it (the quarantine
+   lists run through the headers), and zeroes and reuses it only after the
+   sweep. A second free is refused, as is another heap's block.
+4. **Sweeps.** The library never waits for one. It asks for one
+   (`sys_revoke_start`) when quarantine grows large or a request finds no
+   room, and a refused `allocate` says whether quarantine would cover the
+   request and which epoch to wait for.
+5. **Locking.** One lock per heap (§2.6). Without the scheduler's lock
+   entries, a thread that finds another inside the heap is refused. A thread
+   that ends holding the lock leaves the heap unusable for good, its contents
+   lost. Through the service, only destroying its root quota still works
+   (`HEAP_BROKEN`).
+
+**The service** alone holds the `OType::QuotaHeap` and `OType::HeapAllocation`
+sealing authorities (§3.1). Its entries (`user/abi.hpp`) run on the caller's
+thread. A refusal is a negative `HEAP_*` status; an entry that returns a
+capability returns the status as the address of an untagged capability.
+
+| Entry | Purpose |
+| --- | --- |
+| `heap.create` | Make a heap of the size asked for (rounded up to pages, at most 1 GiB) on a revocable arena paid for by the caller's `QuotaVm`. Returns its root quota, with both rights. |
+| `heap.alloc` | `Permit_Load`. Allocate a block, store it through the caller's `out`, and return its allocation handle. Refused at once if the quota cannot pay or the heap has no room. |
+| `heap.free` | Free the block an allocation handle names. |
+| `heap.derive` | `Permit_Store`. Make a child quota with a limit and a subset of the parent's rights. The parent pays at once for the whole limit and the child's node, a block of the heap. |
+| `heap.destroy` | `Permit_Store`. A child quota closes with all quotas below it: no new charges, unused allowance back to the parent at once, blocks freed. A root quota ends the heap: every handle to it is refused from then on, and the arena goes back to the kernel against the VM quota that paid for it. |
+| `heap.reclaim` | Take every block of the quota's heap whose sweep has completed out of quarantine, refunding their quotas, and ask for a sweep if any remain. Returns the bytes still in quarantine. |
+| `heap.wait` | `heap.reclaim` for a caller with nothing else to do: if anything is left in quarantine, sleep in `sched.block` on the caller's thread, holding no heap lock, until fewer bytes remain or `timeout_us` (at most 100 ms) passes. |
+| `heap.info` | A quota's limit and charge, the number of sleeps on its heap's lock, and the number of client heaps the service holds. |
+
+1. **Memory.** Arenas are the service's own memory, so that it can revoke
+   parts of them. The caller's VM quota pays for each arena and its
+   revocation marks (§4.2). The service spends one table entry per heap;
+   everything else, quota nodes included, is in the arena.
+2. **Allocation handles.** The block is plain memory. Its handle is the same
+   capability with every permission removed, sealed as `HeapAllocation`: it
+   reaches no memory and is the authority to free the block, which itself
+   frees nothing. It has the block's base, so the block's sweep revokes it
+   too.
+3. **Quota handles.** A capability to the quota's node, sealed as
+   `QuotaHeap`: `Permit_Load` allocates, `Permit_Store` derives and destroys
+   (§2.4). Quotas form a static tree like the kernel's memory quotas: a
+   closed quota passes refunds on to its first live ancestor, and its node is
+   freed once nothing is charged to it.
+4. **Charged until swept.** A block costs its quota its length plus the
+   16-byte header until it leaves quarantine; `heap.free` refunds nothing. A
+   caller refused for quota (`HEAP_OVER_QUOTA`) or room (`HEAP_NEEDS_SWEEP`)
+   calls `heap.reclaim` between other work, or sleeps in `heap.wait`, until a
+   sweep brings memory back.
+5. **Stale handles.** Only the service makes handles, so one that unseals is
+   genuine. But until a sweep, the handle of a freed block or destroyed quota
+   still unseals, so each handle is checked against the heap, under its lock,
+   and stale ones are refused.
+6. **Trust.** The service can reach every block of every heap, and holds the
+   VM quota each `heap.create` was given (§5.7). Clients trust it with both.
+
+**C `malloc` shim for programs (`user/malloc.hpp`).** With `MALLOC_MANIFEST(X)`
+in its manifest and `SIGNETOS_MALLOC()` in its source, a program gets
+`malloc`, `calloc`, `realloc` and `free` on a heap made at first use from its
+VM quota, or on a `QuotaHeap` its launcher handed in. Requests refused for
+want of swept memory wait in `heap.wait` and retry. Each block holds its
+sealed handle in 16 extra bytes at its start; the caller gets the block's
+capability, bounds unchanged, pointing past them. `free(ptr)` reads the
+handle at the capability's base, with no side table, so a block can be passed
+to another compartment and freed there. A holder can move `ptr` back and
+overwrite the handle, which only stops it freeing that block: `heap.free`
+refuses anything but a live `HeapAllocation`.
+
+**Not done, and known limits.** The prototype is not hardened:
+
+* **Heaps outlive their clients.** A client that ends without destroying its
+  heap leaves the arena allocated and charged to the VM quota that paid for
+  it, and its table entry taken. Nothing cleans up (§3.8).
+* **At most 32 heaps at once** (`HEAP_MAX_HEAPS`); `heap.create` is refused
+  beyond that. The table is the service's own, so no quota pays for an entry.
+* **One hart.** `heapstress N shared` runs up to 8 compartments on one heap,
+  preempted and contending for its lock (`sched.lock_wait`,
+  `sched.lock_wake`), but every thread runs on the boot hart (§4.4). No heap
+  has run on more than one hart.
+* **Programs cannot use the library.** A program the shell starts holds no
+  kernel call but `compartment_invoke` (§5.7.4), so it can neither allocate
+  an arena nor revoke. It uses the service.
+* **The library's `free` trusts its caller.** It refuses what it can tell is
+  not a block, but finds the header directly in front of the capability and
+  keeps no record of where blocks start. So a capability into the middle of a
+  live block, with a forged header in front, would pass. Across compartments
+  the service's sealed handles prevent this; within one, nobody would forge
+  one. The library has no quotas either.
+* **Kernel calls.** Every `free` makes one (`sys_revoke`); while anything is
+  in quarantine, each operation makes about one more (`sys_revoke_query`).
+  Through the service, each operation is also a cross-compartment call.
+
+**Tests.** `mstress.bin` (`external/apps/mstress.cpp`) is mimalloc's
+allocator stress test (`third_party/mimalloc_stress/`), allocating through
+`user/malloc.hpp`. The shell's `heapstress [N] [shared] [SCALE] [ITER]` runs 1
+to 8 copies of it at once. Each copy makes its own heap; with `shared`, all
+use one heap and pass blocks between compartments through a shared
+`transfer` array. `make HEAP_DEBUG=1` adds the allocator's own consistency
+checks to the service.
+
+Users today: only the heap service is built with the library. The service is
+used by `mstress.bin` and the shell's `heapstress`. Every other compartment
+still works from page-granular `sys_vm_allocate` and static arrays.
 
 #### 5.7.2 Scheduler (`sched`)
 
@@ -1504,7 +1627,7 @@ their parent; there are no directory-entry blocks.
 | `dma` | Device setup, once | The only compartment that knows a physical address. Writes queue 0's addresses and a fixed four-entry descriptor table (one 4 KiB read chain, one 4 KiB write chain), negotiates `VERSION_1` only, and keeps status, features, queue select/ready and the queue addresses out of `blk`'s reach. |
 | `blk` | Sector `read` / `write` | Modern virtio-mmio only. Handles **one 4 KiB request at a time** through a bounce buffer in the DMA arena, starting one of `dma`'s two chains. It never sees a physical address and cannot point the device outside the arena. The caller sleeps in `sched.irq_wait` until the device interrupts, with a timeout, and polls when it cannot sleep. |
 | `naming` | `publish` / `lookup` of entry points by name | Currently a fixed-size table with no unpublish and no access control. TODO! |
-| `shell` | Console | Commands: `help`, `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `shutdown`. Input comes from `uart.read`, which sleeps until a key is pressed. |
+| `shell` | Console | Commands: `help`, `ls`, `cat`, `write`, `append`, `mkdir`, `rm`, `df`, `run <prog> [args]`, `heapstress` (§5.7.1), `shutdown`. Input comes from `uart.read`, which sleeps until a key is pressed. |
 
 DMA is isolated by `dma` (`boot/dma.cpp`): every address the device can use
 is written once, at boot, into memory and registers only `dma` can reach, so
@@ -1515,7 +1638,7 @@ The shell's `run` policy decides what a `/bin` program can get from its
 manifest:
 
 * `SYSCALL`: only `compartment_invoke`.
-* `SERVICE`: `uart` and the `fs.*` entries.
+* `SERVICE`: `uart`, the `fs.*` entries and the `heap.*` entries (§5.7.1).
 * `DISK`: a capped sub-node under `/home/<prog>`.
 * `FILE`: files opened under `/home`.
 * A capped amount of memory, which `QUOTA_VM` hands to the program.
@@ -1534,6 +1657,7 @@ Two programs ship: `hello` (disk sandbox, fs IPC and a `FILE` handle) and
 | `RW_SLOT_SYSCALL_BASE` … | One `EntryPoint` per syscall. `init` passes most on through manifests; `trap_install` it keeps (§3.6) |
 | `RW_SLOT_THREAD_QUOTA` | The root `QuotaThreadMem` |
 | `RW_SLOT_OTYPE_SCHED`, `RW_SLOT_OTYPE_DISK` | Hardware `Seal|Unseal` authorities for `OType::QuotaSched` and `OType::QuotaDisk` |
+| `RW_SLOT_SEAL_QUOTA_HEAP`, `RW_SLOT_SEAL_HEAP_ALLOC` | Hardware `Seal` and `Unseal` authorities for `OType::QuotaHeap` and `OType::HeapAllocation`, which `init` hands to the heap service and to nobody else (§5.7.1) |
 | `RW_SLOT_SCHED_RUN` | Written by `init` and read back by the kernel (§2.6) |
 
 ---

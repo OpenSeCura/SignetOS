@@ -101,6 +101,121 @@ struct alignas(16) UartInterface {
 // Published by the sealer itself; `init` hands nothing back from it.
 
 // ----------------------------------------------------------------------------
+// Heap service (`external/services/heap.cpp`, user/heap.hpp)
+// ----------------------------------------------------------------------------
+//   Capability heap.create(Capability vm_quota, size_t bytes)
+//                                        -> root quota handle, or a status
+//   Capability heap.alloc(Capability quota, size_t size, Capability out)
+//                                        -> allocation handle, or a status;
+//                                           the block is stored through `out`
+//   int64_t    heap.free(Capability handle)                  -> status
+//   int64_t    heap.destroy(Capability quota)                -> status
+//   int64_t    heap.reclaim(Capability quota)
+//                              -> bytes still in quarantine (>= 0), or a status
+//   int64_t    heap.info(Capability quota, Capability out)   -> status;
+//                                           `*out` is a HeapInfo
+//   int64_t    heap.wait(Capability quota, uint64_t timeout_us)
+//                              -> bytes still in quarantine (>= 0), or a status
+//   Capability heap.derive(Capability parent, size_t bytes, uint64_t rights)
+//                                        -> child quota handle, or a status
+//
+// Sub-page allocation for compartments with no allocator of their own
+// (CORE_DESIGN.md §2.1, "Heap"). An entry that returns a capability returns
+// a refusal as an untagged capability whose address is the status
+// (`status_cap`, `cap_error`, above).
+//
+// A HEAP is one arena of revocable memory, `bytes` rounded up to pages. The
+// memory is the service's; the `vm_quota` handed to `create` pays for it and
+// its revocation marks (vm.hpp). At most HEAP_MAX_HEAPS heaps exist at once.
+//
+// A QUOTA HANDLE (`OType::QuotaHeap`) names a quota: a limit and what is
+// charged now. Permit_Load allows `alloc`; Permit_Store, `derive` and
+// `destroy`. `create` returns the root quota: both rights, the whole heap.
+//
+// QUOTAS FORM A TREE, a static partition like the kernel's VM quotas
+// (CORE_DESIGN.md §6). `derive` gives a child limit `bytes` and those of
+// `rights` that `parent` has. The parent pays at once for `bytes` and the
+// node (HEAP_NODE_COST), and needs `bytes` + HEAP_NODE_COST_MAX left. The
+// child's allocations are then charged to the child alone.
+//
+// `destroy` of a child quota closes it and all below it: their handles are
+// refused, their unused limits return to the parent at once, and their
+// blocks are freed and refund the parent as they leave quarantine (each
+// node a sweep later). `destroy` of a root quota ends the heap: its handles
+// are refused, the arena goes back to its VM quota, and the next sweep
+// kills every capability into it and refunds that quota.
+//
+// AN ALLOCATION is two capabilities. The block is plain memory: exactly
+// bounded, zeroed, at least `size` bytes, a multiple of 16 long. The handle
+// (`OType::HeapAllocation`) has the block's bounds and no permissions: it
+// reaches no memory and is the only authority to free the block. `out` must
+// be 16-byte aligned, with room for 16 bytes and permission to store
+// capabilities; it is checked before anything is allocated.
+//
+// CHARGED UNTIL SWEPT. A block costs its quota its length plus 16 bytes.
+// `free` refunds nothing: every capability to the block, handle included,
+// works until a revocation sweep clears it; only then is the block reused
+// and its quota refunded. The service asks for a sweep when quarantine
+// grows large, when a request is refused for want of quota or room, and on
+// `reclaim`, which also takes back what completed sweeps allow.
+//
+// A refused caller calls `reclaim` until enough is back, or `wait` if it has
+// nothing else to do (a refused `malloc`, user/malloc.hpp): programs hold no
+// scheduler entry to sleep with. If blocks are left in quarantine, `wait`
+// sleeps on the caller's thread, holding no heap's lock, until fewer are
+// left or `timeout_us` has passed (at most HEAP_WAIT_MAX_US; call again to
+// wait longer), then returns what `reclaim` would. No other entry waits.
+//
+// Published by the heap service itself; `init` hands nothing back from it.
+
+constexpr int64_t HEAP_OK          = 0;
+constexpr int64_t HEAP_BAD_REQUEST = -1;   // unusable size, rights or `out`
+constexpr int64_t HEAP_INVALID     = -2;   // not a live handle of the kind needed
+constexpr int64_t HEAP_PERMISSION  = -3;   // the handle lacks the right
+constexpr int64_t HEAP_OVER_QUOTA  = -4;   // the quota cannot pay for it now
+constexpr int64_t HEAP_NEEDS_SWEEP = -5;   // room only in quarantine: reclaim, retry
+constexpr int64_t HEAP_NO_MEMORY   = -6;   // alloc: the heap is full; create: the
+                                           // VM quota could not pay (now)
+constexpr int64_t HEAP_TOO_BIG     = -7;   // more than the heap could ever hold,
+                                           // or nothing
+constexpr int64_t HEAP_FULL        = -8;   // create: HEAP_MAX_HEAPS heaps exist
+constexpr int64_t HEAP_BUSY        = -9;   // the caller's thread is inside this
+                                           // heap already
+constexpr int64_t HEAP_BROKEN      = -10;  // a thread ended inside this heap: only
+                                           // `destroy` of its root still works
+
+// The service's entries, by index and by published name.
+enum : uint32_t {
+  HEAP_CALL_CREATE, HEAP_CALL_ALLOC, HEAP_CALL_FREE, HEAP_CALL_DESTROY,
+  HEAP_CALL_RECLAIM, HEAP_CALL_INFO, HEAP_CALL_DERIVE, HEAP_CALL_WAIT,
+  HEAP_CALLS
+};
+inline constexpr const char* HEAP_CALL_NAMES[HEAP_CALLS] = {
+    "heap.create",  "heap.alloc",   "heap.free",  "heap.destroy",
+    "heap.reclaim", "heap.info",    "heap.derive", "heap.wait"};
+
+// Heaps the service can hold at once.
+constexpr size_t HEAP_MAX_HEAPS = 32;
+// The largest arena `create` takes.
+constexpr uint64_t HEAP_MAX_BYTES = 1ULL << 30;
+// The longest one `wait` sleeps.
+constexpr uint64_t HEAP_WAIT_MAX_US = 100'000;
+
+// What a child quota costs its parent beyond its limit (`heap.derive`): its
+// node, the node's 16-byte header, and 16 more if the allocator rounds up.
+constexpr uint64_t HEAP_NODE_BYTES = 48;
+constexpr uint64_t HEAP_NODE_COST = HEAP_NODE_BYTES + 16;
+constexpr uint64_t HEAP_NODE_COST_MAX = HEAP_NODE_COST + 16;
+
+// `heap.info`: the quota named, its heap, and the service.
+struct alignas(16) HeapInfo {
+  uint64_t limit;      // the most that can be charged to it at once, in bytes
+  uint64_t used;       // charged now: live blocks, and freed ones not yet swept
+  uint64_t heaps;      // clients' heaps the service holds now, this one included
+  uint64_t contended;  // sleeps on this heap's lock (`sched.lock_wait`)
+};
+
+// ----------------------------------------------------------------------------
 // Sweeper service (`external/services/sweeper.cpp`)
 // ----------------------------------------------------------------------------
 //   int64_t sweeper.stop() -> 0   the sweeper's thread ends
@@ -475,11 +590,13 @@ struct alignas(16) FsInterface {
 // Applications (`external/apps/*.cpp`)
 // ----------------------------------------------------------------------------
 constexpr size_t APP_ARGS_MAX = 64;
+constexpr size_t APP_CAPS_MAX = 2;
 
 struct alignas(16) AppRequest {
-  char args[APP_ARGS_MAX];  // in: the rest of the command line, NUL-terminated
-  int64_t status;           // out: the program's exit status; 0 is success
-  uint64_t ticks_per_us;    // in: `time` ticks per us (from DTB timebase-frequency)
+  char args[APP_ARGS_MAX];        // in: the rest of the command line, NUL-terminated
+  int64_t status;                 // out: the program's exit status; 0 is success
+  uint64_t ticks_per_us;          // in: `time` ticks per us (from DTB timebase-frequency)
+  Capability caps[APP_CAPS_MAX];  // in: capabilities handed in for this run, or null
 };
 
 // ============================================================================
